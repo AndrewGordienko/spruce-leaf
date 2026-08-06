@@ -1,0 +1,120 @@
+//! Reply triage: classify an inbound reply and take the right action.
+//!
+//! The moment a real human replies, the sequence must stop — nothing reads worse
+//! than touch 4 landing after someone already answered. This module classifies
+//! each reply (interested / objection / not-now / referral / unsubscribe /
+//! auto-reply) and acts:
+//!   * unsubscribe / opt-out  → suppress + stop the sequence (compliance)
+//!   * auto-reply (OOO)       → note it, leave the sequence running
+//!   * anything else human     → mark replied, stop the sequence, flag for you
+//!
+//! Opt-out detection never depends on the model: [`Compliance::is_optout`] runs
+//! first and forces the unsubscribe path.
+
+use anyhow::Result;
+use serde::Deserialize;
+use serde_json::{json, Value};
+
+use crate::compliance::Compliance;
+use crate::db::{Person, Reply, SharedDb};
+use crate::engine::Claude;
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct Classification {
+    /// interested | not_now | objection | referral | unsubscribe | auto_reply | other
+    pub category: String,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub suggested_reply: String,
+}
+
+pub async fn classify(client: &Claude, person_name: &str, subject: &str, body: &str) -> Result<Classification> {
+    let system = "You triage inbound replies to cold B2B sales outreach for the sender. Read the \
+                  reply and classify the sender's intent. Be conservative: an out-of-office or \
+                  automated bounce is auto_reply, not interested.";
+    let user = format!(
+        "Reply from {person_name}.\nSubject: {subject}\n\n{}\n\nClassify it, summarize in one line, \
+         and draft a short suggested reply the sender could send back.",
+        body.chars().take(4000).collect::<String>()
+    );
+    client.structured::<Classification>(system, &user, schema()).await
+}
+
+/// Record a reply and apply the resulting state changes. Idempotent on Message-ID.
+/// Returns a short human description of the action taken.
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_reply(
+    db: &SharedDb,
+    client: &Claude,
+    person: &Person,
+    from_email: &str,
+    subject: &str,
+    body: &str,
+    message_id: &str,
+    in_reply_to: &str,
+) -> Result<String> {
+    if db.reply_exists(message_id)? {
+        return Ok("duplicate".into());
+    }
+    let seq = db.active_sequence_for_person(&person.id)?.unwrap_or_default();
+
+    // Model classification, with a hard opt-out override that never trusts the LLM.
+    let class = classify(client, &person.name, subject, body)
+        .await
+        .unwrap_or_default();
+    let optout = Compliance::is_optout(body) || Compliance::is_optout(subject);
+    let category = if optout { "unsubscribe".to_string() } else if class.category.is_empty() { "other".into() } else { class.category.clone() };
+
+    let action = match category.as_str() {
+        "unsubscribe" => {
+            db.add_suppression(&person.brand, from_email, "unsubscribed")?;
+            db.set_person_status(&person.id, "unsubscribed")?;
+            if !seq.is_empty() {
+                db.stop_sequence(&seq, "stopped", "cancelled")?;
+            }
+            db.log_event(&person.brand, &person.id, "", "unsubscribed", "opt-out honored")?;
+            "suppressed + sequence stopped".to_string()
+        }
+        "auto_reply" => {
+            db.log_event(&person.brand, &person.id, "", "classified", "auto-reply / OOO")?;
+            "noted (auto-reply, sequence continues)".to_string()
+        }
+        other => {
+            db.set_person_status(&person.id, "replied")?;
+            if !seq.is_empty() {
+                db.stop_sequence(&seq, "completed", "cancelled")?;
+            }
+            db.log_event(&person.brand, &person.id, "", "replied", &format!("{other}: {}", class.summary))?;
+            format!("marked replied ({other}), sequence paused")
+        }
+    };
+
+    db.record_reply(&Reply {
+        person_id: person.id.clone(),
+        sequence_id: seq,
+        from_email: from_email.to_string(),
+        subject: subject.to_string(),
+        body: body.chars().take(4000).collect(),
+        classification: category,
+        action_taken: action.clone(),
+        message_id: message_id.to_string(),
+        in_reply_to: in_reply_to.to_string(),
+        ..Default::default()
+    })?;
+
+    Ok(action)
+}
+
+fn schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["category"],
+        "properties": {
+            "category": { "type": "string", "enum": ["interested","not_now","objection","referral","unsubscribe","auto_reply","other"] },
+            "summary": { "type": "string" },
+            "suggested_reply": { "type": "string" }
+        }
+    })
+}

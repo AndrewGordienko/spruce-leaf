@@ -1,0 +1,38 @@
+[package]
+name = "spruce-leaf"
+version = "0.1.0"
+edition = "2021"
+description = "Codex-for-sales: an interactive agent that finds companies with an expensive problem, the people responsible, writes multi-stage outreach, and files it all in a local CRM."
+
+[[bin]]
+name = "spruce-leaf"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+dotenvy = "0.15"
+axum = "0.7"
+rustyline = "14"
+chrono = { version = "0.4", features = ["serde", "clock"], default-features = false }
+uuid = { version = "1", features = ["v4"] }
+toml = "0.8"
+# Book ingestion: extract text from PDFs (.txt/.md are read directly).
+pdf-extract = "0.7"
+# --- SDR execution layer ---
+# Durable execution spine: real leads, mailboxes, scheduled touches, events.
+rusqlite = { version = "0.31", features = ["bundled"] }
+# Email verification (MX lookup) + deliverability DNS checks (SPF/DKIM/DMARC).
+hickory-resolver = "0.24"
+# SMTP send transport for the cadence engine.
+lettre = { version = "0.11", default-features = false, features = ["tokio1", "tokio1-rustls-tls", "smtp-transport", "builder", "pool"] }
+# Inbound reply parsing (bounce/OOO/unsub detection, thread matching).
+mail-parser = "0.9"
+# IMAP polling for the reply-handling loop (sync client, run on a blocking task).
+imap = "2"
+native-tls = "0.2"

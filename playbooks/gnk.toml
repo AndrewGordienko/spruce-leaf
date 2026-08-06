@@ -1,0 +1,98 @@
+# GnK — custom software & AI boutique.
+# GnK finds a current, expensive, organization-specific information/software
+# workflow that generic products serve poorly, and proposes one concrete system.
+
+key = "gnk"
+name = "GnK"
+signature = "Andrew"
+
+one_liner = "I run GnK, a small, senior software and AI team that builds custom systems — we're not an agency looking for projects."
+
+motion = "a current, expensive, organization-specific information or software workflow that generic products serve poorly — evidence reconstruction, exception triage, decision support over records scattered across systems"
+
+# Word band for the email body. Founder-led notes may run a little longer when
+# the explanation genuinely earns the space.
+min_words = 70
+max_words = 130
+
+# A high-value candidate should show more than one independent signal.
+# "They are hiring AI engineers" alone is NOT a sufficient thesis.
+min_signals = 2
+
+system_concept_examples = [
+  "an evidence-reconstruction workbench that links each finding to its source record",
+  "a shipment-readiness exception queue",
+  "an experiment-failure intelligence layer across customer implementations",
+  "a location-matched outage classification view",
+  "a delay decision-map over the project record",
+  "a historical-review tool that assembles the dispute packet",
+  "a workflow-specific assistant with evidence links",
+]
+
+subject_examples = [
+  "Reconstructing delay evidence",
+  "Retail deduction evidence",
+  "Shipment release decisions",
+  "Experiment failure patterns",
+  "Pack-out changeovers",
+  "Store continuity checks",
+]
+
+vantage_notes = [
+  "Process owner / controls lead: can describe how the record is turned into a defensible account, and where the evidence actually lives.",
+  "Operational executive (VP Ops, program lead): can compare the reconstruction burden across projects/programs and decide it merits a look, or route.",
+  "Technical evaluator (VP Eng, Head of Data): assesses feasibility/integration — do NOT lead here while the open question is whether the business problem exists.",
+  "Router (BD, chief of staff): ask one easy question about who owns the workflow; never ask them to approve a pilot.",
+]
+
+requirements = [
+  "Never let the email read like 'we are an AI agency with capacity'. Center the expensive workflow and the operating decision; mention GnK only after.",
+  "Lead with the operating decision (reconstructing a delay, releasing a shipment, disputing a deduction), not with software, an AI agent, automation, or 'digital transformation'.",
+  "AI is the mechanism, never the headline. Do not list capabilities (agents, dashboards, integrations, mobile, cloud).",
+  "Every account claim must trace to an observed fact or be reframed as a question. Convert unsupported claims into questions.",
+  "Position GnK as able to BUILD the system and start with a bounded historical test — not merely advise.",
+  "Good framing: 'When a major project falls behind, how difficult is it to turn the schedule history into a defensible account of what actually caused the delay?' Bad framing: 'Aecon is a leader in construction. GnK helps construction companies leverage AI to streamline project management.'",
+]
+
+forbidden = [
+  "million-dollar problem",
+  "million dollar problem",
+  "don't pay if it doesn't work",
+  "digital transformation",
+  "end-to-end automation",
+  "intelligent workflow",
+  "AI-powered",
+  "AI powered",
+]
+
+doctrine = """
+GnK's motion: find a current, expensive, organization-specific information or
+software workflow that off-the-shelf products serve poorly, and propose ONE
+concrete system that improves a specific recurring decision.
+
+Establish, across the email or sequence:
+  1. A concrete operating workflow (a recurring decision, delay, handoff,
+     exception, or investigation).
+  2. Public evidence or current signals that make the hypothesis plausible —
+     ideally MORE THAN ONE independent signal. "Hiring AI engineers" alone is
+     not a thesis.
+  3. Why the contacted role can observe or own it (their vantage, not title).
+  4. The MECHANISM producing time, risk, or rework — e.g. the deduction notice
+     arrives separately from the WMS record, the ASN, the bill of lading, the
+     appointment history, and the label evidence, leaving someone to reconstruct
+     the packet before anyone can decide whether to dispute it.
+  5. ONE specific system GnK could build (see the concept examples).
+  6. What discovery must confirm.
+  7. A bounded next step (often: test against a small historical sample — but
+     never ask for that in the first email).
+
+Strong GnK opening (evidence reconstruction is the recurring GnK shape):
+"The schedule shows where the project moved, but the explanation may be spread
+across correspondence, daily reports, changes, and approvals — so reconstructing
+a defensible account of a delay takes real analyst time." Then a question the
+controls lead can actually answer.
+
+Keep human judgment central: GnK prepares the evidence / reconstructs the record
+/ classifies the likely pattern, while the expert (claims team, project controls,
+scientist, operations) decides what to do with it.
+"""

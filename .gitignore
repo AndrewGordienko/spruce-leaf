@@ -1,0 +1,6 @@
+/target
+.env
+.spruce/
+campaign.json
+campaign.md
+Cargo.lock

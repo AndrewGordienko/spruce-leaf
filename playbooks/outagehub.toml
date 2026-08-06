@@ -1,0 +1,99 @@
+# OutageHub — Canadian utility outage data matched to locations.
+# The value is never "we tell you the power is out" — their sites/alarms already
+# do. The value is EXTERNAL CONTEXT around an operational decision at the moment
+# an outage occurs.
+
+key = "outagehub"
+name = "OutageHub"
+signature = "Andrew Gordienko"
+
+one_liner = "I'm the founder of OutageHub. We bring Canadian utility outage updates together and match reported events to locations."
+
+motion = "one operational decision at the moment an outage occurs, where location-matched external utility context could help classify or prioritize — beyond what internal alarms and site calls already say"
+
+min_words = 90
+max_words = 140
+
+min_signals = 1
+
+system_concept_examples = [
+  "a real-time Canadian utility outage feed matched against your site locations",
+  "a location-matched view that flags which sites sit inside a reported outage area before each site checks in",
+  "an independent timeline of what the utility reported out, and when, around an incident",
+  "a signal that helps classify whether clustered alarms share one external utility cause",
+]
+
+subject_examples = [
+  "Attributing downtime at Ivy sites",
+  "Utility outages near Amica residences",
+  "Classifying power-related site alarms",
+  "Identifying affected charging locations",
+  "Prioritizing checks after an outage",
+]
+
+vantage_notes = [
+  "Workflow owner (ops manager / NOC lead): can explain the actual classification/prioritization process and judge usefulness.",
+  "Executive sponsor: can describe the organizational response and route — do not force them to pretend they run the workflow.",
+  "Router (BD / commercial): ask who owns the daily decision; do not ask them to assess product-market fit.",
+  "Technical contact: relevant only when the question is genuinely about data or integration.",
+]
+
+requirements = [
+  "Connect FOUR things every time: site/network footprint + a public utility event + a specific operational decision + the likely owner. Missing any one makes it too broad.",
+  "Always implicitly answer 'our sites/alarms already tell us the power is out — what does this ADD?'. The answer is external context: which sites are exposed before each reports; utility vs equipment/connectivity/site fault; whether alarms share one cause; which sites to check first; an independent timeline.",
+  "OutageHub COMPLEMENTS internal telemetry, alarms, backup power, and site calls — it never replaces them, and public data is never claimed to be more authoritative than internal telemetry.",
+  "Distinguish data types honestly: public utility info vs private alarms vs carrier telemetry vs internal tickets vs generator status vs customer/site records. Never claim to know private site status without an authorized integration.",
+  "The natural first step is a location-matched historical example or review — NOT an API integration. Measure handling time, classification changes, or dispatch decisions only after the workflow is confirmed.",
+  "Anchor the question in a specific decision at a specific moment, never 'could outage data help your operations?'.",
+]
+
+forbidden = [
+  "operational resilience",
+  "proactive decision-making",
+  "proactive decision making",
+  "enhance operational",
+  "not selling",
+  "enable proactive",
+]
+
+doctrine = """
+OutageHub's value is external context around a decision, not outage detection.
+Their sites, staff, telemetry, alarms, or customers usually already know the
+power is out. The credible value is: identifying which locations may be exposed
+BEFORE every location reports; distinguishing a utility event from an equipment,
+connectivity, or site-specific failure; determining whether several alarms likely
+share ONE external cause; helping central operations decide which sites to check
+first; and preserving an independent timeline of what the utility reported and
+when.
+
+Ask about one operational decision at a specific moment:
+  - "When a utility reports an outage near a residence, how does your team decide
+     which site leaders check backup power and resident-support plans first?"
+  - "When several chargers at one site stop communicating, how do you determine
+     whether the cause is site equipment, a third-party service, or the utility?"
+  - "When multiple site alarms appear at once, how does the team decide whether
+     they share an external power cause before dispatching technicians?"
+
+State the hypothesis carefully and invite correction: "I wondered whether the
+hard part is that utility updates identify an affected AREA without identifying
+each of your locations inside it." Do not say "the process breaks" unless the
+evidence is unusually strong.
+
+Per-vertical framing:
+  - EV charging: classify whether a silent charger is utility vs communications
+    vs third-party platform vs local equipment.
+  - Senior residences / healthcare: which facilities need an early continuity
+    check — do NOT imply OutageHub manages generators, backup power, or care.
+  - Telecom / network ops: whether clustered alarms share a utility cause before
+    dispatch; public data COMPLEMENTS internal telemetry, never outranks it.
+  - Generator / temporary-power: which customer sites lost grid power, and which
+    events may outlast onsite backup.
+  - Insurance / claims: must tie to a claims decision, classification, or
+    post-incident timeline — "outages cause claims" is far too broad.
+  - Multi-location retail / labs / logistics: whether a CENTRAL team needs to
+    identify which sites warrant a continuity check before each reports. Avoid
+    where local staff already report faster and there is no central decision.
+
+Reveal one layer at a time across the sequence; do not dump the map, API,
+historical data, alerting, and every use case into one email.
+"""
