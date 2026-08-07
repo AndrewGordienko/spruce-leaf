@@ -9,7 +9,8 @@
 //!      title/seniority. NOTE: on most plans this returns *masked* data (no
 //!      email, obfuscated last name); it's for discovery only.
 //!   3. **People enrichment / match** (`/people/match`) — reveals a single
-//!      person's verified email and phone (consumes credits).
+//!      person's verified email and optionally requests phone delivery to a
+//!      configured webhook (consumes credits).
 //!
 //! Auth is header-only (`x-api-key`) as of Apollo's Sept-2024 change. The key
 //! comes from `APOLLO_API_KEY`. All response structs use `#[serde(default)]` and
@@ -22,8 +23,27 @@ use serde_json::{json, Value};
 
 const BASE: &str = "https://api.apollo.io/api/v1";
 
+/// Apollo sends explicit `null`s for absent fields (e.g. `organization_state: null`).
+/// Our response structs use `#[serde(default)]`, which only fills *missing* keys — a
+/// `null` where a `String`/`Vec` is expected still fails with "invalid type: null,
+/// expected a string". Recursively dropping null-valued object keys lets those
+/// defaults apply instead, keeping the drifting payloads safe to deserialize.
+fn strip_nulls(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            map.retain(|_, v| !v.is_null());
+            for v in map.values_mut() {
+                strip_nulls(v);
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(strip_nulls),
+        _ => {}
+    }
+}
+
 pub struct Apollo {
     key: String,
+    phone_webhook_url: Option<String>,
     http: Client,
 }
 
@@ -32,6 +52,10 @@ pub struct Apollo {
 pub struct OrgFilters {
     /// Free-text ICP keywords (e.g. "third party logistics", "clinical trials").
     pub keywords: Vec<String>,
+    /// Specific organization name; Apollo accepts partial company-name matches.
+    pub name: String,
+    /// Employer domains without scheme, www, or @.
+    pub domains: Vec<String>,
     /// Apollo headcount buckets, e.g. "51,200" or "201,500".
     pub employee_ranges: Vec<String>,
     /// HQ locations, e.g. "Canada", "Ontario, Canada".
@@ -44,6 +68,7 @@ pub struct OrgFilters {
 #[derive(Debug, Clone, Default)]
 pub struct PeopleFilters {
     pub organization_ids: Vec<String>,
+    pub organization_domains: Vec<String>,
     pub titles: Vec<String>,
     pub seniorities: Vec<String>,
     pub locations: Vec<String>,
@@ -91,9 +116,21 @@ impl ApolloOrg {
     }
 
     pub fn hq(&self) -> String {
-        let city = if !self.organization_city.is_empty() { &self.organization_city } else { &self.city };
-        let state = if !self.organization_state.is_empty() { &self.organization_state } else { &self.state };
-        let country = if !self.organization_country.is_empty() { &self.organization_country } else { &self.country };
+        let city = if !self.organization_city.is_empty() {
+            &self.organization_city
+        } else {
+            &self.city
+        };
+        let state = if !self.organization_state.is_empty() {
+            &self.organization_state
+        } else {
+            &self.state
+        };
+        let country = if !self.organization_country.is_empty() {
+            &self.organization_country
+        } else {
+            &self.country
+        };
         [city.as_str(), state.as_str(), country.as_str()]
             .into_iter()
             .filter(|s| !s.is_empty())
@@ -147,8 +184,22 @@ impl ApolloPerson {
         if !self.name.is_empty() {
             self.name.clone()
         } else {
-            format!("{} {}", self.first_name, self.last_name).trim().to_string()
+            format!("{} {}", self.first_name, self.last_name)
+                .trim()
+                .to_string()
         }
+    }
+
+    pub fn location(&self) -> String {
+        [
+            self.city.as_str(),
+            self.state.as_str(),
+            self.country.as_str(),
+        ]
+        .into_iter()
+        .filter(|part| !part.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(", ")
     }
 }
 
@@ -158,6 +209,12 @@ struct OrgSearchResp {
     organizations: Vec<ApolloOrg>,
     #[serde(default)]
     accounts: Vec<ApolloOrg>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OrgEnrichResp {
+    #[serde(default)]
+    organization: Option<ApolloOrg>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -183,26 +240,60 @@ impl Apollo {
         if key.trim().is_empty() {
             bail!("APOLLO_API_KEY is empty");
         }
-        Ok(Self { key, http: Client::new() })
+        Ok(Self {
+            key,
+            phone_webhook_url: std::env::var("APOLLO_WEBHOOK_URL")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
+            http: Client::new(),
+        })
     }
 
     async fn post(&self, path: &str, body: Value) -> Result<Value> {
-        let resp = self
-            .http
-            .post(format!("{BASE}{path}"))
-            .header("x-api-key", &self.key)
-            .header("Content-Type", "application/json")
-            .header("Cache-Control", "no-cache")
-            .json(&body)
-            .send()
-            .await
-            .with_context(|| format!("calling Apollo {path}"))?;
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            bail!("Apollo {path} returned {status}: {}", text.chars().take(400).collect::<String>());
+        // Retry transient rate-limit (429) and 5xx responses with exponential
+        // backoff so a bulk pass (hundreds of reveals) rides out Apollo's rate
+        // limits instead of failing mid-run. Honors Retry-After when present.
+        const MAX_ATTEMPTS: u32 = 4;
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let resp = self
+                .http
+                .post(format!("{BASE}{path}"))
+                .header("x-api-key", &self.key)
+                .header("Content-Type", "application/json")
+                .header("Cache-Control", "no-cache")
+                .json(&body)
+                .send()
+                .await
+                .with_context(|| format!("calling Apollo {path}"))?;
+            let status = resp.status();
+            if (status.as_u16() == 429 || status.is_server_error()) && attempt < MAX_ATTEMPTS {
+                let retry_after = resp
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.trim().parse::<u64>().ok());
+                let delay = retry_after.unwrap_or(2u64.pow(attempt)).clamp(1, 60);
+                eprintln!(
+                    "  · Apollo {path} {} — backing off {delay}s (attempt {attempt}/{MAX_ATTEMPTS})",
+                    status.as_u16()
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                continue;
+            }
+            let text = resp.text().await.unwrap_or_default();
+            if !status.is_success() {
+                bail!(
+                    "Apollo {path} returned {status}: {}",
+                    text.chars().take(400).collect::<String>()
+                );
+            }
+            let mut value: Value = serde_json::from_str(&text)
+                .with_context(|| format!("parsing Apollo {path} response"))?;
+            strip_nulls(&mut value);
+            return Ok(value);
         }
-        serde_json::from_str(&text).with_context(|| format!("parsing Apollo {path} response"))
     }
 
     /// Search for organizations matching the ICP filters.
@@ -214,16 +305,40 @@ impl Apollo {
         if !f.keywords.is_empty() {
             body["q_organization_keyword_tags"] = json!(f.keywords);
         }
+        if !f.name.trim().is_empty() {
+            body["q_organization_name"] = json!(f.name.trim());
+        }
+        if !f.domains.is_empty() {
+            body["q_organization_domains_list"] = json!(f.domains);
+        }
         if !f.employee_ranges.is_empty() {
             body["organization_num_employees_ranges"] = json!(f.employee_ranges);
         }
         if !f.locations.is_empty() {
             body["organization_locations"] = json!(f.locations);
         }
-        let resp: OrgSearchResp = serde_json::from_value(self.post("/mixed_companies/search", body).await?)?;
+        let resp: OrgSearchResp =
+            serde_json::from_value(self.post("/mixed_companies/search", body).await?)?;
         let mut orgs = resp.organizations;
         orgs.extend(resp.accounts);
         Ok(orgs)
+    }
+
+    /// Enrich one organization by domain, returning full firmographics.
+    ///
+    /// Apollo's company *search* frequently returns sparse records (little more
+    /// than name + domain), which makes fit-qualification reject real companies
+    /// for *missing* data rather than bad fit. This fills in industry, headcount,
+    /// revenue, description, keywords, and technologies. Organization enrichment
+    /// does not consume the people/email-reveal credits.
+    pub async fn enrich_organization(&self, domain: &str) -> Result<Option<ApolloOrg>> {
+        if domain.trim().is_empty() {
+            return Ok(None);
+        }
+        let body = json!({ "domain": domain.trim() });
+        let resp: OrgEnrichResp =
+            serde_json::from_value(self.post("/organizations/enrich", body).await?)?;
+        Ok(resp.organization)
     }
 
     /// Search for people (masked) within orgs / by title.
@@ -234,6 +349,9 @@ impl Apollo {
         });
         if !f.organization_ids.is_empty() {
             body["organization_ids"] = json!(f.organization_ids);
+        }
+        if !f.organization_domains.is_empty() {
+            body["q_organization_domains_list"] = json!(f.organization_domains);
         }
         if !f.titles.is_empty() {
             body["person_titles"] = json!(f.titles);
@@ -252,8 +370,10 @@ impl Apollo {
         Ok(people)
     }
 
-    /// Reveal a person's verified email + phone. Match by Apollo id when known,
-    /// else by name + org domain. `reveal_personal_emails` costs credits.
+    /// Reveal a person's verified email and optionally request phone enrichment.
+    /// Apollo delivers revealed phones asynchronously, so phone requests require
+    /// `APOLLO_WEBHOOK_URL`; any phone already present in the synchronous person
+    /// response is still persisted by the caller.
     pub async fn enrich_person(
         &self,
         apollo_id: &str,
@@ -276,9 +396,58 @@ impl Apollo {
             body["domain"] = json!(domain);
         }
         if reveal_phone {
+            let webhook_url = self.phone_webhook_url.as_deref().ok_or_else(|| {
+                anyhow!(
+                    "phone reveal requires APOLLO_WEBHOOK_URL (Apollo delivers phone results asynchronously)"
+                )
+            })?;
             body["reveal_phone_number"] = json!(true);
+            body["webhook_url"] = json!(webhook_url);
         }
         let resp: MatchResp = serde_json::from_value(self.post("/people/match", body).await?)?;
-        resp.person.ok_or_else(|| anyhow!("Apollo returned no match for {first_name} {last_name}"))
+        resp.person
+            .ok_or_else(|| anyhow!("Apollo returned no match for {first_name} {last_name}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn null_string_and_vec_fields_deserialize_to_defaults() {
+        // A realistic Apollo org payload where several fields come back as `null`.
+        // Without strip_nulls this fails with "invalid type: null, expected a string".
+        let mut raw = serde_json::json!({
+            "id": "abc",
+            "name": "Acme Logistics",
+            "organization_state": null,
+            "annual_revenue_printed": null,
+            "keywords": null,
+            "estimated_num_employees": null,
+        });
+        strip_nulls(&mut raw);
+        let org: ApolloOrg = serde_json::from_value(raw).expect("should deserialize");
+        assert_eq!(org.name, "Acme Logistics");
+        assert_eq!(org.organization_state, "");
+        assert_eq!(org.estimated_num_employees, 0);
+        assert!(org.keywords.is_empty());
+    }
+
+    #[test]
+    fn strip_nulls_recurses_into_nested_person_org() {
+        let mut raw = serde_json::json!({
+            "person": {
+                "id": "p1",
+                "name": "Dana Ops",
+                "title": null,
+                "organization": { "id": "o1", "name": "Acme", "industry": null }
+            }
+        });
+        strip_nulls(&mut raw);
+        let resp: MatchResp = serde_json::from_value(raw).expect("should deserialize");
+        let person = resp.person.expect("person present");
+        assert_eq!(person.title, "");
+        assert_eq!(person.organization.unwrap().industry, "");
     }
 }

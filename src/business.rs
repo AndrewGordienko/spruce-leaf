@@ -1,0 +1,408 @@
+//! Business profiles: what each company is, what it is trying to accomplish,
+//! and which operating motions are enabled.
+//!
+//! Outreach playbooks deliberately remain about buyer-facing copy. These
+//! profiles are the durable operating context used by opportunity discovery,
+//! eligibility assessment, and the agent router. Keeping this in TOML means a
+//! new grant, tender, pilot, or partnership motion does not require Rust code.
+
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use anyhow::{anyhow, Context, Result};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct BusinessProfile {
+    pub key: String,
+    pub name: String,
+    pub summary: String,
+    #[serde(default)]
+    pub known_facts: Vec<String>,
+    #[serde(default)]
+    pub unknowns: Vec<String>,
+    #[serde(default)]
+    pub goals: Vec<String>,
+    #[serde(default)]
+    pub constraints: Vec<String>,
+    #[serde(default)]
+    pub motions: Vec<Motion>,
+    #[serde(default)]
+    pub funding: Option<FundingProfile>,
+    #[serde(default)]
+    pub calendar: OutreachCalendar,
+}
+
+/// The business-owned outreach calendar. This is deliberately separate from
+/// mailbox warm-up limits: adding a second mailbox must never double a
+/// business's total daily activity.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct OutreachCalendar {
+    #[serde(default = "default_daily_touch_cap")]
+    pub daily_touch_cap: usize,
+    #[serde(default = "default_calendar_timezone")]
+    pub quota_timezone: String,
+    #[serde(default = "default_calendar_timezone")]
+    pub fallback_recipient_timezone: String,
+    #[serde(default = "default_weekdays")]
+    pub weekdays: Vec<String>,
+    #[serde(default = "default_window_start")]
+    pub window_start: u32,
+    #[serde(default = "default_window_end")]
+    pub window_end: u32,
+    #[serde(default = "default_preferred_hours")]
+    pub preferred_hours: Vec<u32>,
+    #[serde(default = "default_learning_min_samples")]
+    pub learning_min_samples: usize,
+    #[serde(default)]
+    pub rules: Vec<TimingRule>,
+}
+
+impl Default for OutreachCalendar {
+    fn default() -> Self {
+        Self {
+            daily_touch_cap: default_daily_touch_cap(),
+            quota_timezone: default_calendar_timezone(),
+            fallback_recipient_timezone: default_calendar_timezone(),
+            weekdays: default_weekdays(),
+            window_start: default_window_start(),
+            window_end: default_window_end(),
+            preferred_hours: default_preferred_hours(),
+            learning_min_samples: default_learning_min_samples(),
+            rules: Vec::new(),
+        }
+    }
+}
+
+/// A named timing hypothesis. Match fields are ANDed across groups and ORed
+/// within a group. This makes weekend activity explicit and auditable instead
+/// of allowing a model to infer that every person in an industry works Sunday.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct TimingRule {
+    pub key: String,
+    #[serde(default)]
+    pub industries: Vec<String>,
+    #[serde(default)]
+    pub title_keywords: Vec<String>,
+    #[serde(default)]
+    pub vantages: Vec<String>,
+    #[serde(default)]
+    pub channels: Vec<String>,
+    #[serde(default)]
+    pub weekdays: Vec<String>,
+    #[serde(default)]
+    pub preferred_hours: Vec<u32>,
+    #[serde(default)]
+    pub window_start: Option<u32>,
+    #[serde(default)]
+    pub window_end: Option<u32>,
+    #[serde(default)]
+    pub rationale: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Motion {
+    pub key: String,
+    pub kind: String,
+    pub objective: String,
+    #[serde(default = "yes")]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct FundingProfile {
+    pub objective: String,
+    #[serde(default)]
+    pub themes: Vec<String>,
+    #[serde(default)]
+    pub project_shapes: Vec<String>,
+    #[serde(default)]
+    pub preferred_contact_titles: Vec<String>,
+    #[serde(default)]
+    pub sources: Vec<OpportunitySource>,
+    #[serde(default = "default_funding_min_words")]
+    pub min_words: usize,
+    #[serde(default = "default_funding_max_words")]
+    pub max_words: usize,
+    #[serde(default = "default_funding_touches")]
+    pub default_touches: usize,
+    #[serde(default)]
+    pub doctrine: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct OpportunitySource {
+    pub name: String,
+    /// `catalog` extracts programme links; `program` treats the URL as one
+    /// opportunity; `search` uses Jina Search and requires JINA_API_KEY.
+    pub mode: String,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub query: String,
+    #[serde(default)]
+    pub allowed_domains: Vec<String>,
+    /// Optional Apollo employer hints for programme pages whose public-web
+    /// domain or programme name differs from the administering organization.
+    #[serde(default)]
+    pub apollo_organization_name: String,
+    #[serde(default)]
+    pub apollo_domains: Vec<String>,
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn default_funding_min_words() -> usize {
+    80
+}
+
+fn default_funding_max_words() -> usize {
+    170
+}
+
+fn default_funding_touches() -> usize {
+    2
+}
+
+fn default_daily_touch_cap() -> usize {
+    30
+}
+
+fn default_calendar_timezone() -> String {
+    "Europe/London".into()
+}
+
+fn default_weekdays() -> Vec<String> {
+    ["mon", "tue", "wed", "thu", "fri"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+fn default_window_start() -> u32 {
+    8
+}
+
+fn default_window_end() -> u32 {
+    17
+}
+
+fn default_preferred_hours() -> Vec<u32> {
+    vec![9, 11, 14]
+}
+
+fn default_learning_min_samples() -> usize {
+    20
+}
+
+pub struct Businesses {
+    profiles: BTreeMap<String, BusinessProfile>,
+}
+
+impl Businesses {
+    pub fn load(dir: impl AsRef<Path>) -> Result<Self> {
+        let dir = dir.as_ref();
+        let mut profiles = BTreeMap::new();
+        for key in ["gnk", "wapahki", "outagehub"] {
+            let path = dir.join(format!("{key}.toml"));
+            let raw = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading business profile {}", path.display()))?;
+            let profile: BusinessProfile = toml::from_str(&raw)
+                .with_context(|| format!("parsing business profile {}", path.display()))?;
+            if profile.key != key {
+                return Err(anyhow!(
+                    "{}: key = '{}' does not match filename '{key}.toml'",
+                    path.display(),
+                    profile.key
+                ));
+            }
+            validate(&profile).with_context(|| format!("validating {key} business profile"))?;
+            profiles.insert(key.to_string(), profile);
+        }
+        Ok(Self { profiles })
+    }
+
+    pub fn get(&self, key: &str) -> Result<&BusinessProfile> {
+        self.profiles.get(key).ok_or_else(|| {
+            anyhow!(
+                "unknown business '{key}'. Available: {}",
+                self.keys().join(", ")
+            )
+        })
+    }
+
+    pub fn keys(&self) -> Vec<&str> {
+        self.profiles.keys().map(String::as_str).collect()
+    }
+}
+
+impl BusinessProfile {
+    pub fn has_motion(&self, kind: &str) -> bool {
+        self.motions
+            .iter()
+            .any(|m| m.enabled && m.kind.eq_ignore_ascii_case(kind))
+    }
+
+    pub fn funding(&self) -> Result<&FundingProfile> {
+        if !self.has_motion("funding") {
+            return Err(anyhow!(
+                "{} does not have an enabled funding motion",
+                self.name
+            ));
+        }
+        self.funding
+            .as_ref()
+            .ok_or_else(|| anyhow!("{} has no funding profile", self.name))
+    }
+
+    pub fn agent_summary(&self) -> String {
+        let motions = self
+            .motions
+            .iter()
+            .filter(|m| m.enabled)
+            .map(|m| format!("{} ({})", m.key, m.kind))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "{}: {} Enabled motions: {}. Outreach calendar: at most {} total touchpoints per {} day; recipient-local timing with named industry/title exceptions.",
+            self.name,
+            self.summary,
+            motions,
+            self.calendar.daily_touch_cap,
+            self.calendar.quota_timezone,
+        )
+    }
+}
+
+fn validate(profile: &BusinessProfile) -> Result<()> {
+    if profile.name.trim().is_empty() || profile.summary.trim().is_empty() {
+        return Err(anyhow!("name and summary are required"));
+    }
+    if profile.has_motion("funding") {
+        let funding = profile
+            .funding
+            .as_ref()
+            .ok_or_else(|| anyhow!("funding motion requires a [funding] section"))?;
+        if funding.sources.is_empty() {
+            return Err(anyhow!(
+                "funding motion requires at least one [[funding.sources]]"
+            ));
+        }
+        for source in &funding.sources {
+            match source.mode.as_str() {
+                "catalog" | "program" if source.url.trim().is_empty() => {
+                    return Err(anyhow!("source '{}' requires url", source.name));
+                }
+                "search" if source.query.trim().is_empty() => {
+                    return Err(anyhow!("search source '{}' requires query", source.name));
+                }
+                "catalog" | "program" | "search" => {}
+                other => {
+                    return Err(anyhow!(
+                        "source '{}' has unsupported mode '{other}'",
+                        source.name
+                    ));
+                }
+            }
+        }
+    }
+    validate_calendar(&profile.calendar)?;
+    Ok(())
+}
+
+fn validate_calendar(calendar: &OutreachCalendar) -> Result<()> {
+    if calendar.daily_touch_cap == 0 {
+        return Err(anyhow!(
+            "calendar.daily_touch_cap must be greater than zero"
+        ));
+    }
+    for (label, value) in [
+        ("quota_timezone", calendar.quota_timezone.as_str()),
+        (
+            "fallback_recipient_timezone",
+            calendar.fallback_recipient_timezone.as_str(),
+        ),
+    ] {
+        value
+            .parse::<chrono_tz::Tz>()
+            .map_err(|_| anyhow!("calendar.{label} is not a valid IANA timezone: '{value}'"))?;
+    }
+    validate_window(
+        calendar.window_start,
+        calendar.window_end,
+        &calendar.preferred_hours,
+        "calendar",
+    )?;
+    validate_weekdays(&calendar.weekdays, "calendar.weekdays")?;
+    for rule in &calendar.rules {
+        if rule.key.trim().is_empty() {
+            return Err(anyhow!("calendar rule key is required"));
+        }
+        let start = rule.window_start.unwrap_or(calendar.window_start);
+        let end = rule.window_end.unwrap_or(calendar.window_end);
+        let hours = if rule.preferred_hours.is_empty() {
+            &calendar.preferred_hours
+        } else {
+            &rule.preferred_hours
+        };
+        validate_window(start, end, hours, &format!("calendar rule '{}'", rule.key))?;
+        if !rule.weekdays.is_empty() {
+            validate_weekdays(
+                &rule.weekdays,
+                &format!("calendar rule '{}'.weekdays", rule.key),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_window(start: u32, end: u32, hours: &[u32], label: &str) -> Result<()> {
+    if start >= end || end > 24 {
+        return Err(anyhow!(
+            "{label} window must satisfy 0 <= start < end <= 24"
+        ));
+    }
+    if hours.is_empty() || hours.iter().any(|hour| *hour < start || *hour >= end) {
+        return Err(anyhow!(
+            "{label} preferred_hours must be non-empty and inside [{start}, {end})"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_weekdays(days: &[String], label: &str) -> Result<()> {
+    if days.is_empty() {
+        return Err(anyhow!("{label} must not be empty"));
+    }
+    for day in days {
+        if !matches!(
+            day.trim().to_ascii_lowercase().as_str(),
+            "mon" | "tue" | "wed" | "thu" | "fri" | "sat" | "sun"
+        ) {
+            return Err(anyhow!("{label} contains unknown weekday '{day}'"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Businesses;
+
+    #[test]
+    fn loads_three_distinct_businesses_and_outagehub_funding() {
+        let businesses = Businesses::load("businesses").expect("business profiles");
+        assert_eq!(businesses.keys(), vec!["gnk", "outagehub", "wapahki"]);
+        assert!(!businesses.get("gnk").unwrap().has_motion("funding"));
+        assert!(businesses.get("outagehub").unwrap().has_motion("funding"));
+        assert!(!businesses
+            .get("outagehub")
+            .unwrap()
+            .funding()
+            .unwrap()
+            .sources
+            .is_empty());
+    }
+}

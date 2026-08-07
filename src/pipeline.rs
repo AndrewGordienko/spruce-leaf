@@ -9,7 +9,7 @@ use anyhow::Result;
 use futures::stream::{self, StreamExt, TryStreamExt};
 
 use crate::domain::*;
-use crate::engine::Claude;
+use crate::engine::Engine;
 use crate::knowledge::Library;
 use crate::playbook::{self, Lint, Playbook, Shared};
 use crate::prompts;
@@ -33,7 +33,7 @@ impl Progress for () {
 
 /// Everything a run needs that doesn't change between stages.
 pub struct Run<'a> {
-    pub client: &'a Claude,
+    pub client: &'a Engine,
     pub pb: &'a Playbook,
     pub shared: &'a Shared,
     /// The book-knowledge library, retrieved from per stage. Empty is fine —
@@ -49,7 +49,7 @@ pub struct Run<'a> {
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
-    client: &Claude,
+    client: &Engine,
     pb: &Playbook,
     shared: &Shared,
     library: &Library,
@@ -100,7 +100,8 @@ async fn plan_account(
     n_touches: usize,
 ) -> Result<AccountPlan> {
     let contacts = find_contacts(run, &account, n_contacts).await?;
-    run.reporter.account_contacts(&account.name, contacts.contacts.len());
+    run.reporter
+        .account_contacts(&account.name, contacts.contacts.len());
 
     let plans = stream::iter(contacts.contacts.into_iter().map(|mut contact| {
         contact.vantage = normalize_vantage(&contact.vantage);
@@ -114,15 +115,23 @@ async fn plan_account(
             } else {
                 Vec::new()
             };
+            enforce_email_signatures(&mut sequence, &run.pb.signature);
             run.reporter.sequence_done(&account.name);
-            Ok::<ContactPlan, anyhow::Error>(ContactPlan { contact, sequence, reviews })
+            Ok::<ContactPlan, anyhow::Error>(ContactPlan {
+                contact,
+                sequence,
+                reviews,
+            })
         }
     }))
     .buffered(run.concurrency)
     .try_collect::<Vec<ContactPlan>>()
     .await?;
 
-    Ok(AccountPlan { account, contacts: plans })
+    Ok(AccountPlan {
+        account,
+        contacts: plans,
+    })
 }
 
 async fn find_accounts(run: &Run<'_>, thesis: &str, n: usize) -> Result<Accounts> {
@@ -131,7 +140,10 @@ async fn find_accounts(run: &Run<'_>, thesis: &str, n: usize) -> Result<Accounts
          {thesis}; {motion}",
         motion = run.pb.motion,
     );
-    let knowledge = run.library.retrieve_stage(&query, "companies", 5, 2).playbook_block();
+    let knowledge = run
+        .library
+        .retrieve_stage(&query, "companies", 5, 2)
+        .playbook_block();
     let user = prompts::accounts_user(run.pb, thesis, n, &knowledge);
     run.client
         .structured::<Accounts>(&run.system, &user, prompts::accounts_schema())
@@ -144,7 +156,10 @@ async fn find_contacts(run: &Run<'_>, account: &Account, n: usize) -> Result<Con
          the person who owns the problem: {}",
         account.hypothesis,
     );
-    let knowledge = run.library.retrieve_stage(&query, "people", 4, 1).playbook_block();
+    let knowledge = run
+        .library
+        .retrieve_stage(&query, "people", 4, 1)
+        .playbook_block();
     let user = prompts::contacts_user(run.pb, account, n, &knowledge);
     run.client
         .structured::<Contacts>(&run.system, &user, prompts::contacts_schema())
@@ -162,7 +177,10 @@ async fn write_sequence(
          the ask; earning a reply about: {}",
         account.hypothesis,
     );
-    let knowledge = run.library.retrieve_stage(&query, "sequence", 6, 2).playbook_block();
+    let knowledge = run
+        .library
+        .retrieve_stage(&query, "sequence", 6, 2)
+        .playbook_block();
     let user = prompts::sequence_user(run.pb, account, contact, n, &knowledge);
     run.client
         .structured::<Sequence>(&run.system, &user, prompts::sequence_schema())
@@ -183,20 +201,50 @@ async fn critique(
         .collect();
 
     let user = prompts::critique_user(run.pb, account, contact, sequence, &lints);
-    run.client
+    let mut review = run
+        .client
         .structured::<SequenceReview>(&run.system, &user, prompts::critique_schema())
-        .await
+        .await?;
+
+    // Preserve an honest verdict even if the model overlooks a mechanical
+    // signature flag while rewriting the body.
+    for (touch, lint) in sequence.touches.iter().zip(&lints) {
+        if lint.signature_ok {
+            continue;
+        }
+        if let Some(item) = review
+            .reviews
+            .iter_mut()
+            .find(|item| item.stage == touch.stage)
+        {
+            item.passes = false;
+            if !item
+                .issues
+                .iter()
+                .any(|issue| issue.to_ascii_lowercase().contains("signature"))
+            {
+                item.issues.push(format!(
+                    "Signature mismatch: the email must end with exactly '{}'.",
+                    run.pb.signature
+                ));
+            }
+        }
+    }
+
+    Ok(review)
 }
 
 /// Lint one touch: forbidden phrases across subject+body, length band on the
 /// body (skipped for call scripts, which aren't word-bounded).
 fn lint_touch(pb: &Playbook, t: &Touch, forbidden: &[&str]) -> Lint {
+    let is_email = t.channel.eq_ignore_ascii_case("email");
     let (min, max) = if t.channel.eq_ignore_ascii_case("call") {
         (0, 0)
     } else {
         (pb.min_words, pb.max_words)
     };
     let mut lint = playbook::lint(&t.body, forbidden, min, max);
+    lint.signature_ok = !is_email || playbook::has_exact_signature(&t.body, &pb.signature);
     if !t.subject.is_empty() {
         let subj = playbook::lint(&t.subject, forbidden, 0, 0);
         for hit in subj.forbidden_hits {
@@ -223,12 +271,25 @@ fn apply_revisions(sequence: &mut Sequence, review: &SequenceReview) {
     }
 }
 
+/// Apply the playbook signature after the critic so its rewrite cannot drift.
+fn enforce_email_signatures(sequence: &mut Sequence, signature: &str) {
+    for touch in &mut sequence.touches {
+        if touch.channel.eq_ignore_ascii_case("email") {
+            touch.body = playbook::enforce_signature(&touch.body, signature);
+        }
+    }
+}
+
 /// Normalize a model-supplied vantage to the canonical set for consistent badges.
 fn normalize_vantage(raw: &str) -> String {
     let v = raw.trim().to_lowercase().replace([' ', '-'], "_");
     match v.as_str() {
-        "process_owner" | "operator" | "operational_executive" | "technical_evaluator"
-        | "economic_buyer" | "router" => v,
+        "process_owner"
+        | "operator"
+        | "operational_executive"
+        | "technical_evaluator"
+        | "economic_buyer"
+        | "router" => v,
         _ => raw.trim().to_lowercase(),
     }
 }

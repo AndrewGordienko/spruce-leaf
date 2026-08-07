@@ -47,6 +47,15 @@ pub struct Playbook {
     /// Independent signals a high-value candidate should show.
     #[serde(default = "default_min_signals")]
     pub min_signals: usize,
+    /// Realistic upper bound on target company headcount. Keeps ICP derivation and
+    /// qualification off enterprise giants a small/founder-led vendor can't land.
+    /// `None` (unset) means no ceiling. Set per business in its private config.
+    #[serde(default)]
+    pub max_employees: Option<i64>,
+    /// Free-text firmographic guidance woven into ICP derivation (e.g. "mid-market,
+    /// founder-reachable; avoid Fortune 500 with entrenched internal IT").
+    #[serde(default)]
+    pub icp_note: String,
 
     #[serde(default)]
     pub system_concept_examples: Vec<String>,
@@ -122,8 +131,8 @@ impl Playbooks {
 }
 
 fn read_toml<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))
 }
 
@@ -155,8 +164,14 @@ impl Playbook {
 
         s.push_str(&format!("=== {} DOCTRINE ===\n", self.name.to_uppercase()));
         s.push_str(&format!("Brand: {}\n", self.name));
-        s.push_str(&format!("Brand intro (use close to verbatim): {}\n", self.one_liner));
-        s.push_str(&format!("The motion this brand tests for: {}\n", self.motion));
+        s.push_str(&format!(
+            "Brand intro (use close to verbatim): {}\n",
+            self.one_liner
+        ));
+        s.push_str(&format!(
+            "The motion this brand tests for: {}\n",
+            self.motion
+        ));
         s.push_str(&format!(
             "Email body length band: {}–{} words. A high-value candidate should show at \
              least {} independent signal(s).\n\n",
@@ -191,7 +206,9 @@ impl Playbook {
         }
 
         let all_forbidden = self.forbidden(shared);
-        s.push_str("\nNEVER use these phrases in a subject or body (they read as generic sales copy):\n  ");
+        s.push_str(
+            "\nNEVER use these phrases in a subject or body (they read as generic sales copy):\n  ",
+        );
         s.push_str(&all_forbidden.join(", "));
         s.push_str(&format!("\n\nSign emails as: {}\n", self.signature));
         s
@@ -199,12 +216,26 @@ impl Playbook {
 }
 
 /// Result of the mechanical (non-LLM) lint of one piece of copy.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Lint {
     /// Forbidden phrases found (as they appear in the doctrine list).
     pub forbidden_hits: Vec<String>,
     pub word_count: usize,
     pub length_ok: bool,
+    /// Whether an email ends with the exact configured playbook signature.
+    /// Generic lint calls leave this true; the pipeline sets it for email bodies.
+    pub signature_ok: bool,
+}
+
+impl Default for Lint {
+    fn default() -> Self {
+        Self {
+            forbidden_hits: Vec::new(),
+            word_count: 0,
+            length_ok: false,
+            signature_ok: true,
+        }
+    }
 }
 
 /// Lint a body against the forbidden list and the word band. `min`/`max` of 0
@@ -220,5 +251,119 @@ pub fn lint(text: &str, forbidden: &[&str], min: usize, max: usize) -> Lint {
     let word_count = text.split_whitespace().count();
     let length_ok = (min == 0 && max == 0) || (word_count >= min && word_count <= max);
 
-    Lint { forbidden_hits, word_count, length_ok }
+    Lint {
+        forbidden_hits,
+        word_count,
+        length_ok,
+        signature_ok: true,
+    }
+}
+
+/// True when the last non-empty line is exactly the configured signature.
+pub fn has_exact_signature(body: &str, signature: &str) -> bool {
+    let expected = signature.trim();
+    !expected.is_empty()
+        && body
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .is_some_and(|line| line.trim() == expected)
+}
+
+/// Make an email body end in exactly one configured signature.
+///
+/// The model occasionally abbreviates a configured full name (for example,
+/// `Andrew Gordienko` to `Andrew`). Remove an exact signature or a leading-name
+/// abbreviation from the end, drop a conventional closing immediately before
+/// it, then append the canonical playbook value. Calling this repeatedly is
+/// idempotent.
+pub fn enforce_signature(body: &str, signature: &str) -> String {
+    let expected = signature.trim();
+    if expected.is_empty() {
+        return body.trim_end().to_string();
+    }
+
+    let mut lines: Vec<&str> = body.trim_end().lines().collect();
+    loop {
+        while lines.last().is_some_and(|line| line.trim().is_empty()) {
+            lines.pop();
+        }
+        let Some(last) = lines.last() else { break };
+        if !is_signature_variant(last.trim(), expected) {
+            break;
+        }
+        lines.pop();
+        while lines.last().is_some_and(|line| line.trim().is_empty()) {
+            lines.pop();
+        }
+        if lines
+            .last()
+            .is_some_and(|line| is_conventional_closing(line.trim()))
+        {
+            lines.pop();
+        }
+    }
+
+    let mut out = lines.join("\n").trim_end().to_string();
+    if !out.is_empty() {
+        out.push_str("\n\n");
+    }
+    out.push_str(expected);
+    out
+}
+
+fn is_signature_variant(candidate: &str, expected: &str) -> bool {
+    let normalize = |value: &str| {
+        value
+            .split_whitespace()
+            .map(|part| part.trim_matches([',', '.']).to_lowercase())
+            .collect::<Vec<_>>()
+    };
+    let candidate = normalize(candidate);
+    let expected = normalize(expected);
+    !candidate.is_empty()
+        && candidate.len() <= expected.len()
+        && candidate
+            .iter()
+            .zip(&expected)
+            .all(|(left, right)| left == right)
+}
+
+fn is_conventional_closing(line: &str) -> bool {
+    matches!(
+        line.trim_end_matches(',').to_ascii_lowercase().as_str(),
+        "best" | "best regards" | "regards" | "thanks" | "thank you" | "cheers" | "sincerely"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{enforce_signature, has_exact_signature};
+
+    #[test]
+    fn appends_the_configured_signature_when_missing() {
+        let body = enforce_signature("One answer would help.", "Andrew Gordienko");
+        assert_eq!(body, "One answer would help.\n\nAndrew Gordienko");
+        assert!(has_exact_signature(&body, "Andrew Gordienko"));
+    }
+
+    #[test]
+    fn replaces_an_abbreviated_signature_and_closing() {
+        let body = enforce_signature(
+            "One answer would help.\n\nBest,\nAndrew",
+            "Andrew Gordienko",
+        );
+        assert_eq!(body, "One answer would help.\n\nAndrew Gordienko");
+    }
+
+    #[test]
+    fn enforcement_is_idempotent_and_removes_duplicates() {
+        let once = enforce_signature(
+            "One answer would help.\n\nAndrew\n\nAndrew Gordienko",
+            "Andrew Gordienko",
+        );
+        let twice = enforce_signature(&once, "Andrew Gordienko");
+        assert_eq!(once, "One answer would help.\n\nAndrew Gordienko");
+        assert_eq!(twice, once);
+    }
 }

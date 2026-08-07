@@ -34,7 +34,11 @@ any outreach. Consequences are metrics to measure, not proven numbers.\n"
             let _ = writeln!(s, "**Magnitude (internal only):** {}\n", a.magnitude_note);
         }
         if !a.applied_principles.is_empty() {
-            let _ = writeln!(s, "**Playbook applied:** {}\n", a.applied_principles.join(", "));
+            let _ = writeln!(
+                s,
+                "**Playbook applied:** {}\n",
+                a.applied_principles.join(", ")
+            );
         }
 
         for cp in &ap.contacts {

@@ -20,6 +20,7 @@ dotenvy = "0.15"
 axum = "0.7"
 rustyline = "14"
 chrono = { version = "0.4", features = ["serde", "clock"], default-features = false }
+chrono-tz = "0.10"
 uuid = { version = "1", features = ["v4"] }
 toml = "0.8"
 # Book ingestion: extract text from PDFs (.txt/.md are read directly).

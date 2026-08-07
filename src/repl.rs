@@ -1,28 +1,123 @@
-//! The interactive `spruce-leaf` prompt.
+//! The interactive `spruce-leaf` composer.
 //!
-//! A blocking readline loop on the main thread; each non-command line is sent
-//! to the agent via the shared Tokio runtime. Slash commands are handled
-//! locally.
+//! Rustyline keeps editing, history, multiline paste, and terminal restoration
+//! dependable. This layer adds the Codex-like surface: a `›` composer, ghost
+//! placeholder, slash completion, and compact transcript cells.
+
+use std::borrow::Cow;
 
 use anyhow::Result;
+use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
-use rustyline::DefaultEditor;
+use rustyline::highlight::Highlighter;
+use rustyline::hint::{Hint, Hinter};
+use rustyline::history::DefaultHistory;
+use rustyline::validate::Validator;
+use rustyline::{Context, Editor, Helper};
 use tokio::runtime::Runtime;
 
 use crate::agent::{open_browser, Agent};
+use crate::ui;
+
+const COMMANDS: &[(&str, &str)] = &[
+    ("/crm", "/crm"),
+    ("/brand ", "/brand [key]"),
+    ("/clear", "/clear"),
+    ("/help", "/help"),
+    ("/quit", "/quit"),
+];
+
+struct PlaceholderHint(&'static str);
+
+impl Hint for PlaceholderHint {
+    fn display(&self) -> &str {
+        self.0
+    }
+
+    fn completion(&self) -> Option<&str> {
+        None
+    }
+}
+
+struct ReplHelper;
+
+impl Completer for ReplHelper {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+        let typed = &line[..pos];
+        if !typed.starts_with('/') {
+            return Ok((0, Vec::new()));
+        }
+        let matches = COMMANDS
+            .iter()
+            .filter(|(replacement, _)| replacement.starts_with(typed))
+            .map(|(replacement, display)| Pair {
+                display: (*display).to_string(),
+                replacement: (*replacement).to_string(),
+            })
+            .collect();
+        Ok((0, matches))
+    }
+}
+
+impl Hinter for ReplHelper {
+    type Hint = PlaceholderHint;
+
+    fn hint(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> Option<Self::Hint> {
+        (line.is_empty() && pos == 0).then_some(PlaceholderHint("Ask Spruce Leaf to do anything"))
+    }
+}
+
+impl Highlighter for ReplHelper {
+    fn highlight_prompt<'b, 's: 'b, 'p: 'b>(
+        &'s self,
+        prompt: &'p str,
+        default: bool,
+    ) -> Cow<'b, str> {
+        if default && ui::fancy() {
+            Cow::Owned(ui::bold(prompt))
+        } else {
+            Cow::Borrowed(prompt)
+        }
+    }
+
+    fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
+        if ui::fancy() {
+            Cow::Owned(ui::dim(hint))
+        } else {
+            Cow::Borrowed(hint)
+        }
+    }
+}
+
+impl Validator for ReplHelper {}
+impl Helper for ReplHelper {}
 
 pub fn run_repl(rt: &Runtime, mut agent: Agent) -> Result<()> {
-    let mut ed = DefaultEditor::new()?;
+    let mut editor = Editor::<ReplHelper, DefaultHistory>::new()?;
+    editor.set_helper(Some(ReplHelper));
     banner(&agent);
 
     loop {
-        match ed.readline("spruce-leaf \u{203a} ") {
+        ui::context_line(
+            agent.backend(),
+            agent.model(),
+            agent.brand(),
+            &directory_label(),
+        );
+        match editor.readline("› ") {
             Ok(line) => {
                 let line = line.trim();
                 if line.is_empty() {
                     continue;
                 }
-                let _ = ed.add_history_entry(line);
+                let _ = editor.add_history_entry(line);
 
                 if let Some(cmd) = line.strip_prefix('/') {
                     if handle_command(&mut agent, cmd) {
@@ -35,20 +130,25 @@ pub fn run_repl(rt: &Runtime, mut agent: Agent) -> Result<()> {
                     Ok(reply) => {
                         let reply = reply.trim();
                         if !reply.is_empty() {
-                            println!("{reply}\n");
+                            ui::assistant_message(reply);
                         }
+                        println!();
                     }
-                    Err(e) => println!("error: {e:#}\n"),
+                    Err(error) => {
+                        ui::assistant_message(&format!("Error: {error:#}"));
+                        println!();
+                    }
                 }
             }
             Err(ReadlineError::Interrupted) => {
-                println!("(ctrl-c \u{2014} type /quit or ctrl-d to exit)");
+                ui::assistant_message("Press Ctrl-D or type /quit to exit.");
+                println!();
             }
             Err(ReadlineError::Eof) => {
-                println!("bye \u{1F332}");
+                ui::assistant_message("See you soon 🌲");
                 break;
             }
-            Err(e) => return Err(e.into()),
+            Err(error) => return Err(error.into()),
         }
     }
     Ok(())
@@ -58,63 +158,86 @@ pub fn run_repl(rt: &Runtime, mut agent: Agent) -> Result<()> {
 fn handle_command(agent: &mut Agent, cmd: &str) -> bool {
     match cmd.split_whitespace().next().unwrap_or("") {
         "quit" | "exit" | "q" => {
-            println!("bye \u{1F332}");
+            ui::assistant_message("See you soon 🌲");
             return true;
         }
         "help" | "h" | "?" => help(),
         "crm" => {
             let url = agent.crm_url();
             open_browser(&url);
-            println!("opening {url}\n");
+            ui::activity("Opened CRM dashboard", &url);
+            println!();
         }
         "clear" => {
             agent.reset();
-            println!("(conversation cleared \u{2014} CRM kept)\n");
+            if ui::fancy() {
+                print!("\x1b[2J\x1b[H");
+            }
+            banner(agent);
         }
         "brand" | "brands" => {
             let arg = cmd.split_whitespace().nth(1).unwrap_or("");
             if arg.is_empty() {
-                println!(
-                    "active brand: {}   (available: {})\n  use: /brand <key>\n",
-                    agent.brand(),
-                    agent.brand_keys().join(", ")
+                ui::activity(
+                    &format!("Active brand: {}", agent.brand()),
+                    format!(
+                        "Available: {}\nUse /brand <key> to switch",
+                        agent.brand_keys().join(", ")
+                    ),
                 );
+                println!();
             } else if agent.set_brand(arg) {
-                println!("switched brand to {}\n", agent.brand());
+                ui::activity("Switched brand", agent.brand());
+                println!();
             } else {
-                println!(
-                    "unknown brand '{arg}'  \u{2014}  available: {}\n",
+                ui::assistant_message(&format!(
+                    "Unknown brand '{arg}'. Available: {}",
                     agent.brand_keys().join(", ")
-                );
+                ));
+                println!();
             }
         }
-        other => println!("unknown command: /{other}  \u{2014}  try /help\n"),
+        other => {
+            ui::assistant_message(&format!("Unknown command: /{other}. Try /help."));
+            println!();
+        }
     }
     false
 }
 
 fn banner(agent: &Agent) {
-    println!("\u{1F332} spruce-leaf \u{2014} Codex for sales");
-    println!("   CRM dashboard: {}", agent.crm_url());
-    println!(
-        "   brand: {}   (switch with /brand <{}> )",
+    let directory = std::env::current_dir()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| ".".to_string());
+    ui::session_header(
+        agent.backend(),
+        agent.model(),
         agent.brand(),
-        agent.brand_keys().join(" | ")
+        &directory,
+        &agent.crm_url(),
     );
-    println!("   Ask me to find accounts with an expensive workflow, the people who see it,");
-    println!("   and I'll write hypothesis-led sequences and file them in the CRM.");
-    println!("   Try: find 5 companies with a $1M reconciliation problem in mid-market");
-    println!("        logistics, 5 people each, 7 touches.");
-    println!("   /help for commands, /quit to exit.\n");
+    println!();
 }
 
 fn help() {
-    println!("commands:");
-    println!("  /crm            open the CRM dashboard in your browser");
-    println!("  /brand [key]    show or switch the active brand");
-    println!("  /clear          clear the conversation (keeps the CRM)");
-    println!("  /help           show this");
-    println!("  /quit           exit (or ctrl-d)");
-    println!("anything else is sent to the agent \u{2014} e.g.");
-    println!("  \"find 3 accounts drowning in manual QA, 4 people each, 5 touches\"\n");
+    ui::activity(
+        "Shortcuts",
+        "/crm          Open the CRM dashboard\n\
+         /brand [key]  Show or switch the active brand\n\
+         /clear        Clear the conversation; keep CRM data\n\
+         /help         Show this list\n\
+         /quit         Exit (or Ctrl-D)\n\
+         Tab           Complete a slash command",
+    );
+    println!();
+}
+
+fn directory_label() -> String {
+    std::env::current_dir()
+        .ok()
+        .and_then(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| ".".to_string())
 }

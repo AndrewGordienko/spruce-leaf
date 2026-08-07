@@ -34,12 +34,18 @@ pub fn load_from_env(db: &SharedDb, brand_keys: &[&str]) -> Result<usize> {
             from_name: env_for(brand, "FROM_NAME").unwrap_or_else(|| brand.to_string()),
             from_email: from_email.clone(),
             smtp_host,
-            smtp_port: env_for(brand, "SMTP_PORT").and_then(|s| s.parse().ok()).unwrap_or(587),
+            smtp_port: env_for(brand, "SMTP_PORT")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(587),
             smtp_user: env_for(brand, "SMTP_USER").unwrap_or(from_email),
             smtp_pass: env_for(brand, "SMTP_PASS").unwrap_or_default(),
             imap_host: env_for(brand, "IMAP_HOST").unwrap_or_default(),
-            imap_port: env_for(brand, "IMAP_PORT").and_then(|s| s.parse().ok()).unwrap_or(993),
-            daily_cap: env_for(brand, "DAILY_CAP").and_then(|s| s.parse().ok()).unwrap_or(30),
+            imap_port: env_for(brand, "IMAP_PORT")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(993),
+            daily_cap: env_for(brand, "DAILY_CAP")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(30),
             active: true,
             ..Default::default()
         };
@@ -55,10 +61,15 @@ pub fn mailbox_domain(m: &Mailbox) -> String {
 }
 
 /// Health-check every mailbox's sending domain (SPF/DMARC/MX).
-pub async fn health_check(db: &SharedDb, brand: Option<&str>) -> Result<Vec<(Mailbox, verify::DomainAuth)>> {
+pub async fn health_check(
+    db: &SharedDb,
+    brand: Option<&str>,
+) -> Result<Vec<(Mailbox, verify::DomainAuth)>> {
     let mut out = Vec::new();
     for m in db.list_mailboxes(brand)? {
-        let auth = verify::check_sending_domain(&mailbox_domain(&m)).await.unwrap_or_default();
+        let auth = verify::check_sending_domain(&mailbox_domain(&m))
+            .await
+            .unwrap_or_default();
         out.push((m, auth));
     }
     Ok(out)

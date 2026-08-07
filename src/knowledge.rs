@@ -2,7 +2,7 @@
 //!
 //! This is how we do what Genspark's SecondBrain does: you ingest business /
 //! sales books once, we parse them into a persistent on-disk library, distill
-//! each into compact *principle cards* (with Claude), and then retrieve the
+//! each into compact *principle cards* (with the selected model), then retrieve the
 //! handful of relevant principles for every pipeline stage so the model's
 //! output is grounded in — and cites — real playbooks instead of its unaided
 //! priors.
@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 
-use crate::engine::Claude;
+use crate::engine::Engine;
 
 // --- Data model ------------------------------------------------------------
 
@@ -236,7 +236,7 @@ impl Library {
     /// read directly; `.pdf` is text-extracted. Unsupported files are skipped.
     pub async fn ingest(
         &mut self,
-        client: &Claude,
+        client: &Engine,
         path: &Path,
         distill: bool,
         max_sections: usize,
@@ -255,21 +255,23 @@ impl Library {
         };
 
         if files.is_empty() {
-            report
-                .notes
-                .push(format!("no supported files (.txt/.md/.pdf) under {}", path.display()));
+            report.notes.push(format!(
+                "no supported files (.txt/.md/.pdf) under {}",
+                path.display()
+            ));
             return Ok(report);
         }
 
-        let existing: HashSet<u64> = self.books.iter().map(|b| b.hash).collect();
+        let mut existing: HashSet<u64> = self.books.iter().map(|b| b.hash).collect();
 
         for file in files {
             let text = match extract_text(&file) {
                 Ok(t) if t.trim().len() > 200 => t,
                 Ok(_) => {
-                    report
-                        .notes
-                        .push(format!("skipped {} (too little extractable text)", file.display()));
+                    report.notes.push(format!(
+                        "skipped {} (too little extractable text)",
+                        file.display()
+                    ));
                     continue;
                 }
                 Err(e) => {
@@ -318,23 +320,41 @@ impl Library {
                         title, sections.used, sections.total
                     ));
                 }
-                let raws: Vec<Vec<RawPrinciple>> = stream::iter(sections.batches.into_iter().map(
-                    |batch| {
+                let results: Vec<Result<Vec<RawPrinciple>>> =
+                    stream::iter(sections.batches.into_iter().map(|batch| {
                         let title = title.clone();
-                        async move { distill_batch(client, &title, &batch).await.unwrap_or_default() }
-                    },
-                ))
-                .buffer_unordered(concurrency.max(1))
-                .collect()
-                .await;
+                        async move { distill_batch(client, &title, &batch).await }
+                    }))
+                    .buffered(concurrency.max(1))
+                    .collect()
+                    .await;
 
-                let mut used_ids: HashSet<String> = self
-                    .principles
-                    .iter()
-                    .map(|p| p.id.clone())
-                    .collect();
+                let mut raws = Vec::new();
+                let mut failed_batches = 0usize;
+                for (index, result) in results.into_iter().enumerate() {
+                    match result {
+                        Ok(batch) => raws.extend(batch),
+                        Err(error) => {
+                            failed_batches += 1;
+                            report.notes.push(format!(
+                                "{title}: principle distillation failed for section {}: {error:#}",
+                                index + 1
+                            ));
+                        }
+                    }
+                }
+                if failed_batches > 0 && raws.is_empty() {
+                    report.books_skipped += 1;
+                    report.notes.push(format!(
+                        "{title}: not ingested because every principle-distillation call failed; retry when the selected model CLI is available"
+                    ));
+                    continue;
+                }
+
+                let mut used_ids: HashSet<String> =
+                    self.principles.iter().map(|p| p.id.clone()).collect();
                 let mut used_names: HashSet<String> = HashSet::new();
-                for raw in raws.into_iter().flatten() {
+                for raw in raws {
                     let key = raw.name.to_lowercase();
                     if raw.name.trim().is_empty() || !used_names.insert(key) {
                         continue; // drop blank / duplicate names within this book
@@ -367,6 +387,7 @@ impl Library {
             });
             self.chunks.extend(chunks);
             self.principles.extend(principles);
+            existing.insert(hash);
         }
 
         self.build_index();
@@ -454,7 +475,7 @@ pub fn open(path: impl AsRef<Path>) -> Result<SharedLibrary> {
     Ok(Arc::new(RwLock::new(lib)))
 }
 
-// --- Distillation (Claude) -------------------------------------------------
+// --- Distillation (model) --------------------------------------------------
 
 #[derive(Deserialize, Default)]
 struct RawPrincipleSet {
@@ -483,7 +504,7 @@ decision (who to target, who buys, how to frame a message, how to price). Prefer
 sharper principles over many vague ones.";
 
 async fn distill_batch(
-    client: &Claude,
+    client: &Engine,
     book_title: &str,
     excerpt: &str,
 ) -> Result<Vec<RawPrinciple>> {
@@ -557,7 +578,10 @@ fn collect_files(path: &Path, out: &mut Vec<PathBuf>) {
 
 fn is_supported(path: &Path) -> bool {
     matches!(
-        path.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()).as_deref(),
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_lowercase())
+            .as_deref(),
         Some("txt") | Some("md") | Some("markdown") | Some("text") | Some("pdf")
     )
 }
@@ -568,13 +592,17 @@ fn extract_text(path: &Path) -> Result<String> {
         .and_then(|e| e.to_str())
         .map(|e| e.to_lowercase())
         .unwrap_or_default();
-    if ext == "pdf" {
+    let text = if ext == "pdf" {
         pdf_extract::extract_text(path)
             .with_context(|| format!("extracting text from PDF {}", path.display()))
     } else {
-        std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))
-    }
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))
+    }?;
+
+    // Gutenberg plain-text files commonly use CRLF. The chunker splits on
+    // blank LF-delimited paragraphs, so normalize all input sources first;
+    // otherwise an entire CRLF book becomes one enormous passage.
+    Ok(text.replace("\r\n", "\n").replace('\r', "\n"))
 }
 
 /// Split text into overlapping ~800-token chunks, tracking the nearest heading.
@@ -655,9 +683,19 @@ fn section_batches(chunks: &[Chunk], target: usize, max: usize) -> Sections {
         let sampled: Vec<String> = (0..max)
             .map(|i| groups[((i as f32 * step) as usize).min(total - 1)].clone())
             .collect();
-        return Sections { used: sampled.len(), batches: sampled, total, sampled: true };
+        return Sections {
+            used: sampled.len(),
+            batches: sampled,
+            total,
+            sampled: true,
+        };
     }
-    Sections { used: total, batches: groups, total, sampled: false }
+    Sections {
+        used: total,
+        batches: groups,
+        total,
+        sampled: false,
+    }
 }
 
 // --- BM25 ------------------------------------------------------------------
@@ -689,7 +727,12 @@ impl Bm25 {
         let total: u64 = doc_len.iter().map(|&x| x as u64).sum();
         let n = docs.len();
         let avgdl = if n > 0 { total as f32 / n as f32 } else { 0.0 };
-        Bm25 { postings, doc_len, avgdl, n }
+        Bm25 {
+            postings,
+            doc_len,
+            avgdl,
+            n,
+        }
     }
 
     fn search(&self, query: &str, k: usize) -> Vec<(usize, f32)> {
@@ -701,7 +744,9 @@ impl Bm25 {
         let avgdl = self.avgdl.max(1.0);
         let mut scores: HashMap<usize, f32> = HashMap::new();
         for t in tokenize(query) {
-            let Some(post) = self.postings.get(&t) else { continue };
+            let Some(post) = self.postings.get(&t) else {
+                continue;
+            };
             let df = post.len() as f32;
             let idf = (((self.n as f32 - df + 0.5) / (df + 0.5)) + 1.0).ln();
             for &(doc, tf) in post {
@@ -729,11 +774,49 @@ fn tokenize(s: &str) -> Vec<String> {
 fn is_stopword(w: &str) -> bool {
     matches!(
         w,
-        "the" | "and" | "for" | "are" | "but" | "not" | "you" | "your" | "with" | "this"
-            | "that" | "from" | "have" | "has" | "was" | "were" | "will" | "would" | "their"
-            | "they" | "them" | "its" | "into" | "than" | "then" | "when" | "what" | "who"
-            | "how" | "why" | "can" | "could" | "should" | "about" | "which" | "these"
-            | "those" | "such" | "each" | "any" | "all" | "one" | "two"
+        "the"
+            | "and"
+            | "for"
+            | "are"
+            | "but"
+            | "not"
+            | "you"
+            | "your"
+            | "with"
+            | "this"
+            | "that"
+            | "from"
+            | "have"
+            | "has"
+            | "was"
+            | "were"
+            | "will"
+            | "would"
+            | "their"
+            | "they"
+            | "them"
+            | "its"
+            | "into"
+            | "than"
+            | "then"
+            | "when"
+            | "what"
+            | "who"
+            | "how"
+            | "why"
+            | "can"
+            | "could"
+            | "should"
+            | "about"
+            | "which"
+            | "these"
+            | "those"
+            | "such"
+            | "each"
+            | "any"
+            | "all"
+            | "one"
+            | "two"
     )
 }
 
@@ -817,4 +900,32 @@ fn snippet(s: &str, max: usize) -> String {
     }
     let truncated: String = collapsed.chars().take(max).collect();
     format!("{truncated}…")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Library;
+    use crate::engine::{Backend, Engine};
+
+    #[tokio::test]
+    async fn skips_duplicate_content_within_one_ingest_run() {
+        let root = std::env::temp_dir().join(format!(
+            "spruce-leaf-knowledge-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let text = "A durable sales principle needs enough repeated source text to be ingested. "
+            .repeat(8);
+        std::fs::write(root.join("first.txt"), &text).unwrap();
+        std::fs::write(root.join("duplicate.txt"), &text).unwrap();
+
+        let mut library = Library::load(root.join("knowledge.json")).unwrap();
+        let engine = Engine::new(Backend::Codex, None);
+        let report = library.ingest(&engine, &root, false, 1, 1).await.unwrap();
+
+        assert_eq!(report.books_added, 1);
+        assert_eq!(report.books_skipped, 1);
+        assert_eq!(library.books.len(), 1);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 }

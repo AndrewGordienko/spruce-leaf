@@ -18,7 +18,6 @@ pub enum EmailVerdict {
     Verified,
     Risky,
     Invalid,
-    Unknown,
 }
 
 impl EmailVerdict {
@@ -27,7 +26,6 @@ impl EmailVerdict {
             EmailVerdict::Verified => "verified",
             EmailVerdict::Risky => "risky",
             EmailVerdict::Invalid => "invalid",
-            EmailVerdict::Unknown => "unknown",
         }
     }
 }
@@ -59,7 +57,10 @@ pub async fn has_mx(domain: &str) -> bool {
         }
     }
     // Some domains accept mail on the A record with no explicit MX.
-    r.lookup_ip(domain).await.map(|l| l.iter().next().is_some()).unwrap_or(false)
+    r.lookup_ip(domain)
+        .await
+        .map(|l| l.iter().next().is_some())
+        .unwrap_or(false)
 }
 
 /// Combine syntax + MX with Apollo's status into a single verdict.
@@ -108,7 +109,11 @@ impl DomainAuth {
 }
 
 fn yn(b: bool) -> &'static str {
-    if b { "ok" } else { "MISSING" }
+    if b {
+        "ok"
+    } else {
+        "MISSING"
+    }
 }
 
 /// Check SPF + DMARC + MX for one of our sending domains.
@@ -119,14 +124,18 @@ pub async fn check_sending_domain(domain: &str) -> Result<DomainAuth> {
     if let Ok(txt) = r.txt_lookup(domain).await {
         auth.has_spf = txt.iter().any(|rec| {
             rec.txt_data().iter().any(|d| {
-                String::from_utf8_lossy(d).to_lowercase().starts_with("v=spf1")
+                String::from_utf8_lossy(d)
+                    .to_lowercase()
+                    .starts_with("v=spf1")
             })
         });
     }
     if let Ok(txt) = r.txt_lookup(format!("_dmarc.{domain}")).await {
         auth.has_dmarc = txt.iter().any(|rec| {
             rec.txt_data().iter().any(|d| {
-                String::from_utf8_lossy(d).to_lowercase().contains("v=dmarc1")
+                String::from_utf8_lossy(d)
+                    .to_lowercase()
+                    .contains("v=dmarc1")
             })
         });
     }

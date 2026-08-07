@@ -2,8 +2,9 @@
 //! touches on the timeline the cadence engine drives.
 //!
 //! Sourcing + enrichment give us a real, verified person and a doctrine-framed
-//! lead. This turns that into an actual multi-touch sequence: Claude writes the
-//! copy (grounded in the lead's real facts + the person's vantage), we run the
+//! lead. This turns that into an actual multi-touch sequence: the configured AI
+//! backend writes the copy (grounded in the lead's real facts + the person's
+//! vantage), we run the
 //! mechanical forbidden-phrase/length lint over it, then persist a `sequence`
 //! plus its `touches` with `due_at` computed from each touch's day offset.
 //!
@@ -16,9 +17,11 @@ use chrono::{Duration, Utc};
 use futures::stream::{self, StreamExt};
 use serde_json::{json, Value};
 
+use crate::business::BusinessProfile;
+use crate::calendar::{self, TimingContext};
 use crate::db::{Sequence, SharedDb, Touch};
 use crate::domain::Sequence as CopySequence;
-use crate::engine::Claude;
+use crate::engine::Engine;
 use crate::knowledge::Library;
 use crate::playbook::{self, Playbook, Shared};
 
@@ -33,8 +36,9 @@ pub struct PlanSummary {
 #[allow(clippy::too_many_arguments)]
 pub async fn plan_pending(
     db: &SharedDb,
-    client: &Claude,
+    client: &Engine,
     pb: &Playbook,
+    business: &BusinessProfile,
     shared: &Shared,
     library: &Library,
     n_touches: usize,
@@ -57,23 +61,36 @@ pub async fn plan_pending(
 
     // Generate copy concurrently.
     let leads = db.list_leads(Some(&pb.key))?;
+    eprintln!("  · drafting sequences for {} verified people…", todo.len());
     let drafts = stream::iter(todo.into_iter().map(|person| {
         let system = system.clone();
         let lead = leads.iter().find(|l| l.id == person.lead_id).cloned();
         let knowledge = library
             .retrieve_stage(
-                &format!("cold outreach copy earning a reply: {}", lead.as_ref().map(|l| l.hypothesis.clone()).unwrap_or_default()),
+                &format!(
+                    "cold outreach copy earning a reply: {}",
+                    lead.as_ref()
+                        .map(|l| l.hypothesis.clone())
+                        .unwrap_or_default()
+                ),
                 "sequence",
                 6,
                 2,
             )
             .playbook_block();
         async move {
-            let Some(lead) = lead else { return None };
+            let lead = lead?;
             match write_sequence(client, &system, pb, &lead, &person, n_touches, &knowledge).await {
-                Ok(seq) => Some((person, lead, seq)),
+                Ok(seq) => {
+                    eprintln!(
+                        "  · ✓ drafted {}-touch sequence for {}",
+                        seq.touches.len(),
+                        person.name
+                    );
+                    Some((person, lead, seq))
+                }
                 Err(e) => {
-                    eprintln!("  · copy failed for {}: {e:#}", person.name);
+                    eprintln!("  · ✗ copy failed for {} — {}", person.name, first_line(&e.to_string()));
                     None
                 }
             }
@@ -99,18 +116,53 @@ pub async fn plan_pending(
 
         for t in &seq.touches {
             let is_email = t.channel.eq_ignore_ascii_case("email");
-            let (min, max) = if is_email { (pb.min_words, pb.max_words) } else { (0, 0) };
-            let lint = playbook::lint(&t.body, &forbidden, min, max);
+            let (min, max) = if is_email {
+                (pb.min_words, pb.max_words)
+            } else {
+                (0, 0)
+            };
+            let body = if is_email {
+                playbook::enforce_signature(&t.body, &pb.signature)
+            } else {
+                t.body.clone()
+            };
+            let lint = playbook::lint(&body, &forbidden, min, max);
             let passes = lint.forbidden_hits.is_empty() && (min == 0 || lint.length_ok);
 
-            let status = if is_email && auto_schedule { "scheduled" } else { "draft" };
+            let status = if is_email && auto_schedule && passes {
+                "scheduled"
+            } else {
+                "draft"
+            };
             if status == "scheduled" {
                 summary.touches_scheduled += 1;
             } else {
                 summary.touches_drafted += 1;
             }
 
-            let due = now + Duration::days(t.day_offset.max(0) as i64);
+            let desired = now + Duration::days(t.day_offset as i64);
+            let stable_key = format!("{}:{}:{}", person.id, seq_id, t.stage);
+            let timing = TimingContext {
+                industry: &lead.industry,
+                title: &person.title,
+                vantage: &person.vantage,
+                channel: &t.channel,
+                location: if person.location.is_empty() {
+                    &lead.hq
+                } else {
+                    &person.location
+                },
+                timezone: if person.timezone.is_empty() {
+                    &lead.timezone
+                } else {
+                    &person.timezone
+                },
+                stable_key: &stable_key,
+            };
+            let slot =
+                calendar::schedule_with_capacity(business, &timing, desired, |start, end| {
+                    db.planned_touch_count_between(&pb.key, start, end)
+                })?;
             db.insert_touch(&Touch {
                 sequence_id: seq_id.clone(),
                 person_id: person.id.clone(),
@@ -120,17 +172,26 @@ pub async fn plan_pending(
                 day_offset: t.day_offset as i64,
                 channel: t.channel.clone(),
                 subject: t.subject.clone(),
-                body: t.body.clone(),
+                body,
                 purpose: t.purpose.clone(),
                 goal: t.goal.clone(),
                 status: status.into(),
-                due_at: due.to_rfc3339(),
+                due_at: slot.at.to_rfc3339(),
+                recipient_timezone: slot.recipient_timezone,
+                scheduled_rule: slot.rule,
+                schedule_reason: slot.rationale,
                 review_passes: Some(passes),
                 review_issues: lint.forbidden_hits.clone(),
                 ..Default::default()
             })?;
         }
-        db.log_event(&pb.key, &person.id, "", "scheduled", &format!("{}-touch sequence", seq.touches.len()))?;
+        db.log_event(
+            &pb.key,
+            &person.id,
+            "",
+            "scheduled",
+            &format!("{}-touch sequence", seq.touches.len()),
+        )?;
         summary.people_planned += 1;
     }
 
@@ -138,7 +199,7 @@ pub async fn plan_pending(
 }
 
 async fn write_sequence(
-    client: &Claude,
+    client: &Engine,
     system: &str,
     pb: &Playbook,
     lead: &crate::db::Lead,
@@ -174,7 +235,13 @@ async fn write_sequence(
         ctx = serde_json::to_string_pretty(&ctx).unwrap_or_default(),
         sig = pb.signature,
     );
-    client.structured::<CopySequence>(system, &user, sequence_schema(n)).await
+    client
+        .structured::<CopySequence>(system, &user, sequence_schema(n))
+        .await
+}
+
+fn first_line(s: &str) -> String {
+    s.lines().next().unwrap_or("").chars().take(70).collect()
 }
 
 fn sequence_schema(n: usize) -> Value {

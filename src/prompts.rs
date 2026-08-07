@@ -159,7 +159,13 @@ pub fn contacts_schema() -> Value {
 
 // --- Stage 3: sequence -----------------------------------------------------
 
-pub fn sequence_user(pb: &Playbook, account: &Account, contact: &Contact, n: usize, knowledge: &str) -> String {
+pub fn sequence_user(
+    pb: &Playbook,
+    account: &Account,
+    contact: &Contact,
+    n: usize,
+    knowledge: &str,
+) -> String {
     let base = format!(
         "Write a {n}-touch outreach sequence to {name} ({title}, vantage: {vantage}) at {acct}.\n\n\
 ACCOUNT CONTEXT (your research — most of this stays OUT of the email):\n\
@@ -249,12 +255,21 @@ pub fn critique_user(
         touches.push_str(&format!("Body:\n{}\n", t.body));
         let mut flags = Vec::new();
         if !lint.forbidden_hits.is_empty() {
-            flags.push(format!("FORBIDDEN PHRASES PRESENT: {}", lint.forbidden_hits.join(", ")));
+            flags.push(format!(
+                "FORBIDDEN PHRASES PRESENT: {}",
+                lint.forbidden_hits.join(", ")
+            ));
         }
         if !lint.length_ok {
             flags.push(format!(
                 "LENGTH OFF: {} words (band is {}–{})",
                 lint.word_count, pb.min_words, pb.max_words
+            ));
+        }
+        if !lint.signature_ok {
+            flags.push(format!(
+                "SIGNATURE MISMATCH: final email line must be exactly '{}'",
+                pb.signature
             ));
         }
         if !flags.is_empty() {
@@ -273,7 +288,8 @@ Context you may rely on:\n\
   Recipient vantage: {vantage} — {can_observe}\n\n\
 For each touch return: stage; passes (did the ORIGINAL pass the pre-send test?); issues (specific \
 problems); revised_subject; revised_body. Fix EVERY mechanical flag listed. Keep the body inside \
-the {min}–{max} word band. Preserve the sequence as one unfolding investigation. If a touch is \
+the {min}–{max} word band. Every revised email body must end with exactly `{signature}`. Preserve \
+the sequence as one unfolding investigation. If a touch is \
 already clean, return it unchanged with passes=true and empty issues.\n\
 {touches}",
         brand = pb.name,
@@ -283,6 +299,7 @@ already clean, return it unchanged with passes=true and empty issues.\n\
         can_observe = contact.can_observe,
         min = pb.min_words,
         max = pb.max_words,
+        signature = pb.signature,
     )
 }
 
