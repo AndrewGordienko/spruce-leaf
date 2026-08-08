@@ -23,6 +23,7 @@ pub struct Shared {
     #[serde(default)]
     pub forbidden: Vec<String>,
     /// Prose doctrine injected verbatim into every system prompt.
+    #[allow(dead_code)]
     pub doctrine: String,
 }
 
@@ -58,6 +59,7 @@ pub struct Playbook {
     pub icp_note: String,
 
     #[serde(default)]
+    #[allow(dead_code)]
     pub system_concept_examples: Vec<String>,
     #[serde(default)]
     pub subject_examples: Vec<String>,
@@ -71,6 +73,7 @@ pub struct Playbook {
     #[serde(default)]
     pub forbidden: Vec<String>,
     /// Prose doctrine for this brand.
+    #[allow(dead_code)]
     pub doctrine: String,
 }
 
@@ -147,8 +150,59 @@ impl Playbook {
             .collect()
     }
 
+    /// Compact sourcing prompt: firmographic translation does not need several
+    /// thousand words of copywriting doctrine.
+    pub fn icp_system_prompt(&self) -> String {
+        format!(
+            "You translate a concrete commercial thesis into conservative Apollo search filters for {name}. Target organizations where this motion is plausible: {motion}. Prefer reachable workflow owners over prestige titles. Never invent companies, people, facts, urgency, or financial impact. Return only the requested structured data.",
+            name = self.name,
+            motion = self.motion,
+        )
+    }
+
+    /// Compact company qualification prompt, focused on evidence boundaries.
+    pub fn qualification_system_prompt(&self) -> String {
+        format!(
+            "You qualify real companies for {name}. Motion: {motion}. Separate supported facts, reasonable inferences, and a falsifiable workflow hypothesis. A company qualifies only when at least {signals} independent signals support one specific recurring workflow and the company is realistically winnable. Never invent systems, customers, volumes, savings, urgency, or dollar impact. Name the mechanism, a measurable non-dollar consequence, the strongest objection, and what would falsify the thesis. Return only the requested structured data.",
+            name = self.name,
+            motion = self.motion,
+            signals = self.min_signals,
+        )
+    }
+
+    /// Compact people-mapping prompt. Copy rules are irrelevant at this stage.
+    pub fn vantage_system_prompt(&self) -> String {
+        format!(
+            "You map real people to the workflow vantage they can credibly observe for {name}. Choose by access to the work, not seniority. Prefer a process owner or operator; then an operational executive. Use a router only when ownership is unclear. Mark at most two primary contacts per account. Never infer responsibilities beyond the supplied title and account hypothesis. Return only the requested structured data.",
+            name = self.name,
+        )
+    }
+
+    /// Compact copy prompt used only for buyer-facing writing. It carries the
+    /// enforceable rules and forbidden list, not the long-form internal essay.
+    pub fn copy_system_prompt(&self, shared: &Shared) -> String {
+        let requirements = self
+            .requirements
+            .iter()
+            .map(|rule| format!("- {rule}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let subjects = self.subject_examples.join(" | ");
+        let forbidden = self.forbidden(shared).join(", ");
+        format!(
+            "You write founder-led cold outreach for Andrew and {name}. Write warm, natural, plain English that a busy operator reads once and understands. The goal is a useful reply, correction, or referral — earned by being specific and human, not by pitching.\n\nSELLER: {intro}\nMOTION: {motion}\n\nEach recipient comes with a per-touch `sequence_plan` (objective, angle, channel, ask). Follow it: write the actual sendable copy that executes that plan, touch by touch.\n\nCore rules:\n- Open every EMAIL with a short greeting on its own line: `Hi <first name>,`. LinkedIn notes and calls take no greeting.\n- After the greeting, lead with one recognizable operating moment in their world — not a compliment, and nothing about Andrew or software.\n- State only supplied observed facts as facts. Frame everything else as a question or modest uncertainty. Never fabricate numbers, savings, systems, customers, or urgency, and never claim what their current tools can't do.\n- Give one crisp framing, then exactly one clear ask the recipient can answer from their vantage (one question mark per email). Never ask a router to evaluate the business case.\n- Mention {name} only once, in touch 1. Keep paragraphs short and never explain the outreach strategy.\n- Each later touch adds one new diagnostic, consequence, objection, artifact, or routing angle — never repeat the opening premise.\n- Keep human judgment central and describe at most one narrow system.\n- Email 1 is {min}–{max} words including the greeting and `{signature}`; later emails 25–70; LinkedIn 12–40; calls 12–45; the final close 20–45 with no question.\n- Seven-touch channel order: email, LinkedIn, email, call, email, LinkedIn, email; finish by day 21.\n- Every email ends with a brief warm sign-off line, then exactly `{signature}` on its own line.\n\nBrand-specific rules:\n{requirements}\n\nPlain subject examples: {subjects}\nForbidden phrases: {forbidden}\nReturn only the requested structured data.",
+            name = self.name,
+            intro = self.one_liner,
+            motion = self.motion,
+            min = self.min_words,
+            max = self.max_words,
+            signature = self.signature,
+        )
+    }
+
     /// The system-prompt preamble every stage shares: who we are, the shared
     /// doctrine, this brand's doctrine, and the brand's structured knobs.
+    #[allow(dead_code)]
     pub fn system_prompt(&self, shared: &Shared) -> String {
         let mut s = String::new();
         s.push_str(&format!(
@@ -338,7 +392,7 @@ fn is_conventional_closing(line: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{enforce_signature, has_exact_signature};
+    use super::{enforce_signature, has_exact_signature, Playbooks};
 
     #[test]
     fn appends_the_configured_signature_when_missing() {
@@ -365,5 +419,17 @@ mod tests {
         let twice = enforce_signature(&once, "Andrew Gordienko");
         assert_eq!(once, "One answer would help.\n\nAndrew Gordienko");
         assert_eq!(twice, once);
+    }
+
+    #[test]
+    fn stage_prompts_are_materially_smaller_than_the_legacy_full_doctrine() {
+        let playbooks = Playbooks::load("playbooks").expect("load playbooks");
+        let gnk = playbooks.get("gnk").expect("gnk");
+        let full = gnk.system_prompt(&playbooks.shared);
+        let copy = gnk.copy_system_prompt(&playbooks.shared);
+        assert!(copy.split_whitespace().count() * 2 < full.split_whitespace().count());
+        assert!(gnk.icp_system_prompt().split_whitespace().count() < 100);
+        assert!(gnk.qualification_system_prompt().split_whitespace().count() < 150);
+        assert!(copy.contains("natural, plain English"));
     }
 }

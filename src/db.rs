@@ -119,6 +119,8 @@ pub struct Sequence {
     pub lead_id: String,
     pub brand: String,
     pub thesis: String,
+    /// Knowledge-library principle ids applied to the buyer-facing copy.
+    pub applied_principles: Vec<String>,
     pub status: String,
     pub current_stage: i64,
     pub created_at: String,
@@ -169,6 +171,21 @@ pub struct Event {
     pub detail: String,
 }
 
+/// One accumulated lesson about a brand's outbound — a company we skipped and
+/// why, an outreach angle that keeps failing — persisted so the funnel improves
+/// over time instead of relearning the same thing every run.
+#[derive(Debug, Clone, Default)]
+pub struct Learning {
+    pub brand: String,
+    /// qualification_skip | outreach_failure | ...
+    pub kind: String,
+    pub subject: String,
+    pub detail: String,
+    /// How many times we've observed this — a high count is a strong pattern.
+    pub hits: i64,
+    pub updated_at: String,
+}
+
 /// One historical send attributed to the last touch before a reply. Calendar
 /// analysis treats these as directional observations, not causal proof.
 #[derive(Debug, Clone, Default)]
@@ -198,6 +215,7 @@ pub struct CalendarEntry {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Reply {
     pub id: String,
+    pub conversation_id: String,
     pub person_id: String,
     pub sequence_id: String,
     pub ts: String,
@@ -208,6 +226,69 @@ pub struct Reply {
     pub action_taken: String,
     pub message_id: String,
     pub in_reply_to: String,
+}
+
+/// Durable identity for one sales email thread. A conversation remains tied to
+/// the originally researched account/person even when a referral replies from a
+/// new address on CC, which is why inbound matching cannot rely on `From:` alone.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Conversation {
+    pub id: String,
+    pub brand: String,
+    pub sequence_id: String,
+    pub person_id: String,
+    pub lead_id: String,
+    pub subject: String,
+    pub status: String,
+    pub last_message_at: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// One inbound or outbound message in a conversation. Outbound reply-agent
+/// drafts use the same draft → scheduled → sent state machine as cold touches,
+/// but stay separate so a human reply never restarts the stopped cold cadence.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ConversationMessage {
+    pub id: String,
+    pub conversation_id: String,
+    pub direction: String,
+    pub sender_email: String,
+    pub recipient_email: String,
+    pub participants: Vec<String>,
+    pub subject: String,
+    pub body: String,
+    pub status: String,
+    pub message_id: String,
+    pub in_reply_to: String,
+    pub references: Vec<String>,
+    pub classification: String,
+    pub action: String,
+    /// RFC3339 candidates included in this exact outbound draft. They become
+    /// bookable only after this message reaches `sent`.
+    pub offered_slots: Vec<String>,
+    pub mailbox_id: String,
+    pub sent_at: String,
+    pub created_at: String,
+}
+
+/// A meeting booked from an explicitly accepted, previously-sent slot.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Meeting {
+    pub id: String,
+    pub conversation_id: String,
+    pub brand: String,
+    pub person_id: String,
+    pub attendee_email: String,
+    pub starts_at: String,
+    pub ends_at: String,
+    pub timezone: String,
+    pub status: String,
+    pub google_event_id: String,
+    pub html_link: String,
+    pub meet_link: String,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 /// A real funding/tender/pilot/partnership opportunity supported by source
@@ -388,6 +469,7 @@ impl Db {
             ("leads", "timezone", "TEXT DEFAULT ''"),
             ("people", "location", "TEXT DEFAULT ''"),
             ("people", "timezone", "TEXT DEFAULT ''"),
+            ("sequences", "applied_principles", "TEXT DEFAULT '[]'"),
             ("touches", "recipient_timezone", "TEXT DEFAULT ''"),
             ("touches", "scheduled_rule", "TEXT DEFAULT ''"),
             ("touches", "schedule_reason", "TEXT DEFAULT ''"),
@@ -400,6 +482,7 @@ impl Db {
             ),
             ("opportunity_touches", "scheduled_rule", "TEXT DEFAULT ''"),
             ("opportunity_touches", "schedule_reason", "TEXT DEFAULT ''"),
+            ("replies", "conversation_id", "TEXT DEFAULT ''"),
         ] {
             ensure_column(&conn, table, column, definition)?;
         }
@@ -667,12 +750,37 @@ impl Db {
             s.id.clone()
         };
         conn.execute(
-            "INSERT INTO sequences (id,person_id,lead_id,brand,thesis,status,current_stage,created_at) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            "INSERT INTO sequences (id,person_id,lead_id,brand,thesis,applied_principles,status,current_stage,created_at) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             params![id, s.person_id, s.lead_id, s.brand, s.thesis,
-                status_or(&s.status, "active"), s.current_stage, now()],
+                js(&s.applied_principles), status_or(&s.status, "active"), s.current_stage, now()],
         )?;
         Ok(id)
+    }
+
+    /// Permanently remove an active sequence only when none of its touches were
+    /// sent. Used to replace rejected drafts without rewriting delivery history.
+    pub fn discard_unsent_sequence(&self, sequence_id: &str) -> Result<bool> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let sent: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM touches WHERE sequence_id=?1 AND status='sent'",
+            params![sequence_id],
+            |row| row.get(0),
+        )?;
+        if sent > 0 {
+            return Ok(false);
+        }
+        tx.execute(
+            "DELETE FROM touches WHERE sequence_id=?1",
+            params![sequence_id],
+        )?;
+        let removed = tx.execute(
+            "DELETE FROM sequences WHERE id=?1 AND status='active'",
+            params![sequence_id],
+        )?;
+        tx.commit()?;
+        Ok(removed > 0)
     }
 
     pub fn reschedule_touch(
@@ -796,7 +904,15 @@ impl Db {
             params![brand, start, end],
             |r| r.get(0),
         )?;
-        Ok((regular + opportunities).max(0) as usize)
+        let conversations: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM conversation_messages m
+             JOIN conversations c ON c.id=m.conversation_id
+             WHERE c.brand=?1 AND m.direction='outbound' AND m.status='sent'
+               AND m.sent_at>=?2 AND m.sent_at<?3",
+            params![brand, start, end],
+            |r| r.get(0),
+        )?;
+        Ok((regular + opportunities + conversations).max(0) as usize)
     }
 
     /// Actual automated email sends across every mailbox and motion for a
@@ -822,9 +938,224 @@ impl Db {
             params![brand, start, end],
             |r| r.get(0),
         )?;
-        Ok((regular + opportunities).max(0) as usize)
+        let conversations: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM conversation_messages m
+             JOIN conversations c ON c.id=m.conversation_id
+             WHERE c.brand=?1 AND m.direction='outbound' AND m.status='sent'
+               AND m.sent_at>=?2 AND m.sent_at<?3",
+            params![brand, start, end],
+            |r| r.get(0),
+        )?;
+        Ok((regular + opportunities + conversations).max(0) as usize)
     }
 
+    /// Distinct people at one account (lead) whose *first* touch (stage 0) was
+    /// actually sent within the window — i.e. the number of new conversational
+    /// fronts opened at that account today. This is the quantity the
+    /// per-account/day throttle bounds so a blast of cold emails can't land on
+    /// five people at the same company within hours.
+    pub fn account_openers_sent_between(
+        &self,
+        lead_id: &str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let start = start.to_rfc3339();
+        let end = end.to_rfc3339();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(DISTINCT person_id) FROM touches
+             WHERE lead_id=?1 AND stage=0 AND status='sent'
+               AND sent_at>=?2 AND sent_at<?3",
+            params![lead_id, start, end],
+            |r| r.get(0),
+        )?;
+        Ok(n.max(0) as usize)
+    }
+
+    /// People at one account already engaged in outreach — currently contacted
+    /// or who have replied. Bounds how many parallel fronts one account carries,
+    /// across days rather than just within a single day.
+    pub fn account_engaged_people(&self, lead_id: &str) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM people
+             WHERE lead_id=?1 AND status IN ('contacted','replied','meeting_booked')",
+            params![lead_id],
+            |r| r.get(0),
+        )?;
+        Ok(n.max(0) as usize)
+    }
+
+    /// Touches actually sent so far for one sequence. Used to stop a cadence
+    /// that has gone quiet rather than marching through every remaining stage.
+    pub fn sequence_sent_count(&self, sequence_id: &str) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM touches WHERE sequence_id=?1 AND status='sent'",
+            params![sequence_id],
+            |r| r.get(0),
+        )?;
+        Ok(n.max(0) as usize)
+    }
+
+    // --- Jobs (durable background work) -----------------------------------
+}
+
+impl Db {
+    /// Enqueue a job. If `dedup_key` is set and a row already holds it, this is a
+    /// no-op returning the existing id — so a supervisor can re-decide every tick
+    /// without piling up duplicate work.
+    pub fn enqueue_job(&self, job: &Job) -> Result<String> {
+        let conn = self.conn.lock().unwrap();
+        let now = now();
+        if !job.dedup_key.is_empty() {
+            let existing: Option<String> = conn
+                .query_row(
+                    "SELECT id FROM jobs WHERE dedup_key=?1",
+                    params![job.dedup_key],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(id) = existing {
+                return Ok(id);
+            }
+        }
+        let id = if job.id.is_empty() {
+            Uuid::new_v4().to_string()
+        } else {
+            job.id.clone()
+        };
+        let next_run_at = if job.next_run_at.is_empty() {
+            now.clone()
+        } else {
+            job.next_run_at.clone()
+        };
+        let payload = if job.payload.is_empty() {
+            "{}".to_string()
+        } else {
+            job.payload.clone()
+        };
+        let max_attempts = if job.max_attempts <= 0 {
+            5
+        } else {
+            job.max_attempts
+        };
+        conn.execute(
+            "INSERT INTO jobs (id,brand,kind,payload,status,priority,next_run_at,
+                 attempt_count,max_attempts,dedup_key,created_at,updated_at)
+             VALUES (?1,?2,?3,?4,'pending',?5,?6,0,?7,?8,?9,?9)",
+            params![
+                id,
+                job.brand,
+                job.kind,
+                payload,
+                job.priority,
+                next_run_at,
+                max_attempts,
+                if job.dedup_key.is_empty() {
+                    None
+                } else {
+                    Some(job.dedup_key.clone())
+                },
+                now,
+            ],
+        )?;
+        Ok(id)
+    }
+
+    /// Atomically lease the next due job to `worker`, reclaiming any whose lease
+    /// has expired (a worker that died mid-flight). Bumps the attempt counter as
+    /// part of the same statement, so a crash after claim still counts as a try.
+    /// Returns None when nothing is due.
+    pub fn claim_job(&self, worker: &str, lease_secs: i64) -> Result<Option<Job>> {
+        let conn = self.conn.lock().unwrap();
+        let now = now();
+        let lease_until = (Utc::now() + chrono::Duration::seconds(lease_secs.max(1))).to_rfc3339();
+        conn.query_row(
+            "UPDATE jobs SET status='leased', lease_owner=?1, lease_expires_at=?2,
+                 attempt_count=attempt_count+1, updated_at=?3
+             WHERE id = (
+                 SELECT id FROM jobs
+                 WHERE (status='pending' AND next_run_at<=?3)
+                    OR (status='leased' AND lease_expires_at IS NOT NULL
+                        AND lease_expires_at<?3)
+                 ORDER BY priority DESC, next_run_at ASC
+                 LIMIT 1
+             )
+             RETURNING *",
+            params![worker, lease_until, now],
+            |r| Ok(row_to_job(r)),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Mark a leased job done and stash whatever the worker returned.
+    pub fn complete_job(&self, id: &str, result: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE jobs SET status='done', result=?2, lease_owner=NULL,
+                 lease_expires_at=NULL, last_error=NULL, updated_at=?3 WHERE id=?1",
+            params![id, result, now()],
+        )?;
+        Ok(())
+    }
+
+    /// Record a failed attempt: retry with linear backoff until `max_attempts`
+    /// is reached, then park the job as 'dead' (dead-letter) for a human to see.
+    /// Returns the resulting status ('pending' or 'dead').
+    pub fn fail_job(&self, id: &str, error: &str) -> Result<String> {
+        let conn = self.conn.lock().unwrap();
+        let now = now();
+        let (attempt, max): (i64, i64) = conn.query_row(
+            "SELECT attempt_count, max_attempts FROM jobs WHERE id=?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if attempt >= max {
+            conn.execute(
+                "UPDATE jobs SET status='dead', last_error=?2, lease_owner=NULL,
+                     lease_expires_at=NULL, updated_at=?3 WHERE id=?1",
+                params![id, error, now],
+            )?;
+            Ok("dead".into())
+        } else {
+            let next = (Utc::now() + chrono::Duration::seconds(60 * attempt.max(1))).to_rfc3339();
+            conn.execute(
+                "UPDATE jobs SET status='pending', last_error=?2, next_run_at=?3,
+                     lease_owner=NULL, lease_expires_at=NULL, updated_at=?4 WHERE id=?1",
+                params![id, error, next, now],
+            )?;
+            Ok("pending".into())
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn get_job(&self, id: &str) -> Result<Option<Job>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row("SELECT * FROM jobs WHERE id=?1", params![id], |r| {
+            Ok(row_to_job(r))
+        })
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Job counts by status for one brand (or all) — the queue's health at a
+    /// glance, including the dead-letter backlog that must never grow unnoticed.
+    pub fn job_status_counts(&self, brand: Option<&str>) -> Result<Vec<(String, usize)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT status, COUNT(*) FROM jobs WHERE (?1 IS NULL OR brand=?1) GROUP BY status",
+        )?;
+        let rows = stmt.query_map(params![brand], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?.max(0) as usize))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+}
+
+impl Db {
     pub fn upcoming_calendar(&self, brand: &str, limit: usize) -> Result<Vec<CalendarEntry>> {
         let conn = self.conn.lock().unwrap();
         let mut entries = Vec::new();
@@ -964,6 +1295,340 @@ impl Db {
                 |r| r.get(0),
             )
             .optional()?)
+    }
+
+    // --- Sales conversations ----------------------------------------------
+
+    /// Resolve an inbound message to a durable conversation. RFC thread
+    /// headers win over `From:` so a CC'd referral stays attached to the
+    /// original account even when their address was never sourced.
+    pub fn conversation_for_inbound(
+        &self,
+        brand: &str,
+        from_email: &str,
+        subject: &str,
+        thread_ids: &[String],
+    ) -> Result<Option<Conversation>> {
+        let conn = self.conn.lock().unwrap();
+
+        for message_id in thread_ids
+            .iter()
+            .map(|id| id.trim())
+            .filter(|id| !id.is_empty())
+        {
+            let existing = conn
+                .query_row(
+                    "SELECT c.* FROM conversations c
+                     JOIN conversation_messages m ON m.conversation_id=c.id
+                     WHERE c.brand=?1 AND m.message_id=?2 LIMIT 1",
+                    params![brand, message_id],
+                    |row| Ok(row_to_conversation(row)),
+                )
+                .optional()?;
+            if existing.is_some() {
+                return Ok(existing);
+            }
+
+            let touch: Option<(String, String, String)> = conn
+                .query_row(
+                    "SELECT sequence_id,person_id,lead_id FROM touches
+                     WHERE brand=?1 AND message_id=?2 LIMIT 1",
+                    params![brand, message_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            if let Some((sequence_id, person_id, lead_id)) = touch {
+                return Ok(Some(ensure_conversation(
+                    &conn,
+                    brand,
+                    &sequence_id,
+                    &person_id,
+                    &lead_id,
+                    subject,
+                )?));
+            }
+        }
+
+        // Headerless replies are a reality (forwarders and some CRM relays
+        // strip them). Fall back to a known sender's most recent sequence.
+        let identity: Option<(String, String)> = conn
+            .query_row(
+                "SELECT id,lead_id FROM people
+                 WHERE brand=?1 AND lower(email)=lower(?2) LIMIT 1",
+                params![brand, from_email],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((person_id, lead_id)) = identity else {
+            return Ok(None);
+        };
+        let sequence_id: Option<String> = conn
+            .query_row(
+                "SELECT id FROM sequences WHERE person_id=?1
+                 ORDER BY CASE WHEN status='active' THEN 0 ELSE 1 END, created_at DESC LIMIT 1",
+                params![person_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(Some(ensure_conversation(
+            &conn,
+            brand,
+            sequence_id.as_deref().unwrap_or(""),
+            &person_id,
+            &lead_id,
+            subject,
+        )?))
+    }
+
+    pub fn get_conversation(&self, id: &str) -> Result<Option<Conversation>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT * FROM conversations WHERE id=?1",
+            params![id],
+            |row| Ok(row_to_conversation(row)),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn insert_conversation_message(&self, message: &ConversationMessage) -> Result<String> {
+        let conn = self.conn.lock().unwrap();
+        if !message.message_id.trim().is_empty() {
+            let existing: Option<String> = conn
+                .query_row(
+                    "SELECT id FROM conversation_messages WHERE message_id=?1 LIMIT 1",
+                    params![message.message_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(id) = existing {
+                return Ok(id);
+            }
+        }
+        let id = if message.id.is_empty() {
+            Uuid::new_v4().to_string()
+        } else {
+            message.id.clone()
+        };
+        let created_at = if message.created_at.is_empty() {
+            now()
+        } else {
+            message.created_at.clone()
+        };
+        conn.execute(
+            "INSERT INTO conversation_messages
+             (id,conversation_id,direction,sender_email,recipient_email,participants,
+              subject,body,status,message_id,in_reply_to,references_json,classification,
+              action,offered_slots,mailbox_id,sent_at,created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+            params![
+                id,
+                message.conversation_id,
+                message.direction,
+                message.sender_email,
+                message.recipient_email,
+                js(&message.participants),
+                message.subject,
+                message.body,
+                message.status,
+                message.message_id,
+                message.in_reply_to,
+                js(&message.references),
+                message.classification,
+                message.action,
+                js(&message.offered_slots),
+                message.mailbox_id,
+                message.sent_at,
+                created_at,
+            ],
+        )?;
+        conn.execute(
+            "UPDATE conversations SET last_message_at=?2,updated_at=?2,
+             subject=CASE WHEN subject='' THEN ?3 ELSE subject END WHERE id=?1",
+            params![message.conversation_id, created_at, message.subject],
+        )?;
+        Ok(id)
+    }
+
+    pub fn list_conversation_messages(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Vec<ConversationMessage>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT * FROM conversation_messages WHERE conversation_id=?1
+             ORDER BY created_at ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(params![conversation_id], |row| {
+            Ok(row_to_conversation_message(row))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn due_conversation_messages(&self, limit: i64) -> Result<Vec<ConversationMessage>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT * FROM conversation_messages
+             WHERE direction='outbound' AND status='scheduled'
+             ORDER BY created_at ASC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |row| Ok(row_to_conversation_message(row)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn approve_conversation_messages(
+        &self,
+        brand: Option<&str>,
+        conversation_id: Option<&str>,
+    ) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute(
+            "UPDATE conversation_messages SET status='scheduled'
+             WHERE direction='outbound' AND status='draft'
+               AND conversation_id IN (
+                   SELECT id FROM conversations
+                   WHERE (?1 IS NULL OR brand=?1) AND (?2 IS NULL OR id=?2)
+               )",
+            params![brand, conversation_id],
+        )?)
+    }
+
+    pub fn set_conversation_message_status(
+        &self,
+        id: &str,
+        status: &str,
+        mailbox_id: &str,
+        message_id: &str,
+        action: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let sent_at = (status == "sent").then(now).unwrap_or_default();
+        conn.execute(
+            "UPDATE conversation_messages SET status=?2,mailbox_id=?3,
+             sender_email=CASE WHEN ?3='' THEN sender_email ELSE
+               COALESCE((SELECT from_email FROM mailboxes WHERE id=?3),sender_email) END,
+             message_id=CASE WHEN ?4='' THEN message_id ELSE ?4 END,
+             action=CASE WHEN ?5='' THEN action ELSE ?5 END,
+             sent_at=CASE WHEN ?2='sent' THEN ?6 ELSE sent_at END WHERE id=?1",
+            params![id, status, mailbox_id, message_id, action, sent_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn last_conversation_message_id(&self, conversation_id: &str) -> Result<String> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT message_id FROM conversation_messages
+                 WHERE conversation_id=?1 AND message_id<>''
+                   AND status IN ('received','sent')
+                 ORDER BY created_at DESC,id DESC LIMIT 1",
+                params![conversation_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or_default())
+    }
+
+    /// Slots are eligible for booking only if they appeared in a message that
+    /// was actually sent, not merely generated in a draft.
+    pub fn sent_offered_slots(&self, conversation_id: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT offered_slots FROM conversation_messages
+             WHERE conversation_id=?1 AND direction='outbound' AND status='sent'",
+        )?;
+        let rows = stmt.query_map(params![conversation_id], |row| row.get::<_, String>(0))?;
+        let mut slots = Vec::new();
+        for row in rows {
+            slots.extend(jd(&row?));
+        }
+        slots.sort();
+        slots.dedup();
+        Ok(slots)
+    }
+
+    pub fn record_meeting(&self, meeting: &Meeting) -> Result<String> {
+        let conn = self.conn.lock().unwrap();
+        let id = if meeting.id.is_empty() {
+            Uuid::new_v4().to_string()
+        } else {
+            meeting.id.clone()
+        };
+        let timestamp = now();
+        conn.execute(
+            "INSERT INTO meetings
+             (id,conversation_id,brand,person_id,attendee_email,starts_at,ends_at,
+              timezone,status,google_event_id,html_link,meet_link,created_at,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?13)
+             ON CONFLICT(conversation_id,starts_at) DO UPDATE SET
+              status=CASE WHEN meetings.status='booked' THEN meetings.status ELSE excluded.status END,
+              google_event_id=CASE WHEN meetings.status='booked' THEN meetings.google_event_id ELSE excluded.google_event_id END,
+              html_link=CASE WHEN meetings.status='booked' THEN meetings.html_link ELSE excluded.html_link END,
+              meet_link=CASE WHEN meetings.status='booked' THEN meetings.meet_link ELSE excluded.meet_link END,
+              updated_at=?13",
+            params![
+                id,
+                meeting.conversation_id,
+                meeting.brand,
+                meeting.person_id,
+                meeting.attendee_email,
+                meeting.starts_at,
+                meeting.ends_at,
+                meeting.timezone,
+                status_or(&meeting.status, "booked"),
+                meeting.google_event_id,
+                meeting.html_link,
+                meeting.meet_link,
+                timestamp,
+            ],
+        )?;
+        let (stored_id, stored_status): (String, String) = conn.query_row(
+            "SELECT id,status FROM meetings WHERE conversation_id=?1 AND starts_at=?2",
+            params![meeting.conversation_id, meeting.starts_at],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let conversation_status = if stored_status == "pending" {
+            "meeting_pending"
+        } else {
+            "meeting_booked"
+        };
+        conn.execute(
+            "UPDATE conversations SET status=?2,updated_at=?3 WHERE id=?1",
+            params![meeting.conversation_id, conversation_status, timestamp],
+        )?;
+        Ok(stored_id)
+    }
+
+    pub fn update_meeting_booked(
+        &self,
+        id: &str,
+        google_event_id: &str,
+        html_link: &str,
+        meet_link: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let timestamp = now();
+        conn.execute(
+            "UPDATE meetings SET status='booked',google_event_id=?2,html_link=?3,
+             meet_link=?4,updated_at=?5 WHERE id=?1",
+            params![id, google_event_id, html_link, meet_link, timestamp],
+        )?;
+        conn.execute(
+            "UPDATE conversations SET status='meeting_booked',updated_at=?2
+             WHERE id=(SELECT conversation_id FROM meetings WHERE id=?1)",
+            params![id, timestamp],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_meetings(&self, brand: Option<&str>) -> Result<Vec<Meeting>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT * FROM meetings WHERE (?1 IS NULL OR brand=?1) ORDER BY starts_at ASC",
+        )?;
+        let rows = stmt.query_map(params![brand], |row| Ok(row_to_meeting(row)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 }
 
@@ -1536,6 +2201,19 @@ impl Db {
             )
             .optional()?)
     }
+
+    pub fn active_sequence_principles_for_person(&self, person_id: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let value = conn
+            .query_row(
+                "SELECT applied_principles FROM sequences \
+                 WHERE person_id=?1 AND status='active' ORDER BY created_at DESC LIMIT 1",
+                params![person_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(value.map(|value| jd(&value)).unwrap_or_default())
+    }
 }
 
 // --- Suppression -------------------------------------------------------
@@ -1584,11 +2262,12 @@ impl Db {
             r.id.clone()
         };
         conn.execute(
-            "INSERT INTO replies (id,person_id,sequence_id,ts,from_email,subject,body,\
+            "INSERT INTO replies (id,conversation_id,person_id,sequence_id,ts,from_email,subject,body,\
              classification,action_taken,message_id,in_reply_to) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
             params![
                 id,
+                r.conversation_id,
                 r.person_id,
                 r.sequence_id,
                 now(),
@@ -1607,11 +2286,11 @@ impl Db {
     /// Recent inbound replies (most recent first) for the CRM review view.
     pub fn list_replies(&self, limit: i64) -> Result<Vec<Reply>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare("SELECT * FROM replies ORDER BY ts DESC LIMIT ?1")?;
+        let mut stmt = conn.prepare("SELECT * FROM replies ORDER BY ts DESC LIMIT ?1")?;
         let rows = stmt.query_map(params![limit], |r| {
             Ok(Reply {
                 id: g(r, "id"),
+                conversation_id: g(r, "conversation_id"),
                 person_id: g(r, "person_id"),
                 sequence_id: g(r, "sequence_id"),
                 ts: g(r, "ts"),
@@ -1629,18 +2308,6 @@ impl Db {
             out.push(row?);
         }
         Ok(out)
-    }
-
-    /// Find a person by any of their known emails (for matching inbound replies).
-    pub fn person_by_email(&self, brand: &str, email: &str) -> Result<Option<Person>> {
-        let conn = self.conn.lock().unwrap();
-        Ok(conn
-            .query_row(
-                "SELECT * FROM people WHERE brand=?1 AND lower(email)=lower(?2) LIMIT 1",
-                params![brand, email],
-                |r| Ok(row_to_person(r)),
-            )
-            .optional()?)
     }
 
     /// Was this inbound Message-ID already recorded? (idempotent reply ingest)
@@ -1675,6 +2342,88 @@ impl Db {
             params![Uuid::new_v4().to_string(), now(), brand, person_id, touch_id, kind, detail],
         )?;
         Ok(())
+    }
+
+    /// Record (or reinforce) a durable lesson for a brand — a qualification skip,
+    /// an outreach failure, whatever the funnel learns — so future runs don't
+    /// start from a clean state. Repeated observations about the same subject bump
+    /// `hits` and refresh the detail instead of piling up duplicate rows. The
+    /// subject_key (an Apollo org id, a domain, a persona) is the dedup handle;
+    /// when it's blank we fall back to the human subject so a keyless learning
+    /// still dedups sensibly.
+    pub fn record_learning(
+        &self,
+        brand: &str,
+        kind: &str,
+        subject: &str,
+        subject_key: &str,
+        detail: &str,
+    ) -> Result<()> {
+        let key = if subject_key.trim().is_empty() {
+            subject
+        } else {
+            subject_key
+        };
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO learnings (id,brand,kind,subject,subject_key,detail,hits,created_at,updated_at) \
+             VALUES (?1,?2,?3,?4,?5,?6,1,?7,?7) \
+             ON CONFLICT(brand,kind,subject_key) DO UPDATE SET \
+               hits=hits+1, detail=excluded.detail, subject=excluded.subject, updated_at=excluded.updated_at",
+            params![
+                Uuid::new_v4().to_string(),
+                brand,
+                kind,
+                subject,
+                key,
+                detail,
+                now()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Recent learnings for a brand (or all brands when `brand` is None), most
+    /// reinforced first — the material fed back into targeting and shown to the
+    /// operator as accumulated business intelligence.
+    pub fn recent_learnings(
+        &self,
+        brand: Option<&str>,
+        kind: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Learning>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT brand,kind,subject,detail,hits,updated_at FROM learnings \
+             WHERE (?1 IS NULL OR brand=?1) AND (?2 IS NULL OR kind=?2) \
+             ORDER BY hits DESC, updated_at DESC LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![brand, kind, limit as i64], |r| {
+            Ok(Learning {
+                brand: r.get(0)?,
+                kind: r.get(1)?,
+                subject: r.get(2)?,
+                detail: r.get(3)?,
+                hits: r.get(4)?,
+                updated_at: r.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Stable subject keys we've already recorded a learning of `kind` about for a
+    /// brand — used to skip re-evaluating (and re-researching) known rejects.
+    pub fn learning_keys(
+        &self,
+        brand: &str,
+        kind: &str,
+    ) -> Result<std::collections::HashSet<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT subject_key FROM learnings WHERE brand=?1 AND kind=?2 AND subject_key<>''",
+        )?;
+        let rows = stmt.query_map(params![brand, kind], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<std::collections::HashSet<_>>>()?)
     }
 
     /// Count events of each `kind` for a brand (or all) — the funnel raw numbers.
@@ -2016,7 +2765,169 @@ fn row_to_application_brief(r: &Row) -> ApplicationBrief {
     }
 }
 
+fn row_to_conversation(r: &Row) -> Conversation {
+    Conversation {
+        id: g(r, "id"),
+        brand: g(r, "brand"),
+        sequence_id: g(r, "sequence_id"),
+        person_id: g(r, "person_id"),
+        lead_id: g(r, "lead_id"),
+        subject: g(r, "subject"),
+        status: g(r, "status"),
+        last_message_at: g(r, "last_message_at"),
+        created_at: g(r, "created_at"),
+        updated_at: g(r, "updated_at"),
+    }
+}
+
+fn row_to_conversation_message(r: &Row) -> ConversationMessage {
+    ConversationMessage {
+        id: g(r, "id"),
+        conversation_id: g(r, "conversation_id"),
+        direction: g(r, "direction"),
+        sender_email: g(r, "sender_email"),
+        recipient_email: g(r, "recipient_email"),
+        participants: jd(&g(r, "participants")),
+        subject: g(r, "subject"),
+        body: g(r, "body"),
+        status: g(r, "status"),
+        message_id: g(r, "message_id"),
+        in_reply_to: g(r, "in_reply_to"),
+        references: jd(&g(r, "references_json")),
+        classification: g(r, "classification"),
+        action: g(r, "action"),
+        offered_slots: jd(&g(r, "offered_slots")),
+        mailbox_id: g(r, "mailbox_id"),
+        sent_at: g(r, "sent_at"),
+        created_at: g(r, "created_at"),
+    }
+}
+
+fn row_to_meeting(r: &Row) -> Meeting {
+    Meeting {
+        id: g(r, "id"),
+        conversation_id: g(r, "conversation_id"),
+        brand: g(r, "brand"),
+        person_id: g(r, "person_id"),
+        attendee_email: g(r, "attendee_email"),
+        starts_at: g(r, "starts_at"),
+        ends_at: g(r, "ends_at"),
+        timezone: g(r, "timezone"),
+        status: g(r, "status"),
+        google_event_id: g(r, "google_event_id"),
+        html_link: g(r, "html_link"),
+        meet_link: g(r, "meet_link"),
+        created_at: g(r, "created_at"),
+        updated_at: g(r, "updated_at"),
+    }
+}
+
+fn ensure_conversation(
+    conn: &Connection,
+    brand: &str,
+    sequence_id: &str,
+    person_id: &str,
+    lead_id: &str,
+    subject: &str,
+) -> Result<Conversation> {
+    let existing = if sequence_id.is_empty() {
+        conn.query_row(
+            "SELECT * FROM conversations WHERE brand=?1 AND person_id=?2
+             ORDER BY updated_at DESC LIMIT 1",
+            params![brand, person_id],
+            |row| Ok(row_to_conversation(row)),
+        )
+        .optional()?
+    } else {
+        conn.query_row(
+            "SELECT * FROM conversations WHERE sequence_id=?1 LIMIT 1",
+            params![sequence_id],
+            |row| Ok(row_to_conversation(row)),
+        )
+        .optional()?
+    };
+    if let Some(conversation) = existing {
+        return Ok(conversation);
+    }
+
+    let id = Uuid::new_v4().to_string();
+    let timestamp = now();
+    conn.execute(
+        "INSERT INTO conversations
+         (id,brand,sequence_id,person_id,lead_id,subject,status,last_message_at,created_at,updated_at)
+         VALUES (?1,?2,?3,?4,?5,?6,'open',?7,?7,?7)",
+        params![
+            id,
+            brand,
+            sequence_id,
+            person_id,
+            lead_id,
+            subject,
+            timestamp
+        ],
+    )?;
+    Ok(Conversation {
+        id,
+        brand: brand.to_string(),
+        sequence_id: sequence_id.to_string(),
+        person_id: person_id.to_string(),
+        lead_id: lead_id.to_string(),
+        subject: subject.to_string(),
+        status: "open".into(),
+        last_message_at: timestamp.clone(),
+        created_at: timestamp.clone(),
+        updated_at: timestamp,
+    })
+}
+
 // --- helpers ---------------------------------------------------------------
+
+/// A durable unit of background work. The cadence loop already proved the
+/// pattern — claim due rows from SQLite, act, persist state — for one hard-coded
+/// kind (send a touch). `Job` generalizes it: any worker can enqueue, lease, and
+/// retry work that survives a restart, terminating in a dead-letter state after
+/// `max_attempts` rather than silently stranding a prospect mid-pipeline. This
+/// is the spine an autonomous supervisor schedules its decisions onto.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Job {
+    pub id: String,
+    pub brand: String,
+    pub kind: String,
+    pub payload: String,
+    pub status: String,
+    pub priority: i64,
+    pub next_run_at: String,
+    pub attempt_count: i64,
+    pub max_attempts: i64,
+    pub lease_owner: String,
+    pub lease_expires_at: String,
+    pub last_error: String,
+    pub dedup_key: String,
+    pub result: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+fn row_to_job(r: &Row) -> Job {
+    Job {
+        id: g(r, "id"),
+        brand: g(r, "brand"),
+        kind: g(r, "kind"),
+        payload: g(r, "payload"),
+        status: g(r, "status"),
+        priority: r.get("priority").unwrap_or(0),
+        next_run_at: g(r, "next_run_at"),
+        attempt_count: r.get("attempt_count").unwrap_or(0),
+        max_attempts: r.get("max_attempts").unwrap_or(0),
+        lease_owner: g(r, "lease_owner"),
+        lease_expires_at: g(r, "lease_expires_at"),
+        last_error: g(r, "last_error"),
+        dedup_key: g(r, "dedup_key"),
+        result: g(r, "result"),
+        created_at: g(r, "created_at"),
+        updated_at: g(r, "updated_at"),
+    }
+}
 
 /// Column getter that tolerates NULL/missing by returning an empty string.
 fn g(r: &Row, col: &str) -> String {
@@ -2110,6 +3021,7 @@ CREATE TABLE IF NOT EXISTS sequences (
     lead_id TEXT NOT NULL,
     brand TEXT NOT NULL,
     thesis TEXT,
+    applied_principles TEXT DEFAULT '[]',
     status TEXT DEFAULT 'active',
     current_stage INTEGER DEFAULT 0,
     created_at TEXT
@@ -2138,16 +3050,78 @@ CREATE TABLE IF NOT EXISTS suppression (
     UNIQUE(brand, email)
 );
 CREATE TABLE IF NOT EXISTS replies (
-    id TEXT PRIMARY KEY,
+    id TEXT PRIMARY KEY, conversation_id TEXT DEFAULT '',
     person_id TEXT, sequence_id TEXT, ts TEXT,
     from_email TEXT, subject TEXT, body TEXT,
     classification TEXT, action_taken TEXT,
     message_id TEXT, in_reply_to TEXT
 );
+CREATE TABLE IF NOT EXISTS conversations (
+    id TEXT PRIMARY KEY,
+    brand TEXT NOT NULL,
+    sequence_id TEXT,
+    person_id TEXT NOT NULL,
+    lead_id TEXT,
+    subject TEXT,
+    status TEXT NOT NULL DEFAULT 'open',
+    last_message_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS conversation_messages (
+    id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL,
+    direction TEXT NOT NULL,
+    sender_email TEXT,
+    recipient_email TEXT,
+    participants TEXT,
+    subject TEXT,
+    body TEXT,
+    status TEXT NOT NULL,
+    message_id TEXT,
+    in_reply_to TEXT,
+    references_json TEXT,
+    classification TEXT,
+    action TEXT,
+    offered_slots TEXT,
+    mailbox_id TEXT,
+    sent_at TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(conversation_id) REFERENCES conversations(id)
+);
+CREATE TABLE IF NOT EXISTS meetings (
+    id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL,
+    brand TEXT NOT NULL,
+    person_id TEXT,
+    attendee_email TEXT NOT NULL,
+    starts_at TEXT NOT NULL,
+    ends_at TEXT NOT NULL,
+    timezone TEXT,
+    status TEXT NOT NULL DEFAULT 'booked',
+    google_event_id TEXT,
+    html_link TEXT,
+    meet_link TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(conversation_id) REFERENCES conversations(id)
+);
 CREATE TABLE IF NOT EXISTS events (
     id TEXT PRIMARY KEY,
     ts TEXT, brand TEXT, person_id TEXT, touch_id TEXT,
     kind TEXT, detail TEXT
+);
+CREATE TABLE IF NOT EXISTS learnings (
+    id TEXT PRIMARY KEY,
+    brand TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    subject TEXT DEFAULT '',
+    subject_key TEXT DEFAULT '',
+    detail TEXT DEFAULT '',
+    hits INTEGER DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(brand, kind, subject_key)
 );
 CREATE TABLE IF NOT EXISTS opportunities (
     id TEXT PRIMARY KEY,
@@ -2215,11 +3189,39 @@ CREATE TABLE IF NOT EXISTS opportunity_applications (
     created_at TEXT, updated_at TEXT,
     FOREIGN KEY(opportunity_id) REFERENCES opportunities(id)
 );
+CREATE TABLE IF NOT EXISTS jobs (
+    id TEXT PRIMARY KEY,
+    brand TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    payload TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'pending',
+    priority INTEGER NOT NULL DEFAULT 0,
+    next_run_at TEXT NOT NULL,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 5,
+    lease_owner TEXT,
+    lease_expires_at TEXT,
+    last_error TEXT,
+    dedup_key TEXT,
+    result TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_touches_due ON touches(status, due_at);
 CREATE INDEX IF NOT EXISTS idx_touches_person ON touches(person_id);
 CREATE INDEX IF NOT EXISTS idx_people_brand_email ON people(brand, email);
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
 CREATE INDEX IF NOT EXISTS idx_replies_msgid ON replies(message_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_conversations_sequence
+    ON conversations(sequence_id) WHERE sequence_id IS NOT NULL AND sequence_id<>'';
+CREATE INDEX IF NOT EXISTS idx_conversations_person
+    ON conversations(brand, person_id, updated_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_conversation_messages_msgid
+    ON conversation_messages(message_id) WHERE message_id IS NOT NULL AND message_id<>'';
+CREATE INDEX IF NOT EXISTS idx_conversation_messages_due
+    ON conversation_messages(status, direction, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_meetings_conversation_start
+    ON meetings(conversation_id, starts_at);
 CREATE INDEX IF NOT EXISTS idx_opportunities_brand_status
     ON opportunities(brand, pipeline_status, opportunity_status, fit_score);
 CREATE INDEX IF NOT EXISTS idx_opportunity_contacts_email
@@ -2228,13 +3230,19 @@ CREATE INDEX IF NOT EXISTS idx_opportunity_touches_due
     ON opportunity_touches(status, due_at);
 CREATE INDEX IF NOT EXISTS idx_opportunity_replies_msgid
     ON opportunity_replies(message_id);
+-- Idempotency: a supervisor re-deciding every tick must not enqueue the same
+-- logical action twice. A partial unique index lets un-keyed jobs coexist while
+-- keyed ones (e.g. "gnk:source:2026-08-07") stay singular.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_dedup ON jobs(dedup_key)
+    WHERE dedup_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_jobs_claim ON jobs(status, next_run_at, priority);
 "#;
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ApplicationBrief, Db, Lead, Mailbox, Opportunity, OpportunityContact, OpportunityTouch,
-        Person, Sequence, Touch,
+        ApplicationBrief, ConversationMessage, Db, Job, Lead, Mailbox, Meeting, Opportunity,
+        OpportunityContact, OpportunityTouch, Person, Sequence, Touch,
     };
     use chrono::{TimeZone, Utc};
     use uuid::Uuid;
@@ -2247,6 +3255,356 @@ mod tests {
         ] {
             let _ = std::fs::remove_file(candidate);
         }
+    }
+
+    #[test]
+    fn account_throttle_counts_new_fronts_engaged_and_sent() {
+        let path = std::env::temp_dir().join(format!(
+            "spruce-account-throttle-test-{}.sqlite",
+            Uuid::new_v4()
+        ));
+        let db = Db::open(&path).expect("open temp db");
+        let lead_id = db
+            .upsert_lead(&Lead {
+                brand: "gnk".into(),
+                apollo_org_id: "org-throttle".into(),
+                ..Default::default()
+            })
+            .expect("insert lead");
+
+        // Two people at the same account.
+        let mut person_ids = Vec::new();
+        for i in 0..2 {
+            person_ids.push(
+                db.upsert_person(&Person {
+                    lead_id: lead_id.clone(),
+                    brand: "gnk".into(),
+                    apollo_person_id: format!("person-throttle-{i}"),
+                    email: format!("p{i}@example.com"),
+                    email_status: "verified".into(),
+                    status: "verified".into(),
+                    ..Default::default()
+                })
+                .expect("insert person"),
+            );
+        }
+
+        let day_start = Utc.with_ymd_and_hms(2026, 8, 7, 0, 0, 0).unwrap();
+        let day_end = Utc.with_ymd_and_hms(2026, 8, 8, 0, 0, 0).unwrap();
+
+        // Nothing sent yet: no open fronts, nobody engaged.
+        assert_eq!(
+            db.account_openers_sent_between(&lead_id, day_start, day_end)
+                .unwrap(),
+            0
+        );
+        assert_eq!(db.account_engaged_people(&lead_id).unwrap(), 0);
+
+        // Open person 0 with a stage-0 send timestamped inside the target day.
+        let seq0 = db
+            .create_sequence(&Sequence {
+                person_id: person_ids[0].clone(),
+                lead_id: lead_id.clone(),
+                brand: "gnk".into(),
+                status: "active".into(),
+                ..Default::default()
+            })
+            .expect("seq0");
+        let touch0 = db
+            .insert_touch(&Touch {
+                sequence_id: seq0.clone(),
+                person_id: person_ids[0].clone(),
+                lead_id: lead_id.clone(),
+                brand: "gnk".into(),
+                stage: 0,
+                channel: "email".into(),
+                status: "sent".into(),
+                due_at: "2026-08-07T09:00:00Z".into(),
+                ..Default::default()
+            })
+            .expect("touch0");
+        db.set_person_status(&person_ids[0], "contacted")
+            .expect("contacted");
+        set_sent_at(&db, &touch0, "2026-08-07T09:00:00+00:00");
+
+        // One new front opened today, one engaged person, one send on the seq.
+        assert_eq!(
+            db.account_openers_sent_between(&lead_id, day_start, day_end)
+                .unwrap(),
+            1
+        );
+        assert_eq!(db.account_engaged_people(&lead_id).unwrap(), 1);
+        assert_eq!(db.sequence_sent_count(&seq0).unwrap(), 1);
+
+        // Person 1 opened on a *different* day: engaged, but not a front today.
+        let seq1 = db
+            .create_sequence(&Sequence {
+                person_id: person_ids[1].clone(),
+                lead_id: lead_id.clone(),
+                brand: "gnk".into(),
+                status: "active".into(),
+                ..Default::default()
+            })
+            .expect("seq1");
+        let touch1 = db
+            .insert_touch(&Touch {
+                sequence_id: seq1.clone(),
+                person_id: person_ids[1].clone(),
+                lead_id: lead_id.clone(),
+                brand: "gnk".into(),
+                stage: 0,
+                channel: "email".into(),
+                status: "sent".into(),
+                due_at: "2026-08-01T09:00:00Z".into(),
+                ..Default::default()
+            })
+            .expect("touch1");
+        db.set_person_status(&person_ids[1], "contacted")
+            .expect("contacted1");
+        set_sent_at(&db, &touch1, "2026-08-01T09:00:00+00:00");
+
+        // Still one opener *today*, but two engaged across days.
+        assert_eq!(
+            db.account_openers_sent_between(&lead_id, day_start, day_end)
+                .unwrap(),
+            1
+        );
+        assert_eq!(db.account_engaged_people(&lead_id).unwrap(), 2);
+
+        drop(db);
+        remove_temp_db(&path);
+    }
+
+    #[test]
+    fn rfc_headers_keep_unknown_referrals_on_the_original_thread() {
+        let path = std::env::temp_dir().join(format!(
+            "spruce-conversation-test-{}.sqlite",
+            Uuid::new_v4()
+        ));
+        let db = Db::open(&path).expect("open temp db");
+        let lead_id = db
+            .upsert_lead(&Lead {
+                brand: "gnk".into(),
+                apollo_org_id: "thread-org".into(),
+                name: "Thread Co".into(),
+                ..Default::default()
+            })
+            .expect("lead");
+        let person_id = db
+            .upsert_person(&Person {
+                lead_id: lead_id.clone(),
+                brand: "gnk".into(),
+                apollo_person_id: "thread-person".into(),
+                email: "original@example.com".into(),
+                email_status: "verified".into(),
+                status: "contacted".into(),
+                ..Default::default()
+            })
+            .expect("person");
+        let sequence_id = db
+            .create_sequence(&Sequence {
+                person_id: person_id.clone(),
+                lead_id: lead_id.clone(),
+                brand: "gnk".into(),
+                status: "active".into(),
+                ..Default::default()
+            })
+            .expect("sequence");
+        db.insert_touch(&Touch {
+            sequence_id: sequence_id.clone(),
+            person_id: person_id.clone(),
+            lead_id,
+            brand: "gnk".into(),
+            channel: "email".into(),
+            status: "sent".into(),
+            message_id: "<cold-1@example.com>".into(),
+            ..Default::default()
+        })
+        .expect("touch");
+
+        // The new sender was never sourced, but References points at our touch.
+        let conversation = db
+            .conversation_for_inbound(
+                "gnk",
+                "referral@example.net",
+                "Re: workflow",
+                &["<cold-1@example.com>".into()],
+            )
+            .expect("resolve")
+            .expect("conversation");
+        assert_eq!(conversation.person_id, person_id);
+        assert_eq!(conversation.sequence_id, sequence_id);
+
+        db.insert_conversation_message(&ConversationMessage {
+            conversation_id: conversation.id.clone(),
+            direction: "inbound".into(),
+            sender_email: "referral@example.net".into(),
+            status: "received".into(),
+            message_id: "<inbound-1@example.net>".into(),
+            ..Default::default()
+        })
+        .expect("inbound");
+        db.insert_conversation_message(&ConversationMessage {
+            conversation_id: conversation.id.clone(),
+            direction: "outbound".into(),
+            recipient_email: "referral@example.net".into(),
+            status: "sent".into(),
+            message_id: "<reply-1@example.com>".into(),
+            offered_slots: vec!["2026-08-10T08:00:00+00:00".into()],
+            ..Default::default()
+        })
+        .expect("reply");
+        db.insert_conversation_message(&ConversationMessage {
+            conversation_id: conversation.id.clone(),
+            direction: "outbound".into(),
+            recipient_email: "referral@example.net".into(),
+            status: "draft".into(),
+            offered_slots: vec!["2026-08-11T08:00:00+00:00".into()],
+            ..Default::default()
+        })
+        .expect("draft");
+
+        let same = db
+            .conversation_for_inbound(
+                "gnk",
+                "another-cc@example.org",
+                "Re: workflow",
+                &["<inbound-1@example.net>".into()],
+            )
+            .expect("resolve chain")
+            .expect("same conversation");
+        assert_eq!(same.id, conversation.id);
+        assert_eq!(
+            db.sent_offered_slots(&conversation.id).unwrap(),
+            vec!["2026-08-10T08:00:00+00:00"]
+        );
+
+        let booked = db
+            .record_meeting(&Meeting {
+                conversation_id: conversation.id.clone(),
+                brand: "gnk".into(),
+                person_id: person_id.clone(),
+                attendee_email: "referral@example.net".into(),
+                starts_at: "2026-08-10T08:00:00+00:00".into(),
+                ends_at: "2026-08-10T08:30:00+00:00".into(),
+                status: "booked".into(),
+                google_event_id: "google-1".into(),
+                meet_link: "https://meet.google.com/example".into(),
+                ..Default::default()
+            })
+            .expect("booked meeting");
+        let duplicate_pending = db
+            .record_meeting(&Meeting {
+                conversation_id: conversation.id.clone(),
+                brand: "gnk".into(),
+                person_id,
+                attendee_email: "referral@example.net".into(),
+                starts_at: "2026-08-10T08:00:00+00:00".into(),
+                ends_at: "2026-08-10T08:30:00+00:00".into(),
+                status: "pending".into(),
+                ..Default::default()
+            })
+            .expect("duplicate acceptance");
+        assert_eq!(booked, duplicate_pending);
+        let meetings = db.list_meetings(Some("gnk")).unwrap();
+        assert_eq!(meetings[0].status, "booked");
+        assert_eq!(meetings[0].google_event_id, "google-1");
+
+        drop(db);
+        remove_temp_db(&path);
+    }
+
+    fn set_sent_at(db: &Db, touch_id: &str, sent_at: &str) {
+        let conn = db.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE touches SET sent_at=?2 WHERE id=?1",
+            super::params![touch_id, sent_at],
+        )
+        .expect("stamp sent_at");
+    }
+
+    #[test]
+    fn job_queue_leases_completes_and_dead_letters() {
+        let path =
+            std::env::temp_dir().join(format!("spruce-jobs-queue-test-{}.sqlite", Uuid::new_v4()));
+        let db = Db::open(&path).expect("open temp db");
+
+        // Low max_attempts so we can drive it into the dead-letter state.
+        let id = db
+            .enqueue_job(&Job {
+                brand: "gnk".into(),
+                kind: "source".into(),
+                max_attempts: 2,
+                ..Default::default()
+            })
+            .expect("enqueue");
+
+        // Claim it: leased, attempt 1, and nothing else is due.
+        let claimed = db
+            .claim_job("worker-1", 300)
+            .expect("claim")
+            .expect("a job");
+        assert_eq!(claimed.id, id);
+        assert_eq!(claimed.status, "leased");
+        assert_eq!(claimed.attempt_count, 1);
+        assert!(db.claim_job("worker-1", 300).expect("claim2").is_none());
+
+        // First failure retries (attempt 1 < max 2), but backs off into the
+        // future so it isn't immediately re-claimable.
+        assert_eq!(db.fail_job(&id, "boom").expect("fail"), "pending");
+        assert!(db.claim_job("worker-1", 300).expect("claim3").is_none());
+
+        // Force it due, re-claim (attempt 2), fail again → dead-letter.
+        set_next_run_past(&db, &id);
+        let again = db.claim_job("worker-1", 300).expect("claim4").expect("due");
+        assert_eq!(again.attempt_count, 2);
+        assert_eq!(db.fail_job(&id, "boom again").expect("fail2"), "dead");
+        assert_eq!(db.get_job(&id).expect("get").expect("row").status, "dead");
+
+        // The dead-letter backlog is visible to observability.
+        let counts = db.job_status_counts(Some("gnk")).expect("counts");
+        assert_eq!(
+            counts.iter().find(|(s, _)| s == "dead").map(|(_, n)| *n),
+            Some(1)
+        );
+
+        drop(db);
+        remove_temp_db(&path);
+    }
+
+    #[test]
+    fn enqueue_job_is_idempotent_on_dedup_key() {
+        let path =
+            std::env::temp_dir().join(format!("spruce-jobs-dedup-test-{}.sqlite", Uuid::new_v4()));
+        let db = Db::open(&path).expect("open temp db");
+        let make = || Job {
+            brand: "gnk".into(),
+            kind: "source".into(),
+            dedup_key: "gnk:source:2026-08-07".into(),
+            ..Default::default()
+        };
+        let a = db.enqueue_job(&make()).expect("first");
+        let b = db.enqueue_job(&make()).expect("second");
+        assert_eq!(a, b, "same dedup key must collapse to one job");
+        let pending = db
+            .job_status_counts(Some("gnk"))
+            .expect("counts")
+            .iter()
+            .find(|(s, _)| s == "pending")
+            .map(|(_, n)| *n);
+        assert_eq!(pending, Some(1));
+
+        drop(db);
+        remove_temp_db(&path);
+    }
+
+    fn set_next_run_past(db: &Db, id: &str) {
+        let conn = db.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE jobs SET next_run_at=?2 WHERE id=?1",
+            super::params![id, "2000-01-01T00:00:00+00:00"],
+        )
+        .expect("force due");
     }
 
     #[test]
@@ -2549,5 +3907,52 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn learnings_reinforce_dedup_and_scope_by_brand() {
+        let db = Db::open(":memory:").expect("open memory db");
+
+        // First skip of a company records one learning.
+        db.record_learning("gnk", "qualification_skip", "Acme Co", "acme-id", "thin payload")
+            .unwrap();
+        // Skipping the same company again reinforces it (hits bump), refreshing
+        // the detail rather than creating a duplicate row.
+        db.record_learning(
+            "gnk",
+            "qualification_skip",
+            "Acme Co",
+            "acme-id",
+            "still thin payload",
+        )
+        .unwrap();
+        // A different company for the same brand is its own learning.
+        db.record_learning("gnk", "qualification_skip", "Beta Ltd", "beta-id", "vendor, not buyer")
+            .unwrap();
+        // Same subject key but a different brand must not collide.
+        db.record_learning("wapahki", "qualification_skip", "Acme Co", "acme-id", "wrong motion")
+            .unwrap();
+
+        let gnk = db
+            .recent_learnings(Some("gnk"), Some("qualification_skip"), 10)
+            .unwrap();
+        assert_eq!(gnk.len(), 2, "two distinct gnk learnings, no duplicate");
+        let acme = gnk.iter().find(|l| l.subject == "Acme Co").expect("acme learning");
+        assert_eq!(acme.hits, 2, "reinforced twice");
+        assert_eq!(acme.detail, "still thin payload", "detail refreshed");
+
+        // Known-reject keys are per-brand and drive the re-research skip.
+        let keys = db.learning_keys("gnk", "qualification_skip").unwrap();
+        assert!(keys.contains("acme-id") && keys.contains("beta-id"));
+        assert_eq!(
+            db.learning_keys("outagehub", "qualification_skip")
+                .unwrap()
+                .len(),
+            0
+        );
+
+        // No brand filter spans the whole portfolio.
+        let all = db.recent_learnings(None, None, 10).unwrap();
+        assert_eq!(all.len(), 3);
     }
 }

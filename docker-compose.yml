@@ -1,0 +1,28 @@
+# spruce-leaf cloud daemon. `docker compose up -d` runs it detached; it restarts
+# on crash and on host reboot, and its SQLite state persists in a named volume.
+#
+# ⚠ Before the FIRST `up`, walk the staged rollout in deploy/README.md:
+#   1. dry-run:        docker compose run --rm spruce-leaf daemon
+#   2. closed loop:    set SPRUCE_SEND_ALLOWLIST in .env, seed a test lead, up
+#   3. production:     clear SPRUCE_SEND_ALLOWLIST, up
+# The default command below is the PRODUCTION posture (live send + autopilot).
+
+services:
+  spruce-leaf:
+    build: .
+    image: spruce-leaf:latest
+    container_name: spruce-leaf
+    restart: unless-stopped
+    # All secrets + mailbox config + CLAUDE_CODE_OAUTH_TOKEN come from .env.
+    env_file:
+      - .env
+    environment:
+      TZ: UTC
+    volumes:
+      - spruce-data:/app/.spruce
+    # Uncomment to watch the daemon's log line-by-line: docker compose logs -f
+    # Override for a one-off dry-run: docker compose run --rm spruce-leaf daemon
+    command: ["daemon", "--live", "--autopilot"]
+
+volumes:
+  spruce-data:

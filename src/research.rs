@@ -116,14 +116,24 @@ pub async fn research_company(
         sources.push(homepage);
     }
     if corpus.len() < 1_200 {
-        for path in ["about", "products", "solutions", "services"] {
-            let url = format!("https://{domain}/{path}");
-            if let Some(text) = read_page(research, &url).await {
-                corpus.push_str("\n\n");
-                corpus.push_str(&text);
-                sources.push(url);
-                break;
-            }
+        // Fetch a couple of likely detail pages concurrently and keep the first
+        // that returns text. Walking four paths one-at-a-time meant a slow or dead
+        // site burned one timeout per path in series — the dominant tail latency
+        // of a sourcing run. Two concurrent fetches bound that to a single wait.
+        let about_url = format!("https://{domain}/about");
+        let products_url = format!("https://{domain}/products");
+        let (about, products) = futures::future::join(
+            read_page(research, &about_url),
+            read_page(research, &products_url),
+        )
+        .await;
+        if let Some((url, text)) = [(about_url, about), (products_url, products)]
+            .into_iter()
+            .find_map(|(url, text)| text.map(|body| (url, body)))
+        {
+            corpus.push_str("\n\n");
+            corpus.push_str(&text);
+            sources.push(url);
         }
     }
     if corpus.trim().is_empty() {
@@ -154,7 +164,7 @@ pub async fn research_company(
     );
 
     match client
-        .structured::<CompanyBrief>(system, &user, brief_schema())
+        .structured_bulk::<CompanyBrief>("source.website_research", system, &user, brief_schema())
         .await
     {
         Ok(mut brief) => {

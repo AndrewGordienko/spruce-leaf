@@ -30,6 +30,90 @@ use tokio::sync::RwLock;
 
 use crate::engine::Engine;
 
+/// The compact, always-on operating doctrine for strategy-producing calls.
+///
+/// Full books remain in the private retrieval library; injecting them wholesale
+/// would swamp the task and make outputs worse. These twelve durable rules keep
+/// every requested source represented, while stage retrieval supplies the
+/// detailed, task-relevant evidence on top.
+const CORE_BUSINESS_DOCTRINE: &str = "\
+- [core:lean-startup] The Lean Startup — state the riskiest hypothesis, define the smallest test, and use observed behaviour to persevere, change, or stop.\n\
+- [core:zero-to-one] Zero to One — prefer a differentiated wedge and a defensible advantage over an undifferentiated fight for share.\n\
+- [core:good-to-great] Good to Great — confront the evidence, focus on the intersection of capability, economic value, and durable conviction, then execute with discipline.\n\
+- [core:e-myth] The E-Myth Revisited — design repeatable systems with clear owners and measures so results do not depend on heroic improvisation.\n\
+- [core:one-page-marketing] The 1-Page Marketing Plan — connect one target market, one compelling message, and a deliberate before/during/after customer journey.\n\
+- [core:think-and-grow-rich] Think and Grow Rich — translate a definite objective into an organised plan and persistent action; treat motivation as execution support, never as market evidence.\n\
+- [core:rich-dad-poor-dad] Rich Dad Poor Dad — judge choices by cash-flow resilience and whether they build productive assets; never substitute this heuristic for verified financial facts.\n\
+- [core:psychology-of-money] The Psychology of Money — account for incentives, uncertainty, time horizon, and margin of safety; behaviour often matters more than spreadsheet precision.\n\
+- [core:blue-ocean] Blue Ocean Strategy — pursue value innovation by explicitly eliminating, reducing, raising, and creating factors instead of competing feature-for-feature.\n\
+- [core:hundred-dollar-startup] The $100 Startup — begin with a specific useful outcome someone will pay for, reach a first transaction quickly, and expand from real demand.\n\
+- [core:hundred-million-offers] $100M Offers — increase the buyer's desired outcome and confidence while reducing delay, effort, risk, and unnecessary complexity.\n\
+- [core:atomic-habits] Atomic Habits — turn strategy into an easy-to-repeat system with obvious cues, fast feedback, and an environment that supports the desired behaviour.";
+
+const CORE_PRINCIPLE_IDS: [&str; 12] = [
+    "core:lean-startup",
+    "core:zero-to-one",
+    "core:good-to-great",
+    "core:e-myth",
+    "core:one-page-marketing",
+    "core:think-and-grow-rich",
+    "core:rich-dad-poor-dad",
+    "core:psychology-of-money",
+    "core:blue-ocean",
+    "core:hundred-dollar-startup",
+    "core:hundred-million-offers",
+    "core:atomic-habits",
+];
+
+pub fn core_principle_ids() -> &'static [&'static str] {
+    &CORE_PRINCIPLE_IDS
+}
+
+/// Return the doctrine plus a stage-specific instruction. This function is
+/// deliberately independent of the on-disk library so the strategy layer never
+/// silently disappears when a new machine has not finished ingestion yet.
+pub fn core_strategy_block(stage: &str) -> String {
+    let lens = match stage {
+        "icp" | "companies" => {
+            "Choose a narrow, winnable market from verified pain signals. Separate facts, inferences, and the next falsifiable test."
+        }
+        "positioning" => {
+            "Make the differentiated value and competitive alternative explicit; do not invent superiority or demand."
+        }
+        "people" => {
+            "Map the person who observes the problem, the process owner, the economic buyer, and a credible route between them."
+        }
+        "offers" | "pricing" => {
+            "Design around a measurable customer outcome, confidence, time-to-value, effort, risk, willingness to pay, and healthy cash flow."
+        }
+        "sequence" => {
+            "Use verified relevance, one coherent problem thread, low-friction asks, and small commitment steps; never turn a framework into buyer-facing jargon."
+        }
+        "replies" => {
+            "Treat the reply as evidence, answer the person's actual intent, and ask only for the smallest useful next commitment."
+        }
+        "experiments" => {
+            "Name the hypothesis, leading measure, decision threshold, owner, review date, and what result would cause a change."
+        }
+        "operations" => {
+            "Convert the decision into a repeatable owned process with a visible trigger, measure, feedback loop, and exception path."
+        }
+        "synthesis" => {
+            "Aggregate only evidence that independently recurs; distinguish signal from anecdote and preserve uncertainty and counter-evidence."
+        }
+        "funding" => {
+            "Match a focused, evidence-backed project to explicit criteria; protect cash flow and never treat thematic relevance as eligibility."
+        }
+        _ => {
+            "Apply only the principles that materially improve this decision, preserve uncertainty, and turn the result into a falsifiable next action."
+        }
+    };
+    format!(
+        "=== ALWAYS-ON BUSINESS DOCTRINE ===\n{CORE_BUSINESS_DOCTRINE}\n\nSTAGE APPLICATION: {lens}\n\
+         Use this doctrine to change the reasoning, not to name-drop books. Cite applicable IDs when the response schema provides an applied_principles field."
+    )
+}
+
 // --- Data model ------------------------------------------------------------
 
 /// The whole persisted library. The BM25 indexes and backing path are rebuilt
@@ -82,7 +166,8 @@ pub struct Principle {
     pub when_to_use: String,
     /// Keywords, for retrieval.
     pub tags: Vec<String>,
-    /// Which pipeline stages this applies to: "companies" | "people" | "sequence".
+    /// Strategy stages this principle can inform (ICP, people, offers, replies,
+    /// experiments, operations, funding, and so on).
     pub stages: Vec<String>,
 }
 
@@ -189,9 +274,10 @@ impl Library {
     }
 
     /// Like [`retrieve`], but bias toward principles tagged for a given pipeline
-    /// `stage` ("companies" | "people" | "sequence"). Principles with no stage
-    /// tag are treated as applying everywhere. Falls back to unfiltered results
-    /// if the stage filter would starve the list.
+    /// stage. Results favor different source books before taking a second card
+    /// from one book, preventing one lexically dominant title from becoming the
+    /// whole strategy. Principles with no stage tag apply everywhere, and the
+    /// list is backfilled with unfiltered results when needed.
     pub fn retrieve_stage(
         &self,
         query: &str,
@@ -199,25 +285,53 @@ impl Library {
         n_principles: usize,
         n_chunks: usize,
     ) -> Retrieved {
-        // Over-fetch, then filter by stage tag and take the top `n_principles`.
-        let ranked = self.p_index.search(query, n_principles * 3);
-        let mut principles: Vec<Principle> = ranked
-            .iter()
-            .filter_map(|&(i, _)| self.principles.get(i))
-            .filter(|p| p.stages.is_empty() || p.stages.iter().any(|s| s == stage))
-            .take(n_principles)
-            .cloned()
-            .collect();
-        // If stage filtering left us short, backfill with the best unfiltered hits.
-        if principles.len() < n_principles {
-            for &(i, _) in &ranked {
-                if principles.len() >= n_principles {
-                    break;
-                }
-                if let Some(p) = self.principles.get(i) {
-                    if !principles.iter().any(|x| x.id == p.id) {
-                        principles.push(p.clone());
-                    }
+        // Over-fetch so stage filtering and source diversity have room to work.
+        let ranked = self.p_index.search(query, n_principles.saturating_mul(8));
+        let stage_matches = |principle: &Principle| {
+            principle.stages.is_empty() || principle.stages.iter().any(|value| value == stage)
+        };
+        let mut principles = Vec::new();
+        let mut used_books = HashSet::new();
+
+        // First pass: one stage-relevant principle per source book.
+        for &(index, _) in &ranked {
+            if principles.len() >= n_principles {
+                break;
+            }
+            let Some(principle) = self.principles.get(index) else {
+                continue;
+            };
+            if stage_matches(principle) && used_books.insert(principle.book_id.clone()) {
+                principles.push(principle.clone());
+            }
+        }
+        // Second pass: remaining stage-relevant cards, even from used books.
+        for &(index, _) in &ranked {
+            if principles.len() >= n_principles {
+                break;
+            }
+            let Some(principle) = self.principles.get(index) else {
+                continue;
+            };
+            if stage_matches(principle)
+                && !principles
+                    .iter()
+                    .any(|existing| existing.id == principle.id)
+            {
+                principles.push(principle.clone());
+            }
+        }
+        // Final pass: best unfiltered cards if stage tagging would starve output.
+        for &(index, _) in &ranked {
+            if principles.len() >= n_principles {
+                break;
+            }
+            if let Some(principle) = self.principles.get(index) {
+                if !principles
+                    .iter()
+                    .any(|existing| existing.id == principle.id)
+                {
+                    principles.push(principle.clone());
                 }
             }
         }
@@ -262,8 +376,6 @@ impl Library {
             return Ok(report);
         }
 
-        let mut existing: HashSet<u64> = self.books.iter().map(|b| b.hash).collect();
-
         for file in files {
             let text = match extract_text(&file) {
                 Ok(t) if t.trim().len() > 200 => t,
@@ -283,11 +395,54 @@ impl Library {
             };
 
             let hash = hash_text(&text);
-            if existing.contains(&hash) {
-                report.books_skipped += 1;
-                report
-                    .notes
-                    .push(format!("skipped {} (already ingested)", file.display()));
+            if let Some(book_index) = self.books.iter().position(|book| book.hash == hash) {
+                // A raw-only import can be upgraded after provider usage resets.
+                // Previously the content hash made `--no-distill` permanent.
+                if distill && self.books[book_index].n_principles == 0 {
+                    let title = self.books[book_index].title.clone();
+                    let book_id = self.books[book_index].id.clone();
+                    let chunks = self
+                        .chunks
+                        .iter()
+                        .filter(|chunk| chunk.book_id == book_id)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    let used_ids = self
+                        .principles
+                        .iter()
+                        .map(|principle| principle.id.clone())
+                        .collect::<HashSet<_>>();
+                    let distilled = distill_principles(
+                        client,
+                        &title,
+                        &book_id,
+                        &chunks,
+                        max_sections,
+                        concurrency,
+                        used_ids,
+                        &mut report.notes,
+                    )
+                    .await;
+                    if distilled.all_failed {
+                        report.books_skipped += 1;
+                        report.notes.push(format!(
+                            "{title}: raw passages remain available, but principle upgrade failed; retry when a model CLI is available"
+                        ));
+                        continue;
+                    }
+                    let added = distilled.principles.len();
+                    self.books[book_index].n_principles = added;
+                    self.principles.extend(distilled.principles);
+                    report.principles += added;
+                    report.notes.push(format!(
+                        "{title}: upgraded existing raw import with {added} principle card(s)"
+                    ));
+                } else {
+                    report.books_skipped += 1;
+                    report
+                        .notes
+                        .push(format!("skipped {} (already ingested)", file.display()));
+                }
                 continue;
             }
 
@@ -312,65 +467,30 @@ impl Library {
             // Distill principle cards.
             let mut principles = Vec::new();
             if distill {
-                let sections = section_batches(&chunks, 12_000, max_sections);
-                if sections.sampled {
-                    report.notes.push(format!(
-                        "{}: sampled {} of {} sections for principle distillation \
-                         (raise --max-sections for fuller coverage)",
-                        title, sections.used, sections.total
-                    ));
-                }
-                let results: Vec<Result<Vec<RawPrinciple>>> =
-                    stream::iter(sections.batches.into_iter().map(|batch| {
-                        let title = title.clone();
-                        async move { distill_batch(client, &title, &batch).await }
-                    }))
-                    .buffered(concurrency.max(1))
-                    .collect()
-                    .await;
-
-                let mut raws = Vec::new();
-                let mut failed_batches = 0usize;
-                for (index, result) in results.into_iter().enumerate() {
-                    match result {
-                        Ok(batch) => raws.extend(batch),
-                        Err(error) => {
-                            failed_batches += 1;
-                            report.notes.push(format!(
-                                "{title}: principle distillation failed for section {}: {error:#}",
-                                index + 1
-                            ));
-                        }
-                    }
-                }
-                if failed_batches > 0 && raws.is_empty() {
+                let used_ids = self
+                    .principles
+                    .iter()
+                    .map(|principle| principle.id.clone())
+                    .collect::<HashSet<_>>();
+                let distilled = distill_principles(
+                    client,
+                    &title,
+                    &book_id,
+                    &chunks,
+                    max_sections,
+                    concurrency,
+                    used_ids,
+                    &mut report.notes,
+                )
+                .await;
+                if distilled.all_failed {
                     report.books_skipped += 1;
                     report.notes.push(format!(
                         "{title}: not ingested because every principle-distillation call failed; retry when the selected model CLI is available"
                     ));
                     continue;
                 }
-
-                let mut used_ids: HashSet<String> =
-                    self.principles.iter().map(|p| p.id.clone()).collect();
-                let mut used_names: HashSet<String> = HashSet::new();
-                for raw in raws {
-                    let key = raw.name.to_lowercase();
-                    if raw.name.trim().is_empty() || !used_names.insert(key) {
-                        continue; // drop blank / duplicate names within this book
-                    }
-                    let id = unique_id(&slug(&raw.name), &mut used_ids);
-                    principles.push(Principle {
-                        id,
-                        book_id: book_id.clone(),
-                        book_title: title.clone(),
-                        name: raw.name,
-                        summary: raw.summary,
-                        when_to_use: raw.when_to_use,
-                        tags: raw.tags,
-                        stages: normalize_stages(raw.stages),
-                    });
-                }
+                principles = distilled.principles;
             }
 
             report.books_added += 1;
@@ -387,7 +507,6 @@ impl Library {
             });
             self.chunks.extend(chunks);
             self.principles.extend(principles);
-            existing.insert(hash);
         }
 
         self.build_index();
@@ -496,12 +615,87 @@ struct RawPrinciple {
     stages: Vec<String>,
 }
 
+struct DistilledPrinciples {
+    principles: Vec<Principle>,
+    all_failed: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn distill_principles(
+    client: &Engine,
+    title: &str,
+    book_id: &str,
+    chunks: &[Chunk],
+    max_sections: usize,
+    concurrency: usize,
+    mut used_ids: HashSet<String>,
+    notes: &mut Vec<String>,
+) -> DistilledPrinciples {
+    let sections = section_batches(chunks, 12_000, max_sections);
+    if sections.sampled {
+        notes.push(format!(
+            "{}: sampled {} of {} sections for principle distillation \
+             (raise --max-sections for fuller coverage)",
+            title, sections.used, sections.total
+        ));
+    }
+    let total_batches = sections.batches.len();
+    let results: Vec<Result<Vec<RawPrinciple>>> =
+        stream::iter(sections.batches.into_iter().map(|batch| {
+            let title = title.to_string();
+            async move { distill_batch(client, &title, &batch).await }
+        }))
+        .buffered(concurrency.max(1))
+        .collect()
+        .await;
+
+    let mut raws = Vec::new();
+    let mut failed_batches = 0usize;
+    for (index, result) in results.into_iter().enumerate() {
+        match result {
+            Ok(batch) => raws.extend(batch),
+            Err(error) => {
+                failed_batches += 1;
+                notes.push(format!(
+                    "{title}: principle distillation failed for section {}: {error:#}",
+                    index + 1
+                ));
+            }
+        }
+    }
+
+    let all_failed = total_batches > 0 && failed_batches == total_batches;
+    let mut used_names = HashSet::new();
+    let mut principles = Vec::new();
+    for raw in raws {
+        let key = raw.name.to_lowercase();
+        if raw.name.trim().is_empty() || !used_names.insert(key) {
+            continue;
+        }
+        let id = unique_id(&slug(&raw.name), &mut used_ids);
+        principles.push(Principle {
+            id,
+            book_id: book_id.to_string(),
+            book_title: title.to_string(),
+            name: raw.name,
+            summary: raw.summary,
+            when_to_use: raw.when_to_use,
+            tags: raw.tags,
+            stages: normalize_stages(raw.stages),
+        });
+    }
+    DistilledPrinciples {
+        principles,
+        all_failed,
+    }
+}
+
 const DISTILL_SYSTEM: &str = "\
-You distill business and sales books into reusable, actionable principles a B2B revenue \
-strategist can apply. Extract durable ideas — frameworks, heuristics, rules of thumb — not \
-chapter summaries or anecdotes. Each principle must be specific enough to change a concrete \
-decision (who to target, who buys, how to frame a message, how to price). Prefer fewer, \
-sharper principles over many vague ones.";
+You distill business books into reusable, actionable principles a company strategist can apply. \
+Extract durable ideas — frameworks, heuristics, rules of thumb — not chapter summaries or \
+anecdotes. Each principle must be specific enough to change a concrete decision about markets, \
+positioning, people, offers, pricing, messaging, experiments, operations, synthesis, or funding. \
+Prefer fewer, sharper principles over many vague ones.";
 
 async fn distill_batch(
     client: &Engine,
@@ -510,15 +704,21 @@ async fn distill_batch(
 ) -> Result<Vec<RawPrinciple>> {
     let user = format!(
         "From this excerpt of \"{book_title}\", extract up to 6 concrete, reusable principles \
-a B2B sales strategist could apply.\n\n\
+a company strategist could apply.\n\n\
 For each: `name` (a short handle), `summary` (the rule in 1-2 sentences), `when_to_use` (the \
 situation it applies to), `tags` (5-10 lowercase keywords for retrieval), and `stages` (which \
-of these it informs: \"companies\" = which accounts to target, \"people\" = who in the org \
-buys/owns the problem, \"sequence\" = outreach messaging). Only include principles actually \
-supported by the text.\n\nExcerpt:\n{excerpt}"
+of these it informs: \"strategy\", \"icp\", \"positioning\", \"companies\", \"people\", \
+\"offers\", \"pricing\", \"sequence\", \"replies\", \"experiments\", \"operations\", \
+\"synthesis\", or \"funding\"). Only include principles actually supported by the text.\n\n\
+Excerpt:\n{excerpt}"
     );
     let set: RawPrincipleSet = client
-        .structured(DISTILL_SYSTEM, &user, principles_schema())
+        .structured_bulk(
+            "knowledge.distill",
+            DISTILL_SYSTEM,
+            &user,
+            principles_schema(),
+        )
         .await?;
     Ok(set.principles)
 }
@@ -549,15 +749,30 @@ fn principles_schema() -> Value {
 }
 
 fn normalize_stages(stages: Vec<String>) -> Vec<String> {
+    const ALLOWED: [&str; 13] = [
+        "strategy",
+        "icp",
+        "positioning",
+        "companies",
+        "people",
+        "offers",
+        "pricing",
+        "sequence",
+        "replies",
+        "experiments",
+        "operations",
+        "synthesis",
+        "funding",
+    ];
     let mut out: Vec<String> = stages
         .into_iter()
         .map(|s| s.to_lowercase())
-        .filter(|s| s == "companies" || s == "people" || s == "sequence")
+        .filter(|stage| ALLOWED.contains(&stage.as_str()))
         .collect();
     out.sort();
     out.dedup();
     if out.is_empty() {
-        out = vec!["companies".into(), "people".into(), "sequence".into()];
+        out = vec!["strategy".into()];
     }
     out
 }
@@ -904,8 +1119,50 @@ fn snippet(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::Library;
+    use super::{core_principle_ids, core_strategy_block, Library, Principle};
     use crate::engine::{Backend, Engine};
+
+    #[test]
+    fn always_on_doctrine_represents_every_requested_book() {
+        let block = core_strategy_block("sequence");
+        assert_eq!(core_principle_ids().len(), 12);
+        for id in core_principle_ids() {
+            assert!(block.contains(id), "missing core doctrine id {id}");
+        }
+        assert!(block.contains("STAGE APPLICATION"));
+    }
+
+    #[test]
+    fn stage_retrieval_prefers_different_source_books() {
+        let principle = |id: &str, book_id: &str| Principle {
+            id: id.to_string(),
+            book_id: book_id.to_string(),
+            book_title: book_id.to_string(),
+            name: "Focused account qualification".into(),
+            summary: "Qualify accounts using repeated workflow evidence.".into(),
+            when_to_use: "During account qualification.".into(),
+            tags: vec!["account".into(), "qualification".into(), "workflow".into()],
+            stages: vec!["companies".into()],
+        };
+        let mut library = Library {
+            principles: vec![
+                principle("a-1", "book-a"),
+                principle("a-2", "book-a"),
+                principle("b-1", "book-b"),
+            ],
+            ..Default::default()
+        };
+        library.build_index();
+
+        let retrieved =
+            library.retrieve_stage("account qualification workflow evidence", "companies", 2, 0);
+        let books = retrieved
+            .principles
+            .iter()
+            .map(|principle| principle.book_id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(books.len(), 2);
+    }
 
     #[tokio::test]
     async fn skips_duplicate_content_within_one_ingest_run() {

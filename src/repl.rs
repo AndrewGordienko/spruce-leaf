@@ -17,11 +17,14 @@ use rustyline::{Context, Editor, Helper};
 use tokio::runtime::Runtime;
 
 use crate::agent::{open_browser, Agent};
+use crate::engine::Backend;
 use crate::ui;
 
 const COMMANDS: &[(&str, &str)] = &[
     ("/crm", "/crm"),
     ("/brand ", "/brand [key]"),
+    ("/model ", "/model [codex|claude] [id|default]"),
+    ("/usage", "/usage"),
     ("/clear", "/clear"),
     ("/help", "/help"),
     ("/quit", "/quit"),
@@ -107,8 +110,8 @@ pub fn run_repl(rt: &Runtime, mut agent: Agent) -> Result<()> {
     loop {
         ui::context_line(
             agent.backend(),
-            agent.model(),
-            agent.brand(),
+            &agent.model(),
+            &agent.brand_label(),
             &directory_label(),
         );
         match editor.readline("› ") {
@@ -126,6 +129,7 @@ pub fn run_repl(rt: &Runtime, mut agent: Agent) -> Result<()> {
                     continue;
                 }
 
+                let usage_base = agent.usage_snapshot();
                 match rt.block_on(agent.handle(line)) {
                     Ok(reply) => {
                         let reply = reply.trim();
@@ -139,6 +143,8 @@ pub fn run_repl(rt: &Runtime, mut agent: Agent) -> Result<()> {
                         println!();
                     }
                 }
+                ui::activity("Model usage", agent.usage_since(usage_base));
+                show_model_switches(&agent);
             }
             Err(ReadlineError::Interrupted) => {
                 ui::assistant_message("Press Ctrl-D or type /quit to exit.");
@@ -178,24 +184,38 @@ fn handle_command(agent: &mut Agent, cmd: &str) -> bool {
         "brand" | "brands" => {
             let arg = cmd.split_whitespace().nth(1).unwrap_or("");
             if arg.is_empty() {
+                let status = if agent.is_brand_pinned() {
+                    format!("Pinned to {}", agent.brand())
+                } else {
+                    "Auto-detect (brand-agnostic)".to_string()
+                };
                 ui::activity(
-                    &format!("Active brand: {}", agent.brand()),
+                    &format!("Brand mode: {status}"),
                     format!(
-                        "Available: {}\nUse /brand <key> to switch",
+                        "Available: {}\nUse /brand <key> to pin one brand, /brand auto to go agnostic",
                         agent.brand_keys().join(", ")
                     ),
                 );
                 println!();
-            } else if agent.set_brand(arg) {
-                ui::activity("Switched brand", agent.brand());
+            } else if matches!(arg, "auto" | "any" | "off" | "portfolio" | "all") {
+                agent.unpin_brand();
+                ui::activity("Brand mode", "auto-detect (agnostic) — inferred per request");
+                println!();
+            } else if agent.pin_brand(arg) {
+                ui::activity("Pinned brand", agent.brand());
                 println!();
             } else {
                 ui::assistant_message(&format!(
-                    "Unknown brand '{arg}'. Available: {}",
+                    "Unknown brand '{arg}'. Available: {} (or 'auto' to go agnostic)",
                     agent.brand_keys().join(", ")
                 ));
                 println!();
             }
+        }
+        "model" | "models" => model_command(agent, cmd),
+        "usage" | "tokens" => {
+            ui::activity("Model usage", agent.usage_report());
+            println!();
         }
         other => {
             ui::assistant_message(&format!("Unknown command: /{other}. Try /help."));
@@ -211,8 +231,8 @@ fn banner(agent: &Agent) {
         .unwrap_or_else(|_| ".".to_string());
     ui::session_header(
         agent.backend(),
-        agent.model(),
-        agent.brand(),
+        &agent.model(),
+        &agent.brand_label(),
         &directory,
         &agent.crm_url(),
     );
@@ -223,13 +243,75 @@ fn help() {
     ui::activity(
         "Shortcuts",
         "/crm          Open the CRM dashboard\n\
-         /brand [key]  Show or switch the active brand\n\
+         /brand [key]  Pin a brand, or /brand auto for agnostic (default)\n\
+         /model [provider] [id|default]\n\
+                       Show or switch Codex/Claude\n\
+         /usage        Show input/cache/output usage by stage\n\
          /clear        Clear the conversation; keep CRM data\n\
          /help         Show this list\n\
          /quit         Exit (or Ctrl-D)\n\
          Tab           Complete a slash command",
     );
     println!();
+}
+
+fn model_command(agent: &Agent, cmd: &str) {
+    let mut args = cmd.split_whitespace().skip(1);
+    let Some(provider) = args.next() else {
+        ui::activity(
+            &format!("Active model: {} · {}", agent.backend(), agent.model()),
+            "Use /model codex or /model claude to switch\n\
+             Optional: /model <provider> <model-id|default>",
+        );
+        println!();
+        return;
+    };
+
+    let backend = match provider.to_ascii_lowercase().as_str() {
+        "codex" => Backend::Codex,
+        "claude" => Backend::Claude,
+        "toggle" | "switch" => match agent.backend() {
+            "codex" => Backend::Claude,
+            _ => Backend::Codex,
+        },
+        _ => {
+            ui::assistant_message(&format!(
+                "Unknown model provider '{provider}'. Use /model codex or /model claude."
+            ));
+            println!();
+            return;
+        }
+    };
+
+    if let Some(model) = args.next() {
+        let model = (!model.eq_ignore_ascii_case("default")).then(|| model.to_string());
+        agent.select_model(backend, model);
+    } else {
+        agent.select_backend(backend);
+    }
+
+    ui::activity(
+        "Switched model",
+        format!(
+            "{} · {}\nFallback is enabled for interactive calls and disabled for bulk work",
+            agent.backend(),
+            agent.model()
+        ),
+    );
+    println!();
+}
+
+fn show_model_switches(agent: &Agent) {
+    for switch in agent.take_model_switches() {
+        ui::activity(
+            "Model usage fallback",
+            format!(
+                "{} usage exhausted; switched to {} · {}",
+                switch.from, switch.to, switch.model
+            ),
+        );
+        println!();
+    }
 }
 
 fn directory_label() -> String {

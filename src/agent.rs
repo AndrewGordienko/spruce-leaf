@@ -18,7 +18,7 @@ use crate::business::Businesses;
 use crate::calendar;
 use crate::crm::SharedStore;
 use crate::db::SharedDb;
-use crate::engine::Engine;
+use crate::engine::{Backend, Engine, ModelSwitch, StatsSnapshot};
 use crate::knowledge::SharedLibrary;
 use crate::pipeline;
 use crate::playbook::Playbooks;
@@ -35,8 +35,14 @@ pub struct Agent {
     db: SharedDb,
     playbooks: Arc<Playbooks>,
     businesses: Arc<Businesses>,
-    /// Active brand key (gnk | wapahki | outagehub).
+    /// The current working/fallback brand (gnk | wapahki | outagehub). In auto
+    /// mode this is just the last brand a request resolved to; in pinned mode the
+    /// operator locked it with `/brand <key>`.
     brand: String,
+    /// When false (the default), the session is brand-agnostic: the router infers
+    /// the brand for each request and bare reads span the whole portfolio. Pinned
+    /// via `/brand <key>`; released via `/brand auto`.
+    brand_pinned: bool,
     critique: bool,
     port: u16,
     concurrency: usize,
@@ -75,6 +81,11 @@ struct Decision {
     enrich: bool,
     #[serde(default)]
     actionable: bool,
+    /// Re-draft existing (unsent) sequences to improve them instead of skipping
+    /// contacts who already have a draft. Reuses contacts already found; no
+    /// Apollo spend.
+    #[serde(default)]
+    replace: bool,
     #[serde(default)]
     opportunity_id: String,
 }
@@ -101,6 +112,7 @@ impl Agent {
             playbooks,
             businesses,
             brand,
+            brand_pinned: false,
             critique,
             port,
             concurrency,
@@ -109,26 +121,109 @@ impl Agent {
     }
 
     pub fn crm_url(&self) -> String {
-        format!("http://localhost:{}", self.port)
+        format!("http://127.0.0.1:{}", self.port)
+    }
+
+    /// Guarantee the CRM the agent advertises is actually answering before we
+    /// open or cite it. With several concurrent sessions running, the port we
+    /// were handed at startup can belong to a sibling that has since exited — its
+    /// listener closes and the link starts refusing connections, which reads as
+    /// "the localhost didn't turn on." Probe first; only if the CRM is genuinely
+    /// down do we stand a fresh server back up on a free port and repoint at it.
+    /// Runs inside the REPL's `block_on`, so `tokio::spawn` has an ambient runtime.
+    async fn ensure_crm_live(&mut self) {
+        // Two quick probes: a single dropped packet under load shouldn't trigger a
+        // spurious restart, but a genuinely dead port should be caught fast.
+        for attempt in 0..2 {
+            let port = self.port;
+            let alive = tokio::task::spawn_blocking(move || crate::crm::is_live(port))
+                .await
+                .unwrap_or(false);
+            if alive {
+                return;
+            }
+            if attempt == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+            }
+        }
+
+        let listener = match crate::crm::bind_free_listener(self.port) {
+            Ok(listener) => listener,
+            Err(error) => {
+                ui::activity("CRM unavailable", format!("{error:#}"));
+                return;
+            }
+        };
+        let port = listener
+            .local_addr()
+            .map(|addr| addr.port())
+            .unwrap_or(self.port);
+        let store = self.store.clone();
+        let db = self.db.clone();
+        tokio::spawn(async move {
+            if let Err(error) = crate::crm::serve_on_listener(store, db, listener).await {
+                ui::activity("CRM server error", format!("{error:#}"));
+            }
+        });
+        self.port = port;
+
+        // Let the fresh server bind its routes before we hand the URL to a
+        // browser, so the very next open() doesn't race it to another refusal.
+        for _ in 0..20 {
+            let port = self.port;
+            let ready = tokio::task::spawn_blocking(move || crate::crm::is_live(port))
+                .await
+                .unwrap_or(false);
+            if ready {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        ui::activity("Restarted CRM", self.crm_url());
     }
 
     pub fn brand(&self) -> &str {
         &self.brand
     }
 
-    pub fn backend(&self) -> &str {
+    pub fn backend(&self) -> &'static str {
         self.client.backend().as_str()
     }
 
-    pub fn model(&self) -> &str {
+    pub fn model(&self) -> String {
         self.client.model_label()
+    }
+
+    pub fn usage_report(&self) -> String {
+        self.client.stats().usage_report()
+    }
+
+    pub fn usage_snapshot(&self) -> StatsSnapshot {
+        self.client.stats().snapshot()
+    }
+
+    pub fn usage_since(&self, base: StatsSnapshot) -> String {
+        self.client.stats().usage_summary_since(base)
+    }
+
+    pub fn select_backend(&self, backend: Backend) {
+        self.client.select_backend(backend);
+    }
+
+    pub fn select_model(&self, backend: Backend, model: Option<String>) {
+        self.client.select_model(backend, model);
+    }
+
+    pub fn take_model_switches(&self) -> Vec<ModelSwitch> {
+        self.client.take_model_switches()
     }
 
     pub fn brand_keys(&self) -> Vec<&str> {
         self.playbooks.keys()
     }
 
-    /// Switch the active brand if `key` is valid; returns whether it changed.
+    /// Switch the working brand if `key` is valid; returns whether it changed.
+    /// Used by the router to follow a request to its brand — it does not pin.
     pub fn set_brand(&mut self, key: &str) -> bool {
         if self.playbooks.get(key).is_ok() && self.businesses.get(key).is_ok() {
             self.brand = key.to_string();
@@ -136,6 +231,36 @@ impl Agent {
         } else {
             false
         }
+    }
+
+    pub fn is_brand_pinned(&self) -> bool {
+        self.brand_pinned
+    }
+
+    /// How the brand shows in the chrome: `auto` when agnostic (the default),
+    /// otherwise the pinned brand key — so the session never *looks* locked to one
+    /// brand unless the operator asked for it.
+    pub fn brand_label(&self) -> String {
+        if self.brand_pinned {
+            self.brand.clone()
+        } else {
+            "auto".to_string()
+        }
+    }
+
+    /// Lock the session to one brand (via `/brand <key>`). Returns whether valid.
+    pub fn pin_brand(&mut self, key: &str) -> bool {
+        if self.set_brand(key) {
+            self.brand_pinned = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Return to brand-agnostic auto-detection (via `/brand auto`).
+    pub fn unpin_brand(&mut self) {
+        self.brand_pinned = false;
     }
 
     pub fn reset(&mut self) {
@@ -153,7 +278,8 @@ impl Agent {
         let mut turn = ui::TurnView::new();
         let decision: Decision = self
             .client
-            .structured_streamed(
+            .structured_fast_streamed(
+                "interactive.router",
                 &self.system(),
                 &prompt,
                 decision_schema(&self.brand_keys()),
@@ -163,10 +289,29 @@ impl Agent {
         // Whether the model already streamed a visible answer for this turn.
         let streamed = turn.finish();
 
-        // The router may switch brands as part of a request.
-        if !decision.brand.trim().is_empty() {
+        // In auto mode the router follows each request to whichever brand it
+        // concerns; when the operator has pinned a brand we ignore the router's
+        // pick and stay put.
+        if !self.brand_pinned && !decision.brand.trim().is_empty() {
             self.set_brand(decision.brand.trim());
         }
+
+        // Guarantee the CRM we're about to open or cite is actually answering
+        // before we do so — a sibling session may have owned the port and exited.
+        self.ensure_crm_live().await;
+
+        // Reads scope to the pinned brand; otherwise to a brand named this turn;
+        // otherwise they span the whole portfolio.
+        let read_scope: Option<&str> = if self.brand_pinned {
+            Some(self.brand.as_str())
+        } else {
+            let named = decision.brand.trim();
+            if named.is_empty() {
+                None
+            } else {
+                Some(named)
+            }
+        };
 
         let reply = match decision.action.as_str() {
             "run_campaign" => {
@@ -208,15 +353,22 @@ impl Agent {
                     .await
             }
             "plan_outreach" => {
-                self.plan_outreach(decision.touches.unwrap_or(7).max(1) as usize, decision.auto)
-                    .await
+                self.plan_outreach(
+                    decision.touches.unwrap_or(7).max(1) as usize,
+                    decision.auto,
+                    decision.replace,
+                )
+                .await
             }
             "approve_outreach" => self.approve_outreach(),
             "discover_opportunities" => {
                 self.discover_opportunities(decision.limit.unwrap_or(20).max(1) as usize)
                     .await
             }
-            "list_opportunities" => self.list_opportunities(decision.actionable),
+            "list_opportunities" => self.list_opportunities(read_scope, decision.actionable),
+            "show_learnings" => {
+                self.show_learnings(read_scope, decision.limit.unwrap_or(30).max(1) as usize)
+            }
             "resolve_opportunity_contacts" => {
                 self.resolve_opportunity_contacts(
                     decision.opportunity_id.trim(),
@@ -240,9 +392,9 @@ impl Agent {
                 self.prepare_application(decision.opportunity_id.trim())
                     .await
             }
-            "show_funnel" => self.show_funnel(),
+            "show_funnel" => self.show_funnel(read_scope),
             "show_calendar" => self.show_calendar(),
-            "list_accounts" => self.list_accounts().await,
+            "list_accounts" => self.list_accounts(read_scope).await,
             "search_knowledge" => {
                 let q = if decision.query.trim().is_empty() {
                     input
@@ -354,6 +506,7 @@ impl Agent {
             pb,
             &self.playbooks.shared,
             &business.calendar.fallback_recipient_timezone,
+            &business.operating_context(),
             &lib,
             thesis,
             accounts,
@@ -426,8 +579,17 @@ impl Agent {
         }
     }
 
-    /// Write sequences for verified people, returning the summary.
-    async fn do_plan(&self, touches: usize, auto: bool) -> Result<outreach::PlanSummary, String> {
+    /// Write sequences for verified people, returning the summary. `replace`
+    /// re-drafts existing (unsent) sequences to improve them; the agent always
+    /// sequences every verified contact already found (no Apollo spend), leaving
+    /// real send volume to the send-time account limits.
+    async fn do_plan(
+        &self,
+        touches: usize,
+        auto: bool,
+        replace: bool,
+        only_person_ids: Option<&std::collections::HashSet<String>>,
+    ) -> Result<outreach::PlanSummary, String> {
         let pb = self
             .playbooks
             .get(&self.brand)
@@ -448,6 +610,11 @@ impl Agent {
             touches,
             self.concurrency.max(1),
             auto,
+            self.critique,
+            None,
+            replace,
+            true,
+            only_person_ids,
         )
         .await;
         drop(work);
@@ -466,8 +633,8 @@ impl Agent {
         }
     }
 
-    async fn plan_outreach(&self, touches: usize, auto: bool) -> String {
-        match self.do_plan(touches, auto).await {
+    async fn plan_outreach(&self, touches: usize, auto: bool, replace: bool) -> String {
+        match self.do_plan(touches, auto, replace, None).await {
             Ok(s) => format!(
                 "Planned {} people: {} email touches scheduled and {} touches left as drafts.{}",
                 s.people_planned,
@@ -494,23 +661,31 @@ impl Agent {
         contacts: usize,
         touches: usize,
     ) -> String {
-        let before = self
+        let before_ids: std::collections::HashSet<String> = self
             .db
             .list_people(Some(&self.brand), None)
-            .map(|p| p.len())
-            .unwrap_or(0);
+            .map(|people| people.into_iter().map(|person| person.id).collect())
+            .unwrap_or_default();
 
         // 1. Source real accounts + people.
         let src = match self.do_source(thesis, accounts, contacts).await {
             Ok(s) => s,
             Err(e) => return e,
         };
-        let after = self
+        // Exactly the people this run added — drafting is scoped to these so the
+        // full motion never re-drafts the brand's whole accumulated backlog.
+        let new_ids: std::collections::HashSet<String> = self
             .db
             .list_people(Some(&self.brand), None)
-            .map(|p| p.len())
-            .unwrap_or(before);
-        let new_people = after.saturating_sub(before);
+            .map(|people| {
+                people
+                    .into_iter()
+                    .filter(|person| !before_ids.contains(&person.id))
+                    .map(|person| person.id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let new_people = new_ids.len();
 
         // Nothing to enrich → stop before spending credits, but still show the CRM.
         if new_people == 0 {
@@ -538,7 +713,8 @@ impl Agent {
         };
 
         // 3. Draft the sequences (auto=false → held for approval, nothing sends).
-        let pln = match self.do_plan(touches, false).await {
+        //    Scoped to this run's people so we don't re-draft the whole backlog.
+        let pln = match self.do_plan(touches, false, false, Some(&new_ids)).await {
             Ok(s) => s,
             Err(e) => {
                 open_browser(&self.crm_url());
@@ -639,19 +815,70 @@ impl Agent {
         }
     }
 
-    fn list_opportunities(&self, actionable_only: bool) -> String {
-        match self.db.list_opportunities(Some(&self.brand), None) {
+    fn list_opportunities(&self, scope: Option<&str>, actionable_only: bool) -> String {
+        match self.db.list_opportunities(scope, None) {
             Ok(mut opportunities) => {
                 if actionable_only {
                     opportunities.retain(opportunity::is_actionable);
                 }
                 ui::activity(
                     "Read opportunity pipeline",
-                    format!("{} opportunity/opportunities", opportunities.len()),
+                    format!(
+                        "{} opportunity/opportunities · {}",
+                        opportunities.len(),
+                        scope.unwrap_or("all brands")
+                    ),
                 );
                 opportunity::render_opportunities(&opportunities)
             }
             Err(e) => format!("Couldn't read opportunities: {e:#}"),
+        }
+    }
+
+    /// Accumulated business intelligence: what we've learned and keep learning
+    /// about each brand's outbound (companies skipped and why, and — over time —
+    /// where outreach fails), so the operator can see the funnel isn't starting
+    /// from a clean state. Spans all brands unless a brand was named.
+    fn show_learnings(&self, scope: Option<&str>, limit: usize) -> String {
+        match self.db.recent_learnings(scope, None, limit) {
+            Ok(learnings) => {
+                ui::activity(
+                    "Read business intelligence",
+                    format!(
+                        "{} learning(s) · {}",
+                        learnings.len(),
+                        scope.unwrap_or("all brands")
+                    ),
+                );
+                if learnings.is_empty() {
+                    return "No learnings recorded yet — they accumulate as runs skip companies \
+                            and outreach plays out."
+                        .to_string();
+                }
+                let mut out = format!(
+                    "Business intelligence ({}):\n",
+                    scope.unwrap_or("all brands")
+                );
+                for learning in &learnings {
+                    let seen = if learning.hits > 1 {
+                        format!(" [seen {}×]", learning.hits)
+                    } else {
+                        String::new()
+                    };
+                    let last = learning.updated_at.chars().take(10).collect::<String>();
+                    out.push_str(&format!(
+                        "- [{}] {} — {}{} (last {})\n    {}\n",
+                        learning.brand,
+                        learning.kind,
+                        learning.subject,
+                        seen,
+                        last,
+                        learning.detail
+                    ));
+                }
+                out
+            }
+            Err(e) => format!("Couldn't read business intelligence: {e:#}"),
         }
     }
 
@@ -834,37 +1061,45 @@ impl Agent {
         }
     }
 
-    fn show_funnel(&self) -> String {
-        match metrics::funnel(&self.db, Some(&self.brand)) {
+    fn show_funnel(&self, scope: Option<&str>) -> String {
+        match metrics::funnel(&self.db, scope) {
             Ok(f) => {
-                ui::activity("Read sales funnel", &self.brand);
+                ui::activity("Read sales funnel", scope.unwrap_or("all brands"));
                 metrics::render(&f)
             }
             Err(e) => format!("Couldn't read funnel metrics: {e:#}"),
         }
     }
 
-    async fn list_accounts(&self) -> String {
-        let real = match self.db.list_leads(Some(&self.brand)) {
+    async fn list_accounts(&self, scope: Option<&str>) -> String {
+        let real = match self.db.list_leads(scope) {
             Ok(leads) => leads,
             Err(e) => return format!("Couldn't read execution leads: {e:#}"),
         };
-        let people = match self.db.list_people(Some(&self.brand), None) {
+        let people = match self.db.list_people(scope, None) {
             Ok(people) => people,
             Err(e) => return format!("Couldn't read execution people: {e:#}"),
         };
         let store = self.store.read().await;
-        if real.is_empty() && store.data.accounts.is_empty() {
+        // Research-only accounts carry a brand too; honor the same scope.
+        let research: Vec<_> = store
+            .data
+            .accounts
+            .iter()
+            .filter(|a| scope.map_or(true, |brand| a.brand == brand))
+            .collect();
+        if real.is_empty() && research.is_empty() {
             ui::activity("Read CRM", "No accounts found");
             return "The CRM is empty \u{2014} no campaigns run yet.".to_string();
         }
         ui::activity(
             "Read CRM",
             format!(
-                "{} real leads · {} research accounts · {} people",
+                "{} real leads · {} research accounts · {} people · {}",
                 real.len(),
-                store.data.accounts.len(),
-                people.len()
+                research.len(),
+                people.len(),
+                scope.unwrap_or("all brands")
             ),
         );
         let mut out = String::new();
@@ -878,13 +1113,13 @@ impl Agent {
                 ));
             }
         }
-        if !store.data.accounts.is_empty() {
+        if !research.is_empty() {
             if !out.is_empty() {
                 out.push('\n');
             }
             out.push_str("Research-only campaign hypotheses:\n");
         }
-        for a in &store.data.accounts {
+        for a in research {
             out.push_str(&format!(
                 "- {} ({}, {}) [{}] \u{2014} {} contacts\n    hypothesis: {}\n",
                 a.name,
@@ -943,6 +1178,7 @@ impl Agent {
             .get(&self.brand)
             .map(|profile| profile.agent_summary())
             .unwrap_or_default();
+        let portfolio = self.businesses.roster();
         let calendar_intelligence = self
             .businesses
             .get(&self.brand)
@@ -952,78 +1188,57 @@ impl Agent {
             .db
             .list_opportunities(Some(&self.brand), None)
             .unwrap_or_default();
+        let brand_mode = if self.brand_pinned {
+            format!(
+                "Brand is PINNED to '{brand}' — treat every request as concerning {brand} and set brand={brand}.",
+                brand = self.brand
+            )
+        } else {
+            format!(
+                "No brand is pinned (agnostic): infer the brand for each request from its wording and set it; leave brand empty for portfolio-wide reads. Most recent working brand: {}.",
+                self.brand
+            )
+        };
         p.push_str(&format!(
-            "Active business: {}. {} {} The research CRM holds {n} accounts. The real execution db holds {} qualified leads, {} people, {} verified emails, {} contacted people, and {} persisted opportunities.\n\n",
-            self.brand,
-            business,
-            calendar_intelligence,
-            execution.leads,
-            execution.people,
-            execution.verified,
-            execution.contacted,
-            opportunities.len(),
+            "The portfolio (all brands you operate):\n{portfolio}\n\n{brand_mode}\n\nWorking-brand context ({brand}): {business} {calendar_intelligence} The research CRM holds {n} accounts. The real execution db (working brand) holds {leads} qualified leads, {people} people, {verified} verified emails, {contacted} contacted people, and {opps} persisted opportunities.\n\n",
+            brand = self.brand,
+            business = business,
+            calendar_intelligence = calendar_intelligence,
+            leads = execution.leads,
+            people = execution.people,
+            verified = execution.verified,
+            contacted = execution.contacted,
+            opps = opportunities.len(),
         ));
         p.push_str(&format!("User: {input}"));
         p
     }
 
     fn system(&self) -> String {
+        let brand_mode = if self.brand_pinned {
+            format!(
+                "The operator has PINNED this session to the '{active}' brand: set `brand`={active} for every action and do not switch brands.",
+                active = self.brand
+            )
+        } else {
+            "This is a multi-brand PORTFOLIO, not a single fixed brand. For each request, infer which brand it concerns from its wording and the portfolio list, and set `brand` to that brand — do not stay on the current working brand out of inertia. Leave `brand` empty only for portfolio-wide reads (show_funnel, list_accounts, list_opportunities, show_learnings), which then span every brand.".to_string()
+        };
         format!(
-            "You are spruce-leaf, an interactive business-development agent running in the user's \
-terminal, backed by a local model CLI. You manage distinct sales, funding, and partnership motions \
-for three businesses using their configured business profiles and outreach playbooks. For each user message you first \
-think out loud in `plan` (ONE short first-person sentence of intent, \u{2264}20 words — streamed as \
-your live thinking; not a multi-step plan, not user-facing prose), then choose exactly one action \
-and return it as structured JSON:\n\
-- run_campaign: research-only hypothesis generation when the user explicitly wants a simulated \
-campaign, ideas, or draft strategy without Apollo. Generated companies/people are hypotheses.\n\
-- source_leads: the user wants REAL prospects/accounts/people, asks to source/find leads through \
-Apollo, or wants to begin executable outreach. Set `thesis`; map companies\u{2192}`accounts` and \
-people per company\u{2192}`contacts` (defaults 10/3).\n\
-- run_full_motion: the user asks for the WHOLE outbound motion in one go — i.e. find companies \
-AND the people AND write/prepare the sequences (e.g. \"find 5 companies, 5 people each, and write \
-their sequences\"). This runs source → enrich (reveal/verify emails, spends Apollo credits) → \
-draft the sequences in one pass, then stops for approval; nothing is sent. State intent in one \
-line and never ask the user whether to proceed \u{2014} running straight through to drafts is the point. \
-Set `thesis`, \
-`accounts`, `contacts`, and `touches` (defaults 5/5/7). Prefer this over source_leads whenever the \
-request already spans sourcing through sequences, so you don't make the user re-ask at each stage.\n\
-- enrich_people: reveal and verify emails for already-sourced people. Set `limit` when given and \
-`phone=true` only if the user explicitly requests phone reveal (it costs extra credits and \
-requires APOLLO_WEBHOOK_URL because Apollo delivers results asynchronously).\n\
-- plan_outreach: write sequences for verified people. Map stages/touches\u{2192}`touches` (default 7); \
-set `auto=true` only if the user explicitly asks to schedule without approval.\n\
-- approve_outreach: the user explicitly approves drafted email touches for the active brand.\n\
-- discover_opportunities: find and conservatively qualify live grants, contributions, funded \
-pilots, challenges, tax credits, procurement, advisory programmes, or other configured \
-opportunities from official sources. Use the active business profile; set `limit` if given.\n\
-- list_opportunities: show the active business's persisted opportunity pipeline and ids. Set \
-`actionable=true` when the user asks what can be pursued now; this still includes records that \
-need mandatory evidence and never means eligibility is proven.\n\
-- resolve_opportunity_contacts: map the official programme route and relevant funder people using \
-Apollo. Set `opportunity_id`, `contacts`, and `enrich=true` only when the user explicitly authorizes \
-credit-consuming email reveal. Apollo finds people; it is not the grant search engine.\n\
-- plan_funding_outreach: write 1-3 grant-appropriate pre-application emails for a selected \
-opportunity. Set `opportunity_id`, `touches`; `auto=true` only with explicit authorization.\n\
-- approve_funding_outreach: the user explicitly approves drafted opportunity emails. Require and \
-set the reviewed `opportunity_id`; never approve every funding draft implicitly.\n\
-- prepare_application: create an evidence-gapped go/no-go application brief for `opportunity_id`; \
-never fabricate eligibility, finances, partners, TRL, metrics, or matching funds.\n\
-- show_funnel: the user asks for execution stats, metrics, results, replies, or funnel status.\n\
-- show_calendar: the user asks when outreach will happen, daily capacity, timezone handling, weekend rules, or observed timing intelligence.\n\
-- list_accounts: the user wants to know which real leads or research accounts are in the CRM.\n\
-- open_crm: the user wants to open the CRM dashboard.\n\
-- search_knowledge: the user asks what the ingested books say about a topic (cold email, \
-pricing, discovery, objections). Put the topic in `query`.\n\
-- reply: anything else \u{2014} answer conversationally in `reply`.\n\
-Active brand is {active}. If they name a brand ({brands}), set `brand`. Keep `reply` to at most two \
-short sentences of plain text \u{2014} no markdown headings, numbered pipelines, bullet lists, or emoji \u{2014} \
-and never re-ask the user to confirm a step the chosen action already performs. \
-Never claim research-only generated accounts are real; Apollo-sourced identity fields are real, \
-while commercial conclusions remain hypotheses to verify. Never claim a business is eligible for \
-funding until every mandatory criterion is evidenced, and never call every funding instrument a grant.",
+            "Route one terminal request to exactly one structured action. Write `plan` first as one first-person sentence (max 20 words), then fill only fields needed by the action.\n\n\
+{brand_mode}\n\n\
+Actions:\n\
+- run_campaign: hypothetical research-only campaign; no Apollo.\n\
+- source_leads: ONLY finds and qualifies Apollo accounts+people, then stops — it writes NO emails. Use only when the request is purely to find companies/people. set thesis/accounts/contacts (defaults 10/3).\n\
+- run_full_motion: the end-to-end motion — source, enrich, AND draft the sequences in one request (never sends). Use this whenever ONE request asks to both find companies/people AND write/draft/create outreach or a sequence. set thesis/accounts/contacts/touches (defaults 5/5/7).\n\
+- enrich_people: reveal/verify sourced emails; phone only when explicit.\n\
+- plan_outreach: draft or re-draft sequences for contacts ALREADY found (no Apollo spend). set replace=true to rewrite/improve existing drafts; auto only when explicit.\n\
+- approve_outreach: only after explicit approval — this is what actually schedules drafts to send.\n\
+- discover_opportunities, list_opportunities (actionable when requested), resolve_opportunity_contacts (enrich only with explicit credit authorization), plan_funding_outreach (auto only when explicit), approve_funding_outreach (reviewed opportunity_id + explicit approval), prepare_application: the funding/procurement motion; set opportunity_id where needed.\n\
+- show_funnel, show_calendar, list_accounts, list_opportunities, show_learnings, open_crm: direct read/open actions (leave brand empty to span all brands).\n\
+- search_knowledge: put the topic in query.\n\
+- reply: everything else; at most two short plain-text sentences.\n\n\
+Available brands: {brands}. Drafting always HOLDS sequences for review; nothing sends until approve_outreach. Do not ask for confirmation when the action performs the request. Apollo identities are real but commercial conclusions remain hypotheses. Never claim funding eligibility without every mandatory criterion, invent evidence, or treat every instrument as a grant.",
             brands = self.brand_keys().join(" | "),
-            active = self.brand,
         )
     }
 
@@ -1048,18 +1263,19 @@ fn decision_schema(brands: &[&str]) -> Value {
             },
             "action": {
                 "type": "string",
-                "enum": ["run_campaign", "source_leads", "run_full_motion", "enrich_people", "plan_outreach", "approve_outreach", "discover_opportunities", "list_opportunities", "resolve_opportunity_contacts", "plan_funding_outreach", "approve_funding_outreach", "prepare_application", "show_funnel", "show_calendar", "list_accounts", "open_crm", "search_knowledge", "reply"]
+                "enum": ["run_campaign", "source_leads", "run_full_motion", "enrich_people", "plan_outreach", "approve_outreach", "discover_opportunities", "list_opportunities", "resolve_opportunity_contacts", "plan_funding_outreach", "approve_funding_outreach", "prepare_application", "show_funnel", "show_calendar", "list_accounts", "show_learnings", "open_crm", "search_knowledge", "reply"]
             },
             "reply": { "type": "string", "description": "Message to show the user: at most two short plain-text sentences, no markdown/lists/emoji, no re-asking to confirm steps the action already does." },
             "thesis": { "type": "string", "description": "For run_campaign: the workflow/market to target." },
             "query": { "type": "string", "description": "For search_knowledge: the topic to look up in the ingested books." },
-            "brand": { "type": "string", "enum": brands, "description": "Optional brand to switch to." },
+            "brand": { "type": "string", "enum": brands, "description": "The brand this request concerns; set it per request. Leave empty for portfolio-wide reads (they span all brands)." },
             "accounts": { "type": "integer" },
             "contacts": { "type": "integer" },
             "touches": { "type": "integer" },
             "limit": { "type": "integer" },
             "phone": { "type": "boolean" },
             "auto": { "type": "boolean" }
+            ,"replace": { "type": "boolean", "description": "For plan_outreach: re-draft/improve existing unsent sequences instead of skipping contacts who already have one. Reuses contacts already found; no Apollo spend." }
             ,"enrich": { "type": "boolean", "description": "Reveal Apollo opportunity-contact emails now; costs credits." }
             ,"actionable": { "type": "boolean", "description": "For opportunity lists, exclude closed, ineligible, lost, and expired records." }
             ,"opportunity_id": { "type": "string", "description": "Persisted opportunity id for contact, outreach, or application actions." }

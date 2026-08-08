@@ -1,0 +1,14 @@
+# Build artifacts — rebuilt inside the image.
+target/
+# Local runtime state — must NOT leak into the image; mounted as a volume instead.
+.spruce/
+*.db
+*.db-wal
+*.db-shm
+# Secrets — passed in via env_file at run time, never baked into a layer.
+.env
+# VCS + editor noise.
+.git/
+.gitignore
+.DS_Store
+**/*.swp

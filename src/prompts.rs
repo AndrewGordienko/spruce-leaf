@@ -8,8 +8,8 @@
 
 use serde_json::{json, Value};
 
-use crate::domain::{Account, Contact, Sequence};
-use crate::playbook::{Lint, Playbook};
+use crate::domain::{Account, Contact};
+use crate::playbook::Playbook;
 
 /// Append a retrieved book-knowledge playbook block (if any) to a stage's user
 /// prompt. `cite` toggles the citation instruction for stages whose schema has
@@ -181,6 +181,13 @@ angle — not restatements. Match the channel and ask to {name}'s vantage. Use e
 For each touch set: day_offset from the start; channel; subject (empty string for non-email); the \
 body copy; purpose (which move this is — observation / diagnostic / consequence / artifact / \
 hard-question / routing / close); and goal.\n\n\
+If writing seven touches, use this channel pattern: email, linkedin, email, call, email, linkedin, \
+email. Finish by day 21. Touch 1 email is 40–75 words including the signature; later emails are \
+15–45 words; LinkedIn notes are 12–30 words; calls are short talk tracks. Touch 7 is 15–30 words \
+with no question. Mention {brand} only in touch 1. Use at most one \
+question, one CTA, one verified account fact, and one short sentence about {brand} per touch. \
+Subjects are 2–4 plain words. Do not use fake familiarity, explain your strategy, dump the \
+research, or assert limitations of the recipient's tools.\n\n\
 Follow the length band, the voice, the forbidden list, and the pre-send test from the doctrine. \
 Center the operating decision, not {brand}. Keep the whole sequence on ONE problem thread. A \
 correction or a referral is a successful outcome.",
@@ -225,102 +232,6 @@ pub fn sequence_schema() -> Value {
                         "body": { "type": "string" },
                         "purpose": { "type": "string" },
                         "goal": { "type": "string" }
-                    }
-                }
-            }
-        }
-    })
-}
-
-// --- Stage 4: critique + revise --------------------------------------------
-
-/// Build the critic prompt, feeding in the mechanical lint findings so the model
-/// must fix forbidden phrases and length as well as doctrine issues.
-pub fn critique_user(
-    pb: &Playbook,
-    account: &Account,
-    contact: &Contact,
-    sequence: &Sequence,
-    lints: &[Lint],
-) -> String {
-    let mut touches = String::new();
-    for (t, lint) in sequence.touches.iter().zip(lints) {
-        touches.push_str(&format!(
-            "\n--- Touch {} ({}, day {}, purpose: {}) ---\n",
-            t.stage, t.channel, t.day_offset, t.purpose
-        ));
-        if !t.subject.is_empty() {
-            touches.push_str(&format!("Subject: {}\n", t.subject));
-        }
-        touches.push_str(&format!("Body:\n{}\n", t.body));
-        let mut flags = Vec::new();
-        if !lint.forbidden_hits.is_empty() {
-            flags.push(format!(
-                "FORBIDDEN PHRASES PRESENT: {}",
-                lint.forbidden_hits.join(", ")
-            ));
-        }
-        if !lint.length_ok {
-            flags.push(format!(
-                "LENGTH OFF: {} words (band is {}–{})",
-                lint.word_count, pb.min_words, pb.max_words
-            ));
-        }
-        if !lint.signature_ok {
-            flags.push(format!(
-                "SIGNATURE MISMATCH: final email line must be exactly '{}'",
-                pb.signature
-            ));
-        }
-        if !flags.is_empty() {
-            touches.push_str(&format!("MECHANICAL FLAGS: {}\n", flags.join("; ")));
-        }
-    }
-
-    format!(
-        "You are the final pre-send editor for {brand}. Run each touch below through the pre-send \
-test and rewrite it to pass. This is Andrew's last native-language edit: strip model-like \
-phrasing, corporate mush, leaked internal labels, fabricated numbers, unsupported claims, weak \
-interchangeable CTAs, and anything that only exists to show off research.\n\n\
-Context you may rely on:\n\
-  Hypothesis: {hypothesis}\n\
-  Observed facts (the ONLY things that may be stated as fact): {facts}\n\
-  Recipient vantage: {vantage} — {can_observe}\n\n\
-For each touch return: stage; passes (did the ORIGINAL pass the pre-send test?); issues (specific \
-problems); revised_subject; revised_body. Fix EVERY mechanical flag listed. Keep the body inside \
-the {min}–{max} word band. Every revised email body must end with exactly `{signature}`. Preserve \
-the sequence as one unfolding investigation. If a touch is \
-already clean, return it unchanged with passes=true and empty issues.\n\
-{touches}",
-        brand = pb.name,
-        hypothesis = account.hypothesis,
-        facts = account.observed_facts.join(" | "),
-        vantage = contact.vantage,
-        can_observe = contact.can_observe,
-        min = pb.min_words,
-        max = pb.max_words,
-        signature = pb.signature,
-    )
-}
-
-pub fn critique_schema() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["reviews"],
-        "properties": {
-            "reviews": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "required": ["stage", "passes", "issues", "revised_subject", "revised_body"],
-                    "properties": {
-                        "stage": { "type": "integer" },
-                        "passes": { "type": "boolean" },
-                        "issues": { "type": "array", "items": { "type": "string" } },
-                        "revised_subject": { "type": "string" },
-                        "revised_body": { "type": "string" }
                     }
                 }
             }

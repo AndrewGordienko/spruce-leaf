@@ -242,12 +242,16 @@ pub fn context_line(backend: &str, model: &str, brand: &str, directory: &str) {
     );
 }
 
-/// Format a stats delta as a compact footer, e.g. "31 calls · 2.0k tok · $0.11 · 48s".
+/// Format a transparent stats delta: attempts/failures and all token classes.
 fn footer(snap: StatsSnapshot, elapsed: Duration) -> String {
     format!(
-        "{} calls · {} tok · ${:.2} · {}s",
+        "{}/{} calls · {} in ({} cached) · {} out · {} failed · ${:.2} · {}s",
         snap.calls,
+        snap.attempts,
+        human_tokens(snap.input_tokens),
+        human_tokens(snap.cached_input_tokens),
         human_tokens(snap.output_tokens),
+        snap.failures,
         snap.cost_usd,
         elapsed.as_secs()
     )
@@ -670,8 +674,14 @@ mod turn_view_tests {
             markdown_line("**Running now:** Apollo `search`", false),
             "Running now: Apollo search"
         );
-        assert_eq!(markdown_line("- reveal & verify", false), "• reveal & verify");
-        assert_eq!(markdown_line("### Then the pipeline", false), "Then the pipeline");
+        assert_eq!(
+            markdown_line("- reveal & verify", false),
+            "• reveal & verify"
+        );
+        assert_eq!(
+            markdown_line("### Then the pipeline", false),
+            "Then the pipeline"
+        );
     }
 
     #[test]
@@ -679,8 +689,14 @@ mod turn_view_tests {
         // ANSI styling is TTY-gated, but the markers must be consumed regardless
         // so nothing leaks as literal `**`/`` ` ``.
         let out = markdown_line("**Running now:** Apollo `search`", true);
-        assert!(!out.contains("**"), "bold markers should be consumed: {out:?}");
-        assert!(!out.contains('`'), "code markers should be consumed: {out:?}");
+        assert!(
+            !out.contains("**"),
+            "bold markers should be consumed: {out:?}"
+        );
+        assert!(
+            !out.contains('`'),
+            "code markers should be consumed: {out:?}"
+        );
         assert!(out.contains("Running now:") && out.contains("search"));
     }
 

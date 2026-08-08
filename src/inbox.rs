@@ -5,25 +5,34 @@
 //! \Seen until we've actually handled a message), then parse + match + triage on
 //! the async side. Matched/handled messages are flagged \Seen at the end.
 //!
-//! Matching is by From-address against known people for the brand. Messages from
-//! a mailer-daemon are treated as bounces: any of our recipients found in the
-//! body gets suppressed and its sequence stopped.
+//! Matching prefers RFC `In-Reply-To`/`References` identity, then falls back to
+//! From-address. That keeps a CC'd referral attached to the original account
+//! even when the new sender has never appeared in Apollo. Messages from a
+//! mailer-daemon are treated as bounces.
 
 use anyhow::Result;
 use mail_parser::MessageParser;
 
 use crate::db::{Mailbox, SharedDb};
 use crate::engine::Engine;
+use crate::playbook::Playbooks;
+use crate::reply_agent::{self, InboundMessage};
 use crate::triage;
 
 /// Poll every configured mailbox (optionally one brand). Returns replies handled.
-pub async fn poll_all(db: &SharedDb, client: &Engine, brand: Option<&str>) -> Result<usize> {
+pub async fn poll_all(
+    db: &SharedDb,
+    client: &Engine,
+    playbooks: &Playbooks,
+    brand: Option<&str>,
+    allow_booking: bool,
+) -> Result<usize> {
     let mut handled = 0;
     for m in db.list_mailboxes(brand)? {
         if m.imap_host.trim().is_empty() {
             continue;
         }
-        match poll_mailbox(db, client, &m).await {
+        match poll_mailbox(db, client, playbooks, &m, allow_booking).await {
             Ok(n) => handled += n,
             Err(e) => eprintln!("  ! inbox {}: {e:#}", m.from_email),
         }
@@ -31,7 +40,13 @@ pub async fn poll_all(db: &SharedDb, client: &Engine, brand: Option<&str>) -> Re
     Ok(handled)
 }
 
-async fn poll_mailbox(db: &SharedDb, client: &Engine, m: &Mailbox) -> Result<usize> {
+async fn poll_mailbox(
+    db: &SharedDb,
+    client: &Engine,
+    playbooks: &Playbooks,
+    m: &Mailbox,
+    allow_booking: bool,
+) -> Result<usize> {
     let fetched = fetch_unseen(m.clone()).await?;
     let mut handled = 0;
     let mut done_uids: Vec<u32> = Vec::new();
@@ -40,40 +55,96 @@ async fn poll_mailbox(db: &SharedDb, client: &Engine, m: &Mailbox) -> Result<usi
         let Some(parsed) = MessageParser::default().parse(&raw) else {
             continue;
         };
-        let from = parsed
-            .from()
-            .and_then(|a| a.first())
-            .and_then(|a| a.address.as_deref())
+        let from_address = parsed.from().and_then(|a| a.first());
+        let from = from_address
+            .and_then(|address| address.address.as_deref())
             .unwrap_or("")
             .to_lowercase();
+        let from_name = from_address
+            .and_then(|address| address.name.as_deref())
+            .unwrap_or("")
+            .to_string();
         let subject = parsed.subject().unwrap_or("").to_string();
         let body = parsed
             .body_text(0)
             .map(|c| c.to_string())
             .unwrap_or_default();
         let message_id = parsed.message_id().unwrap_or("").to_string();
-        let in_reply_to = parsed.in_reply_to().as_text().unwrap_or("").to_string();
+        let in_reply_to_values = parsed
+            .in_reply_to()
+            .as_text_list()
+            .unwrap_or_default()
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let in_reply_to = in_reply_to_values.last().cloned().unwrap_or_default();
+        let references = parsed
+            .references()
+            .as_text_list()
+            .unwrap_or_default()
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let mut thread_ids = in_reply_to_values;
+        thread_ids.extend(references.iter().cloned());
+        let mut participants = addresses(parsed.to());
+        participants.extend(addresses(parsed.cc()));
+        participants.push(from.clone());
+        participants.sort();
+        participants.dedup();
 
         if from.is_empty() {
             continue;
         }
 
-        if let Some(person) = db.person_by_email(&m.brand, &from)? {
-            let action = triage::handle_reply(
+        if is_bounce(&from, &subject) {
+            let n = handle_bounce(db, &m.brand, &body)?;
+            if n > 0 {
+                eprintln!("  · [{}] bounce → suppressed {n} address(es)", m.brand);
+                handled += n;
+            }
+            done_uids.push(uid);
+        } else if let Some(conversation) =
+            db.conversation_for_inbound(&m.brand, &from, &subject, &thread_ids)?
+        {
+            let Some(person) = db.get_person(&conversation.person_id)? else {
+                eprintln!(
+                    "  ! [{}] thread {} has no original person {}",
+                    m.brand, conversation.id, conversation.person_id
+                );
+                continue;
+            };
+            let outcome = reply_agent::handle_inbound(
                 db,
                 client,
+                playbooks,
+                &conversation,
                 &person,
-                &from,
-                &subject,
-                &body,
-                &message_id,
-                &in_reply_to,
+                &InboundMessage {
+                    from_email: from.clone(),
+                    from_name,
+                    participants,
+                    subject: subject.clone(),
+                    body: body.clone(),
+                    message_id: message_id.clone(),
+                    in_reply_to: in_reply_to.clone(),
+                    references,
+                },
+                allow_booking,
             )
-            .await
-            .unwrap_or_else(|e| format!("error: {e}"));
-            eprintln!("  · [{}] reply from {from} → {action}", m.brand);
-            handled += 1;
-            done_uids.push(uid);
+            .await;
+            match outcome {
+                Ok(outcome) => {
+                    eprintln!("  · [{}] reply from {from} → {}", m.brand, outcome.action);
+                    handled += 1;
+                    done_uids.push(uid);
+                }
+                Err(error) => {
+                    // Leave it unseen so a transient model/calendar failure is
+                    // retried instead of losing a human reply.
+                    eprintln!("  ! [{}] reply from {from}: {error:#}", m.brand);
+                }
+            }
         } else if let Some(contact) = db.opportunity_contact_by_email(&m.brand, &from)? {
             let action = triage::handle_opportunity_reply(
                 db,
@@ -90,13 +161,6 @@ async fn poll_mailbox(db: &SharedDb, client: &Engine, m: &Mailbox) -> Result<usi
             eprintln!("  · [{}] opportunity reply from {from} → {action}", m.brand);
             handled += 1;
             done_uids.push(uid);
-        } else if is_bounce(&from, &subject) {
-            let n = handle_bounce(db, &m.brand, &body)?;
-            if n > 0 {
-                eprintln!("  · [{}] bounce → suppressed {n} address(es)", m.brand);
-                handled += n;
-            }
-            done_uids.push(uid);
         }
     }
 
@@ -104,6 +168,15 @@ async fn poll_mailbox(db: &SharedDb, client: &Engine, m: &Mailbox) -> Result<usi
         let _ = mark_seen(m.clone(), done_uids).await;
     }
     Ok(handled)
+}
+
+fn addresses(addresses: Option<&mail_parser::Address<'_>>) -> Vec<String> {
+    addresses
+        .into_iter()
+        .flat_map(|addresses| addresses.iter())
+        .filter_map(|address| address.address.as_deref())
+        .map(|address| address.to_lowercase())
+        .collect()
 }
 
 /// Suppress any of our recipients that appear in a bounce body.

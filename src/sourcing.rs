@@ -24,7 +24,7 @@ use crate::apollo::{Apollo, ApolloOrg, ApolloPerson, OrgFilters, PeopleFilters};
 use crate::calendar;
 use crate::db::{Lead, Person, SharedDb};
 use crate::engine::Engine;
-use crate::knowledge::Library;
+use crate::knowledge::{core_strategy_block, Library};
 use crate::opportunity::ResearchClient;
 use crate::playbook::{Playbook, Shared};
 use crate::research;
@@ -110,19 +110,32 @@ pub async fn source(
     client: &Engine,
     apollo: &Apollo,
     pb: &Playbook,
-    shared: &Shared,
+    _shared: &Shared,
     fallback_recipient_timezone: &str,
+    business_context: &str,
     library: &Library,
     thesis: &str,
     n_accounts: usize,
     n_contacts: usize,
     concurrency: usize,
 ) -> Result<SourceSummary> {
-    let system = pb.system_prompt(shared);
+    // Each sourcing stage gets only the rules it needs; buyer-facing copy
+    // doctrine is intentionally absent from ICP, qualification, and routing.
+    let icp_system = pb.icp_system_prompt();
+    let qualification_system = pb.qualification_system_prompt();
+    let vantage_system = pb.vantage_system_prompt();
+
+    // Fold what we've already learned about this brand's outbound into the context
+    // every sourcing stage sees, so each run builds on prior runs instead of
+    // starting from a clean state (the operator's explicit ask).
+    let skip_learnings = db
+        .recent_learnings(Some(&pb.key), Some("qualification_skip"), 15)
+        .unwrap_or_default();
+    let augmented_context = augment_context_with_learnings(business_context, &skip_learnings);
 
     // 1. thesis → Apollo ICP filters, then hard-clamp sizes to the brand's ceiling
     //    so enterprise giants are never even fetched (belt-and-suspenders vs. the prompt).
-    let mut icp = derive_icp(client, &system, pb, thesis).await?;
+    let mut icp = derive_icp(client, &icp_system, pb, &augmented_context, thesis).await?;
     icp.employee_ranges = clamp_employee_ranges(icp.employee_ranges, pb.max_employees);
     eprintln!(
         "  · ICP: {} keyword(s), titles [{}], sizes [{}]",
@@ -164,56 +177,99 @@ pub async fn source(
     };
     let researcher_ref = researcher.as_ref();
 
-    // 3. qualify concurrently; keep the ones that fit, up to n_accounts.
-    let quals = stream::iter(orgs.into_iter().map(|org| {
-        let system = system.clone();
-        let knowledge = library
-            .retrieve_stage(
-                &format!("qualifying an expensive workflow: {thesis}; {}", pb.motion),
-                "companies",
-                5,
-                2,
-            )
-            .playbook_block();
-        async move {
-            // Apollo's company search often returns a sparse payload; enrich thin
-            // orgs by domain first so qualification judges real fit, not missing data.
-            let org = hydrate_org(apollo, org).await;
-            // Winnability gate: a small/founder-led vendor can't realistically land
-            // companies far above its size ceiling. Reject those up front (once we
-            // actually know the headcount) rather than spending a qualify call.
-            let q = if let Some(max) = pb.max_employees.filter(|m| org.estimated_num_employees > *m) {
-                Ok(OrgQual {
-                    reject_reason: format!(
-                        "{} employees is above {}'s ~{}-employee ceiling for a founder-led motion",
-                        org.estimated_num_employees, pb.name, max
-                    ),
-                    ..Default::default()
-                })
-            } else {
-                // Only research companies we're actually going to qualify.
-                let research_block = match researcher_ref {
-                    Some(r) => research::research_company(client, r, pb, &org)
-                        .await
-                        .map(|b| b.as_facts_block())
-                        .unwrap_or_default(),
-                    None => String::new(),
-                };
-                qualify_org(client, &system, pb, thesis, &org, &knowledge, &research_block).await
-            };
-            // Report each verdict the moment it lands so this concurrent stage
-            // isn't a silent multi-minute spinner.
-            match &q {
-                Ok(v) if v.qualified => eprintln!("  · ✓ qualified {}", org.name),
-                Ok(v) => eprintln!("  · ✗ skip {} — {}", org.name, first_line(&v.reject_reason)),
-                Err(e) => eprintln!("  · ! {} qualify error: {e:#}", org.name),
-            }
-            (org, q)
+    // 3. Qualify in bounded batches and stop as soon as the requested number is
+    // available. The old implementation evaluated every overfetched candidate
+    // before keeping the first N, wasting research and qualification calls.
+    let retrieved = library
+        .retrieve_stage(
+            &format!("qualifying an expensive workflow: {thesis}; {}", pb.motion),
+            "companies",
+            3,
+            1,
+        )
+        .playbook_block();
+    let knowledge = format!("{}\n\n{}", core_strategy_block("companies"), retrieved);
+
+    // Drop organizations we've already rejected for this brand in earlier runs —
+    // re-researching and re-qualifying a known reject is exactly the wasted work
+    // the operator flagged. A future run that clears the learning can resurface
+    // them; for now, prior judgment carries forward.
+    let known_rejects = db
+        .learning_keys(&pb.key, "qualification_skip")
+        .unwrap_or_default();
+    let orgs = if known_rejects.is_empty() {
+        orgs
+    } else {
+        let before = orgs.len();
+        let kept: Vec<_> = orgs
+            .into_iter()
+            .filter(|org| {
+                let key = org_learning_key(org);
+                key.is_empty() || !known_rejects.contains(&key)
+            })
+            .collect();
+        let dropped = before - kept.len();
+        if dropped > 0 {
+            eprintln!("  · skipped {dropped} previously-rejected org(s) from prior learnings");
         }
-    }))
-    .buffered(concurrency)
-    .collect::<Vec<_>>()
-    .await;
+        kept
+    };
+
+    let mut candidates = orgs.into_iter();
+    let mut quals = Vec::new();
+    let mut qualified = 0usize;
+    // Each candidate is I/O-bound (website reads + an LLM qualification call), so
+    // fan out wider than the global concurrency default — a low default (2) makes
+    // the qualification stage crawl even though it is almost entirely waiting.
+    let batch_size = concurrency.max(4);
+    while qualified < n_accounts {
+        let batch = candidates.by_ref().take(batch_size).collect::<Vec<_>>();
+        if batch.is_empty() {
+            break;
+        }
+        let results = stream::iter(batch.into_iter().map(|org| {
+            let system = qualification_system.clone();
+            let knowledge = knowledge.clone();
+            let business_context = augmented_context.clone();
+            async move {
+                qualify_candidate(
+                    client,
+                    apollo,
+                    researcher_ref,
+                    pb,
+                    &system,
+                    &business_context,
+                    thesis,
+                    org,
+                    &knowledge,
+                )
+                .await
+            }
+        }))
+        .buffered(batch_size)
+        .collect::<Vec<_>>()
+        .await;
+        // Persist every skip as business intelligence so the next run starts from
+        // what we already learned, not a clean slate.
+        for (org, result) in &results {
+            if let Ok(value) = result {
+                if !value.qualified {
+                    let _ = db.record_learning(
+                        &pb.key,
+                        "qualification_skip",
+                        &org.name,
+                        &org_learning_key(org),
+                        &first_line(&value.reject_reason),
+                    );
+                }
+            }
+        }
+        qualified += results
+            .iter()
+            .filter(|(_, result)| result.as_ref().is_ok_and(|value| value.qualified))
+            .count();
+        quals.extend(results);
+    }
 
     let mut kept = 0usize;
     for (org, q) in quals {
@@ -271,7 +327,7 @@ pub async fn source(
             client,
             apollo,
             pb,
-            &system,
+            &vantage_system,
             &org,
             &lead,
             &lead_id,
@@ -285,6 +341,64 @@ pub async fn source(
     }
 
     Ok(summary)
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
+async fn qualify_candidate(
+    client: &Engine,
+    apollo: &Apollo,
+    researcher: Option<&ResearchClient>,
+    pb: &Playbook,
+    system: &str,
+    business_context: &str,
+    thesis: &str,
+    org: ApolloOrg,
+    knowledge: &str,
+) -> (ApolloOrg, Result<OrgQual>) {
+    // Apollo search rows are often sparse; hydrate before judging fit.
+    let org = hydrate_org(apollo, org).await;
+    let result = if let Some(max) = pb
+        .max_employees
+        .filter(|max| org.estimated_num_employees > *max)
+    {
+        Ok(OrgQual {
+            reject_reason: format!(
+                "{} employees is above {}'s ~{}-employee ceiling for a founder-led motion",
+                org.estimated_num_employees, pb.name, max
+            ),
+            ..Default::default()
+        })
+    } else {
+        let research_block = match researcher {
+            Some(researcher) => research::research_company(client, researcher, pb, &org)
+                .await
+                .map(|brief| brief.as_facts_block())
+                .unwrap_or_default(),
+            None => String::new(),
+        };
+        qualify_org(
+            client,
+            system,
+            pb,
+            business_context,
+            thesis,
+            &org,
+            knowledge,
+            &research_block,
+        )
+        .await
+    };
+    match &result {
+        Ok(value) if value.qualified => eprintln!("  · ✓ qualified {}", org.name),
+        Ok(value) => eprintln!(
+            "  · ✗ skip {} — {}",
+            org.name,
+            first_line(&value.reject_reason)
+        ),
+        Err(error) => eprintln!("  · ! {} qualify error: {error:#}", org.name),
+    }
+    (org, result)
 }
 
 /// Fetch real people at an org, assign a vantage to each, and file them.
@@ -458,7 +572,11 @@ async fn gather_people(
                     let key = if !p.id.is_empty() {
                         p.id.clone()
                     } else {
-                        format!("{}|{}", p.full_name().to_lowercase(), p.title.to_lowercase())
+                        format!(
+                            "{}|{}",
+                            p.full_name().to_lowercase(),
+                            p.title.to_lowercase()
+                        )
                     };
                     if seen.insert(key) {
                         out.push(p);
@@ -501,7 +619,13 @@ async fn resolve_domain(apollo: &Apollo, org: &ApolloOrg) -> String {
 
 // --- Claude calls ----------------------------------------------------------
 
-async fn derive_icp(client: &Engine, system: &str, pb: &Playbook, thesis: &str) -> Result<Icp> {
+async fn derive_icp(
+    client: &Engine,
+    system: &str,
+    pb: &Playbook,
+    business_context: &str,
+    thesis: &str,
+) -> Result<Icp> {
     let mut firmographic = String::new();
     if let Some(max) = pb.max_employees {
         firmographic.push_str(&format!(
@@ -514,22 +638,34 @@ async fn derive_icp(client: &Engine, system: &str, pb: &Playbook, thesis: &str) 
         firmographic.push(' ');
         firmographic.push_str(pb.icp_note.trim());
     }
+    let context_block = if business_context.trim().is_empty() {
+        String::new()
+    } else {
+        format!("{}\n\n", business_context.trim())
+    };
     let user = format!(
-        "Translate this outreach thesis into an Apollo.io search. The brand's motion is: {motion}.\n\n\
+        "{context_block}Translate this outreach thesis into an Apollo.io search. The brand's motion is: {motion}.\n\n\
          THESIS: {thesis}\n\n\
-         Return Apollo filters that will surface companies plausibly having this expensive workflow, \
-         and the job titles/seniorities of the people who would OWN or OBSERVE it (by vantage, not \
-         just seniority). Keep keywords concrete and industry-specific. Employee ranges must use \
-         Apollo's bucket format like \"51,200\".{firmographic} If the thesis implies a region, set locations.",
+         Return Apollo filters that will surface companies plausibly having this expensive workflow \
+         AND that fit what the business (above) is actually trying to accomplish — not merely a loose \
+         keyword match. Include the job titles/seniorities of the people who would OWN or OBSERVE the \
+         workflow (by vantage, not just seniority). Keep keywords concrete and industry-specific. \
+         Employee ranges must use Apollo's bucket format like \"51,200\".{firmographic} If the thesis \
+         implies a region, set locations.\n\n{doctrine}",
         motion = pb.motion,
+        doctrine = core_strategy_block("icp"),
     );
-    client.structured::<Icp>(system, &user, icp_schema()).await
+    client
+        .structured_bulk::<Icp>("source.icp", system, &user, icp_schema())
+        .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn qualify_org(
     client: &Engine,
     system: &str,
     pb: &Playbook,
+    business_context: &str,
     thesis: &str,
     org: &ApolloOrg,
     knowledge: &str,
@@ -551,8 +687,14 @@ async fn qualify_org(
     } else {
         format!("{}\n\n", research.trim())
     };
+    let context_block = if business_context.trim().is_empty() {
+        String::new()
+    } else {
+        format!("{}\n\n", business_context.trim())
+    };
     let user = format!(
-        "Decide whether this REAL company (from Apollo) fits the thesis, and if so frame the \
+        "{context_block}Decide whether this REAL company (from Apollo) fits the thesis AND the \
+         business's goals and constraints above, and if so frame the \
          doctrine fields. THESIS: {thesis}\n\nAPOLLO FACTS (the ONLY things you may state as fact):\n{facts}\n\n{research_block}{knowledge}\n\n\
          Rules: observed_facts must each be supported by the Apollo facts OR the website research \
          above — never invent a customer, metric, or dollar figure. Put every reasonable-but-unproven \
@@ -563,7 +705,7 @@ async fn qualify_org(
         min = pb.min_signals,
     );
     client
-        .structured::<OrgQual>(system, &user, qual_schema())
+        .structured_bulk::<OrgQual>("source.qualify", system, &user, qual_schema())
         .await
 }
 
@@ -584,14 +726,15 @@ async fn assign_vantage(
          For each person, assign the vantage point that best fits what they can observe/decide/route \
          (not their seniority), one narrow sentence of can_observe, one sentence why_them, whether \
          they are the primary first contact, and route_to if they're a router. Vantage notes for this \
-         brand:\n{notes}",
+         brand:\n{notes}\n\n{doctrine}",
         company = lead.name,
         hyp = lead.hypothesis,
         roster = serde_json::to_string_pretty(&roster).unwrap_or_default(),
         notes = pb.vantage_notes.join("\n"),
+        doctrine = core_strategy_block("people"),
     );
     client
-        .structured::<VantageDoc>(system, &user, vantage_schema())
+        .structured_bulk::<VantageDoc>("source.vantage", system, &user, vantage_schema())
         .await
 }
 
@@ -700,7 +843,48 @@ fn normalize_vantage(raw: &str) -> String {
 }
 
 fn first_line(s: &str) -> String {
-    s.lines().next().unwrap_or("").chars().take(80).collect()
+    s.lines().next().unwrap_or("").chars().take(120).collect()
+}
+
+/// Stable dedup handle for a company across runs: prefer Apollo's org id, fall
+/// back to its domain. Used to recognize a company we've already judged.
+fn org_learning_key(org: &ApolloOrg) -> String {
+    if !org.id.trim().is_empty() {
+        org.id.clone()
+    } else {
+        org.domain()
+    }
+}
+
+/// Prepend the brand's accumulated learnings to the operating context so ICP
+/// derivation and qualification see them. A no-op when there's nothing learned
+/// yet, so a brand's first-ever run behaves exactly as before.
+fn augment_context_with_learnings(
+    business_context: &str,
+    learnings: &[crate::db::Learning],
+) -> String {
+    if learnings.is_empty() {
+        return business_context.to_string();
+    }
+    let bullets = learnings
+        .iter()
+        .map(|learning| {
+            let seen = if learning.hits > 1 {
+                format!("[seen {}×] ", learning.hits)
+            } else {
+                String::new()
+            };
+            format!("  - {seen}{}: {}", learning.subject, learning.detail)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "{}\n\nPRIOR LEARNINGS FOR THIS BRAND (companies skipped and why, from earlier runs — \
+         refine targeting accordingly; do NOT re-propose these companies or repeat these \
+         patterns):\n{}",
+        business_context.trim(),
+        bullets,
+    )
 }
 
 /// Drop Apollo size buckets whose lower bound exceeds the brand's headcount
@@ -724,13 +908,45 @@ fn clamp_employee_ranges(ranges: Vec<String>, max_employees: Option<i64>) -> Vec
         return kept;
     }
     const STD: [&str; 8] = [
-        "1,10", "11,50", "51,200", "201,500", "501,1000", "1001,5000", "5001,10000",
+        "1,10",
+        "11,50",
+        "51,200",
+        "201,500",
+        "501,1000",
+        "1001,5000",
+        "5001,10000",
         "10001,1000000",
     ];
     STD.iter()
         .filter(|b| within(b))
         .map(|s| s.to_string())
         .collect()
+}
+
+/// True when an org's search payload lacks the firmographics qualification needs
+/// (industry, headcount, description, keywords) — i.e. it's name+domain only.
+fn org_is_thin(o: &ApolloOrg) -> bool {
+    o.industry.trim().is_empty()
+        && o.short_description.trim().is_empty()
+        && o.keywords.is_empty()
+        && o.estimated_num_employees == 0
+}
+
+/// Fill in a thin org's firmographics via Apollo organization enrichment (by
+/// domain). Falls back to the original record if it's already rich, has no
+/// domain, or enrichment fails/returns nothing — so sourcing never regresses.
+async fn hydrate_org(apollo: &Apollo, org: ApolloOrg) -> ApolloOrg {
+    if !org_is_thin(&org) {
+        return org;
+    }
+    let domain = org.domain();
+    if domain.is_empty() {
+        return org;
+    }
+    match apollo.enrich_organization(&domain).await {
+        Ok(Some(full)) if !org_is_thin(&full) => full,
+        _ => org,
+    }
 }
 
 #[cfg(test)]
@@ -769,31 +985,5 @@ mod tests {
     fn clamp_is_a_noop_without_a_ceiling() {
         let ranges = vec!["10001,1000000".to_string()];
         assert_eq!(clamp_employee_ranges(ranges.clone(), None), ranges);
-    }
-}
-
-/// True when an org's search payload lacks the firmographics qualification needs
-/// (industry, headcount, description, keywords) — i.e. it's name+domain only.
-fn org_is_thin(o: &ApolloOrg) -> bool {
-    o.industry.trim().is_empty()
-        && o.short_description.trim().is_empty()
-        && o.keywords.is_empty()
-        && o.estimated_num_employees == 0
-}
-
-/// Fill in a thin org's firmographics via Apollo organization enrichment (by
-/// domain). Falls back to the original record if it's already rich, has no
-/// domain, or enrichment fails/returns nothing — so sourcing never regresses.
-async fn hydrate_org(apollo: &Apollo, org: ApolloOrg) -> ApolloOrg {
-    if !org_is_thin(&org) {
-        return org;
-    }
-    let domain = org.domain();
-    if domain.is_empty() {
-        return org;
-    }
-    match apollo.enrich_organization(&domain).await {
-        Ok(Some(full)) if !org_is_thin(&full) => full,
-        _ => org,
     }
 }

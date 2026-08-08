@@ -76,7 +76,7 @@ pub fn funnel(db: &SharedDb, brand: Option<&str>) -> Result<Funnel> {
         // correct distinct denominator for the reply rate.
         contacted: db.distinct_event_people(brand, "sent")?,
         touches_sent: sent,
-        replied: count(&|p| p.status == "replied"),
+        replied: count(&|p| matches!(p.status.as_str(), "replied" | "meeting_booked")),
         unsubscribed: count(&|p| p.status == "unsubscribed"),
         bounced: count(&|p| p.status == "bounced"),
         opportunities: opportunities.len(),

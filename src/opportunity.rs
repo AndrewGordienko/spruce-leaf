@@ -22,6 +22,7 @@ use crate::business::{BusinessProfile, FundingProfile, OpportunitySource};
 use crate::calendar::{self, TimingContext};
 use crate::db::{ApplicationBrief, Opportunity, OpportunityContact, OpportunityTouch, SharedDb};
 use crate::engine::Engine;
+use crate::knowledge::core_strategy_block;
 use crate::playbook::{self, Playbook, Shared};
 use crate::verify;
 
@@ -151,6 +152,12 @@ struct FitAssessment {
 }
 
 #[derive(Debug, Deserialize)]
+struct OpportunityEvaluation {
+    opportunity: ExtractedOpportunity,
+    fit: FitAssessment,
+}
+
+#[derive(Debug, Deserialize)]
 struct FundingSequence {
     #[serde(default)]
     touches: Vec<FundingCopyTouch>,
@@ -207,7 +214,10 @@ impl ResearchClient {
     pub fn from_env() -> Result<Self> {
         let http = reqwest::Client::builder()
             .user_agent("spruce-leaf/0.1 opportunity-research")
-            .timeout(std::time::Duration::from_secs(45))
+            // Kept deliberately tight: a hung fetch otherwise stalls a whole
+            // sourcing run one request at a time. Real sites answer well inside
+            // this; a slow one is not worth the wait when research is best-effort.
+            .timeout(std::time::Duration::from_secs(20))
             .redirect(reqwest::redirect::Policy::custom(|attempt| {
                 if safe_public_http_url(attempt.url()).is_ok() {
                     attempt.follow()
@@ -335,8 +345,8 @@ pub async fn discover(
                 continue;
             }
         };
-        let extracted = match extract_opportunity(engine, profile, &candidate, &document).await {
-            Ok(x) if x.is_opportunity => x,
+        let evaluation = match evaluate_opportunity(engine, profile, &candidate, &document).await {
+            Ok(evaluation) if evaluation.opportunity.is_opportunity => evaluation,
             Ok(_) => {
                 summary.skipped += 1;
                 continue;
@@ -348,20 +358,9 @@ pub async fn discover(
                 continue;
             }
         };
+        let extracted = evaluation.opportunity;
+        let fit = evaluation.fit;
         summary.opportunities_verified += 1;
-        let fit = assess_fit(engine, profile, &extracted)
-            .await
-            .unwrap_or_else(|e| {
-                summary
-                    .errors
-                    .push(format!("score {}: {e:#}", extracted.title));
-                FitAssessment {
-                    status: "needs_information".into(),
-                    unknowns: profile.unknowns.clone(),
-                    next_action: "Review eligibility manually against the official source.".into(),
-                    ..Default::default()
-                }
-            });
 
         let canonical_url = if extracted.canonical_url.starts_with("http") {
             extracted.canonical_url.clone()
@@ -481,7 +480,8 @@ async fn collect_source_candidates(
         doc = document,
     );
     let mut batch = engine
-        .structured::<CandidateBatch>(
+        .structured_bulk::<CandidateBatch>(
+            "opportunity.candidates",
             "You extract candidate opportunity links from official-source text. Evidence only; never invent links.",
             &user,
             candidate_schema(),
@@ -508,44 +508,15 @@ async fn collect_source_candidates(
     Ok(batch.candidates)
 }
 
-async fn extract_opportunity(
+async fn evaluate_opportunity(
     engine: &Engine,
     profile: &BusinessProfile,
     candidate: &Candidate,
     document: &str,
-) -> Result<ExtractedOpportunity> {
-    let today = Utc::now().format("%Y-%m-%d");
-    let user = format!(
-        "Extract one opportunity from this official page for a structured opportunity database. \
-         Today is {today}. Preserve the distinction between grant, non-repayable contribution, \
-         repayable contribution, loan, tax credit, procurement, challenge prize, funded pilot, \
-         and advisory support. `opportunity_status` must be open, forecast, rolling, closed, or \
-         unknown based only on the page. Use ISO dates when the page provides enough information. \
-         Every evidence item must identify the field it supports and include source wording or a \
-         close paraphrase. If this is only an article or old award announcement with no programme \
-         to apply to or monitor, set is_opportunity=false. Never infer eligibility for {name}.\n\n\
-         CANDIDATE: {hint}\nFUNDER HINT: {funder_hint}\nURL: {url}\n\nDOCUMENT:\n{document}",
-        name = profile.name,
-        hint = candidate.title,
-        funder_hint = candidate.funder,
-        url = candidate.url,
-    );
-    engine
-        .structured::<ExtractedOpportunity>(
-            "You are a meticulous funding-opportunity analyst. Extract facts from the supplied official page only.",
-            &user,
-            opportunity_schema(),
-        )
-        .await
-}
-
-async fn assess_fit(
-    engine: &Engine,
-    profile: &BusinessProfile,
-    opportunity: &ExtractedOpportunity,
-) -> Result<FitAssessment> {
+) -> Result<OpportunityEvaluation> {
     let funding = profile.funding()?;
-    let context = json!({
+    let today = Utc::now().format("%Y-%m-%d");
+    let business = json!({
         "business": profile.name,
         "summary": profile.summary,
         "known_facts": profile.known_facts,
@@ -554,21 +525,32 @@ async fn assess_fit(
         "funding_objective": funding.objective,
         "themes": funding.themes,
         "project_shapes": funding.project_shapes,
-        "opportunity": opportunity,
     });
     let user = format!(
-        "Assess fit using only known_facts as proven facts. A known_unknown is not evidence. \
-         Mandatory criteria that depend on unknown information must produce needs_information, \
-         not strong_fit. An explicit mismatch produces ineligible. Score 0-100 for prioritization, \
-         list supported reasons separately from blockers and unknowns, and give one concrete next \
-         action. Do not confuse thematic relevance with applicant eligibility.\n\n{}",
-        serde_json::to_string_pretty(&context).unwrap_or_default()
+        "Extract one opportunity from this official page for a structured opportunity database. \
+         Today is {today}. Preserve the distinction between grant, non-repayable contribution, \
+         repayable contribution, loan, tax credit, procurement, challenge prize, funded pilot, \
+         and advisory support. `opportunity_status` must be open, forecast, rolling, closed, or \
+         unknown based only on the page. Use ISO dates when the page provides enough information. \
+         Every evidence item must identify the field it supports and include source wording or a \
+         close paraphrase. If this is only an article or old award announcement with no programme \
+         to apply to or monitor, set is_opportunity=false. Then assess fit conservatively using \
+         only known_facts as proven. Unknown mandatory criteria mean needs_information; explicit \
+         mismatch means ineligible. Separate reasons, blockers, and unknowns. Do not confuse \
+         thematic relevance with eligibility.\n\nBUSINESS:\n{business}\n\n\
+         CANDIDATE: {hint}\nFUNDER HINT: {funder_hint}\nURL: {url}\n\nDOCUMENT:\n{document}\n\n{doctrine}",
+        business = serde_json::to_string_pretty(&business).unwrap_or_default(),
+        hint = candidate.title,
+        funder_hint = candidate.funder,
+        url = candidate.url,
+        doctrine = core_strategy_block("funding"),
     );
     engine
-        .structured::<FitAssessment>(
-            "You are a conservative grant eligibility reviewer. Never claim eligibility without evidence.",
+        .structured_bulk::<OpportunityEvaluation>(
+            "opportunity.evaluate",
+            "You are a meticulous funding analyst and conservative eligibility reviewer. Official evidence before claims.",
             &user,
-            fit_schema(),
+            evaluation_schema(),
         )
         .await
 }
@@ -1019,15 +1001,17 @@ async fn write_funding_sequence(
          project-fit uncertainty, and ask one answerable question. A later touch must add new \
          decision-useful information, not 'follow up'. Use day offsets such as 0 and 6. Keep every \
          body between {min} and {max} words and end it with exactly {signature}. Do not call a \
-         contribution or tax credit a grant. Do not claim eligibility.\n\nDOCTRINE:\n{doctrine}\n\nCONTEXT:\n{context}",
+         contribution or tax credit a grant. Do not claim eligibility.\n\nBUSINESS-SPECIFIC DOCTRINE:\n{doctrine}\n\nCONTEXT:\n{context}\n\n{core_doctrine}",
         min = funding.min_words,
         max = funding.max_words,
         signature = signature,
         doctrine = funding.doctrine,
         context = serde_json::to_string_pretty(&context).unwrap_or_default(),
+        core_doctrine = core_strategy_block("funding"),
     );
     engine
-        .structured::<FundingSequence>(
+        .structured_bulk::<FundingSequence>(
+            "opportunity.outreach",
             "You write precise founder-led pre-application funding enquiries grounded in official criteria.",
             &user,
             funding_sequence_schema(n),
@@ -1065,11 +1049,13 @@ pub async fn prepare_application(
          outline work packages and milestones; identify documents, budget questions, funder \
          questions, risks, and ordered next steps. Do not fabricate metrics, partners, finances, \
          eligibility, TRL, jobs, emissions impact, or matching funds. The narrative must label \
-         assumptions and missing proof.\n\n{}",
-        serde_json::to_string_pretty(&context).unwrap_or_default()
+         assumptions and missing proof.\n\n{}\n\n{}",
+        serde_json::to_string_pretty(&context).unwrap_or_default(),
+        core_strategy_block("funding"),
     );
     let draft = engine
-        .structured::<ApplicationDraft>(
+        .structured_bulk::<ApplicationDraft>(
+            "opportunity.application",
             "You are a conservative non-dilutive funding application strategist. Evidence before claims.",
             &user,
             application_schema(),
@@ -1436,6 +1422,18 @@ fn fit_schema() -> Value {
             "blockers":string_array("Explicit mismatches or closed-status blockers."),
             "unknowns":string_array("Mandatory facts that still require evidence."),
             "next_action":{"type":"string"}
+        }
+    })
+}
+
+fn evaluation_schema() -> Value {
+    json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["opportunity","fit"],
+        "properties":{
+            "opportunity": opportunity_schema(),
+            "fit": fit_schema()
         }
     })
 }

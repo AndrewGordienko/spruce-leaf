@@ -109,24 +109,19 @@ pub struct Sequence {
 
 // --- Critique pass ---------------------------------------------------------
 
-/// The critic's verdict on one touch, with a doctrine-clean rewrite.
+/// The compact reviewer verdict on one touch. Rewrites are applied directly to
+/// the sequence and are not duplicated in the persisted review metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TouchReview {
     pub stage: u32,
-    /// Did the ORIGINAL touch pass the pre-send test?
+    /// Does the REVISED touch pass the pre-send test and score at least 80/100?
     pub passes: bool,
+    /// Sendability score for the revised touch.
+    #[serde(default)]
+    pub score: u32,
     /// Specific problems found (voice, leaked fact, weak question, etc.).
     #[serde(default)]
     pub issues: Vec<String>,
-    /// Doctrine-clean revised subject (may equal the original).
-    pub revised_subject: String,
-    /// Doctrine-clean revised body (may equal the original).
-    pub revised_body: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SequenceReview {
-    pub reviews: Vec<TouchReview>,
 }
 
 // --- Assembled output tree -------------------------------------------------

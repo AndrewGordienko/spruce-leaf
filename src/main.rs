@@ -26,7 +26,9 @@ mod db;
 mod domain;
 mod engine;
 mod enrich;
+mod google_calendar;
 mod inbox;
+mod jobs;
 mod knowledge;
 mod mailbox;
 mod metrics;
@@ -36,16 +38,25 @@ mod pipeline;
 mod playbook;
 mod prompts;
 mod repl;
+mod reply_agent;
 mod report;
 mod research;
 mod send;
 mod sourcing;
+mod synthesis;
 mod triage;
 mod ui;
 mod verify;
 
-use std::path::Path;
+use std::ffi::OsString;
+use std::net::TcpListener;
+use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -83,17 +94,17 @@ struct Cli {
     #[arg(long, global = true)]
     model: Option<String>,
 
-    /// Skip the LLM pre-send critique/rewrite pass.
+    /// Use deterministic QA only; skip the semantic copy-edit pass.
     #[arg(long, global = true)]
     no_critique: bool,
 
     /// Max concurrent model calls at each fan-out step.
-    #[arg(long, global = true, default_value_t = 5, value_parser = positive_usize)]
+    #[arg(long, global = true, default_value_t = 2, value_parser = positive_usize)]
     concurrency: usize,
 
-    /// Port for the local CRM web dashboard.
-    #[arg(long, global = true, default_value_t = 8787)]
-    port: u16,
+    /// Preferred port for the local CRM. Reuses a running CRM or finds a free port.
+    #[arg(long, global = true)]
+    port: Option<u16>,
 
     /// Path to the CRM JSON store.
     #[arg(long, global = true, default_value = ".spruce/crm.json")]
@@ -170,6 +181,12 @@ enum Command {
         /// Schedule email touches immediately instead of leaving them as drafts.
         #[arg(long)]
         auto: bool,
+        /// Limit planning to one exact person id, email, or name.
+        #[arg(long)]
+        person: Option<String>,
+        /// Replace an existing active sequence only when it has no sent touches.
+        #[arg(long)]
+        replace_drafts: bool,
     },
 
     /// Approve drafted email touches so the cadence engine may send them.
@@ -184,6 +201,9 @@ enum Command {
         /// Actually send email continuously. Default previews once and exits.
         #[arg(long)]
         live: bool,
+        /// Continuously source, enrich, and draft toward funnel targets. Requires --live.
+        #[arg(long)]
+        autopilot: bool,
         /// Seconds between cadence passes.
         #[arg(long, default_value_t = 60, value_parser = positive_u64)]
         interval: u64,
@@ -192,11 +212,61 @@ enum Command {
         batch: i64,
     },
 
-    /// Poll inboxes once and triage any replies.
-    Inbox,
+    /// Seed one verified test person (no Apollo) to exercise the full
+    /// send→reply→book loop against a mailbox you control. Pair with
+    /// SPRUCE_SEND_ALLOWLIST so a `--live` daemon can only reach that address.
+    SeedTestLead {
+        /// Recipient address for the seeded person — a mailbox you own.
+        #[arg(long)]
+        email: String,
+        /// Display name for the seeded person.
+        #[arg(long, default_value = "Test Prospect")]
+        name: String,
+        /// Company name for the seeded lead.
+        #[arg(long, default_value = "Test Co")]
+        company: String,
+        /// IANA timezone for scheduling the touch. Pick a zone currently in
+        /// business hours for an immediate test send.
+        #[arg(long, default_value = "America/Toronto")]
+        timezone: String,
+    },
+
+    /// Poll inboxes once, resolve threads, and draft conversational replies.
+    Inbox {
+        /// Book an explicitly accepted, previously-offered Google Calendar slot.
+        #[arg(long)]
+        book: bool,
+    },
+
+    /// Approve reply-agent drafts for delivery by the daemon.
+    ApproveReplies {
+        /// Only approve this conversation id (default: all drafts for the brand).
+        #[arg(long)]
+        conversation: Option<String>,
+    },
+
+    /// List pending and booked meetings.
+    Meetings,
+
+    /// Book pending accepted slots into Google Calendar after rechecking availability.
+    BookMeetings {
+        /// Only book this pending meeting id (default: all for the brand).
+        #[arg(long)]
+        id: Option<String>,
+    },
+
+    /// Show durable autopilot queue health, including dead-letter work.
+    Jobs,
 
     /// Show funnel metrics per brand.
     Stats,
+
+    /// Cluster discovery across sourced companies + replies into an investor-ready synthesis.
+    Synthesize {
+        /// Markdown output path (default: .spruce/synthesis-<brand>.md).
+        #[arg(long, default_value = "")]
+        out: String,
+    },
 
     /// Show timing rules, per-business capacity, and observed response timing.
     Calendar,
@@ -257,6 +327,7 @@ enum Command {
 }
 
 fn main() -> Result<()> {
+    bootstrap_latest_workspace_binary()?;
     dotenvy::dotenv().ok();
     let mut cli = Cli::parse();
     let rt = tokio::runtime::Runtime::new().context("starting Tokio runtime")?;
@@ -273,10 +344,17 @@ fn main() -> Result<()> {
 
     match command {
         Command::Crm => {
-            spawn_server(&rt, &store, &db, cli.port);
-            let url = format!("http://localhost:{}", cli.port);
-            println!("\u{1F332} CRM dashboard at {url}  (ctrl-c to stop)");
+            let endpoint = ensure_crm_server(&rt, &store, &db, cli.port)?;
+            let url = endpoint.url();
+            if endpoint.reused {
+                println!("\u{2713} using the CRM already running at {url}");
+            } else {
+                println!("\u{1F332} CRM dashboard at {url}  (ctrl-c to stop)");
+            }
             agent::open_browser(&url);
+            if endpoint.reused {
+                return Ok(());
+            }
             rt.block_on(std::future::pending::<()>());
             Ok(())
         }
@@ -319,8 +397,8 @@ fn main() -> Result<()> {
             let (ac, ct, to) = rt.block_on(async { store.write().await.ingest(campaign) })?;
             println!(
                 "\u{2713} filed {ac} accounts, {ct} contacts, {to} touches into {}.\n  \
-                 view: spruce-leaf crm   (http://localhost:{})",
-                cli.store, cli.port
+                 view: spruce-leaf crm   (reuses or opens a free localhost port)",
+                cli.store
             );
             Ok(())
         }
@@ -381,6 +459,7 @@ fn main() -> Result<()> {
                 pb,
                 &playbooks.shared,
                 &business.calendar.fallback_recipient_timezone,
+                &business.operating_context(),
                 &lib,
                 &thesis,
                 accounts,
@@ -422,7 +501,12 @@ fn main() -> Result<()> {
             Ok(())
         }
 
-        Command::Plan { touches, auto } => {
+        Command::Plan {
+            touches,
+            auto,
+            person,
+            replace_drafts,
+        } => {
             let client = make_engine(&rt, &cli)?;
             let playbooks = load_playbooks(&cli)?;
             let pb = playbooks.get(&cli.brand)?;
@@ -439,12 +523,19 @@ fn main() -> Result<()> {
                 touches,
                 cli.concurrency,
                 auto,
+                critique,
+                person.as_deref(),
+                replace_drafts,
+                false,
+                None,
             ))?;
             println!(
-                "\u{2713} planned {} people: {} touches scheduled, {} drafted.{}",
+                "\u{2713} planned {} people: {} touches scheduled, {} drafted, {} rejected, {} old draft sequence(s) replaced/pruned.{}",
                 s.people_planned,
                 s.touches_scheduled,
                 s.touches_drafted,
+                s.people_rejected,
+                s.sequences_replaced,
                 if auto {
                     ""
                 } else {
@@ -462,6 +553,7 @@ fn main() -> Result<()> {
 
         Command::Daemon {
             live,
+            autopilot,
             interval,
             batch,
         } => {
@@ -484,6 +576,11 @@ fn main() -> Result<()> {
             if live && compliance.physical_address.trim().is_empty() {
                 anyhow::bail!(
                     "refusing live sending: COMPLIANCE_ADDRESS is unset (required for CASL/CAN-SPAM)"
+                );
+            }
+            if autopilot && !live {
+                anyhow::bail!(
+                    "--autopilot is a continuous process and requires `daemon --live`; cold drafts remain approval-gated"
                 );
             }
             if live {
@@ -516,14 +613,41 @@ fn main() -> Result<()> {
             if live {
                 let inbox_client = make_engine(&rt, &cli)?;
                 let dbi = db.clone();
+                let inbox_playbooks = playbooks.clone();
+                let allow_booking = autopilot;
                 rt.spawn(async move {
                     loop {
-                        if let Err(e) = inbox::poll_all(&dbi, &inbox_client, None).await {
+                        if let Err(e) = inbox::poll_all(
+                            &dbi,
+                            &inbox_client,
+                            &inbox_playbooks,
+                            None,
+                            allow_booking,
+                        )
+                        .await
+                        {
                             eprintln!("  ! inbox poll: {e:#}");
                         }
                         tokio::time::sleep(std::time::Duration::from_secs(interval.max(30))).await;
                     }
                 });
+            }
+            if autopilot {
+                let autopilot_client = make_engine(&rt, &cli)?;
+                let autopilot_db = db.clone();
+                let autopilot_playbooks = playbooks.clone();
+                let autopilot_businesses = businesses.clone();
+                let autopilot_library = library.clone();
+                let concurrency = cli.concurrency;
+                rt.spawn(jobs::run_daemon(
+                    autopilot_db,
+                    autopilot_client,
+                    autopilot_playbooks,
+                    autopilot_businesses,
+                    autopilot_library,
+                    concurrency,
+                    interval,
+                ));
             }
             rt.block_on(cadence::run_daemon(
                 db.clone(),
@@ -534,10 +658,111 @@ fn main() -> Result<()> {
             ))
         }
 
-        Command::Inbox => {
+        Command::SeedTestLead {
+            email,
+            name,
+            company,
+            timezone,
+        } => {
+            let (first, last) = match name.split_once(' ') {
+                Some((f, l)) => (f.to_string(), l.to_string()),
+                None => (name.clone(), String::new()),
+            };
+            let domain = email.split('@').nth(1).unwrap_or("example.com").to_string();
+            let lead_id = db.upsert_lead(&crate::db::Lead {
+                brand: cli.brand.clone(),
+                apollo_org_id: format!("seed-test:{email}"),
+                name: company,
+                domain,
+                industry: "test".into(),
+                hq: "Toronto, Ontario, Canada".into(),
+                timezone: timezone.clone(),
+                thesis: "closed-loop send/reply self-test".into(),
+                hypothesis: "seeded record for exercising the live daemon end to end".into(),
+                status: "qualified".into(),
+                ..Default::default()
+            })?;
+            let person_id = db.upsert_person(&crate::db::Person {
+                lead_id,
+                brand: cli.brand.clone(),
+                apollo_person_id: format!("seed-test:{email}"),
+                first_name: first,
+                last_name: last,
+                name: name.clone(),
+                title: "Operations Lead".into(),
+                timezone,
+                email: email.clone(),
+                email_status: "verified".into(),
+                status: "verified".into(),
+                ..Default::default()
+            })?;
+            println!(
+                "\u{2713} seeded verified test person for {} \u{2192} {person_id} <{email}>",
+                cli.brand
+            );
+            println!(
+                "  plan:  spruce-leaf --brand {} plan --auto --person {person_id}",
+                cli.brand
+            );
+            println!(
+                "  send:  SPRUCE_SEND_ALLOWLIST={email} spruce-leaf --brand {} daemon --live",
+                cli.brand
+            );
+            Ok(())
+        }
+
+        Command::Inbox { book } => {
             let client = make_engine(&rt, &cli)?;
-            let n = rt.block_on(inbox::poll_all(&db, &client, None))?;
+            let playbooks = load_playbooks(&cli)?;
+            let n = rt.block_on(inbox::poll_all(&db, &client, &playbooks, None, book))?;
             println!("\u{2713} handled {n} reply/replies.");
+            Ok(())
+        }
+
+        Command::ApproveReplies { conversation } => {
+            let n = db.approve_conversation_messages(Some(&cli.brand), conversation.as_deref())?;
+            println!("\u{2713} approved {n} reply draft(s) \u{2192} scheduled.");
+            Ok(())
+        }
+
+        Command::Meetings => {
+            let meetings = db.list_meetings(Some(&cli.brand))?;
+            if meetings.is_empty() {
+                println!("no meetings for {}", cli.brand);
+            }
+            for meeting in meetings {
+                println!(
+                    "{}  {}  {}  {}{}",
+                    meeting.starts_at,
+                    meeting.status,
+                    meeting.attendee_email,
+                    meeting.html_link,
+                    if meeting.meet_link.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  {}", meeting.meet_link)
+                    }
+                );
+            }
+            Ok(())
+        }
+
+        Command::BookMeetings { id } => {
+            let n = rt.block_on(reply_agent::book_pending(&db, &cli.brand, id.as_deref()))?;
+            println!("\u{2713} booked {n} pending meeting(s); Google sent attendee updates.");
+            Ok(())
+        }
+
+        Command::Jobs => {
+            let counts = db.job_status_counts(Some(&cli.brand))?;
+            if counts.is_empty() {
+                println!("no autopilot jobs for {}", cli.brand);
+            } else {
+                println!("autopilot jobs [{}]", cli.brand);
+                for (status, count) in counts {
+                    println!("  {status:<10} {count}");
+                }
+            }
             Ok(())
         }
 
@@ -550,6 +775,27 @@ fn main() -> Result<()> {
                     println!("\n{}", metrics::render(&f));
                 }
             }
+            Ok(())
+        }
+
+        Command::Synthesize { out } => {
+            let client = make_engine(&rt, &cli)?;
+            let playbooks = load_playbooks(&cli)?;
+            let pb = playbooks.get(&cli.brand)?;
+            eprintln!(
+                "\u{2192} [{}] synthesizing discovery across sourced companies\u{2026}",
+                pb.name
+            );
+            let s = rt.block_on(synthesis::synthesize(&db, &client, pb))?;
+            let path = if out.trim().is_empty() {
+                format!(".spruce/synthesis-{}.md", cli.brand)
+            } else {
+                out
+            };
+            std::fs::write(&path, synthesis::render_markdown(&s))
+                .with_context(|| format!("writing {path}"))?;
+            println!("{}", synthesis::render_console(&s));
+            println!("\n  wrote {path}");
             Ok(())
         }
 
@@ -742,7 +988,12 @@ fn main() -> Result<()> {
             // Validate the requested brand up front.
             playbooks.get(&cli.brand)?;
             businesses.get(&cli.brand)?;
-            spawn_server(&rt, &store, &db, cli.port);
+            let endpoint = ensure_crm_server(&rt, &store, &db, cli.port)?;
+            if endpoint.reused {
+                eprintln!("\u{2713} reusing CRM at {}", endpoint.url());
+            } else {
+                eprintln!("\u{2713} CRM ready at {}", endpoint.url());
+            }
             let agent = agent::Agent::new(
                 client,
                 store.clone(),
@@ -752,7 +1003,7 @@ fn main() -> Result<()> {
                 businesses,
                 cli.brand.clone(),
                 critique,
-                cli.port,
+                endpoint.port,
                 cli.concurrency,
             );
             repl::run_repl(&rt, agent)
@@ -760,7 +1011,171 @@ fn main() -> Result<()> {
     }
 }
 
-/// Start the CRM web server on the runtime's worker threads.
+const DEFAULT_CRM_PORT: u16 = 8787;
+const BOOTSTRAPPED_ENV: &str = "SPRUCE_LEAF_BOOTSTRAPPED";
+
+#[derive(Debug, Clone, Copy)]
+struct CrmEndpoint {
+    port: u16,
+    reused: bool,
+}
+
+impl CrmEndpoint {
+    fn url(self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+}
+
+/// The installed command is a tiny hand-off point to the current workspace
+/// build. Cargo is incremental, so unchanged launches are fast; changed source
+/// and missing dependencies are rebuilt/downloaded before the real CLI starts.
+fn bootstrap_latest_workspace_binary() -> Result<()> {
+    if std::env::var_os(BOOTSTRAPPED_ENV).is_some() {
+        return Ok(());
+    }
+
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    if !workspace.join("Cargo.toml").is_file() || !workspace.join("src/main.rs").is_file() {
+        return Ok(());
+    }
+
+    let binary_name = if cfg!(windows) {
+        "spruce-leaf.exe"
+    } else {
+        "spruce-leaf"
+    };
+    let workspace_binary = workspace.join("target").join("debug").join(binary_name);
+    let current_binary = std::env::current_exe().context("finding the spruce-leaf executable")?;
+    if !workspace_inputs_are_newer(&workspace, &current_binary) {
+        return Ok(());
+    }
+    let build_is_stale = workspace_inputs_are_newer(&workspace, &workspace_binary);
+
+    if build_is_stale {
+        eprintln!("\u{21bb} preparing the latest local Spruce Leaf build\u{2026}");
+        let status = ProcessCommand::new("cargo")
+            .arg("build")
+            .arg("--quiet")
+            .arg("--manifest-path")
+            .arg(workspace.join("Cargo.toml"))
+            .current_dir(&workspace)
+            .status()
+            .context(
+                "running Cargo; install Rust from https://rustup.rs if `cargo` is unavailable",
+            )?;
+        if !status.success() {
+            anyhow::bail!("Cargo could not build the latest local Spruce Leaf version");
+        }
+    }
+
+    let args = std::env::args_os().skip(1).collect::<Vec<OsString>>();
+    let mut next = ProcessCommand::new(&workspace_binary);
+    next.args(args).env(BOOTSTRAPPED_ENV, "1");
+
+    #[cfg(unix)]
+    {
+        let error = next.exec();
+        Err(error).with_context(|| format!("launching {}", workspace_binary.display()))
+    }
+
+    #[cfg(not(unix))]
+    {
+        let status = next
+            .status()
+            .with_context(|| format!("launching {}", workspace_binary.display()))?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
+}
+
+fn workspace_inputs_are_newer(workspace: &Path, binary: &Path) -> bool {
+    let binary_modified = std::fs::metadata(binary)
+        .and_then(|metadata| metadata.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let mut newest = SystemTime::UNIX_EPOCH;
+    for input in [
+        workspace.join("Cargo.toml"),
+        workspace.join("Cargo.lock"),
+        workspace.join("build.rs"),
+        workspace.join("src"),
+    ] {
+        update_newest_mtime(&input, &mut newest);
+    }
+    newest > binary_modified
+}
+
+fn update_newest_mtime(path: &Path, newest: &mut SystemTime) {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return;
+    };
+    if let Ok(modified) = metadata.modified() {
+        *newest = (*newest).max(modified);
+    }
+    if metadata.is_dir() {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            update_newest_mtime(&entry.path(), newest);
+        }
+    }
+}
+
+/// Reuse a running Spruce Leaf CRM when one is already present. Otherwise bind
+/// the preferred port or the next free loopback port before spawning, avoiding
+/// the check-then-bind race that caused the old silent CRM failures.
+fn ensure_crm_server(
+    rt: &tokio::runtime::Runtime,
+    store: &crm::SharedStore,
+    db: &db::SharedDb,
+    preferred_port: Option<u16>,
+) -> Result<CrmEndpoint> {
+    let first = preferred_port.unwrap_or(DEFAULT_CRM_PORT);
+    let existing_ports = if preferred_port.is_some() {
+        vec![first]
+    } else {
+        crm::port_candidates(first)
+    };
+    if let Some(port) = existing_ports.into_iter().find(|port| is_spruce_crm(*port)) {
+        return Ok(CrmEndpoint { port, reused: true });
+    }
+
+    let listener = bind_available_crm_listener(first)?;
+    let port = listener
+        .local_addr()
+        .context("reading selected CRM port")?
+        .port();
+    let store = store.clone();
+    let db = db.clone();
+    rt.spawn(async move {
+        if let Err(error) = crm::serve_on_listener(store, db, listener).await {
+            eprintln!("CRM server error: {error:#}");
+        }
+    });
+    // The spawn above is fire-and-forget: if the server failed to start we would
+    // otherwise advertise a dead port and every "in the CRM at …" message would
+    // be a lie. Wait for the health endpoint to actually answer before we call it
+    // ready — the socket is already listening, so this resolves in a few ms.
+    for _ in 0..40 {
+        if is_spruce_crm(port) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Ok(CrmEndpoint {
+        port,
+        reused: false,
+    })
+}
+
+fn bind_available_crm_listener(first: u16) -> Result<TcpListener> {
+    crm::bind_free_listener(first)
+}
+
+fn is_spruce_crm(port: u16) -> bool {
+    crm::is_live(port)
+}
+
+#[allow(dead_code)]
 fn spawn_server(
     rt: &tokio::runtime::Runtime,
     store: &crm::SharedStore,
@@ -836,4 +1251,56 @@ fn positive_i64(raw: &str) -> std::result::Result<i64, String> {
                 Err("value must be greater than zero".to_string())
             }
         })
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::{bind_available_crm_listener, is_spruce_crm, CrmEndpoint};
+    use std::io::{Read, Write};
+    use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
+    use std::thread;
+
+    #[test]
+    fn free_port_selection_skips_an_occupied_preference() {
+        let occupied = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .expect("bind occupied port");
+        let preferred = occupied.local_addr().expect("occupied address").port();
+        let selected = bind_available_crm_listener(preferred).expect("select another port");
+        assert_ne!(
+            selected.local_addr().expect("selected address").port(),
+            preferred
+        );
+    }
+
+    #[test]
+    fn health_probe_recognizes_an_existing_spruce_crm() {
+        let listener =
+            TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).expect("bind test CRM");
+        let port = listener.local_addr().expect("test CRM address").port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept health probe");
+            let mut request = [0_u8; 512];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(
+                    b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{\"app\":\"spruce-leaf\"}",
+                )
+                .expect("write health response");
+        });
+
+        assert!(is_spruce_crm(port));
+        server.join().expect("join test CRM");
+    }
+
+    #[test]
+    fn crm_urls_use_unambiguous_ipv4_loopback() {
+        assert_eq!(
+            CrmEndpoint {
+                port: 8799,
+                reused: true,
+            }
+            .url(),
+            "http://127.0.0.1:8799"
+        );
+    }
 }

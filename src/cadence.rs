@@ -58,9 +58,26 @@ pub async fn tick(
     compliance: &Compliance,
     cfg: &CadenceConfig,
 ) -> Result<usize> {
-    let due = db.due_touches(None, cfg.batch)?;
     let mut sent = 0usize;
     let mut dry_run_reservations = HashMap::<String, usize>::new();
+    // Stands in for account-opening sends a live pass would have persisted, so a
+    // dry-run preview reflects the same per-account throttling instead of
+    // "would send" to everyone at a company at once.
+    let mut dry_run_account_openers = HashMap::<String, usize>::new();
+
+    // A real human reply outranks new cold work. These messages are separately
+    // approval-gated, but once approved they get the first share of this pass.
+    sent += tick_conversation_replies(
+        db,
+        playbooks,
+        businesses,
+        compliance,
+        cfg,
+        cfg.batch,
+        &mut dry_run_reservations,
+    )
+    .await?;
+    let due = db.due_touches(None, cfg.batch.saturating_sub(sent as i64))?;
 
     for touch in due {
         let Some(person) = db.get_person(&touch.person_id)? else {
@@ -100,6 +117,28 @@ pub async fn tick(
                     "suppressed",
                     "skipped: suppressed",
                 )?;
+            }
+            continue;
+        }
+
+        // Stop a cadence that has gone quiet rather than marching through every
+        // remaining stage of a possibly mis-generated sequence.
+        let unanswered_cap = profile.account_limits.max_unanswered_touches;
+        if unanswered_cap > 0 && db.sequence_sent_count(&touch.sequence_id)? >= unanswered_cap {
+            if !cfg.dry_run {
+                db.stop_sequence(&touch.sequence_id, "completed", "cancelled")?;
+                db.log_event(
+                    &touch.brand,
+                    &person.id,
+                    &touch.id,
+                    "cadence_stopped",
+                    &format!("stopped: {unanswered_cap} touches sent, no reply"),
+                )?;
+            } else {
+                eprintln!(
+                    "  · would stop [{}] sequence to {} — {unanswered_cap} sent, no reply",
+                    touch.brand, person.email
+                );
             }
             continue;
         }
@@ -165,6 +204,40 @@ pub async fn tick(
             continue;
         }
 
+        // Per-account fan-out throttle: don't open a fresh cold front at an
+        // account that's already being worked, or open more than the daily
+        // allowance. Follow-ups to someone already in a thread are exempt — this
+        // only gates *new* contacts, which is where a blast comes from.
+        let is_new_front = person.status != "contacted";
+        if is_new_front {
+            if let Some(reason) = account_front_block_reason(
+                db,
+                profile,
+                &touch.lead_id,
+                quota_start,
+                quota_end,
+                &quota_date,
+                cfg.dry_run.then_some(&dry_run_account_openers),
+            )? {
+                let slot = calendar::next_slot(profile, &timing, quota_end)?;
+                if !cfg.dry_run {
+                    db.reschedule_touch(
+                        &touch.id,
+                        &slot.at.to_rfc3339(),
+                        &slot.recipient_timezone,
+                        &slot.rule,
+                        &format!("deferred: account throttle ({reason}); {}", slot.rationale),
+                    )?;
+                } else {
+                    eprintln!(
+                        "  · would defer [{}] stage {} to {} — account throttle: {reason}",
+                        touch.brand, touch.stage, person.email
+                    );
+                }
+                continue;
+            }
+        }
+
         // A configured mailbox with daily headroom, else stop for this brand.
         let mailbox = if cfg.dry_run {
             db.preview_mailbox_on(&touch.brand, &quota_date)?
@@ -200,6 +273,7 @@ pub async fn tick(
                 &person.id,
             ),
             in_reply_to,
+            references: Vec::new(),
         };
 
         match send::send_email(&mailbox, &out, cfg.dry_run).await {
@@ -210,6 +284,13 @@ pub async fn tick(
                 );
                 sent += 1;
                 reserve_dry_run(&mut dry_run_reservations, &touch.brand, &quota_date);
+                if is_new_front {
+                    reserve_account_opener(
+                        &mut dry_run_account_openers,
+                        &touch.lead_id,
+                        &quota_date,
+                    );
+                }
                 continue;
             }
             Ok(message_id) => {
@@ -264,6 +345,190 @@ pub async fn tick(
         .await?;
     }
 
+    Ok(sent)
+}
+
+async fn tick_conversation_replies(
+    db: &SharedDb,
+    playbooks: &Playbooks,
+    businesses: &Businesses,
+    compliance: &Compliance,
+    cfg: &CadenceConfig,
+    limit: i64,
+    dry_run_reservations: &mut HashMap<String, usize>,
+) -> Result<usize> {
+    let mut sent = 0usize;
+    for message in db.due_conversation_messages(limit)? {
+        let Some(conversation) = db.get_conversation(&message.conversation_id)? else {
+            if !cfg.dry_run {
+                db.set_conversation_message_status(
+                    &message.id,
+                    "failed",
+                    "",
+                    "",
+                    "conversation missing",
+                )?;
+            }
+            continue;
+        };
+        let Some(person) = db.get_person(&conversation.person_id)? else {
+            if !cfg.dry_run {
+                db.set_conversation_message_status(
+                    &message.id,
+                    "failed",
+                    "",
+                    "",
+                    "person missing",
+                )?;
+            }
+            continue;
+        };
+        let lead = db.get_lead(&conversation.lead_id)?;
+        let profile = businesses.get(&conversation.brand)?;
+        let recipient = message.recipient_email.trim();
+        if recipient.is_empty() {
+            if !cfg.dry_run {
+                db.set_conversation_message_status(
+                    &message.id,
+                    "failed",
+                    "",
+                    "",
+                    "reply recipient missing",
+                )?;
+            }
+            continue;
+        }
+        if db.is_suppressed(&conversation.brand, recipient)? {
+            if !cfg.dry_run {
+                db.set_conversation_message_status(
+                    &message.id,
+                    "cancelled",
+                    "",
+                    "",
+                    "recipient suppressed",
+                )?;
+            }
+            continue;
+        }
+
+        let timing = TimingContext {
+            industry: lead
+                .as_ref()
+                .map(|lead| lead.industry.as_str())
+                .unwrap_or(""),
+            title: &person.title,
+            vantage: &person.vantage,
+            channel: "email",
+            location: if person.location.is_empty() {
+                lead.as_ref().map(|lead| lead.hq.as_str()).unwrap_or("")
+            } else {
+                &person.location
+            },
+            timezone: if person.timezone.is_empty() {
+                lead.as_ref()
+                    .map(|lead| lead.timezone.as_str())
+                    .unwrap_or("")
+            } else {
+                &person.timezone
+            },
+            stable_key: &message.id,
+        };
+        let now = Utc::now();
+        if !calendar::can_send_now(profile, &timing, now)? {
+            continue;
+        }
+        let (quota_start, quota_end, quota_date) = calendar::quota_day_bounds(profile, now)?;
+        if !has_business_capacity(
+            db,
+            profile,
+            quota_start,
+            quota_end,
+            &quota_date,
+            cfg.dry_run,
+            dry_run_reservations,
+        )? {
+            continue;
+        }
+        let mailbox = if cfg.dry_run {
+            db.preview_mailbox_on(&conversation.brand, &quota_date)?
+        } else {
+            db.pick_mailbox_on(&conversation.brand, &quota_date)?
+        };
+        let Some(mailbox) = mailbox else {
+            continue;
+        };
+        let signature = playbooks
+            .get(&conversation.brand)
+            .map(|playbook| playbook.signature.clone())
+            .unwrap_or_default();
+        let body = compliance.render_body(&message.body, &signature, &mailbox.from_email);
+        let in_reply_to = if message.in_reply_to.is_empty() {
+            db.last_conversation_message_id(&conversation.id)?
+        } else {
+            message.in_reply_to.clone()
+        };
+        let outgoing = Outgoing {
+            to: recipient.to_string(),
+            subject: message.subject.clone(),
+            body,
+            list_unsubscribe: compliance.list_unsubscribe(
+                &mailbox.from_email,
+                &conversation.brand,
+                &person.id,
+            ),
+            in_reply_to,
+            references: message.references.clone(),
+        };
+        match send::send_email(&mailbox, &outgoing, cfg.dry_run).await {
+            Ok(_) if cfg.dry_run => {
+                eprintln!(
+                    "  · would send [{} reply] to {} via {}",
+                    conversation.brand, recipient, mailbox.from_email
+                );
+                sent += 1;
+                reserve_dry_run(dry_run_reservations, &conversation.brand, &quota_date);
+            }
+            Ok(message_id) => {
+                db.set_conversation_message_status(
+                    &message.id,
+                    "sent",
+                    &mailbox.id,
+                    &message_id,
+                    "reply sent",
+                )?;
+                db.bump_mailbox_sent(&mailbox.id)?;
+                db.log_event(
+                    &conversation.brand,
+                    &person.id,
+                    &message.id,
+                    "reply_sent",
+                    &format!("conversation reply → {recipient}"),
+                )?;
+                sent += 1;
+            }
+            Err(error) => {
+                db.set_conversation_message_status(
+                    &message.id,
+                    "failed",
+                    &mailbox.id,
+                    "",
+                    &format!("send failed: {error:#}"),
+                )?;
+                db.log_event(
+                    &conversation.brand,
+                    &person.id,
+                    &message.id,
+                    "error",
+                    &format!("conversation reply send failed: {error:#}"),
+                )?;
+            }
+        }
+        tokio::time::sleep(StdDuration::from_millis(jitter(
+            cfg.send_delay_ms,
+            &message.id,
+        )))
+        .await;
+    }
     Ok(sent)
 }
 
@@ -414,6 +679,7 @@ async fn tick_opportunity_outreach(
                 &contact.id,
             ),
             in_reply_to: db.previous_opportunity_message_id(&contact.id, touch.stage)?,
+            references: Vec::new(),
         };
 
         match send::send_email(&mailbox, &out, cfg.dry_run).await {
@@ -532,6 +798,57 @@ fn reserve_dry_run(reservations: &mut HashMap<String, usize>, brand: &str, date:
 
 fn reservation_key(brand: &str, date: &str) -> String {
     format!("{brand}:{date}")
+}
+
+/// Whether opening a *new* front at this account is allowed right now. Returns
+/// `None` if allowed, or `Some(reason)` to defer. In dry-run the reservation map
+/// stands in for the opener sends a live pass would have persisted, so a single
+/// counter feeds both limits: a freshly-opened front is at once a new opener
+/// today and a newly-engaged person.
+fn account_front_block_reason(
+    db: &SharedDb,
+    profile: &BusinessProfile,
+    lead_id: &str,
+    start: chrono::DateTime<Utc>,
+    end: chrono::DateTime<Utc>,
+    date: &str,
+    reservations: Option<&HashMap<String, usize>>,
+) -> Result<Option<String>> {
+    let limits = &profile.account_limits;
+    // `Some(map)` in dry-run, `None` live (where the DB already reflects sends).
+    let reserved = reservations
+        .and_then(|m| m.get(&account_reservation_key(lead_id, date)).copied())
+        .unwrap_or_default();
+
+    if limits.max_active_contacts_per_account > 0 {
+        let engaged = db.account_engaged_people(lead_id)? + reserved;
+        if engaged >= limits.max_active_contacts_per_account {
+            return Ok(Some(format!(
+                "{engaged} active contact(s) at account, max {}",
+                limits.max_active_contacts_per_account
+            )));
+        }
+    }
+    if limits.max_new_contacts_per_account_per_day > 0 {
+        let opened = db.account_openers_sent_between(lead_id, start, end)? + reserved;
+        if opened >= limits.max_new_contacts_per_account_per_day {
+            return Ok(Some(format!(
+                "{opened} new contact(s) opened at account today, max {}/day",
+                limits.max_new_contacts_per_account_per_day
+            )));
+        }
+    }
+    Ok(None)
+}
+
+fn reserve_account_opener(reservations: &mut HashMap<String, usize>, lead_id: &str, date: &str) {
+    *reservations
+        .entry(account_reservation_key(lead_id, date))
+        .or_default() += 1;
+}
+
+fn account_reservation_key(lead_id: &str, date: &str) -> String {
+    format!("{lead_id}:{date}")
 }
 
 /// Deterministic per-touch jitter in [base, base*1.6): spaces sends out without

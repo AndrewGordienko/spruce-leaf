@@ -10,7 +10,7 @@ It's a Rust CLI with a pluggable local-CLI reasoning engine. Each line you type 
 Apollo sourcing, contact enrichment, verified outreach planning, approval, and funnel reporting.
 
 **No model API key is needed.** Reasoning uses your existing authenticated `codex` or `claude`
-CLI session. Select one with `--backend codex|claude`; `codex` is the default. Apollo and mailbox
+CLI session. Select one with `--backend codex|claude`; `claude` is the default. Apollo and mailbox
 credentials are still required for real sourcing and delivery.
 
 ## The doctrine model
@@ -20,8 +20,8 @@ as fact** (`observed_facts`) from what can only be **guessed** (`inferences`), p
 commercial **hypothesis** being tested, its **mechanism**, a **measurable consequence** (never a
 dollar figure), the one narrow **system concept** to offer, the **hard buyer question**, and the
 **kill condition**. Contacts are chosen by **vantage point** (what they can observe/decide/route),
-not seniority. Every sequence gets a mechanical lint (forbidden phrases + length band) and an LLM
-**pre-send critique** that rewrites each touch to pass.
+not seniority. Every sequence gets deterministic sendability checks plus one structured LLM
+**copy-edit pass** that reviews and corrects only failed touches in the same response.
 
 The doctrine itself lives in editable **`playbooks/*.toml`** — a shared spine plus one file per
 brand (`gnk`, `wapahki`, `outagehub`) — so you can tune voice, length, forbidden phrases, and
@@ -30,12 +30,17 @@ vantage notes without recompiling.
 ## Knowledge ("SecondBrain")
 
 Ingest business/sales books once; spruce-leaf parses them, distills each into compact **principle
-cards** (via the selected backend), and retrieves the handful relevant to each pipeline stage (BM25, no extra
-keys) so outputs are grounded in — and cite — real playbooks instead of the model's unaided priors.
+cards** (via the selected backend), and retrieves the handful relevant to each pipeline stage (BM25,
+no extra keys) so outputs are grounded in — and cite — real playbooks instead of the model's unaided
+priors. Strategy-producing calls also receive a compact, always-on twelve-book doctrine; retrieved
+cards favor different source books before repeating one source, so a single title cannot dominate.
 
 ```sh
 spruce-leaf ingest ./books                 # .txt / .md / .pdf, file or directory
 spruce-leaf ingest book.pdf --max-sections 24
+spruce-leaf ingest ./books --no-distill    # add searchable passages without model usage
+# Re-run without --no-distill later to upgrade raw-only sources in place.
+scripts/distill-core-library.sh            # retry the private core library safely
 ```
 
 The YouTube workflow builds copyright-safe research notes from official captions: it keeps
@@ -58,12 +63,22 @@ catalog live under `.spruce/videos/`; full transcripts are never retained.
 
 ## Setup
 
-Needs the Rust toolchain (`cargo`) and either the `codex` CLI (default) or Claude Code on PATH.
+Needs the Rust toolchain (`cargo`) and either Claude Code (default) or the `codex` CLI on PATH.
+
+Install the command once, then use `spruce-leaf` from the project directory. The installed
+command asks Cargo for the latest local workspace build on every launch; Cargo's incremental
+cache makes unchanged starts fast and automatically downloads any missing Rust dependencies.
 
 ```sh
-cargo run                 # launches the interactive REPL + CRM
-cargo run -- --backend claude
+cargo install --path . --force   # one-time command install
+spruce-leaf                      # latest local build + REPL + CRM
+spruce-leaf --backend codex
 ```
+
+CRM startup is automatic. Spruce Leaf first reuses an existing Spruce Leaf CRM; otherwise it
+tries port 8787 and moves to the next free loopback port. The exact `http://127.0.0.1:<port>` URL
+is printed in the session header and `/crm` opens it. `--port <number>` sets a preferred port,
+but an occupied port no longer prevents startup.
 
 For real execution, add `APOLLO_API_KEY` and one or more brand-prefixed mailboxes to `.env`:
 
@@ -148,13 +163,13 @@ $ cargo run
 ╭────────────────────────────────────────────────────────╮
 │ >_ Spruce Leaf (v0.1.0)                                │
 │                                                        │
-│ model:     codex · default                             │
+│ model:     claude · default                            │
 │ brand:     gnk   /brand to change                      │
 │ directory: /work/sales-os2                             │
 │ crm:       http://localhost:8787   /crm to open        │
 ╰────────────────────────────────────────────────────────╯
 
-  codex default · gnk · sales-os2
+  claude default · gnk · sales-os2
 › find 5 logistics accounts with manual invoice reconciliation
 • I’ll map the account pattern, then find the people closest to the workflow.
 
@@ -171,7 +186,13 @@ an empty-state hint, and Tab completion for slash commands.
 Open the dashboard to see both the real execution funnel (leads, people, verification, scheduled
 touches, mailbox capacity, replies, and recent activity) and research-only campaign hypotheses.
 
-REPL commands: `/crm`, `/brand [key]`, `/clear`, `/help`, `/quit`.
+REPL commands: `/crm`, `/brand [key]`, `/model [codex|claude] [id|default]`, `/clear`,
+`/help`, `/quit`.
+
+The selected reasoning CLI automatically falls back to the other provider when it reports an
+exhausted usage allowance. The switch persists for later calls. Use `/model codex` or
+`/model claude` to switch manually; add a model ID to override that provider's default, or use
+`default` to clear its override.
 
 ## Subcommands & options
 
@@ -189,7 +210,14 @@ cargo run -- approve                      # schedules email drafts only
 cargo run -- mailboxes                    # load env config + check SPF/DMARC/MX
 cargo run -- daemon                       # one read-only preview pass, then exit
 cargo run -- daemon --live                # requires address + healthy sending domains
-cargo run -- inbox                        # one IMAP reply-triage pass
+cargo run -- daemon --live --autopilot    # also fill discovery funnel toward configured targets
+cargo run -- inbox                        # resolve threads + create approval-gated reply drafts
+cargo run -- approve-replies              # schedule reply-agent drafts
+cargo run -- inbox --book                 # also book an explicitly accepted offered slot
+cargo run -- meetings                     # inspect pending/booked meetings
+cargo run -- book-meetings                # approve pending calendar insertions
+cargo run -- jobs                         # queue + dead-letter health
+cargo run -- synthesize                    # recurring-problem/convergence report
 cargo run -- stats
 cargo run -- --brand wapahki calendar     # policy, 7-day capacity, observed timing
 cargo run -- suppress person@example.com
@@ -198,15 +226,24 @@ cargo run -- suppress person@example.com
 #   --brand <gnk|wapahki|outagehub>   brand playbook            (default gnk)
 #   --playbooks <dir>                 playbook TOML directory   (default playbooks)
 #   --businesses <dir>                business TOML directory   (default businesses)
-#   --backend <codex|claude>          reasoning CLI             (default codex)
+#   --backend <codex|claude>          reasoning CLI             (default claude)
 #   --model <id>                      backend model override    (default: its default)
-#   --no-critique                     skip the pre-send critique/rewrite
-#   --concurrency <N>                 concurrent model calls    (default 5)
-#   --port <N>                        CRM dashboard port        (default 8787)
+#   --no-critique                     use deterministic QA only; skip the semantic copy edit
+#   --concurrency <N>                 concurrent model calls    (default 2)
+#   --port <N>                        preferred CRM port; otherwise reuse/new free localhost port
 #   --store <path>                    CRM JSON store            (default .spruce/crm.json)
 #   --knowledge <path>                knowledge library JSON    (default .spruce/knowledge.json)
 #   --db <path>                       execution SQLite db        (default .spruce/sales.db)
 ```
+
+The REPL prints input, cached-input, output, failed-attempt, and fallback usage
+after every request. `/usage` shows the cumulative per-stage breakdown. The same
+metadata (never prompts or model output) is appended to
+`.spruce/model-usage.jsonl`. Bulk sourcing, research, opportunity discovery, and
+outreach fail fast when a provider is exhausted; automatic cross-provider
+fallback is reserved for interactive routing and replies. Provider subprocesses
+run without coding tools, project rules, plugins, or browser integrations so an
+inference call does not pay for a second agent workspace.
 
 ## Layout
 
@@ -214,7 +251,7 @@ cargo run -- suppress person@example.com
 - `src/repl.rs` — the interactive `spruce-leaf ›` prompt.
 - `src/agent.rs` — the streaming structured-router agent for research and real execution actions.
 - `src/engine.rs` — provider-neutral structured/streamed inference over Codex or Claude CLI.
-- `src/pipeline.rs` — the doctrine pipeline: accounts → contacts (by vantage) → sequence → critique.
+- `src/pipeline.rs` — the research-only pipeline: accounts → contacts (by vantage) → sequence → copy edit.
 - `src/prompts.rs` / `src/playbook.rs` — per-stage prompts/schemas and the brand playbooks.
 - `src/business.rs` / `src/opportunity.rs` — active-business context and generic sourced opportunity pursuit.
 - `src/knowledge.rs` — the book library: ingest, distill, BM25 retrieval.
@@ -224,10 +261,30 @@ cargo run -- suppress person@example.com
 
 ### SDR execution layer
 
-`src/{db,apollo,sourcing,enrich,verify,outreach,cadence,mailbox,send,inbox,triage,compliance}.rs`
+`src/{db,apollo,sourcing,enrich,verify,outreach,cadence,mailbox,send,inbox,reply_agent,jobs,google_calendar,triage,compliance}.rs`
 form the real execution spine: SQLite durability, Apollo identity data, DNS verification,
-approval-gated scheduling, capped SMTP delivery, IMAP reply handling, suppression, and metrics.
+approval-gated scheduling, capped SMTP delivery, durable job leases, RFC-threaded reply handling,
+guarded Google Calendar booking, suppression, and metrics.
 The CLI, interactive agent, and dashboard all operate on this same database.
+
+### Discovery autopilot and meetings
+
+`daemon --live --autopilot` runs the deterministic supervisor above the existing execution
+pipeline. It fills each brand from the top—source accounts, reveal/verify people, then draft
+reviewed cadences—and persists every lease, retry, result, and dead-letter row in SQLite. Cold
+drafts remain behind `approve`; the autopilot flag does not grant a new sending permission.
+
+Inbound identity prefers RFC `In-Reply-To` and `References` over the sender address. A new person
+introduced on CC therefore stays attached to the original account and thread. Human replies stop
+the cold sequence and produce a separate conversational draft; `approve-replies` schedules it.
+
+Google Calendar is optional. Configure the OAuth variables and per-brand calendar settings shown
+in `.env.example`. The reply agent may offer only slots returned free by Calendar. A meeting is
+booked only when the prospect accepts an exact slot that appeared in a reply actually sent; the
+system rechecks FreeBusy immediately before creating the event and asks Google to notify the
+attendee. The live autopilot daemon may complete that guarded booking automatically. Plain live
+mode and one-shot `inbox` record it as pending unless `inbox --book` is explicit; use
+`book-meetings` to approve pending inserts.
 
 ### Outreach calendar intelligence
 
