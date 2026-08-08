@@ -5,13 +5,14 @@ play: find accounts with an expensive workflow, the people positioned to see tha
 and a hypothesis-led outreach sequence for each — grounded in a library of real sales books —
 then files everything in a local CRM.
 
-It's a Rust CLI with a pluggable local-CLI reasoning engine. Each line you type goes to Codex
-(the default) or Claude, which can research a campaign or operate the real execution pipeline:
+It's a Rust CLI with a provider-neutral reasoning engine. Each line you type goes directly to the
+OpenAI Responses API by default, or to the optional Claude, Codex, or Grok local CLI, and can operate:
 Apollo sourcing, contact enrichment, verified outreach planning, approval, and funnel reporting.
 
-**No model API key is needed.** Reasoning uses your existing authenticated `codex` or `claude`
-CLI session. Select one with `--backend codex|claude`; `codex` is the default. Apollo and mailbox
-credentials are still required for real sourcing and delivery.
+Set `OPENAI_API_KEY` for the default backend. The normal model is `gpt-5.6-terra`; lightweight
+routing uses `gpt-5.6-luna`. Select Sol explicitly for unusually hard work with
+`--model gpt-5.6-sol`. Authenticated `claude`, `codex`, and `grok` CLIs remain available through
+`--backend`. Apollo and mailbox credentials are still required for real sourcing and delivery.
 
 ## The doctrine model
 
@@ -20,31 +21,49 @@ as fact** (`observed_facts`) from what can only be **guessed** (`inferences`), p
 commercial **hypothesis** being tested, its **mechanism**, a **measurable consequence** (never a
 dollar figure), the one narrow **system concept** to offer, the **hard buyer question**, and the
 **kill condition**. Contacts are chosen by **vantage point** (what they can observe/decide/route),
-not seniority. Every sequence gets a mechanical lint (forbidden phrases + length band) and an LLM
-**pre-send critique** that rewrites each touch to pass.
+not seniority. Every sequence gets deterministic sendability checks and structured review. The
+direct API path uses one account-level plan/write call plus one editor pass and, only when needed,
+up to two stage-scoped repair passes per recipient. Every provider then runs the configured
+ten-lens sales council; Rust independently reruns the sendability rules.
 
 The doctrine itself lives in editable **`playbooks/*.toml`** — a shared spine plus one file per
 brand (`gnk`, `wapahki`, `outagehub`) — so you can tune voice, length, forbidden phrases, and
-vantage notes without recompiling.
+vantage notes without recompiling. Specialist roles are also editable rather than embedded in
+Rust: **`playbooks/personas/planner.md`**, **`writer.md`**, and **`reviewer.md`**. The council's
+source-grounded critic lenses live under **`playbooks/personas/critics/`**, one editable Markdown
+file per critic.
 
 ## Knowledge ("SecondBrain")
 
 Ingest business/sales books once; spruce-leaf parses them, distills each into compact **principle
-cards** (via the selected backend), and retrieves the handful relevant to each pipeline stage (BM25, no extra
-keys) so outputs are grounded in — and cite — real playbooks instead of the model's unaided priors.
+cards** (via the selected backend), and retrieves the handful relevant to each pipeline stage (BM25,
+no extra keys) so outputs are grounded in — and cite — real playbooks instead of the model's unaided
+priors. Strategy-producing calls also receive a compact, always-on twelve-book doctrine; retrieved
+cards favor different source books before repeating one source, so a single title cannot dominate.
+For API outreach, planning and writing knowledge are retrieved separately but combined into one
+Terra account-level generation call; each recipient then receives one concurrent Luna reviewer call. Local CLI outreach
+keeps the roles separate. The planner/writer output must cite at least one retrieved library
+principle; citations are stored on the sequence.
 
 ```sh
 spruce-leaf ingest ./books                 # .txt / .md / .pdf, file or directory
 spruce-leaf ingest book.pdf --max-sections 24
+spruce-leaf ingest ./books --no-distill    # add searchable passages without model usage
+# Re-run without --no-distill later to upgrade raw-only sources in place.
+scripts/distill-core-library.sh            # retry the private core library safely
 ```
+
+Markdown skill repositories use the same knowledge path. Install or clone them, then ingest their
+skill directories with `--no-distill` for immediate passage retrieval; re-run later without the
+flag to distill reusable principle cards.
 
 The YouTube workflow builds copyright-safe research notes from official captions: it keeps
 paraphrased summaries, timestamped principles, claims-to-verify, and source URLs, then deletes the
-temporary caption files. The tracked manifest currently contains 12 core and 8 extended
+temporary caption files. The local manifest currently contains 13 core and 8 extended
 Hormozi/Serhant interviews.
 
 ```sh
-# Build or resume the 12 core episode notes, then merge them into the library.
+# Build or resume the 13 core episode notes, then merge them into the library.
 YOUTUBE_NOTES_TIER=core scripts/build-youtube-notes.sh
 scripts/ingest-youtube-notes.sh
 
@@ -58,12 +77,47 @@ catalog live under `.spruce/videos/`; full transcripts are never retained.
 
 ## Setup
 
-Needs the Rust toolchain (`cargo`) and either the `codex` CLI (default) or Claude Code on PATH.
+Needs the Rust toolchain (`cargo`) and an OpenAI API key. Claude Code, Codex CLI, and Grok CLI are
+optional local-backend alternatives.
+
+Install the command once, then use `spruce-leaf` from the project directory. The installed
+command asks Cargo for the latest local workspace build on every launch; Cargo's incremental
+cache makes unchanged starts fast and automatically downloads any missing Rust dependencies.
 
 ```sh
-cargo run                 # launches the interactive REPL + CRM
-cargo run -- --backend claude
+cargo install --path . --force   # one-time command install
+# Add OPENAI_API_KEY to your existing .env
+spruce-leaf                      # latest local build + REPL + CRM (GPT-5.6 Terra)
+spruce-leaf --model gpt-5.6-sol  # opt into frontier quality for a hard run
+spruce-leaf --backend claude
+spruce-leaf --backend codex
+spruce-leaf --backend grok
+# In the REPL: /model gpt   or   /model openai gpt-5.6-sol
 ```
+
+CRM startup is automatic. An interactive `spruce-leaf` session starts a CRM owned by the current
+build and in-memory runtime, choosing port 8787 or the next free loopback port. Standalone
+`spruce-leaf crm` / `spruce-leaf gtm` viewers may reuse a protocol-compatible CRM that is already
+running. The exact `http://127.0.0.1:<port>` URL is printed in the session header and `/crm` opens
+it. `--port <number>` sets the first port to try; an occupied port no longer prevents startup.
+
+The same localhost app has three surfaces:
+
+- **Pipeline** (`/`, `/b/<brand>`) — the live people sheet, sequences, and execution state.
+- **Strategy** (`/strategy`, `/strategy/<brand>`) — the business side of the SDR: what each brand
+  is trying to accomplish, enabled motions, hard constraints, and the outreach doctrine from
+  `businesses/*.toml` + `playbooks/*.toml`. It also shows the three agent personas, all ten sales
+  council lenses, and the live book/skill/passages counts. `spruce-leaf crm` opens the Strategy
+  board first.
+- **GTM Lab** (`/gtm`, `/gtm/<brand>`) — the GTM-engineering control plane: canonical signals,
+  versioned plays, account-level root-cause assessments, controlled experiments, attributed
+  outcomes, and approval-gated customer proofs. Run `spruce-leaf gtm` or use `/gtm` in the REPL.
+
+At phone widths the Pipeline becomes account → contact → touch cards instead of a compressed
+spreadsheet. Approvals, LinkedIn connection state, full copy, QA, and delivery timing remain
+available; Mac widths retain the dense people sheet. The localhost UI is still private and
+single-user. See [ARCHITECTURE.md](ARCHITECTURE.md) for the authenticated mobile agent, Today
+queue, cloud runtime, and outcome-oriented product plan.
 
 For real execution, add `APOLLO_API_KEY` and one or more brand-prefixed mailboxes to `.env`:
 
@@ -112,6 +166,13 @@ instrument type, deadline evidence, eligibility, blockers, unknowns, fit score, 
 last verification time. Closed recurring programmes and forecast calls remain on the watchlist;
 rerun discovery to refresh them. Add `JINA_API_KEY` for the broad official-domain search source.
 
+Business profiles may also carry source-linked `[[discovery_evidence]]` records. These are
+first-party founder call learnings, kept separate from target-account facts. They shape ICP,
+qualification, next questions, and at most one explicitly attributed follow-up angle; participant
+estimates and cross-industry analogies cannot silently become claims about a prospect. Wapahki's
+two current call records are visible on its Strategy page and mirrored in
+`knowledge-sources/wapahki-discovery-calls.md`.
+
 ```sh
 # Find/refresh official opportunities. "Grant" is not used as a catch-all:
 # contributions, tax credits, procurement, pilots, challenges, and advisory programmes stay typed.
@@ -148,30 +209,124 @@ $ cargo run
 ╭────────────────────────────────────────────────────────╮
 │ >_ Spruce Leaf (v0.1.0)                                │
 │                                                        │
-│ model:     codex · default                             │
+│ model:     claude · default                            │
 │ brand:     gnk   /brand to change                      │
 │ directory: /work/sales-os2                             │
 │ crm:       http://localhost:8787   /crm to open        │
 ╰────────────────────────────────────────────────────────╯
 
-  codex default · gnk · sales-os2
+  claude default · gnk · sales-os2
 › find 5 logistics accounts with manual invoice reconciliation
 • I’ll map the account pattern, then find the people closest to the workflow.
 
-• Running campaign
-  └ GnK · manual invoice reconciliation · 5×5×7
-    ⠹ Researching accounts…
+• Sourcing companies
+  └ GnK · 5 account target · 5 people each · active GTM play
+
+  ✓ Built ICP
+    └ 9 keywords · 8 buyer titles · 3 size bands
+
+  ✓ Found candidate companies
+    └ 10 returned · 10 new to qualify · 0 already judged
+
+  ⠹ Qualifying root-cause fit
+    ├ 6/10 reviewed · 2 qualified · 2 research-needed · 2 skipped
+    └ Latest: research needed Acme Logistics · fit 61/100
+
+  └ ⠹ 8/10 calls · 14.2k in · 2.1k out · 94s
 ```
 
-The terminal keeps the transcript readable while work is live: model reasoning streams as muted
-commentary, actions become nested tool cells, and longer campaigns redraw account-level progress
-in place with elapsed time, model calls, tokens, and cost. The composer supports history, paste,
-an empty-state hint, and Tab completion for slash commands.
+The terminal keeps the transcript readable while work is live: private router scratch-work stays
+private, one concise action intent appears before execution, and longer jobs redraw progress in
+place as stable Codex-style milestones with blue active work, gray nested evidence, orange warnings,
+green completions, elapsed time, model calls, tokens, and cost. Sourcing keeps ICP construction,
+Apollo retrieval, official-site research, root-cause qualification, targeting learning, and contact
+mapping on separate rows instead of flattening them into one spinner. Outreach gets a colored per-recipient tree
+for account strategy/writing, per-recipient copy QA, and ready/rejected states; recipient reviews run
+concurrently. The composer supports history, paste, an empty-state hint, and
+Tab completion for slash commands.
+
+Qualification distinguishes negative evidence from missing evidence. Accounts that fully satisfy
+the active play are `qualified`; plausible accounts with two supported play signals and no hard
+blocker are retained as `research_needed`, so discovery copy tests the missing task/exception signal
+without claiming it. Affirmative mismatches are rejected. Each pass also persists recurring ICP and
+contact-coverage failure patterns and injects them into the next ICP build; legacy two-signal rejects
+from the older hard gate are automatically reconsidered once.
+
+Outreach also streams into the CRM. Each recipient gets non-sendable `writing` placeholders as
+soon as work begins; raw copy replaces them when the writer returns, reviewed copy replaces that
+during QA, and the pipeline refreshes every three seconds. Only final-gate-approved copy is
+promoted to an active draft sequence, so a failed rewrite cannot delete the prior unsent draft.
+
+### Gmail login (per brand, browser OAuth)
+
+Connect each brand mailbox without App Passwords or IMAP settings changes:
+
+```sh
+# One-time: put a Google Cloud Desktop OAuth client in .env
+#   GOOGLE_CLIENT_ID=...
+#   GOOGLE_CLIENT_SECRET=...
+# Enable Gmail API on that project. Redirect: loopback http://127.0.0.1
+
+spruce-leaf                # or just run the REPL
+› /login gnk               # Chrome opens → sign in as the GnK mailbox
+› /login wapahki
+› /login outagehub
+› /mail                    # status of linked accounts
+› /mail-sync               # pull inbox + sent → conversations + learnings
+```
+
+Tokens live in `.spruce/google/<brand>.json` (owner-only permissions). Sync matches
+threads to CRM people when possible, records reply / no-reply learnings, and is
+what the daemon/inbox path uses when a brand is OAuth-linked.
+
+### Reuse-first full motion
+
+When you ask Spruce Leaf to find companies, the requested count is the **output count**, not an
+instruction to accept the first Apollo results. The active versioned play first shapes the Apollo
+ICP; Spruce Leaf then over-fetches a bounded candidate pool and requires source-backed evidence for
+the operational decision, underlying root cause/current workaround, a reachable workflow vantage,
+and a bounded proof. Generic industry, scale, hiring, or technology similarity cannot qualify an
+account by itself. Qualified companies are ranked by play-fit score and canonical signal evidence,
+and each assessment is visible in GTM Lab.
+
+For example, `find 5 companies for ohub` uses the active OutageHub play and returns the five
+strongest qualified candidates it found—not simply five outage-sensitive companies. Drafting then
+inherits the exact play version, evidence IDs, and experiment arm that selected each account.
+
+When you already have companies and people on file (for example after an earlier OutageHub run),
+asking for “5 companies, 5 people, 7-stage sequence” **does not re-search Apollo**. Spruce Leaf:
+
+1. picks the strongest on-file accounts/contacts for that brand,
+2. refreshes why each company fits (hypothesis / mechanism / “why them” — no Apollo),
+3. reveals emails only for contacts still missing a verified address,
+4. rewrites the multi-touch sequences against that updated framing.
+
+Apollo runs only for an account shortfall, or when you explicitly ask for **new/fresh** companies
+(`force_new`). That keeps re-runs cheap and keeps sequences aligned with the current business
+profile and playbook.
+
+The working-set IDs are enforced during enrichment: a 5-account × 5-person request reveals those
+five selected contacts at each account, rather than the first 25 unenriched rows in database order.
+The same cardinality contract applies to scoped re-drafting. A request for 5 accounts × 2 people
+cannot be silently reduced by a router-supplied total limit; Spruce Leaf resolves the ten visible
+people first, reports the exact scope, and reveals email only for selected identities that are still
+pending. If Apollo cannot verify someone, the final response names the per-account coverage gap
+instead of pretending the requested batch ran. Add “without Apollo,” “no enrichment,” or
+“verified only” to keep that scoped run credit-free.
+If the reasoning provider reaches a session limit, bulk drafting stops after the already-running
+batch, preserves exact per-recipient feedback, saves any copy that already passed, and reports
+provider-stopped separately from copy-rejected.
 
 Open the dashboard to see both the real execution funnel (leads, people, verification, scheduled
 touches, mailbox capacity, replies, and recent activity) and research-only campaign hypotheses.
 
-REPL commands: `/crm`, `/brand [key]`, `/clear`, `/help`, `/quit`.
+REPL commands: `/crm`, `/gtm`, `/brand [key]`, `/model [openai|codex|claude|grok] [id|default]`, `/clear`,
+`/help`, `/quit`.
+
+The selected reasoning provider automatically falls back when it reports an
+exhausted usage allowance. The switch persists for later calls. Use `/model codex` or
+`/model openai` to switch manually; add a model ID to override that provider's default, or use
+`default` to clear its override.
 
 ## Subcommands & options
 
@@ -180,6 +335,7 @@ cargo run                                 # interactive REPL (default)
 cargo run -- run "<thesis>" [--accounts 5] [--contacts 5] [--touches 7] [--report brief.md]
 cargo run -- ingest <path...> [--no-distill] [--max-sections 24]
 cargo run -- crm                          # just serve the dashboard
+cargo run -- gtm                          # open the GTM engineering lab
 
 # Real, restart-safe SDR execution:
 cargo run -- source "mid-market 3PL invoice reconciliation" --accounts 10 --contacts 3
@@ -189,7 +345,14 @@ cargo run -- approve                      # schedules email drafts only
 cargo run -- mailboxes                    # load env config + check SPF/DMARC/MX
 cargo run -- daemon                       # one read-only preview pass, then exit
 cargo run -- daemon --live                # requires address + healthy sending domains
-cargo run -- inbox                        # one IMAP reply-triage pass
+cargo run -- daemon --live --autopilot    # also fill discovery funnel toward configured targets
+cargo run -- inbox                        # resolve threads + create approval-gated reply drafts
+cargo run -- approve-replies              # schedule reply-agent drafts
+cargo run -- inbox --book                 # also book an explicitly accepted offered slot
+cargo run -- meetings                     # inspect pending/booked meetings
+cargo run -- book-meetings                # approve pending calendar insertions
+cargo run -- jobs                         # queue + dead-letter health
+cargo run -- synthesize                    # recurring-problem/convergence report
 cargo run -- stats
 cargo run -- --brand wapahki calendar     # policy, 7-day capacity, observed timing
 cargo run -- suppress person@example.com
@@ -198,25 +361,35 @@ cargo run -- suppress person@example.com
 #   --brand <gnk|wapahki|outagehub>   brand playbook            (default gnk)
 #   --playbooks <dir>                 playbook TOML directory   (default playbooks)
 #   --businesses <dir>                business TOML directory   (default businesses)
-#   --backend <codex|claude>          reasoning CLI             (default codex)
+#   --backend <openai|claude|codex|grok> inference provider      (default openai)
 #   --model <id>                      backend model override    (default: its default)
-#   --no-critique                     skip the pre-send critique/rewrite
-#   --concurrency <N>                 concurrent model calls    (default 5)
-#   --port <N>                        CRM dashboard port        (default 8787)
+#   --no-critique                     use deterministic QA only; skip the semantic copy edit
+#   --concurrency <N>                 concurrent model calls    (default 2)
+#   --port <N>                        preferred CRM port; otherwise reuse/new free localhost port
 #   --store <path>                    CRM JSON store            (default .spruce/crm.json)
 #   --knowledge <path>                knowledge library JSON    (default .spruce/knowledge.json)
 #   --db <path>                       execution SQLite db        (default .spruce/sales.db)
 ```
+
+The REPL prints input, cached-input, cache-write, output, failed-attempt, and fallback usage
+after every request. `/usage` shows the cumulative per-stage breakdown. The same
+metadata (never prompts or model output) is appended to
+`.spruce/model-usage.jsonl`. Bulk sourcing, research, opportunity discovery, and
+outreach fail fast when a provider is exhausted; automatic cross-provider
+fallback is reserved for interactive routing and replies. Provider subprocesses
+run without coding tools, project rules, plugins, or browser integrations so an
+inference call does not pay for a second agent workspace.
 
 ## Layout
 
 - `src/main.rs` — CLI + subcommands; starts the runtime, CRM server, and REPL.
 - `src/repl.rs` — the interactive `spruce-leaf ›` prompt.
 - `src/agent.rs` — the streaming structured-router agent for research and real execution actions.
-- `src/engine.rs` — provider-neutral structured/streamed inference over Codex or Claude CLI.
-- `src/pipeline.rs` — the doctrine pipeline: accounts → contacts (by vantage) → sequence → critique.
-- `src/prompts.rs` / `src/playbook.rs` — per-stage prompts/schemas and the brand playbooks.
+- `src/engine.rs` — Responses API inference plus optional Codex, Claude, and Grok CLI adapters.
+- `src/pipeline.rs` — the research-only pipeline: accounts → contacts (by vantage) → sequence → copy edit.
+- `src/prompts.rs` / `src/playbook.rs` — per-stage schemas, editable personas, and brand playbooks.
 - `src/business.rs` / `src/opportunity.rs` — active-business context and generic sourced opportunity pursuit.
+- `src/gtm.rs` — canonical signal taxonomy, versioned GTM plays, sourcing policy, and action context.
 - `src/knowledge.rs` — the book library: ingest, distill, BM25 retrieval.
 - `src/crm.rs` — unified axum dashboard for the JSON research store and SQLite execution db.
 - `src/ui.rs` — terminal streaming/progress rendering.
@@ -224,14 +397,48 @@ cargo run -- suppress person@example.com
 
 ### SDR execution layer
 
-`src/{db,apollo,sourcing,enrich,verify,outreach,cadence,mailbox,send,inbox,triage,compliance}.rs`
+`src/{db,apollo,sourcing,enrich,verify,outreach,cadence,mailbox,send,inbox,reply_agent,jobs,google_calendar,triage,compliance}.rs`
 form the real execution spine: SQLite durability, Apollo identity data, DNS verification,
-approval-gated scheduling, capped SMTP delivery, IMAP reply handling, suppression, and metrics.
+approval-gated scheduling, capped SMTP delivery, durable job leases, RFC-threaded reply handling,
+guarded Google Calendar booking, suppression, and metrics.
 The CLI, interactive agent, and dashboard all operate on this same database.
+
+### Discovery autopilot and meetings
+
+`daemon --live --autopilot` runs the deterministic supervisor above the existing execution
+pipeline. It fills each brand from the top—source accounts, reveal/verify people, then draft
+reviewed cadences—and persists every lease, retry, result, and dead-letter row in SQLite. Cold
+drafts remain behind `approve`; the autopilot flag does not grant a new sending permission.
+
+Inbound identity prefers RFC `In-Reply-To` and `References` over the sender address. A new person
+introduced on CC therefore stays attached to the original account and thread. Human replies stop
+the cold sequence and produce a separate conversational draft; `approve-replies` schedules it.
+
+Google Calendar is optional. Configure the OAuth variables and per-brand calendar settings shown
+in `.env.example`. The reply agent may offer only slots returned free by Calendar. A meeting is
+booked only when the prospect accepts an exact slot that appeared in a reply actually sent; the
+system rechecks FreeBusy immediately before creating the event and asks Google to notify the
+attendee. The live autopilot daemon may complete that guarded booking automatically. Plain live
+mode and one-shot `inbox` record it as pending unless `inbox --book` is explicit; use
+`book-meetings` to approve pending inserts.
+
+### Seven-touch email and LinkedIn cadence
+
+New seven-touch plans use one 21-day cadence: email on days 0 and 3, a
+personalized LinkedIn connection request on day 5, email on day 9, a conditional
+LinkedIn/email touch on day 13, email on day 17, and a conditional close on day
+21. There are no new call touches. Connection requests are short and contain no
+pitch or meeting ask.
+
+Spruce Leaf does not scrape LinkedIn connection state. The CRM therefore exposes
+an explicit status beside each person. A conditional touch is held as a manual
+LinkedIn DM when the person is marked connected; otherwise it remains an
+approval-gated email fallback. Completing a connection-request task marks the
+person requested, and every email follow-up keeps RFC thread headers.
 
 ### Outreach calendar intelligence
 
-Every planned email, LinkedIn task, and call receives a recipient-local calendar
+Every planned email, LinkedIn task, and legacy call receives a recipient-local calendar
 slot. Used and reserved capacity is counted across all channels at a maximum of
 30 touchpoints per business day for each of `gnk`, `wapahki`, and `outagehub`
 independently. The live

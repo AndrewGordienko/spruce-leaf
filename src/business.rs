@@ -25,12 +25,84 @@ pub struct BusinessProfile {
     pub goals: Vec<String>,
     #[serde(default)]
     pub constraints: Vec<String>,
+    /// Source-linked founder discovery. Unlike `known_facts`, these are
+    /// participant reports about their own work or market; they guide ICP and
+    /// questions but never become facts about a target account.
+    #[serde(default)]
+    pub discovery_evidence: Vec<DiscoveryEvidence>,
     #[serde(default)]
     pub motions: Vec<Motion>,
     #[serde(default)]
     pub funding: Option<FundingProfile>,
     #[serde(default)]
     pub calendar: OutreachCalendar,
+    #[serde(default)]
+    pub account_limits: AccountLimits,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct DiscoveryEvidence {
+    pub id: String,
+    #[serde(default)]
+    pub recorded_at: String,
+    #[serde(default)]
+    pub source_kind: String,
+    #[serde(default)]
+    pub source_url: String,
+    #[serde(default)]
+    pub segment: String,
+    #[serde(default)]
+    pub participant_context: String,
+    #[serde(default)]
+    pub evidence_level: String,
+    #[serde(default)]
+    pub reported_workflows: Vec<String>,
+    #[serde(default)]
+    pub reported_estimates: Vec<String>,
+    #[serde(default)]
+    pub working_interpretations: Vec<String>,
+    #[serde(default)]
+    pub sourcing_implications: Vec<String>,
+    #[serde(default)]
+    pub follow_up_angles: Vec<String>,
+    #[serde(default)]
+    pub next_questions: Vec<String>,
+    #[serde(default)]
+    pub limits: Vec<String>,
+}
+
+/// Per-account send throttles. The business `daily_touch_cap` bounds the *total*
+/// volume, but says nothing about how that volume is spread. Without these, the
+/// cadence engine will happily open a cold email to five people at the same
+/// plant within the same hour — which reads as a blast, burns the account, and
+/// is exactly the failure mode an autopilot amplifies. These are enforced at
+/// send time, so they hold no matter what queued the work (human approval or an
+/// autonomous supervisor). A value of `0` disables that particular limit.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AccountLimits {
+    /// How many *new* conversational fronts (a first touch to a not-yet-contacted
+    /// person) may open at one account per business day. Follow-ups to people
+    /// already in a thread are never blocked by this.
+    #[serde(default = "default_max_new_contacts_per_account_per_day")]
+    pub max_new_contacts_per_account_per_day: usize,
+    /// How many people at one account may be actively worked (contacted or
+    /// replied) at once. Bounds parallel fronts across days, not just per day.
+    #[serde(default = "default_max_active_contacts_per_account")]
+    pub max_active_contacts_per_account: usize,
+    /// Stop a person's sequence once this many touches have been sent with no
+    /// reply, rather than marching through every stage of a mis-generated cadence.
+    #[serde(default = "default_max_unanswered_touches")]
+    pub max_unanswered_touches: usize,
+}
+
+impl Default for AccountLimits {
+    fn default() -> Self {
+        Self {
+            max_new_contacts_per_account_per_day: default_max_new_contacts_per_account_per_day(),
+            max_active_contacts_per_account: default_max_active_contacts_per_account(),
+            max_unanswered_touches: default_max_unanswered_touches(),
+        }
+    }
 }
 
 /// The business-owned outreach calendar. This is deliberately separate from
@@ -170,6 +242,18 @@ fn default_daily_touch_cap() -> usize {
     30
 }
 
+fn default_max_new_contacts_per_account_per_day() -> usize {
+    1
+}
+
+fn default_max_active_contacts_per_account() -> usize {
+    2
+}
+
+fn default_max_unanswered_touches() -> usize {
+    5
+}
+
 fn default_calendar_timezone() -> String {
     "Europe/London".into()
 }
@@ -236,6 +320,16 @@ impl Businesses {
     pub fn keys(&self) -> Vec<&str> {
         self.profiles.keys().map(String::as_str).collect()
     }
+
+    /// One compact line per business, so the router keeps a sense of the whole
+    /// portfolio (what each brand is) even while it acts on the active one.
+    pub fn roster(&self) -> String {
+        self.profiles
+            .values()
+            .map(|p| format!("- {} ({}): {}", p.name, p.key, p.summary))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 impl BusinessProfile {
@@ -265,20 +359,122 @@ impl BusinessProfile {
             .map(|m| format!("{} ({})", m.key, m.kind))
             .collect::<Vec<_>>()
             .join(", ");
-        format!(
+        let mut summary = format!(
             "{}: {} Enabled motions: {}. Outreach calendar: at most {} total touchpoints per {} day; recipient-local timing with named industry/title exceptions.",
             self.name,
             self.summary,
             motions,
             self.calendar.daily_touch_cap,
             self.calendar.quota_timezone,
-        )
+        );
+        if !self.goals.is_empty() {
+            summary.push_str(&format!(
+                " What {} is trying to accomplish: {}",
+                self.name,
+                self.goals.join(" ")
+            ));
+        }
+        if !self.constraints.is_empty() {
+            summary.push_str(&format!(
+                " Hard constraints: {}",
+                self.constraints.join(" ")
+            ));
+        }
+        summary
+    }
+
+    /// The durable operating context handed to the sourcing pipeline: what the
+    /// business is, what it is actually trying to accomplish with this outreach,
+    /// and the constraints it must respect. Threading this into ICP derivation
+    /// and qualification is what makes those stages judge a candidate against the
+    /// *business's* real goals instead of a single one-line motion.
+    pub fn operating_context(&self) -> String {
+        let mut s = format!("ABOUT {} — {}\n", self.name, self.summary);
+        if !self.known_facts.is_empty() {
+            s.push_str("What is true about the business (may be stated plainly):\n");
+            for fact in &self.known_facts {
+                s.push_str(&format!("  - {fact}\n"));
+            }
+        }
+        if !self.goals.is_empty() {
+            s.push_str("What the business is trying to accomplish with this outreach:\n");
+            for goal in &self.goals {
+                s.push_str(&format!("  - {goal}\n"));
+            }
+        }
+        if !self.constraints.is_empty() {
+            s.push_str("Hard constraints (never violate):\n");
+            for constraint in &self.constraints {
+                s.push_str(&format!("  - {constraint}\n"));
+            }
+        }
+        if !self.unknowns.is_empty() {
+            s.push_str("Open unknowns (do not assume you know the answer to these):\n");
+            for unknown in &self.unknowns {
+                s.push_str(&format!("  - {unknown}\n"));
+            }
+        }
+        if !self.discovery_evidence.is_empty() {
+            s.push_str(
+                "Founder discovery evidence (market-level context, NOT proof about a candidate account):\n",
+            );
+            for call in &self.discovery_evidence {
+                s.push_str(&format!(
+                    "  CALL {} — {} | {} | {}\n",
+                    call.id, call.segment, call.participant_context, call.evidence_level
+                ));
+                for item in &call.reported_workflows {
+                    s.push_str(&format!("    - Participant reported: {item}\n"));
+                }
+                for item in &call.reported_estimates {
+                    s.push_str(&format!("    - Unverified estimate/example: {item}\n"));
+                }
+                for item in &call.working_interpretations {
+                    s.push_str(&format!("    - Working interpretation: {item}\n"));
+                }
+                for item in &call.sourcing_implications {
+                    s.push_str(&format!("    - Sourcing implication: {item}\n"));
+                }
+                for item in &call.follow_up_angles {
+                    s.push_str(&format!(
+                        "    - Permitted call-grounded follow-up angle: {item}\n"
+                    ));
+                }
+                for item in &call.next_questions {
+                    s.push_str(&format!("    - Still ask: {item}\n"));
+                }
+                for item in &call.limits {
+                    s.push_str(&format!("    - Evidence boundary: {item}\n"));
+                }
+                if !call.source_url.is_empty() {
+                    s.push_str(&format!("    - Source record: {}\n", call.source_url));
+                }
+            }
+            s.push_str(
+                "Use these calls to choose segments and ask sharper questions. They do not establish any target company's workflow. In copy, attribute a call insight explicitly (for example, 'In a recent conversation with a technical manager...') and ask whether it matches this recipient's experience. Never imply multiple buyers, consensus, ROI, or adoption.\n",
+            );
+        }
+        s.trim_end().to_string()
     }
 }
 
 fn validate(profile: &BusinessProfile) -> Result<()> {
     if profile.name.trim().is_empty() || profile.summary.trim().is_empty() {
         return Err(anyhow!("name and summary are required"));
+    }
+    let mut discovery_ids = std::collections::HashSet::new();
+    for evidence in &profile.discovery_evidence {
+        if evidence.id.trim().is_empty()
+            || evidence.segment.trim().is_empty()
+            || evidence.participant_context.trim().is_empty()
+        {
+            return Err(anyhow!(
+                "discovery evidence requires id, segment, and participant_context"
+            ));
+        }
+        if !discovery_ids.insert(evidence.id.trim()) {
+            return Err(anyhow!("duplicate discovery evidence id '{}'", evidence.id));
+        }
     }
     if profile.has_motion("funding") {
         let funding = profile
@@ -395,6 +591,12 @@ mod tests {
     fn loads_three_distinct_businesses_and_outagehub_funding() {
         let businesses = Businesses::load("businesses").expect("business profiles");
         assert_eq!(businesses.keys(), vec!["gnk", "outagehub", "wapahki"]);
+        assert!(businesses.keys().into_iter().all(|key| businesses
+            .get(key)
+            .unwrap()
+            .account_limits
+            .max_active_contacts_per_account
+            == 1));
         assert!(!businesses.get("gnk").unwrap().has_motion("funding"));
         assert!(businesses.get("outagehub").unwrap().has_motion("funding"));
         assert!(!businesses
@@ -404,5 +606,11 @@ mod tests {
             .unwrap()
             .sources
             .is_empty());
+        let wapahki = businesses.get("wapahki").unwrap();
+        assert_eq!(wapahki.discovery_evidence.len(), 2);
+        let context = wapahki.operating_context();
+        assert!(context.contains("Founder discovery evidence"));
+        assert!(context.contains("NOT proof about a candidate account"));
+        assert!(context.contains("recent conversation with a technical manager"));
     }
 }

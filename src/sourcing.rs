@@ -19,15 +19,24 @@ use anyhow::Result;
 use futures::stream::{self, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use crate::apollo::{Apollo, ApolloOrg, ApolloPerson, OrgFilters, PeopleFilters};
 use crate::calendar;
-use crate::db::{Lead, Person, SharedDb};
+use crate::db::{AccountPlayAssessment, Lead, Person, SharedDb};
 use crate::engine::Engine;
-use crate::knowledge::Library;
+use crate::gtm::SignalCandidate;
+use crate::knowledge::{core_strategy_block, Library};
 use crate::opportunity::ResearchClient;
 use crate::playbook::{Playbook, Shared};
 use crate::research;
+
+/// How many candidates to source per company relative to the requested contact
+/// count, so unverifiable people can be backfilled by a different contact. Costs
+/// extra enrichment credits (each filed candidate is a reveal) but keeps
+/// companies from ending up short of verified, sequenceable contacts.
+const CONTACT_BACKFILL_FACTOR: usize = 2;
 
 /// What one `source` run accomplished.
 #[derive(Debug, Default)]
@@ -35,6 +44,108 @@ pub struct SourceSummary {
     pub orgs_found: usize,
     pub leads_qualified: usize,
     pub people_added: usize,
+}
+
+/// One stable row in the interactive sourcing transcript. The sourcing layer
+/// reports structured milestones instead of printing ad-hoc lines while a
+/// spinner is repainting the terminal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceProgressUpdate {
+    pub key: String,
+    pub title: String,
+    pub detail: String,
+    /// queued | active | complete | warning | failed
+    pub status: String,
+}
+
+pub type SourceProgressReporter = Arc<dyn Fn(SourceProgressUpdate) + Send + Sync>;
+
+fn report_source(
+    reporter: Option<&SourceProgressReporter>,
+    key: &str,
+    title: impl Into<String>,
+    detail: impl Into<String>,
+    status: &str,
+) {
+    if let Some(reporter) = reporter {
+        reporter(SourceProgressUpdate {
+            key: key.into(),
+            title: title.into(),
+            detail: detail.into(),
+            status: status.into(),
+        });
+    }
+}
+
+fn log_sourcing(message: impl AsRef<str>) {
+    if !crate::ui::fancy() {
+        eprintln!("  · {}", message.as_ref());
+    }
+}
+
+/// On-file inventory selected for a reuse-first motion (no Apollo required).
+#[derive(Debug, Default, Clone)]
+pub struct ReuseSelection {
+    pub lead_ids: Vec<String>,
+    pub person_ids: std::collections::HashSet<String>,
+    pub accounts_on_file: usize,
+    pub people_on_file: usize,
+    pub verified_on_file: usize,
+    pub accounts_selected: usize,
+    pub people_selected: usize,
+    pub verified_selected: usize,
+    /// How many additional accounts still need Apollo if the operator asked for more.
+    pub accounts_shortfall: usize,
+}
+
+/// Doctrine fields rewritten for an already-qualified lead (no re-qualification).
+#[derive(Debug, Default, Deserialize)]
+struct LeadRefresh {
+    #[serde(default)]
+    observed_facts: Vec<String>,
+    #[serde(default)]
+    inferences: Vec<String>,
+    #[serde(default)]
+    hypothesis: String,
+    #[serde(default)]
+    mechanism: String,
+    #[serde(default)]
+    consequence_metric: String,
+    #[serde(default)]
+    signals: Vec<String>,
+    #[serde(default)]
+    structured_signals: Vec<SignalCandidate>,
+    #[serde(default)]
+    play_fit_score: i64,
+    #[serde(default)]
+    matched_signal_keys: Vec<String>,
+    #[serde(default)]
+    symptom: String,
+    #[serde(default)]
+    root_cause: String,
+    #[serde(default)]
+    current_workaround: String,
+    #[serde(default)]
+    why_now: String,
+    #[serde(default)]
+    proof_fit: String,
+    #[serde(default)]
+    evidence_gaps: Vec<String>,
+    #[serde(default)]
+    disqualifiers: Vec<String>,
+    #[serde(default)]
+    system_concept: String,
+    #[serde(default)]
+    hard_buyer_question: String,
+    #[serde(default)]
+    kill_condition: String,
+    #[serde(default)]
+    magnitude_note: String,
+    #[serde(default)]
+    applied_principles: Vec<String>,
+    /// One sentence: why this specific company is worth a sequence now.
+    #[serde(default)]
+    why_this_company: String,
 }
 
 // --- Structured-output shapes ---------------------------------------------
@@ -56,6 +167,10 @@ struct Icp {
 #[derive(Debug, Default, Deserialize)]
 struct OrgQual {
     qualified: bool,
+    /// qualified | research_needed | rejected. Computed locally after the model
+    /// returns so missing public evidence is not confused with negative evidence.
+    #[serde(skip)]
+    routing_status: String,
     #[serde(default)]
     reject_reason: String,
     #[serde(default)]
@@ -70,6 +185,26 @@ struct OrgQual {
     consequence_metric: String,
     #[serde(default)]
     signals: Vec<String>,
+    #[serde(default)]
+    structured_signals: Vec<SignalCandidate>,
+    #[serde(default)]
+    play_fit_score: i64,
+    #[serde(default)]
+    matched_signal_keys: Vec<String>,
+    #[serde(default)]
+    symptom: String,
+    #[serde(default)]
+    root_cause: String,
+    #[serde(default)]
+    current_workaround: String,
+    #[serde(default)]
+    why_now: String,
+    #[serde(default)]
+    proof_fit: String,
+    #[serde(default)]
+    evidence_gaps: Vec<String>,
+    #[serde(default)]
+    disqualifiers: Vec<String>,
     #[serde(default)]
     system_concept: String,
     #[serde(default)]
@@ -110,41 +245,157 @@ pub async fn source(
     client: &Engine,
     apollo: &Apollo,
     pb: &Playbook,
-    shared: &Shared,
+    _shared: &Shared,
     fallback_recipient_timezone: &str,
+    business_context: &str,
     library: &Library,
     thesis: &str,
     n_accounts: usize,
     n_contacts: usize,
     concurrency: usize,
+    progress: Option<SourceProgressReporter>,
 ) -> Result<SourceSummary> {
-    let system = pb.system_prompt(shared);
+    // Each sourcing stage gets only the rules it needs; buyer-facing copy
+    // doctrine is intentionally absent from ICP, qualification, and routing.
+    let icp_system = pb.icp_system_prompt();
+    let qualification_system = pb.qualification_system_prompt();
+    let vantage_system = pb.vantage_system_prompt();
+    let active_play = db.current_gtm_play(&pb.key)?;
+    let gtm_play_context = crate::gtm::sourcing_play_block(active_play.as_ref());
+    let allowed_signal_keys = db
+        .list_signal_definitions(Some(&pb.key))?
+        .into_iter()
+        .filter(|definition| definition.status == "active")
+        .map(|definition| definition.key)
+        .collect::<HashSet<_>>();
+
+    // Fold what we've already learned about this brand's outbound into the context
+    // every sourcing stage sees, so each run builds on prior runs instead of
+    // starting from a clean state (the operator's explicit ask).
+    let mut skip_learnings = db
+        .recent_learnings(Some(&pb.key), Some("qualification_skip"), 15)
+        .unwrap_or_default();
+    skip_learnings.retain(|learning| !is_legacy_two_signal_reject(&learning.detail));
+    skip_learnings.extend(
+        db.recent_learnings(Some(&pb.key), Some("qualification_pattern"), 8)
+            .unwrap_or_default(),
+    );
+    skip_learnings.extend(
+        db.recent_learnings(Some(&pb.key), Some("contact_search_pattern"), 4)
+            .unwrap_or_default(),
+    );
+    let augmented_context = augment_context_with_learnings(business_context, &skip_learnings);
 
     // 1. thesis → Apollo ICP filters, then hard-clamp sizes to the brand's ceiling
     //    so enterprise giants are never even fetched (belt-and-suspenders vs. the prompt).
-    let mut icp = derive_icp(client, &system, pb, thesis).await?;
+    report_source(
+        progress.as_ref(),
+        "icp",
+        "Building ICP",
+        "Applying the active GTM play, business constraints, and prior qualification learnings",
+        "active",
+    );
+    let mut icp = derive_icp(
+        client,
+        &icp_system,
+        pb,
+        &augmented_context,
+        &gtm_play_context,
+        thesis,
+    )
+    .await?;
     icp.employee_ranges = clamp_employee_ranges(icp.employee_ranges, pb.max_employees);
-    eprintln!(
-        "  · ICP: {} keyword(s), titles [{}], sizes [{}]",
-        icp.keywords.len(),
-        icp.titles.join(", "),
-        icp.employee_ranges.join(", "),
+    report_source(
+        progress.as_ref(),
+        "icp",
+        "Built ICP",
+        format!(
+            "{} keywords · {} buyer titles · {} size bands\nTop titles: {}\nEmployee ranges: {}",
+            icp.keywords.len(),
+            icp.titles.len(),
+            icp.employee_ranges.len(),
+            compact_list(&icp.titles, 4),
+            compact_list(&icp.employee_ranges, 8),
+        ),
+        "complete",
     );
 
-    // 2. real organizations (overfetch so qualification can be selective).
-    let orgs = apollo
-        .search_organizations(&OrgFilters {
-            keywords: icp.keywords.clone(),
-            employee_ranges: icp.employee_ranges.clone(),
-            locations: icp.locations.clone(),
-            page: 1,
-            per_page: (n_accounts * 2).clamp(10, 100) as u32,
-            ..Default::default()
-        })
-        .await?;
-    eprintln!("  · Apollo returned {} organizations", orgs.len());
+    // 2. Real organizations (overfetch so qualification can be selective). Reuse
+    // across runs: never re-qualify a company we've already judged. Rejects live
+    // in the learning store; companies we already qualified are Lead rows on file.
+    // Combining both lets `source` spend its qualification budget only on genuinely
+    // NEW companies — and page deeper when a page is all-known, so a re-run ADDS
+    // leads instead of stalling on the same top results.
+    const MAX_SOURCE_PAGES: u32 = 5;
+    let mut seen: std::collections::HashSet<String> = db
+        .durable_qualification_skip_keys(&pb.key)
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let on_file = db.list_leads(Some(&pb.key)).unwrap_or_default();
+    for lead in &on_file {
+        let key = lead_dedup_key(lead);
+        if !key.is_empty() {
+            seen.insert(key);
+        }
+    }
+
+    let want_candidates = (n_accounts * 2).clamp(10, 100);
+    let per_page = want_candidates as u32;
+    report_source(
+        progress.as_ref(),
+        "apollo",
+        "Searching Apollo",
+        format!(
+            "Looking for about {want_candidates} candidates across up to {MAX_SOURCE_PAGES} pages"
+        ),
+        "active",
+    );
+    let mut fresh: Vec<ApolloOrg> = Vec::new();
+    let mut orgs_found = 0usize;
+    let mut skipped_known = 0usize;
+    for page in 1..=MAX_SOURCE_PAGES {
+        let page_orgs = apollo
+            .search_organizations(&OrgFilters {
+                keywords: icp.keywords.clone(),
+                employee_ranges: icp.employee_ranges.clone(),
+                locations: icp.locations.clone(),
+                page,
+                per_page,
+                ..Default::default()
+            })
+            .await?;
+        if page_orgs.is_empty() {
+            break;
+        }
+        orgs_found += page_orgs.len();
+        for org in page_orgs {
+            let key = org_learning_key(&org);
+            // Skip anything already judged; `insert` returning false also guards
+            // the same company reappearing across pages.
+            if !key.is_empty() && !seen.insert(key) {
+                skipped_known += 1;
+                continue;
+            }
+            fresh.push(org);
+        }
+        if fresh.len() >= want_candidates {
+            break;
+        }
+    }
+    report_source(
+        progress.as_ref(),
+        "apollo",
+        "Found candidate companies",
+        format!(
+            "{orgs_found} returned · {} new to qualify · {skipped_known} already judged · {} qualified on file",
+            fresh.len(),
+            on_file.len(),
+        ),
+        "complete",
+    );
     let mut summary = SourceSummary {
-        orgs_found: orgs.len(),
+        orgs_found,
         ..Default::default()
     };
 
@@ -154,77 +405,255 @@ pub async fn source(
     let researcher = if research::enabled() {
         match ResearchClient::from_env() {
             Ok(r) => {
-                eprintln!("  · per-company website research: on");
+                report_source(
+                    progress.as_ref(),
+                    "research",
+                    "Official-site research enabled",
+                    "Reading each company's website before judging workflow fit",
+                    "complete",
+                );
                 Some(r)
             }
-            Err(_) => None,
+            Err(_) => {
+                report_source(
+                    progress.as_ref(),
+                    "research",
+                    "Official-site research unavailable",
+                    "Qualifying from Apollo facts and stored evidence only",
+                    "warning",
+                );
+                None
+            }
         }
     } else {
+        report_source(
+            progress.as_ref(),
+            "research",
+            "Official-site research disabled",
+            "SPRUCE_RESEARCH=0 · qualifying from Apollo facts and stored evidence",
+            "warning",
+        );
         None
     };
     let researcher_ref = researcher.as_ref();
 
-    // 3. qualify concurrently; keep the ones that fit, up to n_accounts.
-    let quals = stream::iter(orgs.into_iter().map(|org| {
-        let system = system.clone();
-        let knowledge = library
-            .retrieve_stage(
-                &format!("qualifying an expensive workflow: {thesis}; {}", pb.motion),
-                "companies",
-                5,
-                2,
-            )
-            .playbook_block();
+    // 3. Qualify the bounded overfetch, then rank it. Stopping at the first N
+    // model-approved Apollo rows made result order masquerade as strategy; the
+    // active versioned play now decides which requested N survive.
+    let retrieved = library
+        .retrieve_stage(
+            &format!("qualifying an expensive workflow: {thesis}; {}", pb.motion),
+            "companies",
+            3,
+            1,
+        )
+        .playbook_block();
+    let knowledge = format!("{}\n\n{}", core_strategy_block("companies"), retrieved);
+
+    let qualification_total = fresh.len();
+    report_source(
+        progress.as_ref(),
+        "qualification",
+        "Qualifying root-cause fit",
+        format!(
+            "0/{qualification_total} reviewed · testing signals, root cause, reachable buyer, and bounded-proof fit"
+        ),
+        "active",
+    );
+    let mut quals = Vec::new();
+    // Each candidate is I/O-bound (website reads + an LLM qualification call), so
+    // fan out wider than the global concurrency default — a low default (2) makes
+    // the qualification stage crawl even though it is almost entirely waiting. With
+    // ~10 overfetched orgs this usually clears qualification in a single wave.
+    let batch_size = concurrency.max(8);
+    let mut results = stream::iter(fresh.into_iter().map(|org| {
+        let system = qualification_system.clone();
+        let knowledge = knowledge.clone();
+        let business_context = augmented_context.clone();
+        let gtm_play_context = gtm_play_context.clone();
+        let active_play = active_play.clone();
+        let allowed_signal_keys = allowed_signal_keys.clone();
         async move {
-            // Apollo's company search often returns a sparse payload; enrich thin
-            // orgs by domain first so qualification judges real fit, not missing data.
-            let org = hydrate_org(apollo, org).await;
-            // Winnability gate: a small/founder-led vendor can't realistically land
-            // companies far above its size ceiling. Reject those up front (once we
-            // actually know the headcount) rather than spending a qualify call.
-            let q = if let Some(max) = pb.max_employees.filter(|m| org.estimated_num_employees > *m) {
-                Ok(OrgQual {
-                    reject_reason: format!(
-                        "{} employees is above {}'s ~{}-employee ceiling for a founder-led motion",
-                        org.estimated_num_employees, pb.name, max
-                    ),
-                    ..Default::default()
-                })
-            } else {
-                // Only research companies we're actually going to qualify.
-                let research_block = match researcher_ref {
-                    Some(r) => research::research_company(client, r, pb, &org)
-                        .await
-                        .map(|b| b.as_facts_block())
-                        .unwrap_or_default(),
-                    None => String::new(),
-                };
-                qualify_org(client, &system, pb, thesis, &org, &knowledge, &research_block).await
-            };
-            // Report each verdict the moment it lands so this concurrent stage
-            // isn't a silent multi-minute spinner.
-            match &q {
-                Ok(v) if v.qualified => eprintln!("  · ✓ qualified {}", org.name),
-                Ok(v) => eprintln!("  · ✗ skip {} — {}", org.name, first_line(&v.reject_reason)),
-                Err(e) => eprintln!("  · ! {} qualify error: {e:#}", org.name),
-            }
-            (org, q)
+            qualify_candidate(
+                client,
+                apollo,
+                researcher_ref,
+                pb,
+                &system,
+                &business_context,
+                &gtm_play_context,
+                active_play.as_ref(),
+                &allowed_signal_keys,
+                thesis,
+                org,
+                &knowledge,
+            )
+            .await
         }
     }))
-    .buffered(concurrency)
-    .collect::<Vec<_>>()
-    .await;
-
-    let mut kept = 0usize;
-    for (org, q) in quals {
-        if kept >= n_accounts {
-            break;
-        }
-        // Verdicts were already logged as they streamed in above.
-        let q = match q {
-            Ok(q) if q.qualified => q,
-            _ => continue,
+    .buffer_unordered(batch_size);
+    let mut reviewed = 0usize;
+    let mut qualified = 0usize;
+    let mut research_needed = 0usize;
+    let mut skipped = 0usize;
+    let mut errors = 0usize;
+    while let Some((org, result)) = results.next().await {
+        reviewed += 1;
+        let latest = match &result {
+            Ok(value) if value.qualified => {
+                if value.routing_status == "research_needed" {
+                    research_needed += 1;
+                    format!(
+                        "Latest: research needed {} · fit {}/100",
+                        org.name, value.play_fit_score
+                    )
+                } else {
+                    qualified += 1;
+                    format!(
+                        "Latest: passed {} · fit {}/100",
+                        org.name, value.play_fit_score
+                    )
+                }
+            }
+            Ok(value) => {
+                skipped += 1;
+                let classification = if value.disqualifiers.is_empty() {
+                    "insufficient_fit"
+                } else {
+                    "hard_reject"
+                };
+                let _ = db.record_learning(
+                    &pb.key,
+                    "qualification_skip",
+                    &org.name,
+                    &org_learning_key(&org),
+                    &format!("{classification}: {}", first_line(&value.reject_reason)),
+                );
+                format!(
+                    "Latest: skipped {} · {}",
+                    org.name,
+                    first_line(&value.reject_reason)
+                )
+            }
+            Err(error) => {
+                errors += 1;
+                format!(
+                    "Latest: error for {} · {}",
+                    org.name,
+                    first_line(&error.to_string())
+                )
+            }
         };
+        report_source(
+            progress.as_ref(),
+            "qualification",
+            "Qualifying root-cause fit",
+            format!(
+                "{reviewed}/{qualification_total} reviewed · {qualified} qualified · {research_needed} research-needed · {skipped} skipped · {errors} errors\n{latest}"
+            ),
+            "active",
+        );
+        quals.push((org, result));
+    }
+
+    report_source(
+        progress.as_ref(),
+        "learning",
+        "Learning from qualification misses",
+        "Turning repeated rejection causes into tighter filters for the next sourcing run",
+        "active",
+    );
+    let learned_patterns = record_qualification_patterns(db, pb, &quals);
+    report_source(
+        progress.as_ref(),
+        "learning",
+        if learned_patterns == 0 {
+            "Qualification learning checked"
+        } else {
+            "Saved targeting corrections"
+        },
+        if learned_patterns == 0 {
+            "No recurring failure pattern was strong enough to persist"
+        } else {
+            "Stored corrections for missing signals, weak root-cause evidence, and hard disqualifiers; the next ICP build will apply them"
+        },
+        "complete",
+    );
+
+    let mut ranked = quals
+        .into_iter()
+        .filter_map(|(org, result)| match result {
+            Ok(qualification) if qualification.qualified => Some((org, qualification)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        (right.1.routing_status == "qualified")
+            .cmp(&(left.1.routing_status == "qualified"))
+            .then_with(|| right.1.play_fit_score.cmp(&left.1.play_fit_score))
+            .then_with(|| {
+                right
+                    .1
+                    .structured_signals
+                    .len()
+                    .cmp(&left.1.structured_signals.len())
+            })
+            .then_with(|| {
+                right
+                    .1
+                    .observed_facts
+                    .len()
+                    .cmp(&left.1.observed_facts.len())
+            })
+            .then_with(|| left.0.name.cmp(&right.0.name))
+    });
+    let selected_count = ranked.len().min(n_accounts);
+    let selected_qualified = ranked
+        .iter()
+        .take(selected_count)
+        .filter(|(_, qualification)| qualification.routing_status == "qualified")
+        .count();
+    let selected_research = selected_count.saturating_sub(selected_qualified);
+    report_source(
+        progress.as_ref(),
+        "qualification",
+        if selected_research == 0 {
+            "Ranked qualified companies"
+        } else {
+            "Ranked discovery candidates"
+        },
+        format!(
+            "{reviewed}/{qualification_total} reviewed · {qualified} qualified · {research_needed} research-needed\nSelected {selected_count}: {selected_qualified} qualified · {selected_research} research-needed"
+        ),
+        if selected_count > 0 { "complete" } else { "warning" },
+    );
+
+    // Persist the highest-ranked leads and their play-version assessment, then
+    // source people only at those winners.
+    let mut winners: Vec<(ApolloOrg, Lead, String)> = Vec::new();
+    for (org, q) in ranked.into_iter().take(n_accounts) {
+        let structured_signals = q.structured_signals.clone();
+        let assessment = active_play.as_ref().map(|play| AccountPlayAssessment {
+            brand: pb.key.clone(),
+            play_id: play.id.clone(),
+            play_version: play.version,
+            status: if q.routing_status.is_empty() {
+                "qualified".into()
+            } else {
+                q.routing_status.clone()
+            },
+            fit_score: q.play_fit_score,
+            matched_signal_keys: q.matched_signal_keys.clone(),
+            symptom: q.symptom.clone(),
+            root_cause: q.root_cause.clone(),
+            current_workaround: q.current_workaround.clone(),
+            why_now: q.why_now.clone(),
+            proof_fit: q.proof_fit.clone(),
+            evidence_gaps: q.evidence_gaps.clone(),
+            disqualifiers: q.disqualifiers.clone(),
+            source: "source.qualify".into(),
+            ..Default::default()
+        });
 
         let hq = org.hq();
         let lead = Lead {
@@ -255,36 +684,306 @@ pub async fn source(
             ..Default::default()
         };
         let lead_id = db.upsert_lead(&lead)?;
+        db.record_signal_candidates(&pb.key, &lead_id, &structured_signals, "source.qualify")?;
+        if let Some(mut assessment) = assessment {
+            assessment.lead_id = lead_id.clone();
+            db.upsert_account_play_assessment(&assessment)?;
+        }
         db.log_event(
             &pb.key,
             "",
             "",
             "sourced",
-            &format!("qualified lead {}", org.name),
+            &format!(
+                "qualified lead {} (play fit {}/100; ranked by evidence + root cause)",
+                org.name, q.play_fit_score
+            ),
         )?;
-        kept += 1;
         summary.leads_qualified += 1;
-
-        // 4. real people at this org, mapped to vantage points.
-        let added = source_people(
-            db,
-            client,
-            apollo,
-            pb,
-            &system,
-            &org,
-            &lead,
-            &lead_id,
-            &icp,
-            n_contacts,
-            fallback_recipient_timezone,
-        )
-        .await?;
-        summary.people_added += added;
-        eprintln!("  · {} — {added} contact(s)", org.name);
+        winners.push((org, lead, lead_id));
     }
 
+    // 4. Real people at each org, mapped to vantage points. Every org is
+    // independent (its own Apollo people search + one vantage call), so fan them
+    // out concurrently — walking them one-at-a-time was the serialized tail of a
+    // sourcing run.
+    let vantage_system = &vantage_system;
+    let icp = &icp;
+    let people_total = winners.len();
+    report_source(
+        progress.as_ref(),
+        "contacts",
+        "Mapping buyer contacts",
+        format!(
+            "0/{people_total} companies mapped · targeting up to {n_contacts} useful vantage points per company"
+        ),
+        if people_total == 0 { "warning" } else { "active" },
+    );
+    let mut people_counts =
+        stream::iter(winners.into_iter().map(|(org, lead, lead_id)| async move {
+            let result = source_people(
+                db,
+                client,
+                apollo,
+                pb,
+                vantage_system,
+                &org,
+                &lead,
+                &lead_id,
+                icp,
+                n_contacts,
+                fallback_recipient_timezone,
+            )
+            .await;
+            (org.name, result)
+        }))
+        .buffer_unordered(concurrency.max(4));
+    let mut companies_mapped = 0usize;
+    let mut contact_errors = 0usize;
+    let mut contact_shortfalls = 0usize;
+    while let Some((name, result)) = people_counts.next().await {
+        companies_mapped += 1;
+        match result {
+            Ok(added) => {
+                summary.people_added += added;
+                if added < n_contacts {
+                    contact_shortfalls += 1;
+                }
+                report_source(
+                    progress.as_ref(),
+                    "contacts",
+                    "Mapping buyer contacts",
+                    format!(
+                        "{companies_mapped}/{people_total} companies mapped · {} contacts filed\nLatest: {name} · {added} contacts",
+                        summary.people_added,
+                    ),
+                    "active",
+                );
+            }
+            Err(error) => {
+                contact_errors += 1;
+                report_source(
+                    progress.as_ref(),
+                    "contacts",
+                    "Mapping buyer contacts",
+                    format!(
+                        "{companies_mapped}/{people_total} companies mapped · {} contacts filed · {contact_errors} errors\nLatest: {name} · {}",
+                        summary.people_added,
+                        first_line(&error.to_string()),
+                    ),
+                    "active",
+                );
+            }
+        }
+    }
+    if contact_shortfalls > 0 {
+        let detail = format!(
+            "{contact_shortfalls}/{people_total} qualified companies returned fewer than {n_contacts} useful contacts after title and broad fallback searches; prefer accounts with a visible operations team"
+        );
+        let _ = db.record_learning(
+            &pb.key,
+            "contact_search_pattern",
+            "Qualified accounts with thin contact coverage",
+            "thin_contact_coverage",
+            &detail,
+        );
+        report_source(
+            progress.as_ref(),
+            "contact-learning",
+            "Saved contact-coverage correction",
+            detail,
+            "warning",
+        );
+    }
+    report_source(
+        progress.as_ref(),
+        "contacts",
+        "Mapped buyer contacts",
+        format!(
+            "{companies_mapped}/{people_total} companies · {} contacts filed · {contact_errors} errors",
+            summary.people_added,
+        ),
+        if contact_errors == 0 { "complete" } else { "warning" },
+    );
+
     Ok(summary)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn qualify_candidate(
+    client: &Engine,
+    apollo: &Apollo,
+    researcher: Option<&ResearchClient>,
+    pb: &Playbook,
+    system: &str,
+    business_context: &str,
+    gtm_play_context: &str,
+    active_play: Option<&crate::db::GtmPlay>,
+    allowed_signal_keys: &HashSet<String>,
+    thesis: &str,
+    org: ApolloOrg,
+    knowledge: &str,
+) -> (ApolloOrg, Result<OrgQual>) {
+    // Apollo search rows are often sparse; hydrate before judging fit.
+    let org = hydrate_org(apollo, org).await;
+    let mut result = if let Some(max) = pb
+        .max_employees
+        .filter(|max| org.estimated_num_employees > *max)
+    {
+        Ok(OrgQual {
+            reject_reason: format!(
+                "{} employees is above {}'s ~{}-employee ceiling for a founder-led motion",
+                org.estimated_num_employees, pb.name, max
+            ),
+            ..Default::default()
+        })
+    } else {
+        let research_block = match researcher {
+            Some(researcher) => research::research_company(client, researcher, pb, &org)
+                .await
+                .map(|brief| brief.as_facts_block())
+                .unwrap_or_default(),
+            None => String::new(),
+        };
+        qualify_org(
+            client,
+            system,
+            pb,
+            business_context,
+            gtm_play_context,
+            thesis,
+            &org,
+            knowledge,
+            &research_block,
+        )
+        .await
+    };
+    if let Ok(qualification) = &mut result {
+        enforce_play_qualification(qualification, active_play, allowed_signal_keys);
+    }
+    (org, result)
+}
+
+fn enforce_play_qualification(
+    qualification: &mut OrgQual,
+    play: Option<&crate::db::GtmPlay>,
+    allowed_signal_keys: &HashSet<String>,
+) {
+    // Models often put "no public evidence of X" in disqualifiers. That is an
+    // unknown to investigate, not evidence that X is false. Preserve real hard
+    // blockers while moving absence-of-proof language to evidence_gaps.
+    let (unknowns, hard_disqualifiers): (Vec<_>, Vec<_>) = qualification
+        .disqualifiers
+        .drain(..)
+        .partition(|item| is_missing_evidence(item));
+    qualification.evidence_gaps.extend(unknowns);
+    qualification.disqualifiers = hard_disqualifiers;
+
+    qualification.structured_signals.retain(|signal| {
+        allowed_signal_keys.contains(signal.definition_key.trim())
+            && !signal.evidence.trim().is_empty()
+            && signal.confidence >= 0.60
+    });
+    let mut matched = qualification
+        .structured_signals
+        .iter()
+        .map(|signal| signal.definition_key.trim().to_string())
+        .collect::<Vec<_>>();
+    matched.sort();
+    matched.dedup();
+    qualification.matched_signal_keys = matched.clone();
+
+    let Some(play) = play else {
+        qualification.routing_status = if qualification.qualified {
+            "qualified".into()
+        } else {
+            "rejected".into()
+        };
+        return;
+    };
+    let required_matches = play
+        .required_signal_keys
+        .iter()
+        .filter(|key| matched.contains(key))
+        .count();
+    let minimum = play.minimum_signal_matches.max(1) as usize;
+    let fully_supported = required_matches >= minimum
+        && !qualification.root_cause.trim().is_empty()
+        && !qualification.proof_fit.trim().is_empty()
+        && qualification.play_fit_score >= 65
+        && qualification.disqualifiers.is_empty();
+    let has_account_fit = matched.iter().any(|key| key == "account.fit_evidence");
+    let has_source_backed_fit = has_account_fit || !qualification.observed_facts.is_empty();
+    let discovery_candidate = has_source_backed_fit
+        && required_matches >= minimum.saturating_sub(1).max(1)
+        && qualification.play_fit_score >= 50
+        && qualification.disqualifiers.is_empty();
+
+    if fully_supported {
+        qualification.qualified = true;
+        qualification.routing_status = "qualified".into();
+        qualification.reject_reason.clear();
+    } else if discovery_candidate {
+        // This is exactly what cold customer discovery is for: the company is a
+        // plausible buyer and one workflow signal is still unknown. Keep it in
+        // the working set, but label the uncertainty so copy asks for a
+        // correction instead of asserting the pain as fact.
+        qualification.qualified = true;
+        qualification.routing_status = "research_needed".into();
+        qualification.reject_reason.clear();
+        qualification.evidence_gaps.push(format!(
+            "Only {required_matches}/{minimum} required play signals are publicly supported; outreach must test the missing signal rather than claim it."
+        ));
+    } else {
+        qualification.qualified = false;
+        qualification.routing_status = "rejected".into();
+        let mut reasons = Vec::new();
+        if required_matches < minimum {
+            reasons.push(format!(
+                "only {required_matches} canonical play signal(s) matched; {minimum} required for full qualification"
+            ));
+        }
+        if qualification.play_fit_score < 50 {
+            reasons.push(format!(
+                "play-fit score {}/100 is below the 50 discovery floor",
+                qualification.play_fit_score.clamp(0, 100)
+            ));
+        }
+        if qualification.root_cause.trim().is_empty() {
+            reasons.push("no defensible root-cause hypothesis".into());
+        }
+        if qualification.proof_fit.trim().is_empty() {
+            reasons.push("no credible fit to the bounded proof".into());
+        }
+        if !qualification.disqualifiers.is_empty() {
+            reasons.push(format!(
+                "hard disqualifier(s): {}",
+                qualification.disqualifiers.join("; ")
+            ));
+        }
+        if !has_source_backed_fit {
+            reasons.push("no source-backed account-fit evidence".into());
+        }
+        qualification.reject_reason = reasons.join("; ");
+    }
+}
+
+fn is_missing_evidence(item: &str) -> bool {
+    let value = item.to_ascii_lowercase();
+    [
+        "no public evidence",
+        "no evidence provided",
+        "not publicly",
+        "not disclosed",
+        "not found",
+        "unknown",
+        "unclear",
+        "cannot verify",
+        "could not verify",
+        "insufficient evidence",
+    ]
+    .iter()
+    .any(|needle| value.contains(needle))
 }
 
 /// Fetch real people at an org, assign a vantage to each, and file them.
@@ -302,15 +1001,18 @@ async fn source_people(
     n_contacts: usize,
     fallback_recipient_timezone: &str,
 ) -> Result<usize> {
-    // People-search by DOMAIN is far more reliable than by org id (the id from
-    // company search is a different record people are frequently NOT indexed
-    // under, so `organization_ids` silently returns 0 for many real companies).
-    // Run a waterfall — domain+titles → org-id+titles → broaden to any employee
-    // → resolve a missing domain by name — topping up until we reach n_contacts,
-    // so "5 people per company" holds even for stubborn orgs.
-    let people = gather_people(apollo, org, icp, n_contacts).await;
+    // Over-source a bench of candidates, not just n_contacts. Enrichment verifies
+    // only a fraction of any org's people (many have no findable email), so if we
+    // filed exactly n_contacts we'd routinely end up with fewer than n_contacts
+    // VERIFIED contacts and blank rows. Filing extra candidates lets a different
+    // contact backfill anyone who doesn't verify; sequencing later caps at
+    // n_contacts of the strongest verified people per company.
+    let source_pool = n_contacts
+        .saturating_mul(CONTACT_BACKFILL_FACTOR)
+        .max(n_contacts);
+    let people = gather_people(apollo, org, icp, source_pool).await;
     if people.is_empty() {
-        eprintln!("  · no people found for {} (all strategies)", org.name);
+        log_sourcing(format!("no people found for {} (all strategies)", org.name));
         return Ok(0);
     }
 
@@ -321,7 +1023,7 @@ async fn source_people(
         });
 
     let mut added = 0usize;
-    for (i, ap) in people.iter().enumerate().take(n_contacts) {
+    for (i, ap) in people.iter().enumerate().take(source_pool) {
         let va = assignments.assignments.iter().find(|a| a.index == i);
         let location = ap.location();
         let timezone_location = if location.is_empty() {
@@ -458,14 +1160,21 @@ async fn gather_people(
                     let key = if !p.id.is_empty() {
                         p.id.clone()
                     } else {
-                        format!("{}|{}", p.full_name().to_lowercase(), p.title.to_lowercase())
+                        format!(
+                            "{}|{}",
+                            p.full_name().to_lowercase(),
+                            p.title.to_lowercase()
+                        )
                     };
                     if seen.insert(key) {
                         out.push(p);
                     }
                 }
             }
-            Err(e) => eprintln!("  · people search ({label}) failed for {}: {e:#}", org.name),
+            Err(e) => log_sourcing(format!(
+                "people search ({label}) failed for {}: {e:#}",
+                org.name
+            )),
         }
     }
     out.truncate(want);
@@ -501,7 +1210,14 @@ async fn resolve_domain(apollo: &Apollo, org: &ApolloOrg) -> String {
 
 // --- Claude calls ----------------------------------------------------------
 
-async fn derive_icp(client: &Engine, system: &str, pb: &Playbook, thesis: &str) -> Result<Icp> {
+async fn derive_icp(
+    client: &Engine,
+    system: &str,
+    pb: &Playbook,
+    business_context: &str,
+    gtm_play_context: &str,
+    thesis: &str,
+) -> Result<Icp> {
     let mut firmographic = String::new();
     if let Some(max) = pb.max_employees {
         firmographic.push_str(&format!(
@@ -514,22 +1230,35 @@ async fn derive_icp(client: &Engine, system: &str, pb: &Playbook, thesis: &str) 
         firmographic.push(' ');
         firmographic.push_str(pb.icp_note.trim());
     }
+    let context_block = if business_context.trim().is_empty() {
+        String::new()
+    } else {
+        format!("{}\n\n", business_context.trim())
+    };
     let user = format!(
-        "Translate this outreach thesis into an Apollo.io search. The brand's motion is: {motion}.\n\n\
+        "{context_block}Translate this outreach thesis into an Apollo.io search. The brand's motion is: {motion}.\n\n{gtm_play_context}\n\n\
          THESIS: {thesis}\n\n\
-         Return Apollo filters that will surface companies plausibly having this expensive workflow, \
-         and the job titles/seniorities of the people who would OWN or OBSERVE it (by vantage, not \
-         just seniority). Keep keywords concrete and industry-specific. Employee ranges must use \
-         Apollo's bucket format like \"51,200\".{firmographic} If the thesis implies a region, set locations.",
+         Return Apollo filters that will surface companies plausibly having this expensive workflow \
+         AND that fit what the business (above) is actually trying to accomplish — not merely a loose \
+         keyword match. Include the job titles/seniorities of the people who would OWN or OBSERVE the \
+         workflow (by vantage, not just seniority). Keep keywords concrete and industry-specific. \
+         Employee ranges must use Apollo's bucket format like \"51,200\".{firmographic} If the thesis \
+         implies a region, set locations.\n\n{doctrine}",
         motion = pb.motion,
+        doctrine = core_strategy_block("icp"),
     );
-    client.structured::<Icp>(system, &user, icp_schema()).await
+    client
+        .structured_bulk::<Icp>("source.icp", system, &user, icp_schema())
+        .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn qualify_org(
     client: &Engine,
     system: &str,
     pb: &Playbook,
+    business_context: &str,
+    gtm_play_context: &str,
     thesis: &str,
     org: &ApolloOrg,
     knowledge: &str,
@@ -551,19 +1280,39 @@ async fn qualify_org(
     } else {
         format!("{}\n\n", research.trim())
     };
+    let context_block = if business_context.trim().is_empty() {
+        String::new()
+    } else {
+        format!("{}\n\n", business_context.trim())
+    };
+    let signal_catalog = crate::gtm::signal_catalog_prompt(&pb.key);
     let user = format!(
-        "Decide whether this REAL company (from Apollo) fits the thesis, and if so frame the \
+        "{context_block}{gtm_play_context}\n\nDecide whether this REAL company (from Apollo) fits the thesis AND the \
+         business's goals and constraints above, and if so frame the \
          doctrine fields. THESIS: {thesis}\n\nAPOLLO FACTS (the ONLY things you may state as fact):\n{facts}\n\n{research_block}{knowledge}\n\n\
          Rules: observed_facts must each be supported by the Apollo facts OR the website research \
          above — never invent a customer, metric, or dollar figure. Put every reasonable-but-unproven \
          guess in inferences. consequence_metric is a measurable consequence, NOT dollars. If at \
          least {min} independent signals don't support the hypothesis, set qualified=false with a \
-         one-line reject_reason.",
+         one-line reject_reason. Preserve the readable `signals` list, and also map every supported \
+         observation you can to `structured_signals` using the canonical catalog. Never invent a \
+         signal merely to satisfy the catalog. Missing public evidence is an `evidence_gap`, never \
+         a `disqualifier`; reserve disqualifiers for affirmative evidence that the company cannot \
+         realistically run, buy, or validate the motion. A plausible manufacturer with account-fit \
+         evidence and one supported workflow signal may remain a discovery candidate even when the \
+         exact manual task or exception pattern must be tested in outreach. Root-cause analysis must separate the observable \
+         symptom/event from the underlying missing information, coordination, capability, or system \
+         boundary that plausibly produces it; name the current human workaround and mark anything \
+         unproven as hypothesis. Explain why the active play's bounded proof could confirm or kill \
+         that cause. Score play fit 0-100: 30 signal/decision evidence, 25 root-cause + workaround \
+         clarity, 20 reachable stakeholder vantage, 15 bounded-proof fit, 10 credible timing/why-now. \
+         A generic industry, technology, hiring, or scale match cannot score 65. Put real blockers in \
+         disqualifiers and unknown evidence in evidence_gaps.\n\n{signal_catalog}",
         facts = serde_json::to_string_pretty(&facts).unwrap_or_default(),
         min = pb.min_signals,
     );
     client
-        .structured::<OrgQual>(system, &user, qual_schema())
+        .structured_bulk::<OrgQual>("source.qualify", system, &user, qual_schema())
         .await
 }
 
@@ -581,17 +1330,20 @@ async fn assign_vantage(
         .collect();
     let user = format!(
         "These are REAL people at {company}. The hypothesis we're testing: {hyp}\n\nROSTER:\n{roster}\n\n\
-         For each person, assign the vantage point that best fits what they can observe/decide/route \
-         (not their seniority), one narrow sentence of can_observe, one sentence why_them, whether \
-         they are the primary first contact, and route_to if they're a router. Vantage notes for this \
-         brand:\n{notes}",
+         For each person, assign the vantage point that best fits what they may observe, decide, or route \
+         (not their seniority). can_observe must be a cautious 5-15 word note about likely access. \
+         why_them must be a plain 6-18 word internal reason to contact them. Do not repeat their title, \
+         lecture them about their role, or claim ownership that the title does not prove. Use `likely`, \
+         `may`, or `could` where access is inferred. Also say whether they are a primary first contact, \
+         and fill route_to only for a router. Vantage notes for this brand:\n{notes}\n\n{doctrine}",
         company = lead.name,
         hyp = lead.hypothesis,
         roster = serde_json::to_string_pretty(&roster).unwrap_or_default(),
         notes = pb.vantage_notes.join("\n"),
+        doctrine = core_strategy_block("people"),
     );
     client
-        .structured::<VantageDoc>(system, &user, vantage_schema())
+        .structured_fast::<VantageDoc>("source.vantage", system, &user, vantage_schema())
         .await
 }
 
@@ -599,6 +1351,24 @@ async fn assign_vantage(
 
 fn str_array(desc: &str) -> Value {
     json!({ "type": "array", "items": { "type": "string" }, "description": desc })
+}
+
+fn signal_candidates_schema() -> Value {
+    json!({
+        "type": "array",
+        "description": "Source-backed observations mapped to canonical GTM signal keys.",
+        "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["definition_key", "evidence", "confidence"],
+            "properties": {
+                "definition_key": { "type": "string" },
+                "evidence": { "type": "string" },
+                "source_url": { "type": "string" },
+                "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+            }
+        }
+    })
 }
 
 fn icp_schema() -> Value {
@@ -627,7 +1397,7 @@ fn qual_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["qualified", "hypothesis", "mechanism", "consequence_metric"],
+        "required": ["qualified", "hypothesis", "mechanism", "consequence_metric", "play_fit_score", "symptom", "root_cause", "current_workaround", "why_now", "proof_fit"],
         "properties": {
             "qualified": { "type": "boolean" },
             "reject_reason": { "type": "string" },
@@ -637,6 +1407,16 @@ fn qual_schema() -> Value {
             "mechanism": { "type": "string" },
             "consequence_metric": { "type": "string", "description": "Measurable consequence, never dollars." },
             "signals": str_array("Independent signals making the hypothesis plausible."),
+            "structured_signals": signal_candidates_schema(),
+            "play_fit_score": { "type": "integer", "minimum": 0, "maximum": 100 },
+            "matched_signal_keys": str_array("Canonical keys supported by the structured observations."),
+            "symptom": { "type": "string", "description": "Observable event or workflow symptom, not the root cause." },
+            "root_cause": { "type": "string", "description": "Evidence-backed or explicitly hypothetical causal mechanism." },
+            "current_workaround": { "type": "string", "description": "How people or systems plausibly compensate today; mark uncertainty." },
+            "why_now": { "type": "string", "description": "Observed timing relevance, or empty when none exists." },
+            "proof_fit": { "type": "string", "description": "Why the active bounded proof can confirm or kill this hypothesis." },
+            "evidence_gaps": str_array("Unknowns that discovery or research must resolve."),
+            "disqualifiers": str_array("Observed hard reasons not to pursue this play."),
             "system_concept": { "type": "string" },
             "hard_buyer_question": { "type": "string" },
             "kill_condition": { "type": "string" },
@@ -700,7 +1480,215 @@ fn normalize_vantage(raw: &str) -> String {
 }
 
 fn first_line(s: &str) -> String {
-    s.lines().next().unwrap_or("").chars().take(80).collect()
+    s.lines().next().unwrap_or("").chars().take(120).collect()
+}
+
+fn compact_list(values: &[String], limit: usize) -> String {
+    if values.is_empty() {
+        return "none".into();
+    }
+    let shown = values.iter().take(limit).cloned().collect::<Vec<_>>();
+    if values.len() > shown.len() {
+        format!("{} +{}", shown.join(", "), values.len() - shown.len())
+    } else {
+        shown.join(", ")
+    }
+}
+
+fn is_legacy_two_signal_reject(detail: &str) -> bool {
+    !detail.starts_with("hard_reject:")
+        && !detail.starts_with("insufficient_fit:")
+        && detail.starts_with("only 2 canonical play signal(s) matched")
+}
+
+/// Persist repeatable failure *patterns*, not only exact rejected companies.
+/// These rows are injected into the next ICP prompt, so a broad Apollo query
+/// that surfaced retailers/design publications for an industrial motion gets
+/// tighter on the following pass instead of merely avoiding the same domains.
+fn record_qualification_patterns(
+    db: &SharedDb,
+    pb: &Playbook,
+    results: &[(ApolloOrg, Result<OrgQual>)],
+) -> usize {
+    let rejected = results
+        .iter()
+        .filter_map(|(org, result)| {
+            result
+                .as_ref()
+                .ok()
+                .filter(|q| !q.qualified)
+                .map(|q| (org, q))
+        })
+        .collect::<Vec<_>>();
+    if rejected.len() < 2 {
+        return 0;
+    }
+
+    let required = db
+        .current_gtm_play(&pb.key)
+        .ok()
+        .flatten()
+        .map(|play| play.minimum_signal_matches.max(1) as usize)
+        .unwrap_or(pb.min_signals.max(1));
+    let missing_signals = rejected
+        .iter()
+        .filter(|(_, q)| q.matched_signal_keys.len() < required)
+        .count();
+    let missing_root_cause = rejected
+        .iter()
+        .filter(|(_, q)| q.root_cause.trim().is_empty())
+        .count();
+    let missing_proof = rejected
+        .iter()
+        .filter(|(_, q)| q.proof_fit.trim().is_empty())
+        .count();
+    let low_fit = rejected
+        .iter()
+        .filter(|(_, q)| q.play_fit_score < 65)
+        .count();
+    let hard_disqualifiers = rejected
+        .iter()
+        .filter(|(_, q)| !q.disqualifiers.is_empty())
+        .count();
+    let total = rejected.len();
+
+    let mut industry_counts = HashMap::<String, usize>::new();
+    for (org, _) in &rejected {
+        let industry = org.industry.trim();
+        if !industry.is_empty() {
+            *industry_counts.entry(industry.to_string()).or_default() += 1;
+        }
+    }
+    let mut industries = industry_counts.into_iter().collect::<Vec<_>>();
+    industries.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    let recurring_industries = industries
+        .into_iter()
+        .filter(|(_, count)| *count >= 2)
+        .map(|(industry, count)| format!("{industry} ({count})"))
+        .collect::<Vec<_>>();
+
+    let mut saved = 0usize;
+    let patterns = [
+        (
+            "missing_required_signals",
+            "Apollo candidates missing required play signals",
+            missing_signals,
+            format!(
+                "{missing_signals}/{total} rejected candidates matched fewer than {required} canonical signals. Tighten keywords and company types toward accounts that visibly exhibit the play's required operational signals."
+            ),
+        ),
+        (
+            "weak_root_cause_evidence",
+            "Candidates without defensible root-cause evidence",
+            missing_root_cause,
+            format!(
+                "{missing_root_cause}/{total} rejected candidates lacked a defensible root-cause hypothesis. Prefer company evidence that exposes the recurring workflow, current workaround, and decision consequence."
+            ),
+        ),
+        (
+            "weak_bounded_proof_fit",
+            "Candidates that cannot support the bounded proof",
+            missing_proof,
+            format!(
+                "{missing_proof}/{total} rejected candidates had no credible bounded-proof fit. Tighten toward accounts where the proposed test can be run against a real workflow and measurable stop condition."
+            ),
+        ),
+        (
+            "low_play_fit",
+            "Apollo candidate pool below the play-fit floor",
+            low_fit,
+            format!(
+                "{low_fit}/{total} rejected candidates scored below 65/100. Do not treat broad industry or size resemblance as qualification; require operational evidence before selecting the account."
+            ),
+        ),
+        (
+            "hard_disqualifiers",
+            "Hard disqualifiers recurring in Apollo candidates",
+            hard_disqualifiers,
+            format!(
+                "{hard_disqualifiers}/{total} rejected candidates carried hard disqualifiers. Exclude company types that cannot realistically buy, run, or validate this motion."
+            ),
+        ),
+    ];
+    for (key, subject, count, detail) in patterns {
+        if count >= 2
+            && db
+                .record_learning(&pb.key, "qualification_pattern", subject, key, &detail)
+                .is_ok()
+        {
+            saved += 1;
+        }
+    }
+    if !recurring_industries.is_empty() {
+        let detail = format!(
+            "Repeatedly rejected industries in this candidate pool: {}. Treat these as negative evidence unless a company independently shows the required workflow signals.",
+            recurring_industries.join(", ")
+        );
+        if db
+            .record_learning(
+                &pb.key,
+                "qualification_pattern",
+                "Industries repeatedly rejected by the active play",
+                "rejected_industry_clusters",
+                &detail,
+            )
+            .is_ok()
+        {
+            saved += 1;
+        }
+    }
+    saved
+}
+
+/// Stable dedup handle for a company across runs: prefer Apollo's org id, fall
+/// back to its domain. Used to recognize a company we've already judged.
+fn org_learning_key(org: &ApolloOrg) -> String {
+    if !org.id.trim().is_empty() {
+        org.id.clone()
+    } else {
+        org.domain()
+    }
+}
+
+/// Dedup handle for a stored Lead, mirroring [`org_learning_key`] so a company
+/// already qualified in an earlier run is recognized and never re-qualified.
+fn lead_dedup_key(lead: &Lead) -> String {
+    if !lead.apollo_org_id.trim().is_empty() {
+        lead.apollo_org_id.clone()
+    } else {
+        lead.domain.clone()
+    }
+}
+
+/// Prepend the brand's accumulated learnings to the operating context so ICP
+/// derivation and qualification see them. A no-op when there's nothing learned
+/// yet, so a brand's first-ever run behaves exactly as before.
+fn augment_context_with_learnings(
+    business_context: &str,
+    learnings: &[crate::db::Learning],
+) -> String {
+    if learnings.is_empty() {
+        return business_context.to_string();
+    }
+    let bullets = learnings
+        .iter()
+        .map(|learning| {
+            let seen = if learning.hits > 1 {
+                format!("[seen {}×] ", learning.hits)
+            } else {
+                String::new()
+            };
+            format!("  - {seen}{}: {}", learning.subject, learning.detail)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "{}\n\nPRIOR SOURCING LEARNINGS FOR THIS BRAND (exact companies skipped, recurring \
+         qualification failures, and contact-coverage problems from earlier runs — refine the \
+         Apollo filters accordingly; do NOT re-propose these companies or repeat these patterns):\n{}",
+        business_context.trim(),
+        bullets,
+    )
 }
 
 /// Drop Apollo size buckets whose lower bound exceeds the brand's headcount
@@ -724,7 +1712,13 @@ fn clamp_employee_ranges(ranges: Vec<String>, max_employees: Option<i64>) -> Vec
         return kept;
     }
     const STD: [&str; 8] = [
-        "1,10", "11,50", "51,200", "201,500", "501,1000", "1001,5000", "5001,10000",
+        "1,10",
+        "11,50",
+        "51,200",
+        "201,500",
+        "501,1000",
+        "1001,5000",
+        "5001,10000",
         "10001,1000000",
     ];
     STD.iter()
@@ -733,9 +1727,433 @@ fn clamp_employee_ranges(ranges: Vec<String>, max_employees: Option<i64>) -> Vec
         .collect()
 }
 
+/// True when an org's search payload lacks the firmographics qualification needs
+/// (industry, headcount, description, keywords) — i.e. it's name+domain only.
+fn org_is_thin(o: &ApolloOrg) -> bool {
+    o.industry.trim().is_empty()
+        && o.short_description.trim().is_empty()
+        && o.keywords.is_empty()
+        && o.estimated_num_employees == 0
+}
+
+/// Fill in a thin org's firmographics via Apollo organization enrichment (by
+/// domain). Falls back to the original record if it's already rich, has no
+/// domain, or enrichment fails/returns nothing — so sourcing never regresses.
+async fn hydrate_org(apollo: &Apollo, org: ApolloOrg) -> ApolloOrg {
+    if !org_is_thin(&org) {
+        return org;
+    }
+    let domain = org.domain();
+    if domain.is_empty() {
+        return org;
+    }
+    match apollo.enrich_organization(&domain).await {
+        Ok(Some(full)) if !org_is_thin(&full) => full,
+        _ => org,
+    }
+}
+
+// --- Reuse-first inventory -------------------------------------------------
+
+/// Pick the strongest on-file accounts/people for a brand so a full motion can
+/// skip Apollo when the CRM already has enough inventory. Preference order:
+/// more verified contacts, richer doctrine, more recent update.
+pub fn select_reuse(
+    db: &SharedDb,
+    brand: &str,
+    n_accounts: usize,
+    n_contacts: usize,
+) -> Result<ReuseSelection> {
+    let n_accounts = n_accounts.max(1);
+    let n_contacts = n_contacts.max(1);
+    let leads = db.list_leads(Some(brand))?;
+    let people = db.list_people(Some(brand), None)?;
+
+    let mut by_lead: std::collections::HashMap<String, Vec<Person>> =
+        std::collections::HashMap::new();
+    for person in people {
+        by_lead
+            .entry(person.lead_id.clone())
+            .or_default()
+            .push(person);
+    }
+
+    let people_on_file = by_lead.values().map(|v| v.len()).sum::<usize>();
+    let verified_on_file = by_lead
+        .values()
+        .flat_map(|v| v.iter())
+        .filter(|p| p.email_status.eq_ignore_ascii_case("verified"))
+        .count();
+
+    // Only accounts that already have at least one person can be reused without
+    // a fresh Apollo people search.
+    let mut ranked = leads
+        .into_iter()
+        .filter_map(|lead| {
+            let roster = by_lead.get(&lead.id)?;
+            if roster.is_empty() {
+                return None;
+            }
+            let score = reuse_lead_score(&lead, roster);
+            Some((score, lead, roster.clone()))
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.name.cmp(&right.1.name))
+    });
+
+    let accounts_on_file = ranked.len();
+    let mut selection = ReuseSelection {
+        accounts_on_file,
+        people_on_file,
+        verified_on_file,
+        accounts_shortfall: n_accounts.saturating_sub(accounts_on_file),
+        ..Default::default()
+    };
+
+    for (_score, lead, mut roster) in ranked.into_iter().take(n_accounts) {
+        roster.sort_by(|left, right| {
+            reuse_person_score(right)
+                .cmp(&reuse_person_score(left))
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        let take = roster.into_iter().take(n_contacts).collect::<Vec<_>>();
+        selection.accounts_selected += 1;
+        selection.lead_ids.push(lead.id);
+        for person in take {
+            if person.email_status.eq_ignore_ascii_case("verified") {
+                selection.verified_selected += 1;
+            }
+            selection.people_selected += 1;
+            selection.person_ids.insert(person.id);
+        }
+    }
+    Ok(selection)
+}
+
+fn reuse_lead_score(lead: &Lead, people: &[Person]) -> i64 {
+    let verified = people
+        .iter()
+        .filter(|p| p.email_status.eq_ignore_ascii_case("verified"))
+        .count() as i64;
+    let total = people.len() as i64;
+    let doctrine = if lead.hypothesis.trim().is_empty() {
+        0
+    } else {
+        40
+    } + if lead.observed_facts.is_empty() {
+        0
+    } else {
+        20
+    };
+    // Prefer qualified status and denser contact books.
+    let status = if lead.status.eq_ignore_ascii_case("qualified") {
+        15
+    } else {
+        0
+    };
+    verified * 100 + total * 10 + doctrine + status
+}
+
+fn reuse_person_score(person: &Person) -> i64 {
+    let mut score = if person.primary { 100 } else { 0 };
+    if person.email_status.eq_ignore_ascii_case("verified") {
+        score += 80;
+    } else if !person.email.trim().is_empty() {
+        score += 20;
+    }
+    let vantage = person.vantage.to_ascii_lowercase();
+    score += match vantage.as_str() {
+        "process_owner" => 70,
+        "operator" => 65,
+        "operational_executive" => 55,
+        "economic_buyer" => 40,
+        "technical_evaluator" => 25,
+        "router" => 10,
+        _ => 0,
+    };
+    score
+}
+
+/// Rewrite doctrine framing for already-qualified leads using the current
+/// business profile + thesis. No Apollo, no re-qualification rejects — the
+/// company stays; only the commercial "why them" is refreshed for better copy.
+#[allow(clippy::too_many_arguments)]
+pub async fn refresh_lead_context(
+    db: &SharedDb,
+    client: &Engine,
+    pb: &Playbook,
+    business_context: &str,
+    library: &Library,
+    thesis: &str,
+    lead_ids: &[String],
+    concurrency: usize,
+) -> Result<usize> {
+    if lead_ids.is_empty() {
+        return Ok(0);
+    }
+    let active_play = db.current_gtm_play(&pb.key)?;
+    let gtm_play_context = crate::gtm::sourcing_play_block(active_play.as_ref());
+    let system = format!(
+        "You refresh commercial framing for companies already qualified for {name}. Motion: {motion}. \
+         Keep the company; rewrite why it fits now. Separate supported facts, inferences, and a \
+         falsifiable workflow hypothesis. Never invent customers, metrics, systems, or dollar impact. \
+         Return only the requested structured data.",
+        name = pb.name,
+        motion = pb.motion,
+    );
+    let retrieved = library
+        .retrieve_stage(
+            &format!("refreshing account hypothesis: {thesis}; {}", pb.motion),
+            "companies",
+            3,
+            1,
+        )
+        .playbook_block();
+    let knowledge = format!("{}\n\n{}", core_strategy_block("companies"), retrieved);
+    let concurrency = concurrency.max(1);
+
+    let mut leads = Vec::new();
+    for id in lead_ids {
+        if let Some(lead) = db.get_lead(id)? {
+            leads.push(lead);
+        }
+    }
+    if leads.is_empty() {
+        return Ok(0);
+    }
+
+    let results = stream::iter(leads.into_iter().map(|lead| {
+        let system = system.clone();
+        let knowledge = knowledge.clone();
+        let business_context = business_context.to_string();
+        let thesis = thesis.to_string();
+        let gtm_play_context = gtm_play_context.clone();
+        async move {
+            let refresh = refresh_one_lead(
+                client,
+                &system,
+                pb,
+                &business_context,
+                &gtm_play_context,
+                &thesis,
+                &lead,
+                &knowledge,
+            )
+            .await;
+            (lead, refresh)
+        }
+    }))
+    .buffered(concurrency)
+    .collect::<Vec<_>>()
+    .await;
+
+    let mut refreshed = 0usize;
+    for (mut lead, result) in results {
+        match result {
+            Ok(doc) => {
+                let structured_signals = doc.structured_signals.clone();
+                let assessment = active_play.as_ref().map(|play| AccountPlayAssessment {
+                    lead_id: lead.id.clone(),
+                    brand: pb.key.clone(),
+                    play_id: play.id.clone(),
+                    play_version: play.version,
+                    status: if doc.play_fit_score >= 65
+                        && !doc.root_cause.trim().is_empty()
+                        && doc.disqualifiers.is_empty()
+                    {
+                        "qualified".into()
+                    } else {
+                        "research_needed".into()
+                    },
+                    fit_score: doc.play_fit_score,
+                    matched_signal_keys: doc.matched_signal_keys.clone(),
+                    symptom: doc.symptom.clone(),
+                    root_cause: doc.root_cause.clone(),
+                    current_workaround: doc.current_workaround.clone(),
+                    why_now: doc.why_now.clone(),
+                    proof_fit: doc.proof_fit.clone(),
+                    evidence_gaps: doc.evidence_gaps.clone(),
+                    disqualifiers: doc.disqualifiers.clone(),
+                    source: "source.refresh".into(),
+                    ..Default::default()
+                });
+                apply_lead_refresh(&mut lead, doc, thesis);
+                let lead_id = db.upsert_lead(&lead)?;
+                db.record_signal_candidates(
+                    &pb.key,
+                    &lead_id,
+                    &structured_signals,
+                    "source.refresh",
+                )?;
+                if let Some(assessment) = assessment {
+                    db.upsert_account_play_assessment(&assessment)?;
+                }
+                db.log_event(
+                    &pb.key,
+                    "",
+                    "",
+                    "refreshed",
+                    &format!("refreshed framing for {}", lead.name),
+                )?;
+                log_sourcing(format!("✓ refreshed {}", lead.name));
+                refreshed += 1;
+            }
+            Err(error) => {
+                log_sourcing(format!("! {} refresh error: {error:#}", lead.name));
+            }
+        }
+    }
+    Ok(refreshed)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn refresh_one_lead(
+    client: &Engine,
+    system: &str,
+    pb: &Playbook,
+    business_context: &str,
+    gtm_play_context: &str,
+    thesis: &str,
+    lead: &Lead,
+    knowledge: &str,
+) -> Result<LeadRefresh> {
+    let facts = json!({
+        "name": lead.name,
+        "domain": lead.domain,
+        "industry": lead.industry,
+        "headquarters": lead.hq,
+        "estimated_employees": lead.headcount,
+        "annual_revenue": lead.revenue,
+        "prior_observed_facts": lead.observed_facts,
+        "prior_inferences": lead.inferences,
+        "prior_hypothesis": lead.hypothesis,
+        "prior_mechanism": lead.mechanism,
+        "prior_signals": lead.signals,
+        "prior_system_concept": lead.system_concept,
+    });
+    let context_block = if business_context.trim().is_empty() {
+        String::new()
+    } else {
+        format!("{}\n\n", business_context.trim())
+    };
+    let signal_catalog = crate::gtm::signal_catalog_prompt(&pb.key);
+    let user = format!(
+        "{context_block}{gtm_play_context}\n\nThis company is ALREADY on file. Reassess it against the active play and refresh the commercial \
+         framing so outreach copy can explain exactly why THIS company is a fit for the thesis and \
+         for the business goals above. Do not reject the company. Prefer keeping prior observed_facts \
+         that still hold; tighten or replace weak inferences/hypothesis/mechanism.\n\n\
+         THESIS: {thesis}\n\nON-FILE ACCOUNT:\n{facts}\n\n{knowledge}\n\n\
+         Rules: observed_facts must stay grounded in the on-file fields above (and prior facts). \
+         Never invent customers, systems, volumes, or dollar figures. consequence_metric is measurable \
+         and non-dollar. why_this_company: one plain sentence a founder could say out loud. Preserve \
+         readable `signals` and map supported evidence to `structured_signals` using only the catalog. \
+         Separate symptom from root cause, describe the current workaround without asserting guesses \
+         as fact, state why the bounded proof fits, and score the account against the same 100-point \
+         play-fit rubric used during sourcing. Unknowns go in evidence_gaps; hard blockers go in \
+         disqualifiers.\n\n{signal_catalog}",
+        facts = serde_json::to_string_pretty(&facts).unwrap_or_default(),
+    );
+    let _ = pb; // brand motion already in system prompt
+    client
+        .structured_bulk::<LeadRefresh>("source.refresh", system, &user, refresh_schema())
+        .await
+}
+
+fn apply_lead_refresh(lead: &mut Lead, doc: LeadRefresh, thesis: &str) {
+    if !thesis.trim().is_empty() {
+        lead.thesis = thesis.to_string();
+    }
+    if !doc.observed_facts.is_empty() {
+        lead.observed_facts = doc.observed_facts;
+    }
+    if !doc.inferences.is_empty() {
+        lead.inferences = doc.inferences;
+    }
+    if !doc.hypothesis.trim().is_empty() {
+        lead.hypothesis = doc.hypothesis.trim().to_string();
+    }
+    if !doc.mechanism.trim().is_empty() {
+        lead.mechanism = doc.mechanism.trim().to_string();
+    }
+    if !doc.consequence_metric.trim().is_empty() {
+        lead.consequence_metric = doc.consequence_metric.trim().to_string();
+    }
+    if !doc.signals.is_empty() {
+        lead.signals = doc.signals;
+    }
+    if !doc.system_concept.trim().is_empty() {
+        lead.system_concept = doc.system_concept.trim().to_string();
+    }
+    if !doc.hard_buyer_question.trim().is_empty() {
+        lead.hard_buyer_question = doc.hard_buyer_question.trim().to_string();
+    }
+    if !doc.kill_condition.trim().is_empty() {
+        lead.kill_condition = doc.kill_condition.trim().to_string();
+    }
+    // Fold "why this company" into magnitude_note so the CRM and copy planner
+    // both see a crisp internal rationale without a schema migration.
+    let why = doc.why_this_company.trim();
+    let prior = doc.magnitude_note.trim();
+    lead.magnitude_note = match (why.is_empty(), prior.is_empty()) {
+        (false, false) => format!("{why} ({prior})"),
+        (false, true) => why.to_string(),
+        (true, false) => prior.to_string(),
+        (true, true) => lead.magnitude_note.clone(),
+    };
+    if !doc.applied_principles.is_empty() {
+        lead.applied_principles = doc.applied_principles;
+    }
+    if lead.status.trim().is_empty() {
+        lead.status = "qualified".into();
+    }
+}
+
+fn refresh_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["hypothesis", "mechanism", "consequence_metric", "why_this_company", "play_fit_score", "symptom", "root_cause", "current_workaround", "why_now", "proof_fit"],
+        "properties": {
+            "observed_facts": str_array("Facts still supported by the on-file account payload."),
+            "inferences": str_array("Reasonable but unproven guesses."),
+            "hypothesis": { "type": "string" },
+            "mechanism": { "type": "string" },
+            "consequence_metric": { "type": "string", "description": "Measurable consequence, never dollars." },
+            "signals": str_array("Independent signals making the hypothesis plausible."),
+            "structured_signals": signal_candidates_schema(),
+            "play_fit_score": { "type": "integer", "minimum": 0, "maximum": 100 },
+            "matched_signal_keys": str_array("Canonical keys supported by the structured observations."),
+            "symptom": { "type": "string" },
+            "root_cause": { "type": "string" },
+            "current_workaround": { "type": "string" },
+            "why_now": { "type": "string" },
+            "proof_fit": { "type": "string" },
+            "evidence_gaps": str_array("Unknowns the next research or discovery step must resolve."),
+            "disqualifiers": str_array("Hard reasons this account should not run the active play."),
+            "system_concept": { "type": "string" },
+            "hard_buyer_question": { "type": "string" },
+            "kill_condition": { "type": "string" },
+            "magnitude_note": { "type": "string", "description": "Internal-only; never buyer-facing." },
+            "applied_principles": str_array("[id]s of book-library principles applied."),
+            "why_this_company": { "type": "string", "description": "One plain sentence: why this company specifically." }
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::clamp_employee_ranges;
+    use std::collections::HashSet;
+
+    use super::{
+        clamp_employee_ranges, enforce_play_qualification, reuse_lead_score, reuse_person_score,
+        OrgQual,
+    };
+    use crate::db::{Lead, Person};
+    use crate::gtm::{default_plays, SignalCandidate};
 
     #[test]
     fn clamp_drops_buckets_above_the_ceiling() {
@@ -770,30 +2188,162 @@ mod tests {
         let ranges = vec!["10001,1000000".to_string()];
         assert_eq!(clamp_employee_ranges(ranges.clone(), None), ranges);
     }
-}
 
-/// True when an org's search payload lacks the firmographics qualification needs
-/// (industry, headcount, description, keywords) — i.e. it's name+domain only.
-fn org_is_thin(o: &ApolloOrg) -> bool {
-    o.industry.trim().is_empty()
-        && o.short_description.trim().is_empty()
-        && o.keywords.is_empty()
-        && o.estimated_num_employees == 0
-}
+    #[test]
+    fn reuse_scores_prefer_verified_primary_process_owners() {
+        let primary = Person {
+            primary: true,
+            email_status: "verified".into(),
+            vantage: "process_owner".into(),
+            ..Default::default()
+        };
+        let router = Person {
+            primary: false,
+            email_status: "unknown".into(),
+            vantage: "router".into(),
+            ..Default::default()
+        };
+        assert!(reuse_person_score(&primary) > reuse_person_score(&router));
 
-/// Fill in a thin org's firmographics via Apollo organization enrichment (by
-/// domain). Falls back to the original record if it's already rich, has no
-/// domain, or enrichment fails/returns nothing — so sourcing never regresses.
-async fn hydrate_org(apollo: &Apollo, org: ApolloOrg) -> ApolloOrg {
-    if !org_is_thin(&org) {
-        return org;
+        let rich = Lead {
+            hypothesis: "they run a NOC".into(),
+            observed_facts: vec!["utility ops".into()],
+            status: "qualified".into(),
+            ..Default::default()
+        };
+        let thin = Lead::default();
+        let people = vec![primary];
+        assert!(reuse_lead_score(&rich, &people) > reuse_lead_score(&thin, &people));
     }
-    let domain = org.domain();
-    if domain.is_empty() {
-        return org;
+
+    #[test]
+    fn active_play_rejects_superficial_account_fit() {
+        let play = default_plays()
+            .into_iter()
+            .find(|play| play.brand == "outagehub")
+            .expect("outagehub play");
+        let allowed = play
+            .required_signal_keys
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
+        let mut qualification = OrgQual {
+            qualified: true,
+            play_fit_score: 82,
+            structured_signals: vec![SignalCandidate {
+                definition_key: "account.distributed_locations".into(),
+                evidence: "Operates sites in three provinces.".into(),
+                confidence: 0.9,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        enforce_play_qualification(&mut qualification, Some(&play), &allowed);
+
+        assert!(!qualification.qualified);
+        assert!(qualification
+            .reject_reason
+            .contains("canonical play signal"));
+        assert!(qualification.reject_reason.contains("root-cause"));
+        assert!(qualification.reject_reason.contains("bounded proof"));
     }
-    match apollo.enrich_organization(&domain).await {
-        Ok(Some(full)) if !org_is_thin(&full) => full,
-        _ => org,
+
+    #[test]
+    fn active_play_accepts_evidenced_root_cause_and_proof_fit() {
+        let play = default_plays()
+            .into_iter()
+            .find(|play| play.brand == "outagehub")
+            .expect("outagehub play");
+        let allowed = play
+            .required_signal_keys
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
+        let structured_signals = [
+            ("account.fit_evidence", "Runs a 24/7 operations desk."),
+            (
+                "account.outage_sensitive_decision",
+                "Operators dispatch or hold after a loss-of-power alarm.",
+            ),
+            (
+                "account.distributed_locations",
+                "Operates remote locations across utility territories.",
+            ),
+        ]
+        .into_iter()
+        .map(|(definition_key, evidence)| SignalCandidate {
+            definition_key: definition_key.into(),
+            evidence: evidence.into(),
+            confidence: 0.85,
+            ..Default::default()
+        })
+        .collect();
+        let mut qualification = OrgQual {
+            qualified: true,
+            play_fit_score: 78,
+            structured_signals,
+            root_cause: "Site telemetry cannot supply external utility context.".into(),
+            proof_fit: "Replay three historical alarms against public outage records.".into(),
+            ..Default::default()
+        };
+
+        enforce_play_qualification(&mut qualification, Some(&play), &allowed);
+
+        assert!(qualification.qualified);
+        assert_eq!(qualification.matched_signal_keys.len(), 3);
+        assert_eq!(qualification.routing_status, "qualified");
+    }
+
+    #[test]
+    fn active_play_routes_plausible_two_signal_account_to_discovery() {
+        let play = default_plays()
+            .into_iter()
+            .find(|play| play.brand == "wapahki")
+            .expect("wapahki play");
+        let allowed = play
+            .required_signal_keys
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
+        let structured_signals = [
+            (
+                "account.fit_evidence",
+                "Produces packaged food in an operating plant.",
+            ),
+            (
+                "account.format_variability",
+                "The public product catalog spans many case and pack formats.",
+            ),
+        ]
+        .into_iter()
+        .map(|(definition_key, evidence)| SignalCandidate {
+            definition_key: definition_key.into(),
+            evidence: evidence.into(),
+            confidence: 0.8,
+            ..Default::default()
+        })
+        .collect();
+        let mut qualification = OrgQual {
+            qualified: false,
+            play_fit_score: 62,
+            structured_signals,
+            root_cause: "The exact task and exception rate remain unverified.".into(),
+            proof_fit: "A task review could confirm or kill the hypothesis.".into(),
+            disqualifiers: vec![
+                "No public evidence confirms exception-heavy manual handling.".into(),
+            ],
+            ..Default::default()
+        };
+
+        enforce_play_qualification(&mut qualification, Some(&play), &allowed);
+
+        assert!(qualification.qualified);
+        assert_eq!(qualification.routing_status, "research_needed");
+        assert!(qualification.disqualifiers.is_empty());
+        assert!(qualification
+            .evidence_gaps
+            .iter()
+            .any(|gap| gap.contains("No public evidence")));
     }
 }

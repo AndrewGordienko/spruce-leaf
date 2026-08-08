@@ -8,8 +8,8 @@
 
 use serde_json::{json, Value};
 
-use crate::domain::{Account, Contact, Sequence};
-use crate::playbook::{Lint, Playbook};
+use crate::domain::{Account, Contact};
+use crate::playbook::Playbook;
 
 /// Append a retrieved book-knowledge playbook block (if any) to a stage's user
 /// prompt. `cite` toggles the citation instruction for stages whose schema has
@@ -177,10 +177,19 @@ ACCOUNT CONTEXT (your research — most of this stays OUT of the email):\n\
   Hardest buyer question: {hard_q}\n\
   Observed facts (only THESE may be stated as fact): {facts}\n\n\
 Number the touches 1..{n}. The sequence is ONE unfolding investigation, each touch adding a new \
-angle — not restatements. Match the channel and ask to {name}'s vantage. Use email/linkedin/call. \
-For each touch set: day_offset from the start; channel; subject (empty string for non-email); the \
+angle — not restatements. Match the channel and ask to {name}'s vantage. Use email and LinkedIn only. \
+For each touch set: day_offset from the start; channel; subject (empty string for a connection request); the \
 body copy; purpose (which move this is — observation / diagnostic / consequence / artifact / \
 hard-question / routing / close); and goal.\n\n\
+If writing seven touches, use these exact channel/day pairs: email/0, email/3, \
+linkedin_request/5, email/9, linkedin_or_email/13, email/17, linkedin_or_email/21. \
+The connection request is 8–24 words with no pitch or meeting ask. Conditional touches are short \
+LinkedIn DMs when connected and email fallbacks otherwise. Finish by day 21. Touch 1 email is \
+40–75 words including the signature; later emails are 15–45 words; touch 7 has no question. \
+Mention {brand} only in touch 1. Use at most one \
+question, one CTA, one verified account fact, and one short sentence about {brand} per touch. \
+Subjects are 1–3 plain lowercase words with no numbers or question marks. Do not use fake familiarity, explain your strategy, dump the \
+research, or assert limitations of the recipient's tools.\n\n\
 Follow the length band, the voice, the forbidden list, and the pre-send test from the doctrine. \
 Center the operating decision, not {brand}. Keep the whole sequence on ONE problem thread. A \
 correction or a referral is a successful outcome.",
@@ -225,102 +234,6 @@ pub fn sequence_schema() -> Value {
                         "body": { "type": "string" },
                         "purpose": { "type": "string" },
                         "goal": { "type": "string" }
-                    }
-                }
-            }
-        }
-    })
-}
-
-// --- Stage 4: critique + revise --------------------------------------------
-
-/// Build the critic prompt, feeding in the mechanical lint findings so the model
-/// must fix forbidden phrases and length as well as doctrine issues.
-pub fn critique_user(
-    pb: &Playbook,
-    account: &Account,
-    contact: &Contact,
-    sequence: &Sequence,
-    lints: &[Lint],
-) -> String {
-    let mut touches = String::new();
-    for (t, lint) in sequence.touches.iter().zip(lints) {
-        touches.push_str(&format!(
-            "\n--- Touch {} ({}, day {}, purpose: {}) ---\n",
-            t.stage, t.channel, t.day_offset, t.purpose
-        ));
-        if !t.subject.is_empty() {
-            touches.push_str(&format!("Subject: {}\n", t.subject));
-        }
-        touches.push_str(&format!("Body:\n{}\n", t.body));
-        let mut flags = Vec::new();
-        if !lint.forbidden_hits.is_empty() {
-            flags.push(format!(
-                "FORBIDDEN PHRASES PRESENT: {}",
-                lint.forbidden_hits.join(", ")
-            ));
-        }
-        if !lint.length_ok {
-            flags.push(format!(
-                "LENGTH OFF: {} words (band is {}–{})",
-                lint.word_count, pb.min_words, pb.max_words
-            ));
-        }
-        if !lint.signature_ok {
-            flags.push(format!(
-                "SIGNATURE MISMATCH: final email line must be exactly '{}'",
-                pb.signature
-            ));
-        }
-        if !flags.is_empty() {
-            touches.push_str(&format!("MECHANICAL FLAGS: {}\n", flags.join("; ")));
-        }
-    }
-
-    format!(
-        "You are the final pre-send editor for {brand}. Run each touch below through the pre-send \
-test and rewrite it to pass. This is Andrew's last native-language edit: strip model-like \
-phrasing, corporate mush, leaked internal labels, fabricated numbers, unsupported claims, weak \
-interchangeable CTAs, and anything that only exists to show off research.\n\n\
-Context you may rely on:\n\
-  Hypothesis: {hypothesis}\n\
-  Observed facts (the ONLY things that may be stated as fact): {facts}\n\
-  Recipient vantage: {vantage} — {can_observe}\n\n\
-For each touch return: stage; passes (did the ORIGINAL pass the pre-send test?); issues (specific \
-problems); revised_subject; revised_body. Fix EVERY mechanical flag listed. Keep the body inside \
-the {min}–{max} word band. Every revised email body must end with exactly `{signature}`. Preserve \
-the sequence as one unfolding investigation. If a touch is \
-already clean, return it unchanged with passes=true and empty issues.\n\
-{touches}",
-        brand = pb.name,
-        hypothesis = account.hypothesis,
-        facts = account.observed_facts.join(" | "),
-        vantage = contact.vantage,
-        can_observe = contact.can_observe,
-        min = pb.min_words,
-        max = pb.max_words,
-        signature = pb.signature,
-    )
-}
-
-pub fn critique_schema() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["reviews"],
-        "properties": {
-            "reviews": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "required": ["stage", "passes", "issues", "revised_subject", "revised_body"],
-                    "properties": {
-                        "stage": { "type": "integer" },
-                        "passes": { "type": "boolean" },
-                        "issues": { "type": "array", "items": { "type": "string" } },
-                        "revised_subject": { "type": "string" },
-                        "revised_body": { "type": "string" }
                     }
                 }
             }

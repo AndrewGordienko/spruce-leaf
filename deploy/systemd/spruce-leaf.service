@@ -1,0 +1,32 @@
+# Bare-metal (no Docker) alternative to docker-compose.yml.
+#
+# Install:
+#   sudo useradd -r -m -d /home/spruce spruce           # service user with a home for ~/.claude
+#   sudo mkdir -p /opt/spruce-leaf/.spruce
+#   sudo cp target/release/spruce-leaf /usr/local/bin/   # or build on the box
+#   sudo cp -r playbooks businesses .env /opt/spruce-leaf/
+#   sudo chown -R spruce:spruce /opt/spruce-leaf /home/spruce
+#   # as the spruce user: install + authenticate the claude CLI (see deploy/README.md)
+#   sudo cp deploy/systemd/spruce-leaf.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now spruce-leaf
+#   journalctl -u spruce-leaf -f
+
+[Unit]
+Description=spruce-leaf outreach daemon (live send + inbox poll + discovery autopilot)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=spruce
+WorkingDirectory=/opt/spruce-leaf
+EnvironmentFile=/opt/spruce-leaf/.env
+# The claude CLI installs to ~/.local/bin; keep it on PATH for the engine subprocess.
+Environment=PATH=/home/spruce/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/local/bin/spruce-leaf daemon --live --autopilot
+Restart=on-failure
+RestartSec=15
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

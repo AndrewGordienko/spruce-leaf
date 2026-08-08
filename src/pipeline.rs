@@ -10,8 +10,9 @@ use futures::stream::{self, StreamExt, TryStreamExt};
 
 use crate::domain::*;
 use crate::engine::Engine;
-use crate::knowledge::Library;
-use crate::playbook::{self, Lint, Playbook, Shared};
+use crate::knowledge::{core_strategy_block, Library};
+use crate::outreach;
+use crate::playbook::{self, Playbook, Shared};
 use crate::prompts;
 
 /// A live progress sink for the pipeline. The interactive UI implements this to
@@ -39,8 +40,7 @@ pub struct Run<'a> {
     /// The book-knowledge library, retrieved from per stage. Empty is fine —
     /// retrieval then returns nothing and the prompts are unchanged.
     pub library: &'a Library,
-    /// Prebuilt brand system prompt (shared + brand doctrine + knobs).
-    pub system: String,
+    /// Compact stage prompts are built per task; no full doctrine is repeated.
     pub concurrency: usize,
     pub critique: bool,
     /// Live progress sink (the UI tree, or `&()` for none).
@@ -66,7 +66,6 @@ pub async fn run(
         pb,
         shared,
         library,
-        system: pb.system_prompt(shared),
         concurrency,
         critique,
         reporter,
@@ -99,23 +98,36 @@ async fn plan_account(
     n_contacts: usize,
     n_touches: usize,
 ) -> Result<AccountPlan> {
-    let contacts = find_contacts(run, &account, n_contacts).await?;
-    run.reporter
-        .account_contacts(&account.name, contacts.contacts.len());
+    let mut contacts = find_contacts(run, &account, n_contacts).await?.contacts;
+    contacts.sort_by(|left, right| {
+        contact_priority(right)
+            .cmp(&contact_priority(left))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    contacts.truncate(2);
+    run.reporter.account_contacts(&account.name, contacts.len());
 
-    let plans = stream::iter(contacts.contacts.into_iter().map(|mut contact| {
+    let plans = stream::iter(contacts.into_iter().map(|mut contact| {
         contact.vantage = normalize_vantage(&contact.vantage);
         let account = account.clone();
         async move {
             let mut sequence = write_sequence(run, &account, &contact, n_touches).await?;
-            let reviews = if run.critique {
-                let review = critique(run, &account, &contact, &sequence).await?;
-                apply_revisions(&mut sequence, &review);
-                review.reviews
-            } else {
-                Vec::new()
-            };
             enforce_email_signatures(&mut sequence, &run.pb.signature);
+            let reviewer_knowledge =
+                role_knowledge(run, &run.shared.personas.reviewer, &account.hypothesis);
+            let reviews = outreach::review_and_edit_sequence(
+                run.client,
+                run.pb,
+                run.shared,
+                &account,
+                &contact,
+                &mut sequence,
+                n_touches,
+                run.critique,
+                &reviewer_knowledge,
+                None,
+            )
+            .await?;
             run.reporter.sequence_done(&account.name);
             Ok::<ContactPlan, anyhow::Error>(ContactPlan {
                 contact,
@@ -140,13 +152,19 @@ async fn find_accounts(run: &Run<'_>, thesis: &str, n: usize) -> Result<Accounts
          {thesis}; {motion}",
         motion = run.pb.motion,
     );
-    let knowledge = run
+    let retrieved = run
         .library
-        .retrieve_stage(&query, "companies", 5, 2)
+        .retrieve_stage(&query, "companies", 3, 1)
         .playbook_block();
+    let knowledge = format!("{}\n\n{}", core_strategy_block("companies"), retrieved);
     let user = prompts::accounts_user(run.pb, thesis, n, &knowledge);
     run.client
-        .structured::<Accounts>(&run.system, &user, prompts::accounts_schema())
+        .structured_bulk::<Accounts>(
+            "campaign.accounts",
+            &run.pb.qualification_system_prompt(),
+            &user,
+            prompts::accounts_schema(),
+        )
         .await
 }
 
@@ -156,13 +174,19 @@ async fn find_contacts(run: &Run<'_>, account: &Account, n: usize) -> Result<Con
          the person who owns the problem: {}",
         account.hypothesis,
     );
-    let knowledge = run
+    let retrieved = run
         .library
-        .retrieve_stage(&query, "people", 4, 1)
+        .retrieve_stage(&query, "people", 2, 0)
         .playbook_block();
+    let knowledge = format!("{}\n\n{}", core_strategy_block("people"), retrieved);
     let user = prompts::contacts_user(run.pb, account, n, &knowledge);
     run.client
-        .structured::<Contacts>(&run.system, &user, prompts::contacts_schema())
+        .structured_bulk::<Contacts>(
+            "campaign.contacts",
+            &run.pb.vantage_system_prompt(),
+            &user,
+            prompts::contacts_schema(),
+        )
         .await
 }
 
@@ -172,103 +196,27 @@ async fn write_sequence(
     contact: &Contact,
     n: usize,
 ) -> Result<Sequence> {
-    let query = format!(
-        "cold outreach messaging; email copywriting; opening lines, value framing, objections, \
-         the ask; earning a reply about: {}",
-        account.hypothesis,
-    );
-    let knowledge = run
-        .library
-        .retrieve_stage(&query, "sequence", 6, 2)
-        .playbook_block();
+    let knowledge = role_knowledge(run, &run.shared.personas.writer, &account.hypothesis);
     let user = prompts::sequence_user(run.pb, account, contact, n, &knowledge);
     run.client
-        .structured::<Sequence>(&run.system, &user, prompts::sequence_schema())
+        .structured_bulk::<Sequence>(
+            "campaign.sequence",
+            &run.pb.copy_system_prompt(run.shared),
+            &user,
+            prompts::sequence_schema(),
+        )
         .await
 }
 
-async fn critique(
-    run: &Run<'_>,
-    account: &Account,
-    contact: &Contact,
-    sequence: &Sequence,
-) -> Result<SequenceReview> {
-    let forbidden = run.pb.forbidden(run.shared);
-    let lints: Vec<Lint> = sequence
-        .touches
-        .iter()
-        .map(|t| lint_touch(run.pb, t, &forbidden))
-        .collect();
-
-    let user = prompts::critique_user(run.pb, account, contact, sequence, &lints);
-    let mut review = run
-        .client
-        .structured::<SequenceReview>(&run.system, &user, prompts::critique_schema())
-        .await?;
-
-    // Preserve an honest verdict even if the model overlooks a mechanical
-    // signature flag while rewriting the body.
-    for (touch, lint) in sequence.touches.iter().zip(&lints) {
-        if lint.signature_ok {
-            continue;
-        }
-        if let Some(item) = review
-            .reviews
-            .iter_mut()
-            .find(|item| item.stage == touch.stage)
-        {
-            item.passes = false;
-            if !item
-                .issues
-                .iter()
-                .any(|issue| issue.to_ascii_lowercase().contains("signature"))
-            {
-                item.issues.push(format!(
-                    "Signature mismatch: the email must end with exactly '{}'.",
-                    run.pb.signature
-                ));
-            }
-        }
-    }
-
-    Ok(review)
-}
-
-/// Lint one touch: forbidden phrases across subject+body, length band on the
-/// body (skipped for call scripts, which aren't word-bounded).
-fn lint_touch(pb: &Playbook, t: &Touch, forbidden: &[&str]) -> Lint {
-    let is_email = t.channel.eq_ignore_ascii_case("email");
-    let (min, max) = if t.channel.eq_ignore_ascii_case("call") {
-        (0, 0)
-    } else {
-        (pb.min_words, pb.max_words)
-    };
-    let mut lint = playbook::lint(&t.body, forbidden, min, max);
-    lint.signature_ok = !is_email || playbook::has_exact_signature(&t.body, &pb.signature);
-    if !t.subject.is_empty() {
-        let subj = playbook::lint(&t.subject, forbidden, 0, 0);
-        for hit in subj.forbidden_hits {
-            if !lint.forbidden_hits.contains(&hit) {
-                lint.forbidden_hits.push(hit);
-            }
-        }
-    }
-    lint
-}
-
-/// Replace each touch's subject/body with the critic's revised copy.
-fn apply_revisions(sequence: &mut Sequence, review: &SequenceReview) {
-    for r in &review.reviews {
-        if let Some(t) = sequence.touches.iter_mut().find(|t| t.stage == r.stage) {
-            if !r.revised_body.trim().is_empty() {
-                t.body = r.revised_body.clone();
-            }
-            // Only overwrite the subject on channels that have one.
-            if !t.subject.is_empty() && !r.revised_subject.trim().is_empty() {
-                t.subject = r.revised_subject.clone();
-            }
-        }
-    }
+fn role_knowledge(run: &Run<'_>, persona: &str, account_question: &str) -> String {
+    let retrieved =
+        run.library
+            .retrieve_stage(&format!("{persona}\n{account_question}"), "sequence", 6, 2);
+    format!(
+        "{}\n\n{}",
+        core_strategy_block("sequence"),
+        retrieved.playbook_block()
+    )
 }
 
 /// Apply the playbook signature after the critic so its rewrite cannot drift.
@@ -278,6 +226,20 @@ fn enforce_email_signatures(sequence: &mut Sequence, signature: &str) {
             touch.body = playbook::enforce_signature(&touch.body, signature);
         }
     }
+}
+
+fn contact_priority(contact: &Contact) -> i32 {
+    let mut score = if contact.primary { 100 } else { 0 };
+    score += match normalize_vantage(&contact.vantage).as_str() {
+        "process_owner" => 70,
+        "operator" => 65,
+        "operational_executive" => 55,
+        "economic_buyer" => 40,
+        "technical_evaluator" => 25,
+        "router" => 10,
+        _ => 0,
+    };
+    score
 }
 
 /// Normalize a model-supplied vantage to the canonical set for consistent badges.

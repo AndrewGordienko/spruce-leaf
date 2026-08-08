@@ -1,0 +1,26 @@
+# Never send local credentials or live customer/sales data to the Docker daemon.
+.env
+.env.*
+!.env.example
+.spruce/
+
+# Build and repository metadata are large and unnecessary inside the image.
+target/
+.git/
+.github/
+.DS_Store
+
+# Local outputs and database snapshots.
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.log
+campaign.json
+campaign.md
+
+# The image installs dependencies from the manifests, then copies source.
+# Local editor/process debris must not invalidate or contaminate its cache.
+*.swp
+*.tmp
+*~
