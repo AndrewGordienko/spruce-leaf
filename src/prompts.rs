@@ -188,7 +188,7 @@ LinkedIn DMs when connected and email fallbacks otherwise. Finish by day 21. Tou
 40–75 words including the signature; later emails are 15–45 words; touch 7 has no question. \
 Mention {brand} only in touch 1. Use at most one \
 question, one CTA, one verified account fact, and one short sentence about {brand} per touch. \
-Subjects are 2–4 plain words. Do not use fake familiarity, explain your strategy, dump the \
+Subjects are 1–3 plain lowercase words with no numbers or question marks. Do not use fake familiarity, explain your strategy, dump the \
 research, or assert limitations of the recipient's tools.\n\n\
 Follow the length band, the voice, the forbidden list, and the pre-send test from the doctrine. \
 Center the operating decision, not {brand}. Keep the whole sequence on ONE problem thread. A \

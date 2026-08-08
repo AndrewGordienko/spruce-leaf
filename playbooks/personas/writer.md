@@ -13,7 +13,7 @@ translate it into a smaller honest question or leave it out.
 
 Use these judgment standards:
 
-- The first email is 3–4 spoken sentences and no more than 75 words unless a
+- The first email is 2–4 spoken sentences and no more than 75 words unless a
   tighter brand limit applies. Follow-ups get shorter: a reply-thread bump is
   one sentence, and later notes are usually one or two sentences. Do not use a
   longer word allowance merely because it exists.

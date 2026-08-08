@@ -1204,7 +1204,7 @@ async fn write_account_sequences(
         knowledge.writer.block.clone()
     };
     let user = format!(
-        "Write one {n}-touch no-reply sequence for each recipient. {planning_contract} Think through the buyer-safe brief and private GTM action context, then write the messages in Andrew's voice. The play is a policy and hypothesis, never a fixed email template. Return exactly one sequence for every person_key and copy person_key exactly. For seven touches use these exact channels and day offsets: email/0, email/3, linkedin_request/5, email/9, linkedin_or_email/13, email/17, linkedin_or_email/21. A linkedin_request is a short personalized connection note with no pitch, meeting ask, greeting, or signature. A linkedin_or_email touch must work as either a natural LinkedIn DM or a very short email: include a 2-8 word fallback email subject and Andrew's exact email signature, but keep the body concise enough for LinkedIn. Never reveal play labels, experiment arms, confidence scores, internal hypotheses, or strategy language.\n\nBUYER-SAFE ACCOUNT BRIEF:\n{account}\n\nRECIPIENTS (private context; never quote its labels):\n{recipients}\n\nVERIFIED SELLER CONTEXT:\n{business_context}\n\nRETRIEVED KNOWLEDGE:\n{knowledge}",
+        "Write one {n}-touch no-reply sequence for each recipient. {planning_contract} Think through the buyer-safe brief and private GTM action context, then write the messages in Andrew's voice. The play is a policy and hypothesis, never a fixed email template. Return exactly one sequence for every person_key and copy person_key exactly. For seven touches use these exact channels and day offsets: email/0, email/3, linkedin_request/5, email/9, linkedin_or_email/13, email/17, linkedin_or_email/21. A linkedin_request is a short personalized connection note with no pitch, meeting ask, greeting, or signature. A linkedin_or_email touch must work as either a natural LinkedIn DM or a very short email: include a 1-3 word lowercase fallback email subject with no number or question mark and Andrew's exact email signature, but keep the body concise enough for LinkedIn. Every email subject follows that same rule. Never reveal play labels, experiment arms, confidence scores, internal hypotheses, or strategy language.\n\nBUYER-SAFE ACCOUNT BRIEF:\n{account}\n\nRECIPIENTS (private context; never quote its labels):\n{recipients}\n\nVERIFIED SELLER CONTEXT:\n{business_context}\n\nRETRIEVED KNOWLEDGE:\n{knowledge}",
         account = serde_json::to_string_pretty(&writer_account).unwrap_or_default(),
         recipients = serde_json::to_string_pretty(&recipients).unwrap_or_default(),
         knowledge = writer_knowledge,
@@ -2364,7 +2364,7 @@ async fn request_copy_review_with_tier(
     let task = if verify_only {
         "This is a final gate over already-repaired copy. Do not edit it. Return empty revised fields. Mark passes=true only when the CURRENT touch is natural, accurate, easy to answer, and ready for Andrew to send unchanged. List only unresolved issues."
     } else if !deterministic.is_empty() {
-        "Repair the named findings as hard constraints. Change only stages named by those findings unless a finding applies to the whole sequence. For every named stage, return its complete corrected body and, for email, its complete corrected subject. Count the corrected stage's words and question marks before returning: it must fall inside every stated range, contain at most one question mark, and stage 7 must contain none. Preserve verified facts, natural phrasing, and already-good stages. The passes flag and score must grade the FINAL corrected wording you return. List only issues still present after your correction."
+        "Repair the named findings as hard constraints. Any feedback string containing 'stage N' names stage N. Change only named stages unless a finding applies to the whole sequence. For EVERY named stage you MUST return a nonempty complete corrected body and, for email, a nonempty complete corrected subject, even if you disagree with the feedback; never mark a named stage passed with empty revised fields. Count the corrected stage's words and question marks before returning: it must fall inside every stated range, contain at most one question mark, and stage 7 must contain none. Preserve verified facts, natural phrasing, and unnamed stages. The passes flag and score must grade the FINAL corrected wording you return. List only issues still present after your correction."
     } else {
         "Review and repair the copy. For every touch that is not ready to send, return a complete corrected body and, for email, a complete corrected subject. Every corrected touch may contain at most one question mark; the final close contains none. The passes flag and score must grade the FINAL corrected wording you return, not the original. List only issues that remain unresolved after your correction. If it cannot be fixed without inventing facts, mark it failed."
     };
@@ -2593,31 +2593,60 @@ fn lint_copy_touch(pb: &Playbook, shared: &Shared, touch: &CopyTouch) -> playboo
 }
 
 fn touch_word_band(pb: &Playbook, touch: &CopyTouch) -> (usize, usize) {
-    // Cold copy needs enough room for one grounded question, not enough room to
-    // turn the account brief into an executive summary.
+    // These bands follow the shape seen in large cold-email datasets: a compact
+    // first note, then progressively shorter follow-ups. A high maximum becomes
+    // a target for language models, so keep the ceilings honest.
     if touch.channel.eq_ignore_ascii_case("linkedin_request") {
-        (8, 24)
+        (8, 20)
     } else if touch.channel.eq_ignore_ascii_case("linkedin_or_email") {
         if touch.stage == 7 {
-            (12, 35)
+            (8, 25)
         } else {
-            (12, 45)
+            (12, 35)
         }
     } else if touch.channel.eq_ignore_ascii_case("email") {
-        if touch.stage == 1 {
-            (pb.min_words, pb.max_words)
-        } else if touch.stage == 7 {
-            (12, 35)
-        } else {
-            // A reply-thread follow-up can be a single natural sentence. The
-            // old 25-word floor made editors add filler solely for counting.
-            (12, 60)
+        match touch.stage {
+            1 => (pb.min_words.min(75), pb.max_words.min(75)),
+            2 => (8, 30),
+            4 => (12, 45),
+            6 => (8, 35),
+            7 => (8, 25),
+            _ => (8, 40),
         }
     } else if touch.channel.eq_ignore_ascii_case("linkedin") {
-        (12, 32)
+        (8, 30)
     } else {
-        (12, 40)
+        (8, 35)
     }
+}
+
+/// Count spoken sentences after removing the email envelope. Greeting and
+/// signature lines are not copy sentences, and a final clause without terminal
+/// punctuation still counts as one.
+fn copy_sentence_count(body: &str, signature: &str) -> usize {
+    let mut lines = body
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && *line != signature.trim())
+        .collect::<Vec<_>>();
+    if lines.first().is_some_and(|line| {
+        line.ends_with(',') && line.split_whitespace().count() <= 3 && !line.contains('?')
+    }) {
+        lines.remove(0);
+    }
+    let prose = lines.join(" ");
+    let mut sentences = 0usize;
+    let mut has_text = false;
+    for character in prose.chars() {
+        if character.is_alphanumeric() {
+            has_text = true;
+        }
+        if matches!(character, '.' | '?' | '!') && has_text {
+            sentences += 1;
+            has_text = false;
+        }
+    }
+    sentences + usize::from(has_text)
 }
 
 fn sequence_quality_issues(
@@ -2674,9 +2703,35 @@ fn sequence_quality_issues(
         }
         if is_email_capable_channel(&channel) {
             let subject_words = touch.subject.split_whitespace().count();
-            if !(2..=8).contains(&subject_words) {
+            if !(1..=3).contains(&subject_words) {
                 issues.push(format!(
-                    "stage {} subject has {subject_words} words (needs 2–8)",
+                    "stage {} subject has {subject_words} words (needs 1–3)",
+                    touch.stage
+                ));
+            }
+            if touch.subject.chars().any(char::is_uppercase) {
+                issues.push(format!("stage {} subject must be lowercase", touch.stage));
+            }
+            if touch.subject.contains('?') || touch.subject.chars().any(|c| c.is_ascii_digit()) {
+                issues.push(format!(
+                    "stage {} subject must not be a question or contain a number",
+                    touch.stage
+                ));
+            }
+            let sentences = copy_sentence_count(&touch.body, &pb.signature);
+            let sentence_limit_ok = match touch.stage {
+                1 => (2..=4).contains(&sentences),
+                2 | 7 => sentences == 1,
+                _ => (1..=2).contains(&sentences),
+            };
+            if !sentence_limit_ok {
+                let expected = match touch.stage {
+                    1 => "2–4",
+                    2 | 7 => "1",
+                    _ => "1–2",
+                };
+                issues.push(format!(
+                    "stage {} has {sentences} copy sentences (needs {expected})",
                     touch.stage
                 ));
             }
@@ -2737,6 +2792,40 @@ fn sequence_quality_issues(
                 )),
                 None => issues.push(format!("stage {} has no semantic review", touch.stage)),
             }
+        }
+    }
+
+    let question_touches = sequence
+        .touches
+        .iter()
+        .filter(|touch| touch.body.contains('?'))
+        .count();
+    let question_touch_limit = if pb.key == "wapahki" { 3 } else { 4 };
+    if question_touches > question_touch_limit {
+        issues.push(format!(
+            "sequence asks questions in {question_touches} touches (maximum {question_touch_limit})"
+        ));
+    }
+
+    if pb.key == "wapahki" {
+        let brand_mentions = sequence
+            .touches
+            .iter()
+            .map(|touch| touch.body.to_ascii_lowercase().matches("wapahki").count())
+            .sum::<usize>();
+        if brand_mentions > 1 {
+            issues.push(format!(
+                "Wapahki appears {brand_mentions} times (maximum 1 across the sequence)"
+            ));
+        }
+        if sequence
+            .touches
+            .iter()
+            .find(|touch| touch.stage == 1)
+            .is_some_and(|touch| touch.body.to_ascii_lowercase().contains("wapahki"))
+        {
+            issues
+                .push("stage 1 must not introduce Wapahki before relevance is established".into());
         }
     }
 

@@ -11,7 +11,7 @@ reason. A clean email that is easy to ignore fails.
 
 Score the final wording on:
 
-- whether email one is 3–4 spoken sentences and no more than 75 words, and
+- whether email one is 2–4 spoken sentences and no more than 75 words, and
   whether every follow-up is materially shorter;
 - whether the subject is a plain lowercase phrase under four words rather than
   a headline, question, number, or product label;
