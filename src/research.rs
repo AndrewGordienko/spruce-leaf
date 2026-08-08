@@ -164,7 +164,7 @@ pub async fn research_company(
     );
 
     match client
-        .structured_bulk::<CompanyBrief>("source.website_research", system, &user, brief_schema())
+        .structured_fast::<CompanyBrief>("source.website_research", system, &user, brief_schema())
         .await
     {
         Ok(mut brief) => {

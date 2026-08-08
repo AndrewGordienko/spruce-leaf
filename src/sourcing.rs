@@ -29,6 +29,12 @@ use crate::opportunity::ResearchClient;
 use crate::playbook::{Playbook, Shared};
 use crate::research;
 
+/// How many candidates to source per company relative to the requested contact
+/// count, so unverifiable people can be backfilled by a different contact. Costs
+/// extra enrichment credits (each filed candidate is a reveal) but keeps
+/// companies from ending up short of verified, sequenceable contacts.
+const CONTACT_BACKFILL_FACTOR: usize = 2;
+
 /// What one `source` run accomplished.
 #[derive(Debug, Default)]
 pub struct SourceSummary {
@@ -220,8 +226,9 @@ pub async fn source(
     let mut qualified = 0usize;
     // Each candidate is I/O-bound (website reads + an LLM qualification call), so
     // fan out wider than the global concurrency default — a low default (2) makes
-    // the qualification stage crawl even though it is almost entirely waiting.
-    let batch_size = concurrency.max(4);
+    // the qualification stage crawl even though it is almost entirely waiting. With
+    // ~10 overfetched orgs this usually clears qualification in a single wave.
+    let batch_size = concurrency.max(8);
     while qualified < n_accounts {
         let batch = candidates.by_ref().take(batch_size).collect::<Vec<_>>();
         if batch.is_empty() {
@@ -271,9 +278,11 @@ pub async fn source(
         quals.extend(results);
     }
 
-    let mut kept = 0usize;
+    // Persist each qualified lead (cheap SQLite writes) and collect the winners,
+    // capped at n_accounts, so the expensive people stage can then fan out.
+    let mut winners: Vec<(ApolloOrg, Lead, String)> = Vec::new();
     for (org, q) in quals {
-        if kept >= n_accounts {
+        if winners.len() >= n_accounts {
             break;
         }
         // Verdicts were already logged as they streamed in above.
@@ -318,26 +327,45 @@ pub async fn source(
             "sourced",
             &format!("qualified lead {}", org.name),
         )?;
-        kept += 1;
         summary.leads_qualified += 1;
+        winners.push((org, lead, lead_id));
+    }
 
-        // 4. real people at this org, mapped to vantage points.
-        let added = source_people(
+    // 4. Real people at each org, mapped to vantage points. Every org is
+    // independent (its own Apollo people search + one vantage call), so fan them
+    // out concurrently — walking them one-at-a-time was the serialized tail of a
+    // sourcing run.
+    let vantage_system = &vantage_system;
+    let icp = &icp;
+    let people_counts = stream::iter(winners.into_iter().map(|(org, lead, lead_id)| async move {
+        let result = source_people(
             db,
             client,
             apollo,
             pb,
-            &vantage_system,
+            vantage_system,
             &org,
             &lead,
             &lead_id,
-            &icp,
+            icp,
             n_contacts,
             fallback_recipient_timezone,
         )
-        .await?;
-        summary.people_added += added;
-        eprintln!("  · {} — {added} contact(s)", org.name);
+        .await;
+        (org.name, result)
+    }))
+    .buffered(concurrency.max(4))
+    .collect::<Vec<_>>()
+    .await;
+
+    for (name, result) in people_counts {
+        match result {
+            Ok(added) => {
+                summary.people_added += added;
+                eprintln!("  · {name} — {added} contact(s)");
+            }
+            Err(error) => eprintln!("  · ! {name} people error: {error:#}"),
+        }
     }
 
     Ok(summary)
@@ -416,13 +444,14 @@ async fn source_people(
     n_contacts: usize,
     fallback_recipient_timezone: &str,
 ) -> Result<usize> {
-    // People-search by DOMAIN is far more reliable than by org id (the id from
-    // company search is a different record people are frequently NOT indexed
-    // under, so `organization_ids` silently returns 0 for many real companies).
-    // Run a waterfall — domain+titles → org-id+titles → broaden to any employee
-    // → resolve a missing domain by name — topping up until we reach n_contacts,
-    // so "5 people per company" holds even for stubborn orgs.
-    let people = gather_people(apollo, org, icp, n_contacts).await;
+    // Over-source a bench of candidates, not just n_contacts. Enrichment verifies
+    // only a fraction of any org's people (many have no findable email), so if we
+    // filed exactly n_contacts we'd routinely end up with fewer than n_contacts
+    // VERIFIED contacts and blank rows. Filing extra candidates lets a different
+    // contact backfill anyone who doesn't verify; sequencing later caps at
+    // n_contacts of the strongest verified people per company.
+    let source_pool = n_contacts.saturating_mul(CONTACT_BACKFILL_FACTOR).max(n_contacts);
+    let people = gather_people(apollo, org, icp, source_pool).await;
     if people.is_empty() {
         eprintln!("  · no people found for {} (all strategies)", org.name);
         return Ok(0);
@@ -435,7 +464,7 @@ async fn source_people(
         });
 
     let mut added = 0usize;
-    for (i, ap) in people.iter().enumerate().take(n_contacts) {
+    for (i, ap) in people.iter().enumerate().take(source_pool) {
         let va = assignments.assignments.iter().find(|a| a.index == i);
         let location = ap.location();
         let timezone_location = if location.is_empty() {
@@ -734,7 +763,7 @@ async fn assign_vantage(
         doctrine = core_strategy_block("people"),
     );
     client
-        .structured_bulk::<VantageDoc>("source.vantage", system, &user, vantage_schema())
+        .structured_fast::<VantageDoc>("source.vantage", system, &user, vantage_schema())
         .await
 }
 
