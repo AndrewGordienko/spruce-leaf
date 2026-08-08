@@ -25,6 +25,11 @@ pub struct BusinessProfile {
     pub goals: Vec<String>,
     #[serde(default)]
     pub constraints: Vec<String>,
+    /// Source-linked founder discovery. Unlike `known_facts`, these are
+    /// participant reports about their own work or market; they guide ICP and
+    /// questions but never become facts about a target account.
+    #[serde(default)]
+    pub discovery_evidence: Vec<DiscoveryEvidence>,
     #[serde(default)]
     pub motions: Vec<Motion>,
     #[serde(default)]
@@ -33,6 +38,37 @@ pub struct BusinessProfile {
     pub calendar: OutreachCalendar,
     #[serde(default)]
     pub account_limits: AccountLimits,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct DiscoveryEvidence {
+    pub id: String,
+    #[serde(default)]
+    pub recorded_at: String,
+    #[serde(default)]
+    pub source_kind: String,
+    #[serde(default)]
+    pub source_url: String,
+    #[serde(default)]
+    pub segment: String,
+    #[serde(default)]
+    pub participant_context: String,
+    #[serde(default)]
+    pub evidence_level: String,
+    #[serde(default)]
+    pub reported_workflows: Vec<String>,
+    #[serde(default)]
+    pub reported_estimates: Vec<String>,
+    #[serde(default)]
+    pub working_interpretations: Vec<String>,
+    #[serde(default)]
+    pub sourcing_implications: Vec<String>,
+    #[serde(default)]
+    pub follow_up_angles: Vec<String>,
+    #[serde(default)]
+    pub next_questions: Vec<String>,
+    #[serde(default)]
+    pub limits: Vec<String>,
 }
 
 /// Per-account send throttles. The business `daily_touch_cap` bounds the *total*
@@ -339,7 +375,10 @@ impl BusinessProfile {
             ));
         }
         if !self.constraints.is_empty() {
-            summary.push_str(&format!(" Hard constraints: {}", self.constraints.join(" ")));
+            summary.push_str(&format!(
+                " Hard constraints: {}",
+                self.constraints.join(" ")
+            ));
         }
         summary
     }
@@ -375,6 +414,46 @@ impl BusinessProfile {
                 s.push_str(&format!("  - {unknown}\n"));
             }
         }
+        if !self.discovery_evidence.is_empty() {
+            s.push_str(
+                "Founder discovery evidence (market-level context, NOT proof about a candidate account):\n",
+            );
+            for call in &self.discovery_evidence {
+                s.push_str(&format!(
+                    "  CALL {} — {} | {} | {}\n",
+                    call.id, call.segment, call.participant_context, call.evidence_level
+                ));
+                for item in &call.reported_workflows {
+                    s.push_str(&format!("    - Participant reported: {item}\n"));
+                }
+                for item in &call.reported_estimates {
+                    s.push_str(&format!("    - Unverified estimate/example: {item}\n"));
+                }
+                for item in &call.working_interpretations {
+                    s.push_str(&format!("    - Working interpretation: {item}\n"));
+                }
+                for item in &call.sourcing_implications {
+                    s.push_str(&format!("    - Sourcing implication: {item}\n"));
+                }
+                for item in &call.follow_up_angles {
+                    s.push_str(&format!(
+                        "    - Permitted call-grounded follow-up angle: {item}\n"
+                    ));
+                }
+                for item in &call.next_questions {
+                    s.push_str(&format!("    - Still ask: {item}\n"));
+                }
+                for item in &call.limits {
+                    s.push_str(&format!("    - Evidence boundary: {item}\n"));
+                }
+                if !call.source_url.is_empty() {
+                    s.push_str(&format!("    - Source record: {}\n", call.source_url));
+                }
+            }
+            s.push_str(
+                "Use these calls to choose segments and ask sharper questions. They do not establish any target company's workflow. In copy, attribute a call insight explicitly (for example, 'In a recent conversation with a technical manager...') and ask whether it matches this recipient's experience. Never imply multiple buyers, consensus, ROI, or adoption.\n",
+            );
+        }
         s.trim_end().to_string()
     }
 }
@@ -382,6 +461,20 @@ impl BusinessProfile {
 fn validate(profile: &BusinessProfile) -> Result<()> {
     if profile.name.trim().is_empty() || profile.summary.trim().is_empty() {
         return Err(anyhow!("name and summary are required"));
+    }
+    let mut discovery_ids = std::collections::HashSet::new();
+    for evidence in &profile.discovery_evidence {
+        if evidence.id.trim().is_empty()
+            || evidence.segment.trim().is_empty()
+            || evidence.participant_context.trim().is_empty()
+        {
+            return Err(anyhow!(
+                "discovery evidence requires id, segment, and participant_context"
+            ));
+        }
+        if !discovery_ids.insert(evidence.id.trim()) {
+            return Err(anyhow!("duplicate discovery evidence id '{}'", evidence.id));
+        }
     }
     if profile.has_motion("funding") {
         let funding = profile
@@ -513,5 +606,11 @@ mod tests {
             .unwrap()
             .sources
             .is_empty());
+        let wapahki = businesses.get("wapahki").unwrap();
+        assert_eq!(wapahki.discovery_evidence.len(), 2);
+        let context = wapahki.operating_context();
+        assert!(context.contains("Founder discovery evidence"));
+        assert!(context.contains("NOT proof about a candidate account"));
+        assert!(context.contains("recent conversation with a technical manager"));
     }
 }

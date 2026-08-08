@@ -18,11 +18,12 @@
 //!   * touch.status  — draft | scheduled | sent | skipped | failed | replied |
 //!     cancelled  (only `scheduled` + due fire in the daemon)
 
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -81,6 +82,9 @@ pub struct Person {
     pub primary: bool,
     pub route_to: String,
     pub linkedin_url: String,
+    /// unknown | requested | connected | not_connected. This is operator-kept
+    /// state; Spruce Leaf has no authority to inspect LinkedIn connections.
+    pub linkedin_status: String,
     pub email: String,
     /// verified | unverified | risky | invalid | unknown
     pub email_status: String,
@@ -121,6 +125,15 @@ pub struct Sequence {
     pub thesis: String,
     /// Knowledge-library principle ids applied to the buyer-facing copy.
     pub applied_principles: Vec<String>,
+    /// Exact GTM play/version and evidence used when this action was composed.
+    pub play_id: String,
+    pub play_version: i64,
+    pub experiment_id: String,
+    pub experiment_arm: String,
+    pub experiment_assignment_id: String,
+    pub signal_observation_ids: Vec<String>,
+    /// research_required | action_ready | no_play
+    pub gtm_state: String,
     pub status: String,
     pub current_stage: i64,
     pub created_at: String,
@@ -183,6 +196,234 @@ pub struct Learning {
     pub detail: String,
     /// How many times we've observed this — a high count is a strong pattern.
     pub hits: i64,
+    pub updated_at: String,
+}
+
+/// Canonical definition for an observable GTM signal. The definition carries
+/// ownership, freshness, lineage requirements, and a schema version; individual
+/// account observations live separately and may expire without deleting history.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SignalDefinition {
+    pub id: String,
+    pub brand: String,
+    pub key: String,
+    pub name: String,
+    pub description: String,
+    pub topic: String,
+    pub entity_type: String,
+    pub value_type: String,
+    pub source_kind: String,
+    pub owner: String,
+    pub refresh_cadence: String,
+    pub freshness_seconds: i64,
+    pub evidence_required: bool,
+    pub minimum_confidence: f64,
+    pub version: i64,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SignalObservation {
+    pub id: String,
+    pub definition_id: String,
+    pub definition_key: String,
+    pub brand: String,
+    pub lead_id: String,
+    pub person_id: String,
+    pub conversation_id: String,
+    pub source_name: String,
+    pub source_url: String,
+    pub provider_key: String,
+    pub value_json: String,
+    pub evidence: String,
+    pub confidence: f64,
+    pub observed_at: String,
+    pub expires_at: String,
+    /// observed | verified | rejected | expired
+    pub status: String,
+    pub fingerprint: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GtmPlay {
+    pub id: String,
+    pub brand: String,
+    pub key: String,
+    pub version: i64,
+    pub name: String,
+    /// candidate | testing | proven | retired
+    pub lifecycle: String,
+    pub motion: String,
+    pub target_icp: String,
+    pub target_vantages: Vec<String>,
+    pub required_signal_keys: Vec<String>,
+    pub minimum_signal_matches: i64,
+    pub hypothesis: String,
+    pub action_policy: String,
+    pub proof_type: String,
+    pub proof_description: String,
+    pub success_metric: String,
+    pub kill_condition: String,
+    pub source_refs: Vec<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AccountPlayAssessment {
+    pub id: String,
+    pub lead_id: String,
+    pub brand: String,
+    pub play_id: String,
+    pub play_version: i64,
+    /// qualified | research_needed | rejected
+    pub status: String,
+    pub fit_score: i64,
+    pub matched_signal_keys: Vec<String>,
+    pub symptom: String,
+    pub root_cause: String,
+    pub current_workaround: String,
+    pub why_now: String,
+    pub proof_fit: String,
+    pub evidence_gaps: Vec<String>,
+    pub disqualifiers: Vec<String>,
+    pub source: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GtmExperiment {
+    pub id: String,
+    pub brand: String,
+    pub play_id: String,
+    pub name: String,
+    /// list_only | copy_only | combined
+    pub experiment_type: String,
+    pub hypothesis: String,
+    pub variable: String,
+    pub constants: Vec<String>,
+    pub control_description: String,
+    pub variant_description: String,
+    pub minimum_sends_per_arm: i64,
+    pub baseline_sends: i64,
+    pub baseline_positive_reply_rate: f64,
+    pub success_target: f64,
+    pub failure_floor: f64,
+    pub measurement_days: i64,
+    /// draft | running | measuring | complete | inconclusive | cancelled
+    pub status: String,
+    pub starts_at: String,
+    pub ends_at: String,
+    pub result_json: String,
+    pub confidence: String,
+    pub decision: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ExperimentAssignment {
+    pub id: String,
+    pub experiment_id: String,
+    pub lead_id: String,
+    pub person_id: String,
+    pub sequence_id: String,
+    pub arm: String,
+    pub assigned_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GtmOutcome {
+    pub id: String,
+    pub brand: String,
+    pub kind: String,
+    pub lead_id: String,
+    pub person_id: String,
+    pub sequence_id: String,
+    pub conversation_id: String,
+    pub play_id: String,
+    pub experiment_id: String,
+    pub experiment_assignment_id: String,
+    pub signal_observation_ids: Vec<String>,
+    pub value: f64,
+    pub detail: String,
+    pub source: String,
+    pub fingerprint: String,
+    pub occurred_at: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ProofBrief {
+    pub id: String,
+    pub brand: String,
+    pub lead_id: String,
+    pub person_id: String,
+    pub conversation_id: String,
+    pub play_id: String,
+    /// draft | ready | approved | running | passed | failed | withdrawn
+    pub status: String,
+    pub problem: String,
+    pub current_workflow: String,
+    pub evidence_available: Vec<String>,
+    pub scope: String,
+    pub customer_data: Vec<String>,
+    pub success_metric: String,
+    pub baseline: String,
+    pub target: String,
+    pub stop_condition: String,
+    pub stakeholders: Vec<String>,
+    pub owner: String,
+    pub expansion_path: String,
+    pub result: String,
+    pub learnings: Vec<String>,
+    pub approved_at: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// One account-level customer-development thread. This is deliberately
+/// separate from a `ProofBrief`: discovery starts before a proof exists, and a
+/// friendly reply is not the same thing as evidence, an evaluation agreement,
+/// an LOI, or revenue. `stage` is derived from the recorded evidence and the
+/// highest explicit commitment rather than advanced by email activity.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CustomerDevelopmentRecord {
+    pub id: String,
+    pub brand: String,
+    pub lead_id: String,
+    pub person_id: String,
+    pub conversation_id: String,
+    pub stage: String,
+    pub problem: String,
+    pub task_scope: String,
+    pub site: String,
+    pub current_workflow: String,
+    pub why_manual: String,
+    pub variations: Vec<String>,
+    pub exceptions: Vec<String>,
+    pub evidence: Vec<String>,
+    pub economics: String,
+    pub success_criteria: String,
+    pub stop_condition: String,
+    pub stakeholders: Vec<String>,
+    /// none | evaluation_agreed | design_partner | loi_candidate |
+    /// conditional_loi | paid_pilot | deployment
+    pub commitment_kind: String,
+    pub commitment_detail: String,
+    pub quantity: String,
+    pub commercial_case: String,
+    pub timeline: String,
+    pub loi_conditions: String,
+    pub next_action: String,
+    pub engaged_at: String,
+    pub source: String,
+    pub created_at: String,
     pub updated_at: String,
 }
 
@@ -458,7 +699,9 @@ impl Db {
             conn: Mutex::new(conn),
         };
         db.migrate()?;
-        Ok(Arc::new(db))
+        let db = Arc::new(db);
+        crate::gtm::seed_defaults(&db)?;
+        Ok(db)
     }
 
     fn migrate(&self) -> Result<()> {
@@ -469,7 +712,15 @@ impl Db {
             ("leads", "timezone", "TEXT DEFAULT ''"),
             ("people", "location", "TEXT DEFAULT ''"),
             ("people", "timezone", "TEXT DEFAULT ''"),
+            ("people", "linkedin_status", "TEXT DEFAULT 'unknown'"),
             ("sequences", "applied_principles", "TEXT DEFAULT '[]'"),
+            ("sequences", "play_id", "TEXT DEFAULT ''"),
+            ("sequences", "play_version", "INTEGER DEFAULT 0"),
+            ("sequences", "experiment_id", "TEXT DEFAULT ''"),
+            ("sequences", "experiment_arm", "TEXT DEFAULT ''"),
+            ("sequences", "experiment_assignment_id", "TEXT DEFAULT ''"),
+            ("sequences", "signal_observation_ids", "TEXT DEFAULT '[]'"),
+            ("sequences", "gtm_state", "TEXT DEFAULT ''"),
             ("touches", "recipient_timezone", "TEXT DEFAULT ''"),
             ("touches", "scheduled_rule", "TEXT DEFAULT ''"),
             ("touches", "schedule_reason", "TEXT DEFAULT ''"),
@@ -483,6 +734,7 @@ impl Db {
             ("opportunity_touches", "scheduled_rule", "TEXT DEFAULT ''"),
             ("opportunity_touches", "schedule_reason", "TEXT DEFAULT ''"),
             ("replies", "conversation_id", "TEXT DEFAULT ''"),
+            ("gtm_experiments", "baseline_sends", "INTEGER DEFAULT 0"),
         ] {
             ensure_column(&conn, table, column, definition)?;
         }
@@ -527,6 +779,24 @@ impl Db {
             "UPDATE leads SET timezone=?2 WHERE id=?1",
             params![id, lead.timezone],
         )?;
+        for evidence in &lead.signals {
+            if evidence.trim().is_empty() {
+                continue;
+            }
+            let _ = record_signal_observation_conn(
+                &conn,
+                &SignalObservation {
+                    brand: lead.brand.clone(),
+                    definition_key: "account.fit_evidence".into(),
+                    lead_id: id.clone(),
+                    source_name: "account_research".into(),
+                    evidence: evidence.trim().to_string(),
+                    confidence: 0.70,
+                    status: "observed".into(),
+                    ..Default::default()
+                },
+            );
+        }
         Ok(id)
     }
 
@@ -582,6 +852,34 @@ impl Db {
             "UPDATE people SET location=?2,timezone=?3 WHERE id=?1",
             params![id, p.location, p.timezone],
         )?;
+        if !p.linkedin_status.trim().is_empty() {
+            conn.execute(
+                "UPDATE people SET linkedin_status=?2 WHERE id=?1",
+                params![id, normalize_linkedin_status(&p.linkedin_status)],
+            )?;
+        }
+        if !p.vantage.trim().is_empty() || !p.can_observe.trim().is_empty() {
+            let evidence = format!(
+                "{} — vantage: {}; likely access: {}",
+                p.title.trim(),
+                p.vantage.trim(),
+                p.can_observe.trim()
+            );
+            let _ = record_signal_observation_conn(
+                &conn,
+                &SignalObservation {
+                    brand: p.brand.clone(),
+                    definition_key: "contact.workflow_vantage".into(),
+                    lead_id: p.lead_id.clone(),
+                    person_id: id.clone(),
+                    source_name: "contact_research".into(),
+                    evidence,
+                    confidence: 0.70,
+                    status: "observed".into(),
+                    ..Default::default()
+                },
+            );
+        }
         Ok(id)
     }
 
@@ -602,6 +900,16 @@ impl Db {
         )?;
         let rows = stmt.query_map(params![brand, status], |r| Ok(row_to_person(r)))?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn set_person_linkedin_status(&self, id: &str, status: &str) -> Result<()> {
+        let status = normalize_linkedin_status(status);
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE people SET linkedin_status=?2,updated_at=?3 WHERE id=?1",
+            params![id, status, now()],
+        )?;
+        Ok(())
     }
 
     /// Update email + verification result after enrichment/verify.
@@ -750,12 +1058,47 @@ impl Db {
             s.id.clone()
         };
         conn.execute(
-            "INSERT INTO sequences (id,person_id,lead_id,brand,thesis,applied_principles,status,current_stage,created_at) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-            params![id, s.person_id, s.lead_id, s.brand, s.thesis,
-                js(&s.applied_principles), status_or(&s.status, "active"), s.current_stage, now()],
+            "INSERT INTO sequences (id,person_id,lead_id,brand,thesis,applied_principles,\
+             play_id,play_version,experiment_id,experiment_arm,experiment_assignment_id,\
+             signal_observation_ids,gtm_state,status,current_stage,created_at) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+            params![
+                id,
+                s.person_id,
+                s.lead_id,
+                s.brand,
+                s.thesis,
+                js(&s.applied_principles),
+                s.play_id,
+                s.play_version,
+                s.experiment_id,
+                s.experiment_arm,
+                s.experiment_assignment_id,
+                js(&s.signal_observation_ids),
+                s.gtm_state,
+                status_or(&s.status, "active"),
+                s.current_stage,
+                now()
+            ],
         )?;
+        if !s.experiment_assignment_id.is_empty() {
+            conn.execute(
+                "UPDATE experiment_assignments SET sequence_id=?2 WHERE id=?1 AND sequence_id=''",
+                params![s.experiment_assignment_id, id],
+            )?;
+        }
         Ok(id)
+    }
+
+    pub fn sequence_gtm_attribution(&self, sequence_id: &str) -> Result<Option<Sequence>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT * FROM sequences WHERE id=?1",
+                params![sequence_id],
+                |row| Ok(row_to_sequence(row)),
+            )
+            .optional()?)
     }
 
     /// Permanently remove an active sequence only when none of its touches were
@@ -847,8 +1190,110 @@ impl Db {
         Ok(id)
     }
 
+    /// Replace the current checkpoint for one generated touch. Building
+    /// sequences are never send-eligible; these rows exist so the CRM can show
+    /// writing and review progress before the full sequence finishes.
+    pub fn update_touch_checkpoint(&self, t: &Touch) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let updated = conn.execute(
+            "UPDATE touches SET day_offset=?3,channel=?4,subject=?5,body=?6,purpose=?7,
+             goal=?8,status=?9,due_at=?10,recipient_timezone=?11,scheduled_rule=?12,
+             schedule_reason=?13,review_passes=?14,review_issues=?15,error=?16
+             WHERE sequence_id=?1 AND stage=?2",
+            params![
+                t.sequence_id,
+                t.stage,
+                t.day_offset,
+                t.channel,
+                t.subject,
+                t.body,
+                t.purpose,
+                t.goal,
+                status_or(&t.status, "reviewing"),
+                t.due_at,
+                t.recipient_timezone,
+                t.scheduled_rule,
+                t.schedule_reason,
+                t.review_passes,
+                js(&t.review_issues),
+                t.error,
+            ],
+        )?;
+        Ok(updated > 0)
+    }
+
+    /// Atomically make a fully reviewed checkpoint sequence active. An unsent
+    /// sequence being replaced is removed only at this final promotion point,
+    /// so a failed rewrite cannot destroy the operator's prior drafts.
+    pub fn promote_building_sequence(
+        &self,
+        sequence_id: &str,
+        replaced_sequence_id: Option<&str>,
+        applied_principles: &[String],
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        if let Some(old_id) = replaced_sequence_id.filter(|id| !id.is_empty()) {
+            let sent: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM touches WHERE sequence_id=?1 AND status='sent'",
+                params![old_id],
+                |row| row.get(0),
+            )?;
+            if sent > 0 {
+                anyhow::bail!("refusing to replace a sequence with sent touches");
+            }
+            tx.execute("DELETE FROM touches WHERE sequence_id=?1", params![old_id])?;
+            let removed = tx.execute(
+                "DELETE FROM sequences WHERE id=?1 AND status='active'",
+                params![old_id],
+            )?;
+            if removed == 0 {
+                anyhow::bail!("the prior active sequence changed while drafting");
+            }
+        }
+        let promoted = tx.execute(
+            "UPDATE sequences SET status='active',applied_principles=?2 WHERE id=?1 AND status='building'",
+            params![sequence_id, js(applied_principles)],
+        )?;
+        if promoted == 0 {
+            anyhow::bail!("the building sequence is no longer promotable");
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn reject_building_sequence(&self, sequence_id: &str, reason: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE touches SET status='blocked',review_passes=0,review_issues=?2,error=?3
+             WHERE sequence_id=?1 AND status IN ('writing','reviewing')",
+            params![sequence_id, js(&vec![reason.to_string()]), reason],
+        )?;
+        conn.execute(
+            "UPDATE sequences SET status='rejected' WHERE id=?1 AND status='building'",
+            params![sequence_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn interrupt_prior_building_sequences(&self, person_id: &str) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let reason = "A newer drafting run superseded this incomplete checkpoint.";
+        conn.execute(
+            "UPDATE touches SET status='blocked',review_passes=0,review_issues=?2,error=?3
+             WHERE sequence_id IN (
+               SELECT id FROM sequences WHERE person_id=?1 AND status='building'
+             ) AND status IN ('writing','reviewing')",
+            params![person_id, js(&vec![reason.to_string()]), reason],
+        )?;
+        Ok(conn.execute(
+            "UPDATE sequences SET status='rejected' WHERE person_id=?1 AND status='building'",
+            params![person_id],
+        )?)
+    }
+
     /// Touches the cadence engine may fire now: scheduled + due, on an active,
-    /// unpaused sequence, for an email-channel person who isn't suppressed/replied.
+    /// unpaused sequence, for an email-capable person who isn't suppressed/replied.
     pub fn due_touches(&self, brand: Option<&str>, limit: i64) -> Result<Vec<Touch>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -862,7 +1307,7 @@ impl Db {
                AND NOT EXISTS ( \
                    SELECT 1 FROM touches prior \
                    WHERE prior.sequence_id=t.sequence_id AND prior.stage<t.stage \
-                     AND lower(prior.channel)='email' \
+                     AND lower(prior.channel) IN ('email','linkedin_or_email') \
                      AND prior.status NOT IN ('sent','skipped','cancelled','replied') \
                ) \
              ORDER BY t.due_at ASC LIMIT ?3",
@@ -871,12 +1316,39 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Atomically reserve one scheduled touch for delivery. Due-work queries are
+    /// intentionally read-only, so every live worker must pass this gate just
+    /// before crossing the external send boundary. Only one worker can move a
+    /// touch from `scheduled` to `sending`; a crashed worker leaves an explicit
+    /// reconciliation state instead of making another process send it twice.
+    pub fn claim_touch_for_send(&self, id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute(
+            "UPDATE touches SET status='sending',error='' WHERE id=?1 AND status='scheduled'",
+            params![id],
+        )? == 1)
+    }
+
     pub fn list_touches_for_person(&self, person_id: &str) -> Result<Vec<Touch>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare("SELECT * FROM touches WHERE person_id=?1 ORDER BY stage ASC")?;
+        let mut stmt = conn.prepare(
+            "SELECT * FROM touches WHERE sequence_id=(
+               SELECT id FROM sequences WHERE person_id=?1
+               ORDER BY CASE status WHEN 'building' THEN 0 WHEN 'active' THEN 1 ELSE 2 END,
+                        created_at DESC LIMIT 1
+             ) ORDER BY stage ASC",
+        )?;
         let rows = stmt.query_map(params![person_id], |r| Ok(row_to_touch(r)))?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn get_touch(&self, id: &str) -> Result<Option<Touch>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row("SELECT * FROM touches WHERE id=?1", params![id], |row| {
+                Ok(row_to_touch(row))
+            })
+            .optional()?)
     }
 
     /// Capacity used or reserved for one business calendar day. Drafts are
@@ -1271,14 +1743,16 @@ impl Db {
         Ok(())
     }
 
-    /// Approve drafted email touches (draft → scheduled) for a person or
-    /// whole brand. Manual LinkedIn/call tasks deliberately remain drafts: the
-    /// cadence daemon cannot execute them and they must not clog its due queue.
+    /// Approve drafted email-capable touches (draft → scheduled) for a person or
+    /// whole brand. Conditional LinkedIn/email touches resolve at send time from
+    /// the operator-maintained connection state. Pure LinkedIn tasks remain
+    /// manual drafts and never enter the daemon queue.
     pub fn approve_touches(&self, brand: Option<&str>, person_id: Option<&str>) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
         let n = conn.execute(
             "UPDATE touches SET status='scheduled' WHERE status='draft' \
-             AND lower(channel)='email' \
+             AND (lower(channel)='email' OR (lower(channel)='linkedin_or_email' AND \
+                  COALESCE((SELECT linkedin_status FROM people WHERE people.id=touches.person_id),'unknown')<>'connected')) \
              AND review_passes=1 \
              AND (?1 IS NULL OR brand=?1) AND (?2 IS NULL OR person_id=?2)",
             params![brand, person_id],
@@ -1474,6 +1948,16 @@ impl Db {
         )?;
         let rows = stmt.query_map(params![limit], |row| Ok(row_to_conversation_message(row)))?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Reserve an approved reply for exactly one live worker.
+    pub fn claim_conversation_message_for_send(&self, id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute(
+            "UPDATE conversation_messages SET status='sending' \
+             WHERE id=?1 AND direction='outbound' AND status='scheduled'",
+            params![id],
+        )? == 1)
     }
 
     pub fn approve_conversation_messages(
@@ -2042,6 +2526,16 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Reserve one scheduled opportunity touch for exactly one live worker.
+    pub fn claim_opportunity_touch_for_send(&self, id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute(
+            "UPDATE opportunity_touches SET status='sending',error='' \
+             WHERE id=?1 AND status='scheduled'",
+            params![id],
+        )? == 1)
+    }
+
     pub fn approve_opportunity_touches(
         &self,
         brand: Option<&str>,
@@ -2413,6 +2907,7 @@ impl Db {
 
     /// Stable subject keys we've already recorded a learning of `kind` about for a
     /// brand — used to skip re-evaluating (and re-researching) known rejects.
+    #[cfg(test)]
     pub fn learning_keys(
         &self,
         brand: &str,
@@ -2424,6 +2919,1019 @@ impl Db {
         )?;
         let rows = stmt.query_map(params![brand, kind], |r| r.get::<_, String>(0))?;
         Ok(rows.collect::<rusqlite::Result<std::collections::HashSet<_>>>()?)
+    }
+
+    /// Qualification skips that are safe to treat as durable deduplication.
+    /// Before the discovery-lane gate existed, two-signal accounts were stored
+    /// as rejects solely because they missed the old three-signal floor. Those
+    /// legacy rows must be reconsidered once; newly classified skips carry an
+    /// explicit `hard_reject:` / `insufficient_fit:` prefix and remain durable.
+    pub fn durable_qualification_skip_keys(
+        &self,
+        brand: &str,
+    ) -> Result<std::collections::HashSet<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT subject_key,detail FROM learnings \
+             WHERE brand=?1 AND kind='qualification_skip' AND subject_key<>''",
+        )?;
+        let rows = stmt.query_map(params![brand], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut keys = std::collections::HashSet::new();
+        for row in rows {
+            let (key, detail) = row?;
+            let legacy_two_signal_reject = !detail.starts_with("hard_reject:")
+                && !detail.starts_with("insufficient_fit:")
+                && detail.starts_with("only 2 canonical play signal(s) matched");
+            if !legacy_two_signal_reject {
+                keys.insert(key);
+            }
+        }
+        Ok(keys)
+    }
+
+    // --- GTM engineering --------------------------------------------------
+
+    pub fn insert_signal_definition_if_absent(
+        &self,
+        definition: &SignalDefinition,
+    ) -> Result<String> {
+        let conn = self.conn.lock().unwrap();
+        let id = if definition.id.is_empty() {
+            Uuid::new_v4().to_string()
+        } else {
+            definition.id.clone()
+        };
+        let timestamp = now();
+        conn.execute(
+            "INSERT INTO signal_definitions
+             (id,brand,key,name,description,topic,entity_type,value_type,source_kind,owner,
+              refresh_cadence,freshness_seconds,evidence_required,minimum_confidence,version,
+              status,created_at,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?17)
+             ON CONFLICT(brand,key,version) DO NOTHING",
+            params![
+                id,
+                definition.brand,
+                definition.key,
+                definition.name,
+                definition.description,
+                definition.topic,
+                definition.entity_type,
+                definition.value_type,
+                definition.source_kind,
+                definition.owner,
+                definition.refresh_cadence,
+                definition.freshness_seconds.max(0),
+                definition.evidence_required,
+                definition.minimum_confidence.clamp(0.0, 1.0),
+                definition.version.max(1),
+                status_or(&definition.status, "active"),
+                timestamp,
+            ],
+        )?;
+        Ok(conn.query_row(
+            "SELECT id FROM signal_definitions WHERE brand=?1 AND key=?2 AND version=?3",
+            params![definition.brand, definition.key, definition.version.max(1)],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn list_signal_definitions(&self, brand: Option<&str>) -> Result<Vec<SignalDefinition>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT * FROM signal_definitions WHERE (?1 IS NULL OR brand=?1)
+             ORDER BY brand,key,version DESC",
+        )?;
+        let rows = stmt.query_map(params![brand], |row| Ok(row_to_signal_definition(row)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn record_signal_observation(&self, observation: &SignalObservation) -> Result<String> {
+        let conn = self.conn.lock().unwrap();
+        record_signal_observation_conn(&conn, observation)
+    }
+
+    pub fn record_signal_candidates(
+        &self,
+        brand: &str,
+        lead_id: &str,
+        candidates: &[crate::gtm::SignalCandidate],
+        source_name: &str,
+    ) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let mut recorded = 0usize;
+        for candidate in candidates {
+            if candidate.definition_key.trim().is_empty() || candidate.evidence.trim().is_empty() {
+                continue;
+            }
+            let observation = SignalObservation {
+                brand: brand.to_string(),
+                definition_key: candidate.definition_key.trim().to_string(),
+                lead_id: lead_id.to_string(),
+                source_name: source_name.to_string(),
+                source_url: candidate.source_url.trim().to_string(),
+                evidence: candidate.evidence.trim().to_string(),
+                confidence: candidate.confidence.clamp(0.0, 1.0),
+                status: "observed".into(),
+                ..Default::default()
+            };
+            if record_signal_observation_conn(&conn, &observation).is_ok() {
+                recorded += 1;
+            }
+        }
+        Ok(recorded)
+    }
+
+    pub fn list_active_signal_observations(
+        &self,
+        brand: Option<&str>,
+        lead_id: Option<&str>,
+        person_id: Option<&str>,
+    ) -> Result<Vec<SignalObservation>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT o.* FROM signal_observations o
+             JOIN signal_definitions d ON d.id=o.definition_id
+             WHERE (?1 IS NULL OR o.brand=?1)
+               AND (?2 IS NULL OR o.lead_id=?2)
+               AND (?3 IS NULL OR o.person_id=?3)
+               AND o.status IN ('observed','verified')
+               AND o.confidence>=d.minimum_confidence
+               AND (o.expires_at='' OR o.expires_at>?4)
+               AND d.status='active'
+             ORDER BY o.observed_at DESC",
+        )?;
+        let rows = stmt.query_map(params![brand, lead_id, person_id, now()], |row| {
+            Ok(row_to_signal_observation(row))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn list_signal_observations(
+        &self,
+        brand: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<SignalObservation>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT * FROM signal_observations WHERE (?1 IS NULL OR brand=?1)
+             ORDER BY observed_at DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![brand, limit.max(1) as i64], |row| {
+            Ok(row_to_signal_observation(row))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn expire_signal_observations(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute(
+            "UPDATE signal_observations SET status='expired',updated_at=?1
+             WHERE status IN ('observed','verified') AND expires_at<>'' AND expires_at<=?1",
+            params![now()],
+        )?)
+    }
+
+    pub fn backfill_legacy_signal_observations(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id,brand,signals,updated_at FROM leads WHERE signals<>'' AND signals<>'[]'",
+        )?;
+        let leads = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        let mut inserted = 0usize;
+        for (lead_id, brand, raw, observed_at) in leads {
+            for evidence in jd(&raw) {
+                let observation = SignalObservation {
+                    brand: brand.clone(),
+                    definition_key: "account.fit_evidence".into(),
+                    lead_id: lead_id.clone(),
+                    source_name: "legacy_account_research".into(),
+                    value_json: serde_json::json!({"legacy": true}).to_string(),
+                    evidence,
+                    confidence: 0.70,
+                    observed_at: observed_at.clone(),
+                    status: "observed".into(),
+                    ..Default::default()
+                };
+                if record_signal_observation_conn(&conn, &observation).is_ok() {
+                    inserted += 1;
+                }
+            }
+        }
+        Ok(inserted)
+    }
+
+    pub fn insert_gtm_play_if_absent(&self, play: &GtmPlay) -> Result<String> {
+        let conn = self.conn.lock().unwrap();
+        let id = if play.id.is_empty() {
+            Uuid::new_v4().to_string()
+        } else {
+            play.id.clone()
+        };
+        let timestamp = now();
+        conn.execute(
+            "INSERT INTO gtm_plays
+             (id,brand,key,version,name,lifecycle,motion,target_icp,target_vantages,
+              required_signal_keys,minimum_signal_matches,hypothesis,action_policy,proof_type,
+              proof_description,success_metric,kill_condition,source_refs,created_at,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?19)
+             ON CONFLICT(brand,key,version) DO NOTHING",
+            params![
+                id,
+                play.brand,
+                play.key,
+                play.version.max(1),
+                play.name,
+                status_or(&play.lifecycle, "candidate"),
+                play.motion,
+                play.target_icp,
+                js(&play.target_vantages),
+                js(&play.required_signal_keys),
+                play.minimum_signal_matches.max(1),
+                play.hypothesis,
+                play.action_policy,
+                play.proof_type,
+                play.proof_description,
+                play.success_metric,
+                play.kill_condition,
+                js(&play.source_refs),
+                timestamp,
+            ],
+        )?;
+        Ok(conn.query_row(
+            "SELECT id FROM gtm_plays WHERE brand=?1 AND key=?2 AND version=?3",
+            params![play.brand, play.key, play.version.max(1)],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Keep superseded candidate/testing defaults as history without leaving
+    /// two action-eligible versions of the same play active. A genuinely proven
+    /// older version is preserved until market evidence justifies replacing it.
+    pub fn retire_older_unproven_gtm_play_versions(
+        &self,
+        brand: &str,
+        key: &str,
+        current_version: i64,
+    ) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute(
+            "UPDATE gtm_plays SET lifecycle='retired',updated_at=?4
+             WHERE brand=?1 AND key=?2 AND version<?3 AND lifecycle IN ('candidate','testing')",
+            params![brand, key, current_version, now()],
+        )?)
+    }
+
+    pub fn list_gtm_plays(&self, brand: Option<&str>) -> Result<Vec<GtmPlay>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT * FROM gtm_plays WHERE (?1 IS NULL OR brand=?1)
+             ORDER BY brand,key,version DESC",
+        )?;
+        let rows = stmt.query_map(params![brand], |row| Ok(row_to_gtm_play(row)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn upsert_account_play_assessment(
+        &self,
+        assessment: &AccountPlayAssessment,
+    ) -> Result<String> {
+        if assessment.play_id.trim().is_empty() {
+            anyhow::bail!("account assessment requires a versioned play");
+        }
+        let conn = self.conn.lock().unwrap();
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT id FROM account_play_assessments WHERE lead_id=?1 AND play_id=?2",
+                params![assessment.lead_id, assessment.play_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let id = existing.unwrap_or_else(|| {
+            if assessment.id.is_empty() {
+                Uuid::new_v4().to_string()
+            } else {
+                assessment.id.clone()
+            }
+        });
+        let timestamp = now();
+        conn.execute(
+            "INSERT INTO account_play_assessments
+             (id,lead_id,brand,play_id,play_version,status,fit_score,matched_signal_keys,
+              symptom,root_cause,current_workaround,why_now,proof_fit,evidence_gaps,
+              disqualifiers,source,created_at,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?17)
+             ON CONFLICT(lead_id,play_id) DO UPDATE SET
+              play_version=excluded.play_version,status=excluded.status,fit_score=excluded.fit_score,
+              matched_signal_keys=excluded.matched_signal_keys,symptom=excluded.symptom,
+              root_cause=excluded.root_cause,current_workaround=excluded.current_workaround,
+              why_now=excluded.why_now,proof_fit=excluded.proof_fit,
+              evidence_gaps=excluded.evidence_gaps,disqualifiers=excluded.disqualifiers,
+              source=excluded.source,updated_at=excluded.updated_at",
+            params![
+                id,
+                assessment.lead_id,
+                assessment.brand,
+                assessment.play_id,
+                assessment.play_version,
+                status_or(&assessment.status, "research_needed"),
+                assessment.fit_score.clamp(0, 100),
+                js(&assessment.matched_signal_keys),
+                assessment.symptom,
+                assessment.root_cause,
+                assessment.current_workaround,
+                assessment.why_now,
+                assessment.proof_fit,
+                js(&assessment.evidence_gaps),
+                js(&assessment.disqualifiers),
+                status_or(&assessment.source, "source.qualify"),
+                timestamp,
+            ],
+        )?;
+        Ok(id)
+    }
+
+    pub fn list_account_play_assessments(
+        &self,
+        brand: Option<&str>,
+    ) -> Result<Vec<AccountPlayAssessment>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT * FROM account_play_assessments WHERE (?1 IS NULL OR brand=?1)
+             ORDER BY fit_score DESC,updated_at DESC",
+        )?;
+        let rows = stmt.query_map(params![brand], |row| {
+            Ok(row_to_account_play_assessment(row))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn current_gtm_play(&self, brand: &str) -> Result<Option<GtmPlay>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT * FROM gtm_plays WHERE brand=?1 AND lifecycle IN ('proven','testing')
+                 ORDER BY CASE lifecycle WHEN 'proven' THEN 0 ELSE 1 END,version DESC LIMIT 1",
+                params![brand],
+                |row| Ok(row_to_gtm_play(row)),
+            )
+            .optional()?)
+    }
+
+    pub fn set_gtm_play_lifecycle(&self, id: &str, lifecycle: &str) -> Result<()> {
+        if !matches!(lifecycle, "candidate" | "testing" | "proven" | "retired") {
+            anyhow::bail!("invalid play lifecycle '{lifecycle}'");
+        }
+        let conn = self.conn.lock().unwrap();
+        if lifecycle == "proven" {
+            let passed: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM proof_briefs WHERE play_id=?1 AND status='passed'",
+                params![id],
+                |row| row.get(0),
+            )?;
+            if passed < 2 {
+                anyhow::bail!(
+                    "a play needs at least two passed customer-data proofs before promotion; it has {passed}"
+                );
+            }
+        }
+        conn.execute(
+            "UPDATE gtm_plays SET lifecycle=?2,updated_at=?3 WHERE id=?1",
+            params![id, lifecycle, now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn create_gtm_experiment(&self, experiment: &GtmExperiment) -> Result<String> {
+        if !matches!(
+            experiment.experiment_type.as_str(),
+            "list_only" | "copy_only" | "combined"
+        ) {
+            anyhow::bail!("experiment type must be list_only, copy_only, or combined");
+        }
+        if experiment.variable.trim().is_empty()
+            || experiment.control_description.trim().is_empty()
+            || experiment.variant_description.trim().is_empty()
+        {
+            anyhow::bail!(
+                "an experiment needs one variable and explicit control/variant descriptions"
+            );
+        }
+        if experiment.constants.is_empty() {
+            anyhow::bail!("record the constants so a result remains interpretable");
+        }
+        let conn = self.conn.lock().unwrap();
+        let id = if experiment.id.is_empty() {
+            Uuid::new_v4().to_string()
+        } else {
+            experiment.id.clone()
+        };
+        let timestamp = now();
+        conn.execute(
+            "INSERT INTO gtm_experiments
+             (id,brand,play_id,name,experiment_type,hypothesis,variable,constants,
+              control_description,variant_description,minimum_sends_per_arm,baseline_sends,
+              baseline_positive_reply_rate,success_target,failure_floor,measurement_days,status,
+              starts_at,ends_at,result_json,confidence,decision,created_at,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?23)",
+            params![
+                id,
+                experiment.brand,
+                experiment.play_id,
+                experiment.name,
+                experiment.experiment_type,
+                experiment.hypothesis,
+                experiment.variable,
+                js(&experiment.constants),
+                experiment.control_description,
+                experiment.variant_description,
+                experiment.minimum_sends_per_arm.max(1),
+                experiment.baseline_sends.max(0),
+                experiment.baseline_positive_reply_rate.max(0.0),
+                if experiment.success_target > 0.0 {
+                    experiment.success_target
+                } else {
+                    experiment.baseline_positive_reply_rate.max(0.0) * 1.2
+                },
+                if experiment.failure_floor > 0.0 {
+                    experiment.failure_floor
+                } else {
+                    experiment.baseline_positive_reply_rate.max(0.0) * 0.8
+                },
+                experiment.measurement_days.max(21),
+                status_or(&experiment.status, "draft"),
+                experiment.starts_at,
+                experiment.ends_at,
+                experiment.result_json,
+                experiment.confidence,
+                experiment.decision,
+                timestamp,
+            ],
+        )?;
+        Ok(id)
+    }
+
+    pub fn list_gtm_experiments(&self, brand: Option<&str>) -> Result<Vec<GtmExperiment>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT * FROM gtm_experiments WHERE (?1 IS NULL OR brand=?1)
+             ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map(params![brand], |row| Ok(row_to_gtm_experiment(row)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn running_experiment_for_play(&self, play_id: &str) -> Result<Option<GtmExperiment>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT * FROM gtm_experiments WHERE play_id=?1 AND status='running'
+                 ORDER BY created_at DESC LIMIT 1",
+                params![play_id],
+                |row| Ok(row_to_gtm_experiment(row)),
+            )
+            .optional()?)
+    }
+
+    pub fn set_gtm_experiment_status(&self, id: &str, status: &str) -> Result<()> {
+        if !matches!(
+            status,
+            "draft" | "running" | "measuring" | "complete" | "inconclusive" | "cancelled"
+        ) {
+            anyhow::bail!("invalid experiment status '{status}'");
+        }
+        let conn = self.conn.lock().unwrap();
+        if status == "running" {
+            let experiment: (String, i64, i64, f64) = conn.query_row(
+                "SELECT play_id,measurement_days,baseline_sends,baseline_positive_reply_rate
+                 FROM gtm_experiments WHERE id=?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+            if experiment.2 < 200 || experiment.3 < 0.01 {
+                anyhow::bail!(
+                    "establish a healthy baseline first: at least 200 sends and 1% positive replies"
+                );
+            }
+            let already_running: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM gtm_experiments WHERE play_id=?1 AND status='running' AND id<>?2",
+                params![experiment.0, id],
+                |row| row.get(0),
+            )?;
+            if already_running > 0 {
+                anyhow::bail!("only one experiment may run for a play at a time");
+            }
+            let start = Utc::now();
+            let end = start + Duration::days(experiment.1.max(21));
+            conn.execute(
+                "UPDATE gtm_experiments SET status='running',starts_at=?2,ends_at=?3,updated_at=?2 WHERE id=?1",
+                params![id, start.to_rfc3339(), end.to_rfc3339()],
+            )?;
+        } else {
+            conn.execute(
+                "UPDATE gtm_experiments SET status=?2,updated_at=?3 WHERE id=?1",
+                params![id, status, now()],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn evaluate_gtm_experiment(
+        &self,
+        id: &str,
+        control_sent: i64,
+        control_positive: i64,
+        variant_sent: i64,
+        variant_positive: i64,
+    ) -> Result<GtmExperiment> {
+        if control_sent <= 0
+            || variant_sent <= 0
+            || control_positive < 0
+            || variant_positive < 0
+            || control_positive > control_sent
+            || variant_positive > variant_sent
+        {
+            anyhow::bail!("experiment counts are invalid");
+        }
+        let conn = self.conn.lock().unwrap();
+        let mut experiment = conn.query_row(
+            "SELECT * FROM gtm_experiments WHERE id=?1",
+            params![id],
+            |row| Ok(row_to_gtm_experiment(row)),
+        )?;
+        if !matches!(experiment.status.as_str(), "running" | "measuring") {
+            anyhow::bail!("only a running or measuring experiment can be evaluated");
+        }
+        let ends_at = DateTime::parse_from_rfc3339(&experiment.ends_at)
+            .map(|date| date.with_timezone(&Utc))
+            .map_err(|_| anyhow::anyhow!("experiment has no valid measurement date"))?;
+        if Utc::now() < ends_at {
+            anyhow::bail!(
+                "do not call the experiment early; measure after {}",
+                experiment.ends_at
+            );
+        }
+
+        let control_rate = control_positive as f64 / control_sent as f64;
+        let variant_rate = variant_positive as f64 / variant_sent as f64;
+        let relative_lift = if control_rate > 0.0 {
+            (variant_rate - control_rate) / control_rate
+        } else if variant_rate > 0.0 {
+            1.0
+        } else {
+            0.0
+        };
+        let sample_met = control_sent >= experiment.minimum_sends_per_arm
+            && variant_sent >= experiment.minimum_sends_per_arm;
+        let isolated = experiment.experiment_type != "combined";
+        let confidence = if sample_met && isolated {
+            "high"
+        } else if sample_met {
+            "medium"
+        } else {
+            "low"
+        };
+        let (status, decision) = if !sample_met {
+            ("inconclusive", "insufficient_sample_do_not_adopt")
+        } else if !isolated {
+            ("inconclusive", "combined_test_hypothesis_generation_only")
+        } else if variant_rate >= experiment.success_target && relative_lift >= 0.20 {
+            ("complete", "adopt_variant_as_new_baseline")
+        } else if relative_lift >= 0.10 {
+            ("complete", "replicate_variant_on_fresh_leads")
+        } else if variant_rate <= experiment.failure_floor || relative_lift < 0.0 {
+            ("complete", "keep_control_document_loss")
+        } else {
+            ("inconclusive", "drop_or_run_larger_test")
+        };
+        let result_json = serde_json::json!({
+            "control": {"sent": control_sent, "positive": control_positive, "positive_reply_rate": control_rate},
+            "variant": {"sent": variant_sent, "positive": variant_positive, "positive_reply_rate": variant_rate},
+            "relative_lift": relative_lift,
+            "sample_requirement_met": sample_met,
+            "single_variable_isolated": isolated,
+            "measured_after_full_window": true,
+        })
+        .to_string();
+        conn.execute(
+            "UPDATE gtm_experiments SET status=?2,result_json=?3,confidence=?4,decision=?5,
+             updated_at=?6 WHERE id=?1",
+            params![id, status, result_json, confidence, decision, now()],
+        )?;
+        experiment.status = status.into();
+        experiment.result_json = result_json;
+        experiment.confidence = confidence.into();
+        experiment.decision = decision.into();
+        experiment.updated_at = now();
+        Ok(experiment)
+    }
+
+    pub fn ensure_experiment_assignment(
+        &self,
+        experiment_id: &str,
+        lead_id: &str,
+        person_id: &str,
+        sequence_id: &str,
+    ) -> Result<ExperimentAssignment> {
+        let conn = self.conn.lock().unwrap();
+        if let Some(existing) = conn
+            .query_row(
+                "SELECT * FROM experiment_assignments WHERE experiment_id=?1 AND person_id=?2",
+                params![experiment_id, person_id],
+                |row| Ok(row_to_experiment_assignment(row)),
+            )
+            .optional()?
+        {
+            return Ok(existing);
+        }
+        let arm = if stable_hash(&format!("{experiment_id}:{person_id}")).is_multiple_of(2) {
+            "control"
+        } else {
+            "variant"
+        };
+        let assignment = ExperimentAssignment {
+            id: Uuid::new_v4().to_string(),
+            experiment_id: experiment_id.to_string(),
+            lead_id: lead_id.to_string(),
+            person_id: person_id.to_string(),
+            sequence_id: sequence_id.to_string(),
+            arm: arm.into(),
+            assigned_at: now(),
+        };
+        conn.execute(
+            "INSERT INTO experiment_assignments
+             (id,experiment_id,lead_id,person_id,sequence_id,arm,assigned_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                assignment.id,
+                assignment.experiment_id,
+                assignment.lead_id,
+                assignment.person_id,
+                assignment.sequence_id,
+                assignment.arm,
+                assignment.assigned_at
+            ],
+        )?;
+        Ok(assignment)
+    }
+
+    pub fn record_gtm_outcome(&self, outcome: &GtmOutcome) -> Result<String> {
+        let conn = self.conn.lock().unwrap();
+        let id = if outcome.id.is_empty() {
+            Uuid::new_v4().to_string()
+        } else {
+            outcome.id.clone()
+        };
+        let occurred_at = if outcome.occurred_at.is_empty() {
+            now()
+        } else {
+            outcome.occurred_at.clone()
+        };
+        let fingerprint = if outcome.fingerprint.is_empty() {
+            format!(
+                "{:016x}",
+                stable_hash(&format!(
+                    "{}:{}:{}:{}:{}:{}",
+                    outcome.brand,
+                    outcome.kind,
+                    outcome.sequence_id,
+                    outcome.conversation_id,
+                    outcome.source,
+                    occurred_at
+                ))
+            )
+        } else {
+            outcome.fingerprint.clone()
+        };
+        conn.execute(
+            "INSERT INTO gtm_outcomes
+             (id,brand,kind,lead_id,person_id,sequence_id,conversation_id,play_id,experiment_id,
+              experiment_assignment_id,signal_observation_ids,value,detail,source,fingerprint,
+              occurred_at,created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
+             ON CONFLICT(brand,fingerprint) DO NOTHING",
+            params![
+                id,
+                outcome.brand,
+                outcome.kind,
+                outcome.lead_id,
+                outcome.person_id,
+                outcome.sequence_id,
+                outcome.conversation_id,
+                outcome.play_id,
+                outcome.experiment_id,
+                outcome.experiment_assignment_id,
+                js(&outcome.signal_observation_ids),
+                outcome.value,
+                outcome.detail,
+                outcome.source,
+                fingerprint,
+                occurred_at,
+                now(),
+            ],
+        )?;
+        Ok(id)
+    }
+
+    pub fn list_gtm_outcomes(&self, brand: Option<&str>, limit: usize) -> Result<Vec<GtmOutcome>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT * FROM gtm_outcomes WHERE (?1 IS NULL OR brand=?1)
+             ORDER BY occurred_at DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![brand, limit.max(1) as i64], |row| {
+            Ok(row_to_gtm_outcome(row))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn upsert_proof_brief(&self, proof: &ProofBrief) -> Result<String> {
+        let conn = self.conn.lock().unwrap();
+        let existing: Option<String> =
+            if proof.conversation_id.is_empty() || proof.play_id.is_empty() {
+                None
+            } else {
+                conn.query_row(
+                    "SELECT id FROM proof_briefs WHERE conversation_id=?1 AND play_id=?2",
+                    params![proof.conversation_id, proof.play_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+            };
+        let id = existing.unwrap_or_else(|| {
+            if proof.id.is_empty() {
+                Uuid::new_v4().to_string()
+            } else {
+                proof.id.clone()
+            }
+        });
+        let timestamp = now();
+        conn.execute(
+            "INSERT INTO proof_briefs
+             (id,brand,lead_id,person_id,conversation_id,play_id,status,problem,current_workflow,
+              evidence_available,scope,customer_data,success_metric,baseline,target,stop_condition,
+              stakeholders,owner,expansion_path,result,learnings,approved_at,created_at,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?23)
+             ON CONFLICT(conversation_id,play_id) DO UPDATE SET
+              status=excluded.status,problem=excluded.problem,current_workflow=excluded.current_workflow,
+              evidence_available=excluded.evidence_available,scope=excluded.scope,
+              customer_data=excluded.customer_data,success_metric=excluded.success_metric,
+              baseline=excluded.baseline,target=excluded.target,stop_condition=excluded.stop_condition,
+              stakeholders=excluded.stakeholders,owner=excluded.owner,expansion_path=excluded.expansion_path,
+              result=excluded.result,learnings=excluded.learnings,updated_at=excluded.updated_at",
+            params![
+                id,
+                proof.brand,
+                proof.lead_id,
+                proof.person_id,
+                proof.conversation_id,
+                proof.play_id,
+                status_or(&proof.status, "draft"),
+                proof.problem,
+                proof.current_workflow,
+                js(&proof.evidence_available),
+                proof.scope,
+                js(&proof.customer_data),
+                proof.success_metric,
+                proof.baseline,
+                proof.target,
+                proof.stop_condition,
+                js(&proof.stakeholders),
+                proof.owner,
+                proof.expansion_path,
+                proof.result,
+                js(&proof.learnings),
+                proof.approved_at,
+                timestamp,
+            ],
+        )?;
+        Ok(id)
+    }
+
+    pub fn list_proof_briefs(&self, brand: Option<&str>) -> Result<Vec<ProofBrief>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT * FROM proof_briefs WHERE (?1 IS NULL OR brand=?1)
+             ORDER BY updated_at DESC",
+        )?;
+        let rows = stmt.query_map(params![brand], |row| Ok(row_to_proof_brief(row)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn set_proof_status(&self, id: &str, status: &str) -> Result<()> {
+        if !matches!(
+            status,
+            "draft" | "ready" | "approved" | "running" | "passed" | "failed" | "withdrawn"
+        ) {
+            anyhow::bail!("invalid proof status '{status}'");
+        }
+        let conn = self.conn.lock().unwrap();
+        let proof = conn.query_row(
+            "SELECT * FROM proof_briefs WHERE id=?1",
+            params![id],
+            |row| Ok(row_to_proof_brief(row)),
+        )?;
+        let allowed = matches!(
+            (proof.status.as_str(), status),
+            ("draft", "ready")
+                | ("draft", "withdrawn")
+                | ("ready", "draft")
+                | ("ready", "approved")
+                | ("ready", "withdrawn")
+                | ("approved", "running")
+                | ("approved", "withdrawn")
+                | ("running", "passed")
+                | ("running", "failed")
+        ) || proof.status == status;
+        if !allowed {
+            anyhow::bail!(
+                "invalid proof transition {} → {}; approve before running and measure before passing",
+                proof.status,
+                status
+            );
+        }
+        conn.execute(
+            "UPDATE proof_briefs SET status=?2,
+             approved_at=CASE WHEN ?2='approved' AND approved_at='' THEN ?3 ELSE approved_at END,
+             updated_at=?3 WHERE id=?1",
+            params![id, status, now()],
+        )?;
+        if matches!(status, "passed" | "failed") {
+            let kind = if status == "passed" {
+                "proof_passed"
+            } else {
+                "proof_failed"
+            };
+            conn.execute(
+                "INSERT INTO gtm_outcomes
+                 (id,brand,kind,lead_id,person_id,sequence_id,conversation_id,play_id,
+                  experiment_id,experiment_assignment_id,signal_observation_ids,value,detail,
+                  source,fingerprint,occurred_at,created_at)
+                 VALUES (?1,?2,?3,?4,?5,'',?6,?7,'','','[]',?8,?9,'proof',?10,?11,?11)
+                 ON CONFLICT(brand,fingerprint) DO NOTHING",
+                params![
+                    Uuid::new_v4().to_string(),
+                    proof.brand,
+                    kind,
+                    proof.lead_id,
+                    proof.person_id,
+                    proof.conversation_id,
+                    proof.play_id,
+                    if status == "passed" { 1.0 } else { 0.0 },
+                    if proof.result.is_empty() {
+                        format!(
+                            "Proof marked {status}; result narrative still needs documentation."
+                        )
+                    } else {
+                        proof.result
+                    },
+                    format!("proof:{}:{status}", proof.id),
+                    now(),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn upsert_customer_development(
+        &self,
+        record: &CustomerDevelopmentRecord,
+    ) -> Result<String> {
+        if record.brand.trim().is_empty() || record.lead_id.trim().is_empty() {
+            anyhow::bail!("customer development requires brand and lead_id");
+        }
+        let conn = self.conn.lock().unwrap();
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT id FROM customer_development WHERE brand=?1 AND lead_id=?2",
+                params![record.brand, record.lead_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let id = existing.unwrap_or_else(|| {
+            if record.id.is_empty() {
+                Uuid::new_v4().to_string()
+            } else {
+                record.id.clone()
+            }
+        });
+        let timestamp = now();
+        conn.execute(
+            "INSERT INTO customer_development
+             (id,brand,lead_id,person_id,conversation_id,stage,problem,task_scope,site,
+              current_workflow,why_manual,variations,exceptions,evidence,economics,
+              success_criteria,stop_condition,stakeholders,commitment_kind,commitment_detail,
+              quantity,commercial_case,timeline,loi_conditions,next_action,engaged_at,source,
+              created_at,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,
+                     ?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?28)
+             ON CONFLICT(brand,lead_id) DO UPDATE SET
+              person_id=excluded.person_id,conversation_id=excluded.conversation_id,
+              stage=excluded.stage,problem=excluded.problem,task_scope=excluded.task_scope,
+              site=excluded.site,current_workflow=excluded.current_workflow,
+              why_manual=excluded.why_manual,variations=excluded.variations,
+              exceptions=excluded.exceptions,evidence=excluded.evidence,
+              economics=excluded.economics,success_criteria=excluded.success_criteria,
+              stop_condition=excluded.stop_condition,stakeholders=excluded.stakeholders,
+              commitment_kind=excluded.commitment_kind,
+              commitment_detail=excluded.commitment_detail,quantity=excluded.quantity,
+              commercial_case=excluded.commercial_case,timeline=excluded.timeline,
+              loi_conditions=excluded.loi_conditions,next_action=excluded.next_action,
+              engaged_at=excluded.engaged_at,source=excluded.source,
+              updated_at=excluded.updated_at",
+            params![
+                id,
+                record.brand,
+                record.lead_id,
+                record.person_id,
+                record.conversation_id,
+                status_or(&record.stage, "hypothesis"),
+                record.problem,
+                record.task_scope,
+                record.site,
+                record.current_workflow,
+                record.why_manual,
+                js(&record.variations),
+                js(&record.exceptions),
+                js(&record.evidence),
+                record.economics,
+                record.success_criteria,
+                record.stop_condition,
+                js(&record.stakeholders),
+                status_or(&record.commitment_kind, "none"),
+                record.commitment_detail,
+                record.quantity,
+                record.commercial_case,
+                record.timeline,
+                record.loi_conditions,
+                record.next_action,
+                record.engaged_at,
+                status_or(&record.source, "manual_crm"),
+                timestamp,
+            ],
+        )?;
+        Ok(id)
+    }
+
+    pub fn customer_development_for_lead(
+        &self,
+        brand: &str,
+        lead_id: &str,
+    ) -> Result<Option<CustomerDevelopmentRecord>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT * FROM customer_development WHERE brand=?1 AND lead_id=?2",
+            params![brand, lead_id],
+            |row| Ok(row_to_customer_development(row)),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn list_customer_development(
+        &self,
+        brand: Option<&str>,
+    ) -> Result<Vec<CustomerDevelopmentRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT * FROM customer_development WHERE (?1 IS NULL OR brand=?1)
+             ORDER BY updated_at DESC",
+        )?;
+        let rows = stmt.query_map(params![brand], |row| Ok(row_to_customer_development(row)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn backfill_sequence_gtm_attribution(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute(
+            "UPDATE sequences SET
+               play_id=COALESCE((SELECT p.id FROM gtm_plays p
+                 WHERE p.brand=sequences.brand AND p.lifecycle IN ('testing','proven')
+                 ORDER BY CASE p.lifecycle WHEN 'proven' THEN 0 ELSE 1 END,p.version DESC LIMIT 1),''),
+               play_version=COALESCE((SELECT p.version FROM gtm_plays p
+                 WHERE p.brand=sequences.brand AND p.lifecycle IN ('testing','proven')
+                 ORDER BY CASE p.lifecycle WHEN 'proven' THEN 0 ELSE 1 END,p.version DESC LIMIT 1),0),
+               signal_observation_ids=COALESCE((SELECT json_group_array(o.id)
+                 FROM signal_observations o WHERE o.lead_id=sequences.lead_id
+                   AND o.status IN ('observed','verified') AND (o.expires_at='' OR o.expires_at>?1)),'[]'),
+               gtm_state=CASE WHEN EXISTS(SELECT 1 FROM signal_observations o
+                 WHERE o.lead_id=sequences.lead_id AND o.status IN ('observed','verified')
+                   AND (o.expires_at='' OR o.expires_at>?1)) THEN 'action_ready' ELSE 'research_required' END
+             WHERE play_id=''",
+            params![now()],
+        )?)
     }
 
     /// Count events of each `kind` for a brand (or all) — the funnel raw numbers.
@@ -2562,11 +4070,254 @@ fn row_to_person(r: &Row) -> Person {
         primary: r.get::<_, i64>("primary_contact").unwrap_or(0) != 0,
         route_to: g(r, "route_to"),
         linkedin_url: g(r, "linkedin_url"),
+        linkedin_status: g(r, "linkedin_status"),
         email: g(r, "email"),
         email_status: g(r, "email_status"),
         phone: g(r, "phone"),
         status: g(r, "status"),
         enriched_at: g(r, "enriched_at"),
+        created_at: g(r, "created_at"),
+        updated_at: g(r, "updated_at"),
+    }
+}
+
+fn row_to_sequence(r: &Row) -> Sequence {
+    Sequence {
+        id: g(r, "id"),
+        person_id: g(r, "person_id"),
+        lead_id: g(r, "lead_id"),
+        brand: g(r, "brand"),
+        thesis: g(r, "thesis"),
+        applied_principles: jd(&g(r, "applied_principles")),
+        play_id: g(r, "play_id"),
+        play_version: r.get("play_version").unwrap_or(0),
+        experiment_id: g(r, "experiment_id"),
+        experiment_arm: g(r, "experiment_arm"),
+        experiment_assignment_id: g(r, "experiment_assignment_id"),
+        signal_observation_ids: jd(&g(r, "signal_observation_ids")),
+        gtm_state: g(r, "gtm_state"),
+        status: g(r, "status"),
+        current_stage: r.get("current_stage").unwrap_or(0),
+        created_at: g(r, "created_at"),
+    }
+}
+
+fn row_to_signal_definition(r: &Row) -> SignalDefinition {
+    SignalDefinition {
+        id: g(r, "id"),
+        brand: g(r, "brand"),
+        key: g(r, "key"),
+        name: g(r, "name"),
+        description: g(r, "description"),
+        topic: g(r, "topic"),
+        entity_type: g(r, "entity_type"),
+        value_type: g(r, "value_type"),
+        source_kind: g(r, "source_kind"),
+        owner: g(r, "owner"),
+        refresh_cadence: g(r, "refresh_cadence"),
+        freshness_seconds: r.get("freshness_seconds").unwrap_or(0),
+        evidence_required: r.get::<_, i64>("evidence_required").unwrap_or(1) != 0,
+        minimum_confidence: r.get("minimum_confidence").unwrap_or(0.0),
+        version: r.get("version").unwrap_or(1),
+        status: g(r, "status"),
+        created_at: g(r, "created_at"),
+        updated_at: g(r, "updated_at"),
+    }
+}
+
+fn row_to_signal_observation(r: &Row) -> SignalObservation {
+    SignalObservation {
+        id: g(r, "id"),
+        definition_id: g(r, "definition_id"),
+        definition_key: g(r, "definition_key"),
+        brand: g(r, "brand"),
+        lead_id: g(r, "lead_id"),
+        person_id: g(r, "person_id"),
+        conversation_id: g(r, "conversation_id"),
+        source_name: g(r, "source_name"),
+        source_url: g(r, "source_url"),
+        provider_key: g(r, "provider_key"),
+        value_json: g(r, "value_json"),
+        evidence: g(r, "evidence"),
+        confidence: r.get("confidence").unwrap_or(0.0),
+        observed_at: g(r, "observed_at"),
+        expires_at: g(r, "expires_at"),
+        status: g(r, "status"),
+        fingerprint: g(r, "fingerprint"),
+        created_at: g(r, "created_at"),
+        updated_at: g(r, "updated_at"),
+    }
+}
+
+fn row_to_gtm_play(r: &Row) -> GtmPlay {
+    GtmPlay {
+        id: g(r, "id"),
+        brand: g(r, "brand"),
+        key: g(r, "key"),
+        version: r.get("version").unwrap_or(1),
+        name: g(r, "name"),
+        lifecycle: g(r, "lifecycle"),
+        motion: g(r, "motion"),
+        target_icp: g(r, "target_icp"),
+        target_vantages: jd(&g(r, "target_vantages")),
+        required_signal_keys: jd(&g(r, "required_signal_keys")),
+        minimum_signal_matches: r.get("minimum_signal_matches").unwrap_or(1),
+        hypothesis: g(r, "hypothesis"),
+        action_policy: g(r, "action_policy"),
+        proof_type: g(r, "proof_type"),
+        proof_description: g(r, "proof_description"),
+        success_metric: g(r, "success_metric"),
+        kill_condition: g(r, "kill_condition"),
+        source_refs: jd(&g(r, "source_refs")),
+        created_at: g(r, "created_at"),
+        updated_at: g(r, "updated_at"),
+    }
+}
+
+fn row_to_account_play_assessment(r: &Row) -> AccountPlayAssessment {
+    AccountPlayAssessment {
+        id: g(r, "id"),
+        lead_id: g(r, "lead_id"),
+        brand: g(r, "brand"),
+        play_id: g(r, "play_id"),
+        play_version: r.get("play_version").unwrap_or(0),
+        status: g(r, "status"),
+        fit_score: r.get("fit_score").unwrap_or(0),
+        matched_signal_keys: jd(&g(r, "matched_signal_keys")),
+        symptom: g(r, "symptom"),
+        root_cause: g(r, "root_cause"),
+        current_workaround: g(r, "current_workaround"),
+        why_now: g(r, "why_now"),
+        proof_fit: g(r, "proof_fit"),
+        evidence_gaps: jd(&g(r, "evidence_gaps")),
+        disqualifiers: jd(&g(r, "disqualifiers")),
+        source: g(r, "source"),
+        created_at: g(r, "created_at"),
+        updated_at: g(r, "updated_at"),
+    }
+}
+
+fn row_to_gtm_experiment(r: &Row) -> GtmExperiment {
+    GtmExperiment {
+        id: g(r, "id"),
+        brand: g(r, "brand"),
+        play_id: g(r, "play_id"),
+        name: g(r, "name"),
+        experiment_type: g(r, "experiment_type"),
+        hypothesis: g(r, "hypothesis"),
+        variable: g(r, "variable"),
+        constants: jd(&g(r, "constants")),
+        control_description: g(r, "control_description"),
+        variant_description: g(r, "variant_description"),
+        minimum_sends_per_arm: r.get("minimum_sends_per_arm").unwrap_or(500),
+        baseline_sends: r.get("baseline_sends").unwrap_or(0),
+        baseline_positive_reply_rate: r.get("baseline_positive_reply_rate").unwrap_or(0.0),
+        success_target: r.get("success_target").unwrap_or(0.0),
+        failure_floor: r.get("failure_floor").unwrap_or(0.0),
+        measurement_days: r.get("measurement_days").unwrap_or(21),
+        status: g(r, "status"),
+        starts_at: g(r, "starts_at"),
+        ends_at: g(r, "ends_at"),
+        result_json: g(r, "result_json"),
+        confidence: g(r, "confidence"),
+        decision: g(r, "decision"),
+        created_at: g(r, "created_at"),
+        updated_at: g(r, "updated_at"),
+    }
+}
+
+fn row_to_experiment_assignment(r: &Row) -> ExperimentAssignment {
+    ExperimentAssignment {
+        id: g(r, "id"),
+        experiment_id: g(r, "experiment_id"),
+        lead_id: g(r, "lead_id"),
+        person_id: g(r, "person_id"),
+        sequence_id: g(r, "sequence_id"),
+        arm: g(r, "arm"),
+        assigned_at: g(r, "assigned_at"),
+    }
+}
+
+fn row_to_gtm_outcome(r: &Row) -> GtmOutcome {
+    GtmOutcome {
+        id: g(r, "id"),
+        brand: g(r, "brand"),
+        kind: g(r, "kind"),
+        lead_id: g(r, "lead_id"),
+        person_id: g(r, "person_id"),
+        sequence_id: g(r, "sequence_id"),
+        conversation_id: g(r, "conversation_id"),
+        play_id: g(r, "play_id"),
+        experiment_id: g(r, "experiment_id"),
+        experiment_assignment_id: g(r, "experiment_assignment_id"),
+        signal_observation_ids: jd(&g(r, "signal_observation_ids")),
+        value: r.get("value").unwrap_or(0.0),
+        detail: g(r, "detail"),
+        source: g(r, "source"),
+        fingerprint: g(r, "fingerprint"),
+        occurred_at: g(r, "occurred_at"),
+        created_at: g(r, "created_at"),
+    }
+}
+
+fn row_to_proof_brief(r: &Row) -> ProofBrief {
+    ProofBrief {
+        id: g(r, "id"),
+        brand: g(r, "brand"),
+        lead_id: g(r, "lead_id"),
+        person_id: g(r, "person_id"),
+        conversation_id: g(r, "conversation_id"),
+        play_id: g(r, "play_id"),
+        status: g(r, "status"),
+        problem: g(r, "problem"),
+        current_workflow: g(r, "current_workflow"),
+        evidence_available: jd(&g(r, "evidence_available")),
+        scope: g(r, "scope"),
+        customer_data: jd(&g(r, "customer_data")),
+        success_metric: g(r, "success_metric"),
+        baseline: g(r, "baseline"),
+        target: g(r, "target"),
+        stop_condition: g(r, "stop_condition"),
+        stakeholders: jd(&g(r, "stakeholders")),
+        owner: g(r, "owner"),
+        expansion_path: g(r, "expansion_path"),
+        result: g(r, "result"),
+        learnings: jd(&g(r, "learnings")),
+        approved_at: g(r, "approved_at"),
+        created_at: g(r, "created_at"),
+        updated_at: g(r, "updated_at"),
+    }
+}
+
+fn row_to_customer_development(r: &Row) -> CustomerDevelopmentRecord {
+    CustomerDevelopmentRecord {
+        id: g(r, "id"),
+        brand: g(r, "brand"),
+        lead_id: g(r, "lead_id"),
+        person_id: g(r, "person_id"),
+        conversation_id: g(r, "conversation_id"),
+        stage: g(r, "stage"),
+        problem: g(r, "problem"),
+        task_scope: g(r, "task_scope"),
+        site: g(r, "site"),
+        current_workflow: g(r, "current_workflow"),
+        why_manual: g(r, "why_manual"),
+        variations: jd(&g(r, "variations")),
+        exceptions: jd(&g(r, "exceptions")),
+        evidence: jd(&g(r, "evidence")),
+        economics: g(r, "economics"),
+        success_criteria: g(r, "success_criteria"),
+        stop_condition: g(r, "stop_condition"),
+        stakeholders: jd(&g(r, "stakeholders")),
+        commitment_kind: g(r, "commitment_kind"),
+        commitment_detail: g(r, "commitment_detail"),
+        quantity: g(r, "quantity"),
+        commercial_case: g(r, "commercial_case"),
+        timeline: g(r, "timeline"),
+        loi_conditions: g(r, "loi_conditions"),
+        next_action: g(r, "next_action"),
+        engaged_at: g(r, "engaged_at"),
+        source: g(r, "source"),
         created_at: g(r, "created_at"),
         updated_at: g(r, "updated_at"),
     }
@@ -2936,7 +4687,7 @@ fn g(r: &Row, col: &str) -> String {
         .unwrap_or_default()
 }
 
-fn js<T: Serialize>(v: &T) -> String {
+fn js<T: Serialize + ?Sized>(v: &T) -> String {
     serde_json::to_string(v).unwrap_or_else(|_| "[]".into())
 }
 
@@ -2947,11 +4698,140 @@ fn jd(s: &str) -> Vec<String> {
     serde_json::from_str(s).unwrap_or_default()
 }
 
+fn stable_hash(value: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn record_signal_observation_conn(
+    conn: &Connection,
+    observation: &SignalObservation,
+) -> Result<String> {
+    let definition = conn
+        .query_row(
+            "SELECT * FROM signal_definitions
+             WHERE brand=?1 AND key=?2 AND status='active'
+             ORDER BY version DESC LIMIT 1",
+            params![observation.brand, observation.definition_key],
+            |row| Ok(row_to_signal_definition(row)),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown active signal definition {}:{}",
+                observation.brand,
+                observation.definition_key
+            )
+        })?;
+    if definition.evidence_required && observation.evidence.trim().is_empty() {
+        anyhow::bail!("signal {} requires source-backed evidence", definition.key);
+    }
+    let has_entity = match definition.entity_type.as_str() {
+        "account" => !observation.lead_id.trim().is_empty(),
+        "person" => !observation.person_id.trim().is_empty(),
+        "conversation" => !observation.conversation_id.trim().is_empty(),
+        _ => true,
+    };
+    if !has_entity {
+        anyhow::bail!(
+            "signal {} requires a {} entity id",
+            definition.key,
+            definition.entity_type
+        );
+    }
+    let observed_at = DateTime::parse_from_rfc3339(&observation.observed_at)
+        .map(|at| at.with_timezone(&Utc))
+        .unwrap_or_else(|_| Utc::now());
+    let expires_at = if !observation.expires_at.trim().is_empty() {
+        observation.expires_at.clone()
+    } else if definition.freshness_seconds > 0 {
+        (observed_at + Duration::seconds(definition.freshness_seconds)).to_rfc3339()
+    } else {
+        String::new()
+    };
+    let evidence = observation.evidence.trim();
+    let fingerprint = if observation.fingerprint.trim().is_empty() {
+        format!(
+            "{:016x}",
+            stable_hash(&format!(
+                "{}:{}:{}:{}:{}:{}:{}",
+                observation.brand,
+                definition.key,
+                observation.lead_id,
+                observation.person_id,
+                observation.conversation_id,
+                observation.source_url.trim().to_lowercase(),
+                evidence.to_lowercase()
+            ))
+        )
+    } else {
+        observation.fingerprint.clone()
+    };
+    let id = if observation.id.is_empty() {
+        Uuid::new_v4().to_string()
+    } else {
+        observation.id.clone()
+    };
+    let timestamp = now();
+    let status = match observation.status.as_str() {
+        "verified" | "rejected" | "expired" | "observed" => observation.status.as_str(),
+        _ => "observed",
+    };
+    conn.execute(
+        "INSERT INTO signal_observations
+         (id,definition_id,definition_key,brand,lead_id,person_id,conversation_id,source_name,
+          source_url,provider_key,value_json,evidence,confidence,observed_at,expires_at,status,
+          fingerprint,created_at,updated_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?18)
+         ON CONFLICT(brand,fingerprint) DO UPDATE SET
+          definition_id=excluded.definition_id,definition_key=excluded.definition_key,
+          source_name=excluded.source_name,source_url=excluded.source_url,
+          provider_key=excluded.provider_key,value_json=excluded.value_json,
+          evidence=excluded.evidence,confidence=excluded.confidence,observed_at=excluded.observed_at,
+          expires_at=excluded.expires_at,status=excluded.status,updated_at=excluded.updated_at",
+        params![
+            id,
+            definition.id,
+            definition.key,
+            observation.brand,
+            observation.lead_id,
+            observation.person_id,
+            observation.conversation_id,
+            status_or(&observation.source_name, &definition.source_kind),
+            observation.source_url,
+            observation.provider_key,
+            observation.value_json,
+            evidence,
+            observation.confidence.clamp(0.0, 1.0),
+            observed_at.to_rfc3339(),
+            expires_at,
+            status,
+            fingerprint,
+            timestamp,
+        ],
+    )?;
+    Ok(conn.query_row(
+        "SELECT id FROM signal_observations WHERE brand=?1 AND fingerprint=?2",
+        params![observation.brand, fingerprint],
+        |row| row.get(0),
+    )?)
+}
+
 fn status_or(s: &str, default: &str) -> String {
     if s.trim().is_empty() {
         default.to_string()
     } else {
         s.to_string()
+    }
+}
+
+fn normalize_linkedin_status(status: &str) -> &'static str {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "requested" => "requested",
+        "connected" => "connected",
+        "not_connected" | "not-connected" | "not connected" => "not_connected",
+        _ => "unknown",
     }
 }
 
@@ -3000,6 +4880,7 @@ CREATE TABLE IF NOT EXISTS people (
     location TEXT DEFAULT '', timezone TEXT DEFAULT '',
     vantage TEXT, can_observe TEXT, why_them TEXT,
     primary_contact INTEGER DEFAULT 0, route_to TEXT, linkedin_url TEXT,
+    linkedin_status TEXT DEFAULT 'unknown',
     email TEXT, email_status TEXT DEFAULT 'unknown', phone TEXT,
     status TEXT DEFAULT 'new', enriched_at TEXT,
     created_at TEXT, updated_at TEXT,
@@ -3123,6 +5004,214 @@ CREATE TABLE IF NOT EXISTS learnings (
     updated_at TEXT NOT NULL,
     UNIQUE(brand, kind, subject_key)
 );
+CREATE TABLE IF NOT EXISTS signal_definitions (
+    id TEXT PRIMARY KEY,
+    brand TEXT NOT NULL,
+    key TEXT NOT NULL,
+    name TEXT NOT NULL,
+    description TEXT DEFAULT '',
+    topic TEXT DEFAULT '',
+    entity_type TEXT NOT NULL,
+    value_type TEXT NOT NULL DEFAULT 'text',
+    source_kind TEXT NOT NULL,
+    owner TEXT NOT NULL,
+    refresh_cadence TEXT NOT NULL,
+    freshness_seconds INTEGER NOT NULL DEFAULT 7776000,
+    evidence_required INTEGER NOT NULL DEFAULT 1,
+    minimum_confidence REAL NOT NULL DEFAULT 0.6,
+    version INTEGER NOT NULL DEFAULT 1,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(brand,key,version)
+);
+CREATE TABLE IF NOT EXISTS signal_observations (
+    id TEXT PRIMARY KEY,
+    definition_id TEXT NOT NULL,
+    definition_key TEXT NOT NULL,
+    brand TEXT NOT NULL,
+    lead_id TEXT DEFAULT '',
+    person_id TEXT DEFAULT '',
+    conversation_id TEXT DEFAULT '',
+    source_name TEXT NOT NULL,
+    source_url TEXT DEFAULT '',
+    provider_key TEXT DEFAULT '',
+    value_json TEXT DEFAULT '',
+    evidence TEXT NOT NULL,
+    confidence REAL NOT NULL DEFAULT 0,
+    observed_at TEXT NOT NULL,
+    expires_at TEXT DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'observed',
+    fingerprint TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(brand,fingerprint),
+    FOREIGN KEY(definition_id) REFERENCES signal_definitions(id)
+);
+CREATE TABLE IF NOT EXISTS gtm_plays (
+    id TEXT PRIMARY KEY,
+    brand TEXT NOT NULL,
+    key TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1,
+    name TEXT NOT NULL,
+    lifecycle TEXT NOT NULL DEFAULT 'candidate',
+    motion TEXT DEFAULT '',
+    target_icp TEXT DEFAULT '',
+    target_vantages TEXT DEFAULT '[]',
+    required_signal_keys TEXT DEFAULT '[]',
+    minimum_signal_matches INTEGER NOT NULL DEFAULT 1,
+    hypothesis TEXT NOT NULL,
+    action_policy TEXT NOT NULL,
+    proof_type TEXT NOT NULL,
+    proof_description TEXT NOT NULL,
+    success_metric TEXT NOT NULL,
+    kill_condition TEXT NOT NULL,
+    source_refs TEXT DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(brand,key,version)
+);
+CREATE TABLE IF NOT EXISTS account_play_assessments (
+    id TEXT PRIMARY KEY,
+    lead_id TEXT NOT NULL,
+    brand TEXT NOT NULL,
+    play_id TEXT NOT NULL,
+    play_version INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    fit_score INTEGER NOT NULL DEFAULT 0,
+    matched_signal_keys TEXT DEFAULT '[]',
+    symptom TEXT DEFAULT '',
+    root_cause TEXT DEFAULT '',
+    current_workaround TEXT DEFAULT '',
+    why_now TEXT DEFAULT '',
+    proof_fit TEXT DEFAULT '',
+    evidence_gaps TEXT DEFAULT '[]',
+    disqualifiers TEXT DEFAULT '[]',
+    source TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(lead_id,play_id),
+    FOREIGN KEY(lead_id) REFERENCES leads(id),
+    FOREIGN KEY(play_id) REFERENCES gtm_plays(id)
+);
+CREATE TABLE IF NOT EXISTS gtm_experiments (
+    id TEXT PRIMARY KEY,
+    brand TEXT NOT NULL,
+    play_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    experiment_type TEXT NOT NULL,
+    hypothesis TEXT NOT NULL,
+    variable TEXT NOT NULL,
+    constants TEXT NOT NULL DEFAULT '[]',
+    control_description TEXT NOT NULL,
+    variant_description TEXT NOT NULL,
+    minimum_sends_per_arm INTEGER NOT NULL DEFAULT 500,
+    baseline_sends INTEGER NOT NULL DEFAULT 0,
+    baseline_positive_reply_rate REAL NOT NULL DEFAULT 0,
+    success_target REAL NOT NULL DEFAULT 0,
+    failure_floor REAL NOT NULL DEFAULT 0,
+    measurement_days INTEGER NOT NULL DEFAULT 21,
+    status TEXT NOT NULL DEFAULT 'draft',
+    starts_at TEXT DEFAULT '',
+    ends_at TEXT DEFAULT '',
+    result_json TEXT DEFAULT '',
+    confidence TEXT DEFAULT '',
+    decision TEXT DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(play_id) REFERENCES gtm_plays(id)
+);
+CREATE TABLE IF NOT EXISTS experiment_assignments (
+    id TEXT PRIMARY KEY,
+    experiment_id TEXT NOT NULL,
+    lead_id TEXT NOT NULL,
+    person_id TEXT NOT NULL,
+    sequence_id TEXT DEFAULT '',
+    arm TEXT NOT NULL,
+    assigned_at TEXT NOT NULL,
+    UNIQUE(experiment_id,person_id),
+    FOREIGN KEY(experiment_id) REFERENCES gtm_experiments(id)
+);
+CREATE TABLE IF NOT EXISTS gtm_outcomes (
+    id TEXT PRIMARY KEY,
+    brand TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    lead_id TEXT DEFAULT '',
+    person_id TEXT DEFAULT '',
+    sequence_id TEXT DEFAULT '',
+    conversation_id TEXT DEFAULT '',
+    play_id TEXT DEFAULT '',
+    experiment_id TEXT DEFAULT '',
+    experiment_assignment_id TEXT DEFAULT '',
+    signal_observation_ids TEXT DEFAULT '[]',
+    value REAL NOT NULL DEFAULT 0,
+    detail TEXT DEFAULT '',
+    source TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(brand,fingerprint)
+);
+CREATE TABLE IF NOT EXISTS proof_briefs (
+    id TEXT PRIMARY KEY,
+    brand TEXT NOT NULL,
+    lead_id TEXT DEFAULT '',
+    person_id TEXT DEFAULT '',
+    conversation_id TEXT DEFAULT '',
+    play_id TEXT DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'draft',
+    problem TEXT NOT NULL,
+    current_workflow TEXT DEFAULT '',
+    evidence_available TEXT DEFAULT '[]',
+    scope TEXT NOT NULL,
+    customer_data TEXT DEFAULT '[]',
+    success_metric TEXT NOT NULL,
+    baseline TEXT DEFAULT '',
+    target TEXT DEFAULT '',
+    stop_condition TEXT NOT NULL,
+    stakeholders TEXT DEFAULT '[]',
+    owner TEXT DEFAULT '',
+    expansion_path TEXT DEFAULT '',
+    result TEXT DEFAULT '',
+    learnings TEXT DEFAULT '[]',
+    approved_at TEXT DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(conversation_id,play_id)
+);
+CREATE TABLE IF NOT EXISTS customer_development (
+    id TEXT PRIMARY KEY,
+    brand TEXT NOT NULL,
+    lead_id TEXT NOT NULL,
+    person_id TEXT DEFAULT '',
+    conversation_id TEXT DEFAULT '',
+    stage TEXT NOT NULL DEFAULT 'hypothesis',
+    problem TEXT DEFAULT '',
+    task_scope TEXT DEFAULT '',
+    site TEXT DEFAULT '',
+    current_workflow TEXT DEFAULT '',
+    why_manual TEXT DEFAULT '',
+    variations TEXT DEFAULT '[]',
+    exceptions TEXT DEFAULT '[]',
+    evidence TEXT DEFAULT '[]',
+    economics TEXT DEFAULT '',
+    success_criteria TEXT DEFAULT '',
+    stop_condition TEXT DEFAULT '',
+    stakeholders TEXT DEFAULT '[]',
+    commitment_kind TEXT NOT NULL DEFAULT 'none',
+    commitment_detail TEXT DEFAULT '',
+    quantity TEXT DEFAULT '',
+    commercial_case TEXT DEFAULT '',
+    timeline TEXT DEFAULT '',
+    loi_conditions TEXT DEFAULT '',
+    next_action TEXT DEFAULT '',
+    engaged_at TEXT DEFAULT '',
+    source TEXT NOT NULL DEFAULT 'manual_crm',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(brand,lead_id),
+    FOREIGN KEY(lead_id) REFERENCES leads(id)
+);
 CREATE TABLE IF NOT EXISTS opportunities (
     id TEXT PRIMARY KEY,
     brand TEXT NOT NULL,
@@ -3211,6 +5300,22 @@ CREATE INDEX IF NOT EXISTS idx_touches_due ON touches(status, due_at);
 CREATE INDEX IF NOT EXISTS idx_touches_person ON touches(person_id);
 CREATE INDEX IF NOT EXISTS idx_people_brand_email ON people(brand, email);
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
+CREATE INDEX IF NOT EXISTS idx_signal_definitions_brand
+    ON signal_definitions(brand,status,key,version);
+CREATE INDEX IF NOT EXISTS idx_signal_observations_entity
+    ON signal_observations(brand,lead_id,person_id,status,expires_at);
+CREATE INDEX IF NOT EXISTS idx_gtm_plays_brand
+    ON gtm_plays(brand,lifecycle,key,version);
+CREATE INDEX IF NOT EXISTS idx_account_play_assessments_rank
+    ON account_play_assessments(brand,play_id,status,fit_score);
+CREATE INDEX IF NOT EXISTS idx_gtm_experiments_play
+    ON gtm_experiments(play_id,status,created_at);
+CREATE INDEX IF NOT EXISTS idx_gtm_outcomes_attribution
+    ON gtm_outcomes(brand,play_id,experiment_id,kind,occurred_at);
+CREATE INDEX IF NOT EXISTS idx_proof_briefs_brand
+    ON proof_briefs(brand,status,updated_at);
+CREATE INDEX IF NOT EXISTS idx_customer_development_stage
+    ON customer_development(brand,stage,updated_at);
 CREATE INDEX IF NOT EXISTS idx_replies_msgid ON replies(message_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_conversations_sequence
     ON conversations(sequence_id) WHERE sequence_id IS NOT NULL AND sequence_id<>'';
@@ -3241,8 +5346,9 @@ CREATE INDEX IF NOT EXISTS idx_jobs_claim ON jobs(status, next_run_at, priority)
 #[cfg(test)]
 mod tests {
     use super::{
-        ApplicationBrief, ConversationMessage, Db, Job, Lead, Mailbox, Meeting, Opportunity,
-        OpportunityContact, OpportunityTouch, Person, Sequence, Touch,
+        AccountPlayAssessment, ApplicationBrief, ConversationMessage, CustomerDevelopmentRecord,
+        Db, GtmExperiment, Job, Lead, Mailbox, Meeting, Opportunity, OpportunityContact,
+        OpportunityTouch, Person, Sequence, Touch,
     };
     use chrono::{TimeZone, Utc};
     use uuid::Uuid;
@@ -3573,6 +5679,57 @@ mod tests {
     }
 
     #[test]
+    fn customer_development_round_trips_and_updates_per_account() {
+        let db = Db::open(":memory:").expect("open memory db");
+        let lead_id = db
+            .upsert_lead(&Lead {
+                brand: "wapahki".into(),
+                apollo_org_id: "wapahki-discovery-account".into(),
+                name: "Example Foods".into(),
+                ..Default::default()
+            })
+            .expect("insert lead");
+        let id = db
+            .upsert_customer_development(&CustomerDevelopmentRecord {
+                brand: "wapahki".into(),
+                lead_id: lead_id.clone(),
+                stage: "task_mapped".into(),
+                problem: "Manual case handling".into(),
+                task_scope: "Conveyor to pallet".into(),
+                variations: vec!["Five formats".into()],
+                commitment_kind: "none".into(),
+                ..Default::default()
+            })
+            .expect("insert discovery");
+        let stored = db
+            .customer_development_for_lead("wapahki", &lead_id)
+            .expect("read discovery")
+            .expect("record exists");
+        assert_eq!(stored.id, id);
+        assert_eq!(stored.variations, vec!["Five formats"]);
+
+        let updated_id = db
+            .upsert_customer_development(&CustomerDevelopmentRecord {
+                id: id.clone(),
+                brand: "wapahki".into(),
+                lead_id: lead_id.clone(),
+                stage: "evaluation_agreed".into(),
+                problem: stored.problem,
+                commitment_kind: "evaluation_agreed".into(),
+                commitment_detail: "Plant manager agreed to a video review.".into(),
+                ..Default::default()
+            })
+            .expect("update discovery");
+        assert_eq!(updated_id, id);
+        let rows = db
+            .list_customer_development(Some("wapahki"))
+            .expect("list discovery");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].stage, "evaluation_agreed");
+        assert_eq!(rows[0].commitment_kind, "evaluation_agreed");
+    }
+
+    #[test]
     fn enqueue_job_is_idempotent_on_dedup_key() {
         let path =
             std::env::temp_dir().join(format!("spruce-jobs-dedup-test-{}.sqlite", Uuid::new_v4()));
@@ -3734,6 +5891,118 @@ mod tests {
     }
 
     #[test]
+    fn conditional_linkedin_touch_uses_connection_state_at_approval() {
+        let db = Db::open(":memory:").expect("open memory db");
+        let lead_id = db
+            .upsert_lead(&Lead {
+                brand: "gnk".into(),
+                apollo_org_id: "conditional-org".into(),
+                ..Default::default()
+            })
+            .expect("lead");
+        let make_person = |apollo_id: &str| {
+            db.upsert_person(&Person {
+                lead_id: lead_id.clone(),
+                brand: "gnk".into(),
+                apollo_person_id: apollo_id.into(),
+                linkedin_url: format!("https://linkedin.com/in/{apollo_id}"),
+                email: format!("{apollo_id}@example.com"),
+                email_status: "verified".into(),
+                status: "verified".into(),
+                ..Default::default()
+            })
+            .expect("person")
+        };
+        let unknown = make_person("unknown-linkedin");
+        let connected = make_person("connected-linkedin");
+        db.set_person_linkedin_status(&connected, "connected")
+            .expect("mark connected");
+
+        for person_id in [&unknown, &connected] {
+            let sequence_id = db
+                .create_sequence(&Sequence {
+                    person_id: person_id.clone(),
+                    lead_id: lead_id.clone(),
+                    brand: "gnk".into(),
+                    status: "active".into(),
+                    ..Default::default()
+                })
+                .expect("sequence");
+            db.insert_touch(&Touch {
+                sequence_id,
+                person_id: person_id.clone(),
+                lead_id: lead_id.clone(),
+                brand: "gnk".into(),
+                stage: 5,
+                channel: "linkedin_or_email".into(),
+                status: "draft".into(),
+                review_passes: Some(true),
+                due_at: "2030-01-01T00:00:00Z".into(),
+                ..Default::default()
+            })
+            .expect("touch");
+        }
+
+        assert_eq!(db.approve_touches(Some("gnk"), None).unwrap(), 1);
+        assert_eq!(
+            db.get_person(&connected).unwrap().unwrap().linkedin_status,
+            "connected"
+        );
+        assert_eq!(
+            db.list_touches_for_person(&unknown).unwrap()[0].status,
+            "scheduled"
+        );
+        assert_eq!(
+            db.list_touches_for_person(&connected).unwrap()[0].status,
+            "draft"
+        );
+    }
+
+    #[test]
+    fn live_send_claims_are_single_winner() {
+        let db = Db::open(":memory:").expect("open memory db");
+        {
+            let conn = db.conn.lock().expect("lock db");
+            conn.execute_batch(
+                "INSERT INTO touches
+                   (id,sequence_id,person_id,lead_id,brand,status)
+                 VALUES ('touch-claim','sequence-claim','person-claim','lead-claim','gnk','scheduled');
+                 INSERT INTO conversations
+                   (id,brand,person_id,status,created_at,updated_at)
+                 VALUES ('conversation-claim','gnk','person-claim','open','now','now');
+                 INSERT INTO conversation_messages
+                   (id,conversation_id,direction,status,created_at)
+                 VALUES ('message-claim','conversation-claim','outbound','scheduled','now');
+                 INSERT INTO opportunities
+                   (id,brand,fingerprint)
+                 VALUES ('opportunity-claim','gnk','opportunity-claim');
+                 INSERT INTO opportunity_contacts
+                   (id,opportunity_id,brand,contact_key)
+                 VALUES ('contact-claim','opportunity-claim','gnk','contact-claim');
+                 INSERT INTO opportunity_touches
+                   (id,opportunity_id,contact_id,brand,status)
+                 VALUES ('opportunity-touch-claim','opportunity-claim','contact-claim','gnk','scheduled');",
+            )
+            .expect("seed claim rows");
+        }
+
+        assert!(db.claim_touch_for_send("touch-claim").unwrap());
+        assert!(!db.claim_touch_for_send("touch-claim").unwrap());
+        assert!(db
+            .claim_conversation_message_for_send("message-claim")
+            .unwrap());
+        assert!(!db
+            .claim_conversation_message_for_send("message-claim")
+            .unwrap());
+        assert!(db
+            .claim_opportunity_touch_for_send("opportunity-touch-claim")
+            .unwrap());
+        assert!(!db
+            .claim_opportunity_touch_for_send("opportunity-touch-claim")
+            .unwrap());
+    }
+
+    #[test]
     fn opportunity_records_round_trip_through_sqlite() {
         let path = std::env::temp_dir().join(format!(
             "spruce-opportunity-round-trip-test-{}.sqlite",
@@ -3887,7 +6156,7 @@ mod tests {
             id: "wapahki-1".into(),
             brand: "wapahki".into(),
             status: "draft".into(),
-            channel: "call".into(),
+            channel: "linkedin_request".into(),
             due_at: due.to_rfc3339(),
             ..Default::default()
         })
@@ -3914,8 +6183,14 @@ mod tests {
         let db = Db::open(":memory:").expect("open memory db");
 
         // First skip of a company records one learning.
-        db.record_learning("gnk", "qualification_skip", "Acme Co", "acme-id", "thin payload")
-            .unwrap();
+        db.record_learning(
+            "gnk",
+            "qualification_skip",
+            "Acme Co",
+            "acme-id",
+            "thin payload",
+        )
+        .unwrap();
         // Skipping the same company again reinforces it (hits bump), refreshing
         // the detail rather than creating a duplicate row.
         db.record_learning(
@@ -3927,23 +6202,57 @@ mod tests {
         )
         .unwrap();
         // A different company for the same brand is its own learning.
-        db.record_learning("gnk", "qualification_skip", "Beta Ltd", "beta-id", "vendor, not buyer")
-            .unwrap();
+        db.record_learning(
+            "gnk",
+            "qualification_skip",
+            "Beta Ltd",
+            "beta-id",
+            "vendor, not buyer",
+        )
+        .unwrap();
         // Same subject key but a different brand must not collide.
-        db.record_learning("wapahki", "qualification_skip", "Acme Co", "acme-id", "wrong motion")
-            .unwrap();
+        db.record_learning(
+            "wapahki",
+            "qualification_skip",
+            "Acme Co",
+            "acme-id",
+            "wrong motion",
+        )
+        .unwrap();
+        db.record_learning(
+            "gnk",
+            "qualification_skip",
+            "Legacy Borderline Co",
+            "legacy-two-signal",
+            "only 2 canonical play signal(s) matched; 3 required; play-fit score 62/100",
+        )
+        .unwrap();
+        db.record_learning(
+            "gnk",
+            "qualification_skip",
+            "Current Hard Reject",
+            "current-hard-reject",
+            "hard_reject: only 2 canonical play signal(s) matched; affirmative blocker",
+        )
+        .unwrap();
 
         let gnk = db
             .recent_learnings(Some("gnk"), Some("qualification_skip"), 10)
             .unwrap();
-        assert_eq!(gnk.len(), 2, "two distinct gnk learnings, no duplicate");
-        let acme = gnk.iter().find(|l| l.subject == "Acme Co").expect("acme learning");
+        assert_eq!(gnk.len(), 4, "four distinct gnk learnings, no duplicate");
+        let acme = gnk
+            .iter()
+            .find(|l| l.subject == "Acme Co")
+            .expect("acme learning");
         assert_eq!(acme.hits, 2, "reinforced twice");
         assert_eq!(acme.detail, "still thin payload", "detail refreshed");
 
         // Known-reject keys are per-brand and drive the re-research skip.
         let keys = db.learning_keys("gnk", "qualification_skip").unwrap();
         assert!(keys.contains("acme-id") && keys.contains("beta-id"));
+        let durable = db.durable_qualification_skip_keys("gnk").unwrap();
+        assert!(!durable.contains("legacy-two-signal"));
+        assert!(durable.contains("current-hard-reject"));
         assert_eq!(
             db.learning_keys("outagehub", "qualification_skip")
                 .unwrap()
@@ -3953,6 +6262,240 @@ mod tests {
 
         // No brand filter spans the whole portfolio.
         let all = db.recent_learnings(None, None, 10).unwrap();
-        assert_eq!(all.len(), 3);
+        assert_eq!(all.len(), 5);
+    }
+
+    #[test]
+    fn gtm_defaults_drive_evidence_assessment_and_stable_experiment_assignment() {
+        let db = Db::open(":memory:").expect("open memory db");
+        let play = db
+            .current_gtm_play("outagehub")
+            .expect("load current play")
+            .expect("seeded outagehub play");
+        assert_eq!(play.version, 2);
+        assert_eq!(play.minimum_signal_matches, 3);
+        assert!(play
+            .required_signal_keys
+            .contains(&"account.outage_sensitive_decision".to_string()));
+
+        let lead_id = db
+            .upsert_lead(&Lead {
+                brand: "outagehub".into(),
+                apollo_org_id: "org-gtm-test".into(),
+                name: "Distributed Operator".into(),
+                signals: vec!["Runs remote facilities across utility territories.".into()],
+                ..Default::default()
+            })
+            .expect("upsert lead");
+        let observations = db
+            .list_active_signal_observations(Some("outagehub"), Some(&lead_id), None)
+            .expect("list observations");
+        assert!(observations
+            .iter()
+            .any(|observation| observation.definition_key == "account.fit_evidence"));
+
+        db.upsert_account_play_assessment(&AccountPlayAssessment {
+            lead_id: lead_id.clone(),
+            brand: "outagehub".into(),
+            play_id: play.id.clone(),
+            play_version: play.version,
+            status: "qualified".into(),
+            fit_score: 84,
+            root_cause: "Internal telemetry cannot establish the external utility cause.".into(),
+            proof_fit: "Replay three historical incidents.".into(),
+            ..Default::default()
+        })
+        .expect("upsert play assessment");
+        let assessments = db
+            .list_account_play_assessments(Some("outagehub"))
+            .expect("list assessments");
+        assert_eq!(assessments.len(), 1);
+        assert_eq!(assessments[0].fit_score, 84);
+
+        let underpowered_id = db
+            .create_gtm_experiment(&GtmExperiment {
+                brand: "outagehub".into(),
+                play_id: play.id.clone(),
+                name: "Underpowered test".into(),
+                experiment_type: "copy_only".into(),
+                hypothesis: "A correction CTA increases positive replies.".into(),
+                variable: "CTA".into(),
+                constants: vec!["same qualified list".into()],
+                control_description: "Question CTA".into(),
+                variant_description: "Correction CTA".into(),
+                minimum_sends_per_arm: 250,
+                baseline_sends: 100,
+                baseline_positive_reply_rate: 0.02,
+                ..Default::default()
+            })
+            .expect("create underpowered experiment");
+        assert!(db
+            .set_gtm_experiment_status(&underpowered_id, "running")
+            .is_err());
+
+        let experiment_id = db
+            .create_gtm_experiment(&GtmExperiment {
+                brand: "outagehub".into(),
+                play_id: play.id,
+                name: "Correction CTA".into(),
+                experiment_type: "copy_only".into(),
+                hypothesis: "A correction CTA increases positive replies.".into(),
+                variable: "CTA".into(),
+                constants: vec!["same qualified list".into(), "same sender".into()],
+                control_description: "Question CTA".into(),
+                variant_description: "Correction CTA".into(),
+                minimum_sends_per_arm: 250,
+                baseline_sends: 300,
+                baseline_positive_reply_rate: 0.02,
+                ..Default::default()
+            })
+            .expect("create experiment");
+        db.set_gtm_experiment_status(&experiment_id, "running")
+            .expect("start experiment");
+        let first = db
+            .ensure_experiment_assignment(&experiment_id, &lead_id, "person-1", "")
+            .expect("assign arm");
+        let second = db
+            .ensure_experiment_assignment(&experiment_id, &lead_id, "person-1", "")
+            .expect("reuse arm");
+        assert_eq!(first.id, second.id);
+        assert_eq!(first.arm, second.arm);
+    }
+
+    #[test]
+    fn building_sequences_stream_to_crm_and_promote_without_risking_old_drafts() {
+        let db = Db::open(":memory:").expect("open memory db");
+        let lead_id = db
+            .upsert_lead(&Lead {
+                brand: "outagehub".into(),
+                apollo_org_id: "org-checkpoint".into(),
+                name: "Checkpoint Operator".into(),
+                ..Default::default()
+            })
+            .expect("insert lead");
+        let person_id = db
+            .upsert_person(&Person {
+                lead_id: lead_id.clone(),
+                brand: "outagehub".into(),
+                apollo_person_id: "person-checkpoint".into(),
+                name: "Alex Operator".into(),
+                email: "alex@example.com".into(),
+                email_status: "verified".into(),
+                status: "verified".into(),
+                ..Default::default()
+            })
+            .expect("insert person");
+        let old_id = db
+            .create_sequence(&Sequence {
+                person_id: person_id.clone(),
+                lead_id: lead_id.clone(),
+                brand: "outagehub".into(),
+                status: "active".into(),
+                ..Default::default()
+            })
+            .expect("old active sequence");
+        db.insert_touch(&Touch {
+            sequence_id: old_id.clone(),
+            person_id: person_id.clone(),
+            lead_id: lead_id.clone(),
+            brand: "outagehub".into(),
+            stage: 1,
+            channel: "email".into(),
+            body: "Old safe draft".into(),
+            status: "draft".into(),
+            ..Default::default()
+        })
+        .expect("old touch");
+
+        let building_id = db
+            .create_sequence(&Sequence {
+                person_id: person_id.clone(),
+                lead_id: lead_id.clone(),
+                brand: "outagehub".into(),
+                status: "building".into(),
+                ..Default::default()
+            })
+            .expect("building sequence");
+        db.insert_touch(&Touch {
+            sequence_id: building_id.clone(),
+            person_id: person_id.clone(),
+            lead_id: lead_id.clone(),
+            brand: "outagehub".into(),
+            stage: 1,
+            channel: "email".into(),
+            body: "Writing draft…".into(),
+            status: "writing".into(),
+            ..Default::default()
+        })
+        .expect("writing checkpoint");
+        let visible = db
+            .list_touches_for_person(&person_id)
+            .expect("visible checkpoint");
+        assert_eq!(visible[0].status, "writing");
+
+        assert!(db
+            .update_touch_checkpoint(&Touch {
+                sequence_id: building_id.clone(),
+                stage: 1,
+                channel: "email".into(),
+                subject: "Grid context".into(),
+                body: "Reviewed new draft".into(),
+                status: "draft".into(),
+                review_passes: Some(true),
+                ..Default::default()
+            })
+            .expect("update checkpoint"));
+        db.promote_building_sequence(&building_id, Some(&old_id), &["principle-1".into()])
+            .expect("promote checkpoint");
+        assert_eq!(
+            db.active_sequence_for_person(&person_id)
+                .expect("active sequence"),
+            Some(building_id.clone())
+        );
+        assert!(db
+            .sequence_gtm_attribution(&old_id)
+            .expect("old lookup")
+            .is_none());
+        let visible = db
+            .list_touches_for_person(&person_id)
+            .expect("promoted touch");
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].body, "Reviewed new draft");
+
+        let rejected_person = db
+            .upsert_person(&Person {
+                lead_id: lead_id.clone(),
+                brand: "outagehub".into(),
+                apollo_person_id: "person-rejected-checkpoint".into(),
+                name: "Jamie Operator".into(),
+                ..Default::default()
+            })
+            .expect("insert rejected person");
+        let rejected_sequence = db
+            .create_sequence(&Sequence {
+                person_id: rejected_person.clone(),
+                lead_id: lead_id.clone(),
+                brand: "outagehub".into(),
+                status: "building".into(),
+                ..Default::default()
+            })
+            .expect("rejected building sequence");
+        db.insert_touch(&Touch {
+            sequence_id: rejected_sequence.clone(),
+            person_id: rejected_person.clone(),
+            lead_id,
+            brand: "outagehub".into(),
+            stage: 1,
+            status: "writing".into(),
+            ..Default::default()
+        })
+        .expect("rejected writing checkpoint");
+        db.reject_building_sequence(&rejected_sequence, "council rejected the copy")
+            .expect("reject checkpoint");
+        let rejected = db
+            .list_touches_for_person(&rejected_person)
+            .expect("rejected visible");
+        assert_eq!(rejected[0].status, "blocked");
+        assert!(rejected[0].error.contains("council rejected"));
     }
 }

@@ -11,7 +11,7 @@
 //! and into the mechanical lint (forbidden phrases + word band).
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
@@ -22,9 +22,29 @@ pub struct Shared {
     /// Mechanical forbidden phrases matched (case-insensitively) in every brand.
     #[serde(default)]
     pub forbidden: Vec<String>,
-    /// Prose doctrine injected verbatim into every system prompt.
-    #[allow(dead_code)]
+    /// Prose doctrine injected verbatim into every system prompt and shown on
+    /// the Strategy board so operators can see what the SDR is guided by.
     pub doctrine: String,
+    /// Editable specialist roles loaded from playbooks/personas/*.md. These are
+    /// runtime configuration, not TOML fields and not compiled prompt strings.
+    #[serde(skip)]
+    pub personas: OutreachPersonas,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct OutreachPersonas {
+    pub planner: String,
+    pub writer: String,
+    pub reviewer: String,
+    pub critics: Vec<SalesCriticPersona>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SalesCriticPersona {
+    pub id: String,
+    pub name: String,
+    pub source_path: PathBuf,
+    pub prompt: String,
 }
 
 /// One brand's playbook (`<brand>.toml`).
@@ -59,7 +79,6 @@ pub struct Playbook {
     pub icp_note: String,
 
     #[serde(default)]
-    #[allow(dead_code)]
     pub system_concept_examples: Vec<String>,
     #[serde(default)]
     pub subject_examples: Vec<String>,
@@ -72,8 +91,7 @@ pub struct Playbook {
     /// Brand-specific forbidden phrases (added to the shared list).
     #[serde(default)]
     pub forbidden: Vec<String>,
-    /// Prose doctrine for this brand.
-    #[allow(dead_code)]
+    /// Prose doctrine for this brand (surfaced on the Strategy board).
     pub doctrine: String,
 }
 
@@ -97,8 +115,9 @@ impl Playbooks {
     /// Load `shared.toml` and every brand file from `dir`.
     pub fn load(dir: impl AsRef<Path>) -> Result<Self> {
         let dir = dir.as_ref();
-        let shared: Shared = read_toml(&dir.join("shared.toml"))
+        let mut shared: Shared = read_toml(&dir.join("shared.toml"))
             .context("loading shared.toml (the doctrine spine)")?;
+        shared.personas = OutreachPersonas::load(&dir.join("personas"))?;
 
         let mut brands = BTreeMap::new();
         for key in ["gnk", "wapahki", "outagehub"] {
@@ -139,6 +158,51 @@ fn read_toml<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
     toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))
 }
 
+impl OutreachPersonas {
+    fn load(dir: &Path) -> Result<Self> {
+        let critics_dir = dir.join("critics");
+        let mut critic_paths = std::fs::read_dir(&critics_dir)
+            .with_context(|| format!("reading {}", critics_dir.display()))?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
+            .collect::<Vec<_>>();
+        critic_paths.sort();
+        let critics = critic_paths
+            .into_iter()
+            .map(|path| {
+                let id = path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let prompt = read_text(&path)?;
+                let name = prompt
+                    .lines()
+                    .find_map(|line| line.strip_prefix("# "))
+                    .unwrap_or(&id)
+                    .trim()
+                    .to_string();
+                Ok(SalesCriticPersona {
+                    id,
+                    name,
+                    source_path: path,
+                    prompt,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            planner: read_text(&dir.join("planner.md"))?,
+            writer: read_text(&dir.join("writer.md"))?,
+            reviewer: read_text(&dir.join("reviewer.md"))?,
+            critics,
+        })
+    }
+}
+
+fn read_text(path: &Path) -> Result<String> {
+    std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))
+}
+
 impl Playbook {
     /// The full forbidden-phrase list for this brand (shared + brand-specific).
     pub fn forbidden<'a>(&'a self, shared: &'a Shared) -> Vec<&'a str> {
@@ -173,14 +237,30 @@ impl Playbook {
     /// Compact people-mapping prompt. Copy rules are irrelevant at this stage.
     pub fn vantage_system_prompt(&self) -> String {
         format!(
-            "You map real people to the workflow vantage they can credibly observe for {name}. Choose by access to the work, not seniority. Prefer a process owner or operator; then an operational executive. Use a router only when ownership is unclear. Mark at most two primary contacts per account. Never infer responsibilities beyond the supplied title and account hypothesis. Return only the requested structured data.",
+            "You map real people to the workflow vantage they may credibly have for {name}. Choose by likely access to the work, not seniority. Prefer a process owner or operator, then an operational executive. Use a router when ownership is unclear. Mark at most two primary contacts per account. A title is evidence of proximity, not proof of ownership: never say a person owns, directly judges, or makes a decision unless the supplied title itself establishes that. Write can_observe and why_them as short, cautious internal notes in plain English, not outreach copy and not a paraphrase of the title. Return only the requested structured data.",
             name = self.name,
         )
     }
 
-    /// Compact copy prompt used only for buyer-facing writing. It carries the
-    /// enforceable rules and forbidden list, not the long-form internal essay.
+    /// Compact copy prompt used only for buyer-facing writing.
+    ///
+    /// The planner gets the full operating doctrine. Repeating that strategy
+    /// memo in the writer prompt made the model turn a short note into a polished
+    /// internal brief. The writer instead gets the buyer-facing constraints,
+    /// evidence boundary, and voice it can actually use in copy.
     pub fn copy_system_prompt(&self, shared: &Shared) -> String {
+        self.compact_role_system_prompt("WRITER", &shared.personas.writer, shared)
+    }
+
+    pub fn planning_system_prompt(&self, shared: &Shared) -> String {
+        self.role_system_prompt("PLANNER", &shared.personas.planner, shared)
+    }
+
+    pub fn review_system_prompt(&self, shared: &Shared) -> String {
+        self.compact_role_system_prompt("REVIEWER", &shared.personas.reviewer, shared)
+    }
+
+    fn compact_role_system_prompt(&self, role: &str, persona: &str, shared: &Shared) -> String {
         let requirements = self
             .requirements
             .iter()
@@ -190,13 +270,62 @@ impl Playbook {
         let subjects = self.subject_examples.join(" | ");
         let forbidden = self.forbidden(shared).join(", ");
         format!(
-            "You write founder-led cold outreach for Andrew and {name}. Write warm, natural, plain English that a busy operator reads once and understands. The goal is a useful reply, correction, or referral — earned by being specific and human, not by pitching.\n\nSELLER: {intro}\nMOTION: {motion}\n\nEach recipient comes with a per-touch `sequence_plan` (objective, angle, channel, ask). Follow it: write the actual sendable copy that executes that plan, touch by touch.\n\nCore rules:\n- Open every EMAIL with a short greeting on its own line: `Hi <first name>,`. LinkedIn notes and calls take no greeting.\n- After the greeting, lead with one recognizable operating moment in their world — not a compliment, and nothing about Andrew or software.\n- State only supplied observed facts as facts. Frame everything else as a question or modest uncertainty. Never fabricate numbers, savings, systems, customers, or urgency, and never claim what their current tools can't do.\n- Give one crisp framing, then exactly one clear ask the recipient can answer from their vantage (one question mark per email). Never ask a router to evaluate the business case.\n- Mention {name} only once, in touch 1. Keep paragraphs short and never explain the outreach strategy.\n- Each later touch adds one new diagnostic, consequence, objection, artifact, or routing angle — never repeat the opening premise.\n- Keep human judgment central and describe at most one narrow system.\n- Email 1 is {min}–{max} words including the greeting and `{signature}`; later emails 25–70; LinkedIn 12–40; calls 12–45; the final close 20–45 with no question.\n- Seven-touch channel order: email, LinkedIn, email, call, email, LinkedIn, email; finish by day 21.\n- Every email ends with a brief warm sign-off line, then exactly `{signature}` on its own line.\n\nBrand-specific rules:\n{requirements}\n\nPlain subject examples: {subjects}\nForbidden phrases: {forbidden}\nReturn only the requested structured data.",
+            "=== {role} PERSONA (editable file) ===\n{persona}\n\n\
+             === {name} BUYER-FACING CONSTRAINTS ===\n\
+             Seller context (state at most once and only when useful): {intro}\n\
+             Commercial motion being tested privately: {motion}\n\
+             Email 1 length: {min}-{max} words including signature.\n\
+             Required signature: {signature}\n\
+             Brand requirements:\n{requirements}\n\
+             Subject style examples: {subjects}\n\
+             Forbidden buyer-facing phrases: {forbidden}\n\n\
+             Do not expose the commercial motion, planning labels, or internal doctrine. Return only the requested structured data.",
+            role = role,
+            persona = persona.trim(),
             name = self.name,
             intro = self.one_liner,
             motion = self.motion,
             min = self.min_words,
             max = self.max_words,
             signature = self.signature,
+            requirements = requirements,
+            subjects = subjects,
+            forbidden = forbidden,
+        )
+    }
+
+    fn role_system_prompt(&self, role: &str, persona: &str, shared: &Shared) -> String {
+        let requirements = self
+            .requirements
+            .iter()
+            .map(|rule| format!("- {rule}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let subjects = self.subject_examples.join(" | ");
+        let forbidden = self.forbidden(shared).join(", ");
+        format!(
+            "=== {role} PERSONA (editable file) ===\n{persona}\n\n\
+             === SHARED OUTREACH DOCTRINE (editable TOML) ===\n{shared_doctrine}\n\n\
+             === {name} BRAND DOCTRINE (editable TOML) ===\n\
+             Seller: {intro}\nMotion: {motion}\n\
+             Email 1 length: {min}-{max} words including signature.\n\
+             Required signature: {signature}\n\
+             Brand requirements:\n{requirements}\n\
+             Subject style examples: {subjects}\n\
+             Forbidden buyer-facing phrases: {forbidden}\n\n{brand_doctrine}",
+            role = role,
+            persona = persona.trim(),
+            shared_doctrine = shared.doctrine.trim(),
+            name = self.name,
+            intro = self.one_liner,
+            motion = self.motion,
+            min = self.min_words,
+            max = self.max_words,
+            signature = self.signature,
+            requirements = requirements,
+            subjects = subjects,
+            forbidden = forbidden,
+            brand_doctrine = self.doctrine.trim(),
         )
     }
 
@@ -422,14 +551,23 @@ mod tests {
     }
 
     #[test]
-    fn stage_prompts_are_materially_smaller_than_the_legacy_full_doctrine() {
+    fn outreach_roles_load_from_editable_persona_files() {
         let playbooks = Playbooks::load("playbooks").expect("load playbooks");
         let gnk = playbooks.get("gnk").expect("gnk");
-        let full = gnk.system_prompt(&playbooks.shared);
         let copy = gnk.copy_system_prompt(&playbooks.shared);
-        assert!(copy.split_whitespace().count() * 2 < full.split_whitespace().count());
+        let planner = gnk.planning_system_prompt(&playbooks.shared);
+        let reviewer = gnk.review_system_prompt(&playbooks.shared);
         assert!(gnk.icp_system_prompt().split_whitespace().count() < 100);
         assert!(gnk.qualification_system_prompt().split_whitespace().count() < 150);
-        assert!(copy.contains("natural, plain English"));
+        assert!(copy.contains("Founder-led outreach writer persona"));
+        assert!(planner.contains("Outreach planner persona"));
+        assert!(reviewer.contains("Skeptical-recipient and copy-chief persona"));
+        assert!(copy.contains("=== GnK BUYER-FACING CONSTRAINTS"));
+        assert!(!copy.contains("=== SHARED OUTREACH DOCTRINE"));
+        assert!(!reviewer.contains("=== SHARED OUTREACH DOCTRINE"));
+        assert!(planner.contains("=== SHARED OUTREACH DOCTRINE"));
+        assert!(planner.contains("=== GnK BRAND DOCTRINE"));
+        assert_eq!(playbooks.shared.personas.critics.len(), 10);
+        assert_eq!(playbooks.shared.personas.critics[0].id, "01_alex_hormozi");
     }
 }

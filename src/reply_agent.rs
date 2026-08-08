@@ -12,7 +12,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::compliance::Compliance;
-use crate::db::{Conversation, ConversationMessage, Meeting, Person, Reply, SharedDb};
+use crate::db::{
+    Conversation, ConversationMessage, CustomerDevelopmentRecord, GtmOutcome, Meeting, Person,
+    ProofBrief, Reply, SharedDb, SignalObservation,
+};
 use crate::engine::Engine;
 use crate::google_calendar::{CalendarSlot, GoogleCalendar};
 use crate::knowledge::core_strategy_block;
@@ -41,6 +44,34 @@ struct Decision {
     offered_slots: Vec<String>,
     referred_name: String,
     referred_email: String,
+    /// Structured discovery fields are private operating notes. Empty means the
+    /// reply did not establish them; the model must never fill gaps by inference.
+    validated_problem: String,
+    current_workflow: String,
+    #[serde(default)]
+    evidence_available: Vec<String>,
+    #[serde(default)]
+    customer_data: Vec<String>,
+    proof_scope: String,
+    success_metric: String,
+    stop_condition: String,
+    /// none | discovery_needed | ready
+    proof_readiness: String,
+    /// Wapahki customer-development evidence. These stay empty unless the
+    /// prospect's own message establishes them.
+    task_scope: String,
+    why_still_manual: String,
+    #[serde(default)]
+    task_variations: Vec<String>,
+    #[serde(default)]
+    task_exceptions: Vec<String>,
+    task_economics: String,
+    /// none | evaluation_agreed | design_partner | loi_candidate |
+    /// conditional_loi | paid_pilot | deployment
+    commitment_kind: String,
+    commitment_detail: String,
+    loi_terms: String,
+    next_commitment: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -108,6 +139,8 @@ pub async fn handle_inbound(
     }
 
     let lead = db.get_lead(&conversation.lead_id)?;
+    let customer_development =
+        db.customer_development_for_lead(&conversation.brand, &conversation.lead_id)?;
     let pb = playbooks.get(&conversation.brand)?;
     let history = db.list_conversation_messages(&conversation.id)?;
     let sent_slots = db.sent_offered_slots(&conversation.id)?;
@@ -134,6 +167,7 @@ pub async fn handle_inbound(
         pb,
         person,
         lead.as_ref(),
+        customer_development.as_ref(),
         inbound,
         &history,
         &sent_slots,
@@ -344,18 +378,274 @@ pub async fn handle_inbound(
         from_email: inbound.from_email.clone(),
         subject: inbound.subject.clone(),
         body: inbound.body.chars().take(4_000).collect(),
-        classification: category,
+        classification: category.clone(),
         action_taken: action.clone(),
         message_id: inbound.message_id.clone(),
         in_reply_to: inbound.in_reply_to.clone(),
         ..Default::default()
     })?;
+    record_customer_development_reply(db, conversation, person, &decision)?;
+    record_gtm_reply_learning(
+        db,
+        conversation,
+        person,
+        &inbound_id,
+        &inbound.message_id,
+        &category,
+        &decision,
+        booked.is_some(),
+    )?;
 
     Ok(ReplyOutcome {
         action,
         draft_id,
         meeting_id,
     })
+}
+
+fn record_customer_development_reply(
+    db: &SharedDb,
+    conversation: &Conversation,
+    person: &Person,
+    decision: &Decision,
+) -> Result<()> {
+    if conversation.brand != "wapahki" {
+        return Ok(());
+    }
+    let mut record = db
+        .customer_development_for_lead(&conversation.brand, &conversation.lead_id)?
+        .unwrap_or_else(|| CustomerDevelopmentRecord {
+            brand: conversation.brand.clone(),
+            lead_id: conversation.lead_id.clone(),
+            ..Default::default()
+        });
+    let prior_stage = crate::gtm::customer_development_stage(&record).to_string();
+    record.person_id = person.id.clone();
+    record.conversation_id = conversation.id.clone();
+    if record.engaged_at.is_empty() {
+        record.engaged_at = crate::db::now();
+    }
+    replace_if_present(&mut record.problem, &decision.validated_problem);
+    replace_if_present(&mut record.current_workflow, &decision.current_workflow);
+    replace_if_present(&mut record.task_scope, &decision.task_scope);
+    replace_if_present(&mut record.why_manual, &decision.why_still_manual);
+    replace_if_present(&mut record.economics, &decision.task_economics);
+    replace_if_present(&mut record.success_criteria, &decision.success_metric);
+    replace_if_present(&mut record.stop_condition, &decision.stop_condition);
+    replace_if_present(&mut record.commitment_detail, &decision.commitment_detail);
+    replace_if_present(&mut record.loi_conditions, &decision.loi_terms);
+    replace_if_present(&mut record.next_action, &decision.next_commitment);
+    merge_unique(&mut record.variations, &decision.task_variations);
+    merge_unique(&mut record.exceptions, &decision.task_exceptions);
+    merge_unique(&mut record.evidence, &decision.evidence_available);
+    merge_unique(&mut record.evidence, &decision.customer_data);
+    merge_unique(
+        &mut record.stakeholders,
+        &[format!("{} — {}", person.name, person.title)],
+    );
+    let commitment = crate::gtm::normalize_commitment_kind(&decision.commitment_kind);
+    if commitment != "none" {
+        record.commitment_kind = commitment.into();
+    } else if record.commitment_kind.is_empty() {
+        record.commitment_kind = "none".into();
+    }
+    record.stage = crate::gtm::customer_development_stage(&record).into();
+    record.source = "prospect_reply".into();
+    db.upsert_customer_development(&record)?;
+
+    if record.stage != prior_stage {
+        db.record_gtm_outcome(&GtmOutcome {
+            brand: record.brand.clone(),
+            kind: "customer_development_stage".into(),
+            lead_id: record.lead_id.clone(),
+            person_id: record.person_id.clone(),
+            conversation_id: record.conversation_id.clone(),
+            value: crate::gtm::CUSTOMER_DEVELOPMENT_STAGES
+                .iter()
+                .position(|stage| stage.key == record.stage)
+                .unwrap_or(0) as f64,
+            detail: format!("{prior_stage} → {}", record.stage),
+            source: "reply".into(),
+            fingerprint: format!(
+                "customer-development:{}:{}",
+                record.conversation_id, record.stage
+            ),
+            ..Default::default()
+        })?;
+    }
+    Ok(())
+}
+
+fn replace_if_present(target: &mut String, candidate: &str) {
+    if !candidate.trim().is_empty() {
+        *target = candidate.trim().to_string();
+    }
+}
+
+fn merge_unique(target: &mut Vec<String>, candidates: &[String]) {
+    for candidate in candidates.iter().map(|value| value.trim()) {
+        if !candidate.is_empty()
+            && !target
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(candidate))
+        {
+            target.push(candidate.to_string());
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_gtm_reply_learning(
+    db: &SharedDb,
+    conversation: &Conversation,
+    person: &Person,
+    inbound_id: &str,
+    message_id: &str,
+    category: &str,
+    decision: &Decision,
+    meeting_booked: bool,
+) -> Result<()> {
+    let attribution = if conversation.sequence_id.is_empty() {
+        None
+    } else {
+        db.sequence_gtm_attribution(&conversation.sequence_id)?
+    };
+    let Some(attribution) = attribution else {
+        return Ok(());
+    };
+    let outcome_kind = match category {
+        "interested" => "positive_reply",
+        "correction" => "correction",
+        "referral" => "referral",
+        "not_now" => "not_now",
+        "objection" => "objection",
+        _ => "human_reply",
+    };
+    let source_key = if message_id.trim().is_empty() {
+        inbound_id
+    } else {
+        message_id
+    };
+    db.record_gtm_outcome(&GtmOutcome {
+        brand: conversation.brand.clone(),
+        kind: outcome_kind.into(),
+        lead_id: conversation.lead_id.clone(),
+        person_id: person.id.clone(),
+        sequence_id: conversation.sequence_id.clone(),
+        conversation_id: conversation.id.clone(),
+        play_id: attribution.play_id.clone(),
+        experiment_id: attribution.experiment_id.clone(),
+        experiment_assignment_id: attribution.experiment_assignment_id.clone(),
+        signal_observation_ids: attribution.signal_observation_ids.clone(),
+        value: if category == "interested" { 1.0 } else { 0.0 },
+        detail: decision.summary.trim().to_string(),
+        source: "reply".into(),
+        fingerprint: format!("reply:{source_key}"),
+        ..Default::default()
+    })?;
+    if meeting_booked {
+        db.record_gtm_outcome(&GtmOutcome {
+            brand: conversation.brand.clone(),
+            kind: "meeting_booked".into(),
+            lead_id: conversation.lead_id.clone(),
+            person_id: person.id.clone(),
+            sequence_id: conversation.sequence_id.clone(),
+            conversation_id: conversation.id.clone(),
+            play_id: attribution.play_id.clone(),
+            experiment_id: attribution.experiment_id.clone(),
+            experiment_assignment_id: attribution.experiment_assignment_id.clone(),
+            signal_observation_ids: attribution.signal_observation_ids.clone(),
+            value: 1.0,
+            detail: "Prospect accepted a previously offered slot.".into(),
+            source: "meeting".into(),
+            fingerprint: format!("meeting:{source_key}"),
+            ..Default::default()
+        })?;
+    }
+
+    let validated_problem = decision.validated_problem.trim();
+    if validated_problem.is_empty() {
+        return Ok(());
+    }
+    db.record_signal_observation(&SignalObservation {
+        brand: conversation.brand.clone(),
+        definition_key: "conversation.problem_confirmed".into(),
+        lead_id: conversation.lead_id.clone(),
+        person_id: person.id.clone(),
+        conversation_id: conversation.id.clone(),
+        source_name: "prospect_reply".into(),
+        provider_key: source_key.to_string(),
+        value_json: serde_json::json!({"category": category}).to_string(),
+        evidence: validated_problem.to_string(),
+        confidence: if category == "correction" { 0.95 } else { 0.85 },
+        status: "verified".into(),
+        ..Default::default()
+    })?;
+
+    // A proof brief is an internal handoff, never approval to build or send.
+    // Even a model-rated "ready" proof stays at the human-review gate.
+    if matches!(category, "interested" | "correction") && !attribution.play_id.is_empty() {
+        let play = db
+            .list_gtm_plays(Some(&conversation.brand))?
+            .into_iter()
+            .find(|play| play.id == attribution.play_id);
+        if let Some(play) = play {
+            let proof_id = db.upsert_proof_brief(&ProofBrief {
+                brand: conversation.brand.clone(),
+                lead_id: conversation.lead_id.clone(),
+                person_id: person.id.clone(),
+                conversation_id: conversation.id.clone(),
+                play_id: play.id.clone(),
+                status: if decision.proof_readiness == "ready" {
+                    "ready".into()
+                } else {
+                    "draft".into()
+                },
+                problem: validated_problem.to_string(),
+                current_workflow: decision.current_workflow.trim().to_string(),
+                evidence_available: decision.evidence_available.clone(),
+                scope: if decision.proof_scope.trim().is_empty() {
+                    play.proof_description.clone()
+                } else {
+                    decision.proof_scope.trim().to_string()
+                },
+                customer_data: decision.customer_data.clone(),
+                success_metric: if decision.success_metric.trim().is_empty() {
+                    play.success_metric.clone()
+                } else {
+                    decision.success_metric.trim().to_string()
+                },
+                stop_condition: if decision.stop_condition.trim().is_empty() {
+                    play.kill_condition.clone()
+                } else {
+                    decision.stop_condition.trim().to_string()
+                },
+                stakeholders: vec![format!("{} — {}", person.name, person.title)],
+                owner: "forward_deployed_gtm".into(),
+                expansion_path: "Only define expansion after this proof passes its agreed metric."
+                    .into(),
+                ..Default::default()
+            })?;
+            db.record_gtm_outcome(&GtmOutcome {
+                brand: conversation.brand.clone(),
+                kind: "proof_brief_created".into(),
+                lead_id: conversation.lead_id.clone(),
+                person_id: person.id.clone(),
+                sequence_id: conversation.sequence_id.clone(),
+                conversation_id: conversation.id.clone(),
+                play_id: play.id,
+                experiment_id: attribution.experiment_id,
+                experiment_assignment_id: attribution.experiment_assignment_id,
+                signal_observation_ids: attribution.signal_observation_ids,
+                value: 0.0,
+                detail: format!("Internal proof brief {proof_id}; human approval required."),
+                source: "reply".into(),
+                fingerprint: format!("proof-brief:{source_key}"),
+                ..Default::default()
+            })?;
+        }
+    }
+    Ok(())
 }
 
 /// Explicitly finish pending acceptances created by `inbox` without `--book`.
@@ -429,14 +719,20 @@ async fn decide(
     pb: &crate::playbook::Playbook,
     person: &Person,
     lead: Option<&crate::db::Lead>,
+    customer_development: Option<&CustomerDevelopmentRecord>,
     inbound: &InboundMessage,
     history: &[ConversationMessage],
     sent_slots: &[String],
     available: &[CalendarSlot],
 ) -> Result<Decision> {
+    let customer_development_rules = if pb.key == "wapahki" {
+        " For Wapahki, use customer-development discipline: ask about actual past/current behaviour, not hypothetical enthusiasm. Extract task_scope (one object/motion/handoff), why_still_manual, task_variations, task_exceptions, and task_economics only from explicit first-hand evidence. commitment_kind must be none unless the prospect explicitly commits the corresponding currency: an agreed evaluation, ongoing design-partner access, material LOI terms, written conditional intent, payment for a pilot, or deployment. Move only one rung: reply/correction -> task map -> shared sketch/video/SKU data/site observation -> agreed evaluation -> design partner -> LOI candidate -> conditional LOI -> paid pilot -> deployment. Never turn politeness, a meeting, or model confidence into a higher stage."
+    } else {
+        ""
+    };
     let system = format!(
-        "You are Andrew's thread-aware B2B reply agent for {brand}. Continue a real conversation, not a cold sequence. Be concise, answer direct questions honestly, preserve the sender's exact intent, and move only one commitment rung at a time. Never claim a meeting is booked: only the application can book it after your structured decision. If the prospect accepts one of SENT_OFFERED_SLOTS, copy that exact RFC3339 value into accepted_slot. Otherwise accepted_slot must be empty. If offering a meeting, choose at most 2 values exactly from AVAILABLE_SLOTS and include their human display text naturally in draft_reply. Never invent availability or a referral address.",
-        brand = pb.name
+        "You are Andrew's thread-aware B2B reply and discovery agent for {brand}. Continue a real conversation, not a cold sequence. Be concise, answer direct questions honestly, preserve the sender's exact intent, and move only one commitment rung at a time. Extract validated_problem, current_workflow, evidence_available, customer_data, proof_scope, success_metric, and stop_condition only when the human's own message establishes them; leave unknown fields empty. proof_readiness is none, discovery_needed, or ready. A correction is valuable market evidence and must be categorized correction, not disguised as interest. Never claim a meeting is booked: only the application can book it after your structured decision. If the prospect accepts one of SENT_OFFERED_SLOTS, copy that exact RFC3339 value into accepted_slot. Otherwise accepted_slot must be empty. If offering a meeting, choose at most 2 values exactly from AVAILABLE_SLOTS and include their human display text naturally in draft_reply. Never invent availability, proof readiness, customer data, metrics, or a referral address.{customer_development_rules}",
+        brand = pb.name,
     );
     let history = history
         .iter()
@@ -464,13 +760,14 @@ async fn decide(
             "observed_facts": lead.observed_facts,
             "hard_buyer_question": lead.hard_buyer_question,
         })),
+        "customer_development_so_far": customer_development,
         "current_sender": {"name": inbound.from_name, "email": inbound.from_email},
         "thread": history,
         "SENT_OFFERED_SLOTS": sent_slots,
         "AVAILABLE_SLOTS": slots,
     });
     let user = format!(
-        "Analyse the newest inbound message and decide the next bounded action. A correction or referral is useful evidence; do not force a meeting. Draft a reply only when a human response is useful.\n\n{}\n\n{}",
+        "Analyse the newest inbound message and decide the next bounded action. A correction or referral is useful evidence; do not force a meeting or a proof. A proof is ready only when a specific problem, bounded sample/data, and observable success measure are established. Draft a reply only when a human response is useful.\n\n{}\n\n{}",
         serde_json::to_string_pretty(&context).unwrap_or_default(),
         core_strategy_block("replies"),
     );
@@ -528,8 +825,8 @@ fn validate_offers(requested: &[String], available: &[CalendarSlot]) -> Vec<Stri
 
 fn normalized_category(raw: &str) -> String {
     match raw.trim().to_lowercase().as_str() {
-        "interested" | "not_now" | "objection" | "referral" | "unsubscribe" | "auto_reply"
-        | "other" => raw.trim().to_lowercase(),
+        "interested" | "correction" | "not_now" | "objection" | "referral" | "unsubscribe"
+        | "auto_reply" | "other" => raw.trim().to_lowercase(),
         _ => "other".into(),
     }
 }
@@ -563,16 +860,33 @@ fn schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["category","summary","next_action","draft_reply","accepted_slot","offered_slots","referred_name","referred_email"],
+        "required": ["category","summary","next_action","draft_reply","accepted_slot","offered_slots","referred_name","referred_email","validated_problem","current_workflow","evidence_available","customer_data","proof_scope","success_metric","stop_condition","proof_readiness","task_scope","why_still_manual","task_variations","task_exceptions","task_economics","commitment_kind","commitment_detail","loi_terms","next_commitment"],
         "properties": {
-            "category": {"type":"string","enum":["interested","not_now","objection","referral","unsubscribe","auto_reply","other"]},
+            "category": {"type":"string","enum":["interested","correction","not_now","objection","referral","unsubscribe","auto_reply","other"]},
             "summary": {"type":"string"},
             "next_action": {"type":"string","enum":["none","answer","clarify","offer_meeting","accepted_meeting","referral"]},
             "draft_reply": {"type":"string"},
             "accepted_slot": {"type":"string"},
             "offered_slots": {"type":"array","items":{"type":"string"},"maxItems":2},
             "referred_name": {"type":"string"},
-            "referred_email": {"type":"string"}
+            "referred_email": {"type":"string"},
+            "validated_problem": {"type":"string"},
+            "current_workflow": {"type":"string"},
+            "evidence_available": {"type":"array","items":{"type":"string"}},
+            "customer_data": {"type":"array","items":{"type":"string"}},
+            "proof_scope": {"type":"string"},
+            "success_metric": {"type":"string"},
+            "stop_condition": {"type":"string"},
+            "proof_readiness": {"type":"string","enum":["none","discovery_needed","ready"]}
+            ,"task_scope": {"type":"string"}
+            ,"why_still_manual": {"type":"string"}
+            ,"task_variations": {"type":"array","items":{"type":"string"}}
+            ,"task_exceptions": {"type":"array","items":{"type":"string"}}
+            ,"task_economics": {"type":"string"}
+            ,"commitment_kind": {"type":"string","enum":["none","evaluation_agreed","design_partner","loi_candidate","conditional_loi","paid_pilot","deployment"]}
+            ,"commitment_detail": {"type":"string"}
+            ,"loi_terms": {"type":"string"}
+            ,"next_commitment": {"type":"string"}
         }
     })
 }

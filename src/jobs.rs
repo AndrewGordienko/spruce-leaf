@@ -290,6 +290,7 @@ async fn execute(
                 accounts,
                 contacts,
                 concurrency,
+                None,
             )
             .await?;
             Ok(format!(
@@ -304,8 +305,16 @@ async fn execute(
             } else {
                 payload.limit.min(200)
             };
-            let s =
-                enrich::enrich_pending(db, &apollo, Some(&job.brand), limit, payload.phone).await?;
+            let s = enrich::enrich_pending(
+                db,
+                &apollo,
+                Some(&job.brand),
+                limit,
+                payload.phone,
+                None,
+                None,
+            )
+            .await?;
             Ok(format!(
                 "{} attempted, {} emails, {} verified, {} credits",
                 s.attempted, s.emails_found, s.verified, s.credits_spent
@@ -331,7 +340,13 @@ async fn execute(
                 true,
                 None,
                 false,
-                false,
+                Some(
+                    business
+                        .account_limits
+                        .max_active_contacts_per_account
+                        .clamp(1, 2),
+                ),
+                None,
                 None,
             )
             .await?;

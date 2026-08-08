@@ -20,6 +20,9 @@ use crate::reply_agent::{self, InboundMessage};
 use crate::triage;
 
 /// Poll every configured mailbox (optionally one brand). Returns replies handled.
+///
+/// Prefer Gmail OAuth sync when a brand is linked via `/login` (no IMAP needed).
+/// Brands that still have classic IMAP credentials keep the legacy path.
 pub async fn poll_all(
     db: &SharedDb,
     client: &Engine,
@@ -28,8 +31,39 @@ pub async fn poll_all(
     allow_booking: bool,
 ) -> Result<usize> {
     let mut handled = 0;
+
+    // 1) Gmail API path for OAuth-linked brands (browser /login).
+    let gmail_brands: Vec<String> = match brand {
+        Some(b) if crate::google_oauth::GoogleTokenSet::is_logged_in(b) => vec![b.to_string()],
+        Some(_) => Vec::new(),
+        None => crate::gmail::list_logged_in_brands(),
+    };
+    if !gmail_brands.is_empty() {
+        for b in &gmail_brands {
+            match crate::gmail::sync_brand(db, b, 30).await {
+                Ok(summary) => {
+                    eprintln!(
+                        "  · gmail {}: inbox {} · sent {} · matched {}/{}",
+                        b,
+                        summary.inbox_scanned,
+                        summary.sent_scanned,
+                        summary.matched_inbound,
+                        summary.matched_outbound
+                    );
+                    handled += summary.matched_inbound;
+                }
+                Err(e) => eprintln!("  ! gmail {b}: {e:#}"),
+            }
+        }
+    }
+
+    // 2) Legacy IMAP for mailboxes that still have host/password config.
     for m in db.list_mailboxes(brand)? {
         if m.imap_host.trim().is_empty() {
+            continue;
+        }
+        // Skip IMAP when this brand is already covered by Gmail OAuth.
+        if crate::google_oauth::GoogleTokenSet::is_logged_in(&m.brand) {
             continue;
         }
         match poll_mailbox(db, client, playbooks, &m, allow_booking).await {

@@ -113,9 +113,10 @@ async fn plan_account(
         async move {
             let mut sequence = write_sequence(run, &account, &contact, n_touches).await?;
             enforce_email_signatures(&mut sequence, &run.pb.signature);
+            let reviewer_knowledge =
+                role_knowledge(run, &run.shared.personas.reviewer, &account.hypothesis);
             let reviews = outreach::review_and_edit_sequence(
                 run.client,
-                &run.pb.copy_system_prompt(run.shared),
                 run.pb,
                 run.shared,
                 &account,
@@ -123,6 +124,8 @@ async fn plan_account(
                 &mut sequence,
                 n_touches,
                 run.critique,
+                &reviewer_knowledge,
+                None,
             )
             .await?;
             run.reporter.sequence_done(&account.name);
@@ -193,16 +196,7 @@ async fn write_sequence(
     contact: &Contact,
     n: usize,
 ) -> Result<Sequence> {
-    let query = format!(
-        "cold outreach messaging; email copywriting; opening lines, value framing, objections, \
-         the ask; earning a reply about: {}",
-        account.hypothesis,
-    );
-    let retrieved = run
-        .library
-        .retrieve_stage(&query, "sequence", 4, 0)
-        .playbook_block();
-    let knowledge = format!("{}\n\n{}", core_strategy_block("sequence"), retrieved);
+    let knowledge = role_knowledge(run, &run.shared.personas.writer, &account.hypothesis);
     let user = prompts::sequence_user(run.pb, account, contact, n, &knowledge);
     run.client
         .structured_bulk::<Sequence>(
@@ -212,6 +206,17 @@ async fn write_sequence(
             prompts::sequence_schema(),
         )
         .await
+}
+
+fn role_knowledge(run: &Run<'_>, persona: &str, account_question: &str) -> String {
+    let retrieved =
+        run.library
+            .retrieve_stage(&format!("{persona}\n{account_question}"), "sequence", 6, 2);
+    format!(
+        "{}\n\n{}",
+        core_strategy_block("sequence"),
+        retrieved.playbook_block()
+    )
 }
 
 /// Apply the playbook signature after the critic so its rewrite cannot drift.

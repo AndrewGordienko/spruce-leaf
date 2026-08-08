@@ -5,9 +5,8 @@
 //!   * session/composer helpers that give the REPL the same quiet hierarchy as
 //!     Codex: a compact header, `›` input, bullet-prefixed transcript cells,
 //!     and a low-contrast context line.
-//!   * [`TurnView`] — the sink for a streaming router turn. It shows a live
-//!     "thinking…" spinner while the model reasons, then streams the model's
-//!     natural-language plan token-by-token.
+//!   * [`TurnView`] — a quiet router-status sink. Private model scratch-work is
+//!     never printed; the agent renders one truthful action intent after routing.
 //!   * [`CampaignView`] — a live, self-redrawing progress tree for the concurrent
 //!     campaign pipeline (accounts → contacts → sequences), with a running
 //!     tokens/cost/elapsed footer.
@@ -44,6 +43,16 @@ pub fn fancy() -> bool {
     })
 }
 
+/// Start an interactive session on a blank terminal, including scrollback where
+/// the terminal supports the xterm erase-scrollback sequence. Non-TTY commands
+/// keep their output intact for scripts and logs.
+pub fn clear_terminal() {
+    if std::io::stdout().is_terminal() {
+        print!("\x1b[2J\x1b[3J\x1b[H");
+        let _ = std::io::stdout().flush();
+    }
+}
+
 fn paint(s: &str, code: &str) -> String {
     if fancy() {
         format!("\x1b[{code}m{s}\x1b[0m")
@@ -64,9 +73,17 @@ pub fn leaf(s: &str) -> String {
 pub fn cyan(s: &str) -> String {
     paint(s, "38;5;80")
 }
-#[allow(dead_code)]
-pub fn yellow(s: &str) -> String {
-    paint(s, "38;5;179")
+pub fn blue(s: &str) -> String {
+    paint(s, "38;5;75")
+}
+pub fn dark_blue(s: &str) -> String {
+    paint(s, "38;5;68")
+}
+pub fn red(s: &str) -> String {
+    paint(s, "38;5;203")
+}
+pub fn orange(s: &str) -> String {
+    paint(s, "38;5;214")
 }
 pub fn gray(s: &str) -> String {
     paint(s, "38;5;245")
@@ -170,7 +187,11 @@ pub fn markdown_line(line: &str, emphasis: bool) -> String {
 pub fn session_header(backend: &str, model: &str, brand: &str, directory: &str, crm: &str) {
     let lines = session_header_lines(backend, model, brand, directory, crm);
     for (index, line) in lines.iter().enumerate() {
-        let rendered = if index == 1 { bold(line) } else { dim(line) };
+        let rendered = if index == 1 {
+            blue(&bold(line))
+        } else {
+            dim(line)
+        };
         println!("{rendered}");
     }
 }
@@ -190,6 +211,7 @@ fn session_header_lines(
         format!("brand:     {brand}   /brand to change"),
         format!("directory: {directory}"),
         format!("crm:       {crm}   /crm to open"),
+        format!("gtm:       {crm}/gtm   /gtm to open"),
     ];
     let inner = rows
         .iter()
@@ -218,7 +240,7 @@ pub fn assistant_message(message: &str) {
         }
         let line = markdown_line(raw, true);
         if index == 0 {
-            println!("{}{}", dim("• "), line);
+            println!("{}{}", blue("• "), line);
         } else {
             println!("  {line}");
         }
@@ -227,18 +249,33 @@ pub fn assistant_message(message: &str) {
 
 /// Render a compact tool/action cell with optional nested detail.
 pub fn activity(title: &str, detail: impl AsRef<str>) {
-    println!("{}{}", dim("• "), bold(title));
+    println!("{}{}", blue("• "), bold(title));
     for (index, line) in detail.as_ref().lines().enumerate() {
         let branch = if index == 0 { "  └ " } else { "    " };
         println!("{}{}", dim(branch), dim(line));
     }
 }
 
+/// One concise, truthful description of the accepted structured action. This
+/// replaces streamed router scratch-work and never claims completion early.
+pub fn action_intent(title: &str, detail: impl AsRef<str>) {
+    println!("{} {}", blue("›"), bold(title));
+    if !detail.as_ref().trim().is_empty() {
+        println!("  {} {}", gray("└"), dim(detail.as_ref()));
+    }
+    println!();
+}
+
 /// Low-contrast session context shown next to the next composer.
 pub fn context_line(backend: &str, model: &str, brand: &str, directory: &str) {
     println!(
-        "{}",
-        dim(&format!("  {backend} {model} · {brand} · {directory}"))
+        "  {} {} {} {} {} {}",
+        dark_blue(backend),
+        blue(model),
+        dim("·"),
+        blue(brand),
+        dim("·"),
+        dim(directory)
     );
 }
 
@@ -290,7 +327,7 @@ impl Spinner {
                     let secs = started.elapsed().as_secs_f32();
                     print!(
                         "\r\x1b[K{} {} {}",
-                        cyan(FRAMES[i % FRAMES.len()]),
+                        dark_blue(FRAMES[i % FRAMES.len()]),
                         text,
                         dim(&format!("({secs:.0}s)"))
                     );
@@ -309,7 +346,15 @@ impl Spinner {
 
     pub fn set(&self, msg: &str) {
         if let Ok(mut m) = self.msg.lock() {
+            if *m == msg {
+                return;
+            }
             *m = msg.to_string();
+            // Pipes, CI logs, and redirected sessions do not have the render
+            // thread. Preserve meaningful phase changes there as plain lines.
+            if !fancy() {
+                println!("• {msg}");
+            }
         }
     }
 }
@@ -330,39 +375,575 @@ impl Drop for Spinner {
     }
 }
 
-// --- turn view (streaming router reasoning) --------------------------------
+// --- sourcing view --------------------------------------------------------
 
-enum TurnPhase {
-    Idle,
-    Thinking,
-    Reasoning,
-    Text,
+#[derive(Clone)]
+struct SourceRow {
+    key: String,
+    title: String,
+    detail: String,
+    status: String,
 }
 
-/// Renders one streaming agent turn, Codex-style: a "thinking…" spinner while
-/// the model reasons, then its `plan` streamed live as dim reasoning, then its
-/// answer streamed in normal weight.
+struct SourceState {
+    header: String,
+    active_title: String,
+    success_title: String,
+    failure_title: String,
+    rows: Vec<SourceRow>,
+    started: Instant,
+    done: bool,
+    succeeded: bool,
+}
+
+/// A stable, Codex-like activity transcript for account sourcing. Milestones
+/// remain visible while their detail is updated in place, avoiding the long
+/// flattened spinner line that previously mixed ICP filters, Apollo results,
+/// and individual rejection messages together.
+pub struct SourceView {
+    state: Arc<Mutex<SourceState>>,
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+    stats: Arc<Stats>,
+    base: StatsSnapshot,
+}
+
+impl SourceView {
+    pub fn start(header: String, stats: Arc<Stats>) -> Self {
+        Self::start_with_titles(
+            header,
+            stats,
+            "Sourcing companies",
+            "Sourced companies",
+            "Sourcing stopped",
+        )
+    }
+
+    pub fn start_enrichment(header: String, stats: Arc<Stats>) -> Self {
+        Self::start_with_titles(
+            header,
+            stats,
+            "Enriching contacts",
+            "Enriched contacts",
+            "Enrichment stopped",
+        )
+    }
+
+    fn start_with_titles(
+        header: String,
+        stats: Arc<Stats>,
+        active_title: &str,
+        success_title: &str,
+        failure_title: &str,
+    ) -> Self {
+        let base = stats.snapshot();
+        let state = Arc::new(Mutex::new(SourceState {
+            header,
+            active_title: active_title.into(),
+            success_title: success_title.into(),
+            failure_title: failure_title.into(),
+            rows: Vec::new(),
+            started: Instant::now(),
+            done: false,
+            succeeded: false,
+        }));
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = if fancy() {
+            println!();
+            let state_t = Arc::clone(&state);
+            let stop_t = Arc::clone(&stop);
+            let stats_t = Arc::clone(&stats);
+            Some(thread::spawn(move || {
+                source_ticker(state_t, stop_t, stats_t, base)
+            }))
+        } else {
+            activity(active_title, &state.lock().unwrap().header);
+            None
+        };
+        Self {
+            state,
+            stop,
+            handle,
+            stats,
+            base,
+        }
+    }
+
+    pub fn reporter(&self) -> crate::sourcing::SourceProgressReporter {
+        let state = Arc::clone(&self.state);
+        Arc::new(move |update| {
+            update_source_state(
+                &state,
+                update.key,
+                update.title,
+                update.detail,
+                update.status,
+            );
+        })
+    }
+
+    pub fn enrich_reporter(&self) -> crate::enrich::EnrichProgressReporter {
+        let state = Arc::clone(&self.state);
+        Arc::new(move |update| {
+            update_source_state(
+                &state,
+                update.key,
+                update.title,
+                update.detail,
+                update.status,
+            );
+        })
+    }
+
+    pub fn finish(mut self, succeeded: bool) -> StatsSnapshot {
+        {
+            let mut state = self.state.lock().unwrap();
+            state.done = true;
+            state.succeeded = succeeded;
+        }
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+        if fancy() {
+            println!();
+        }
+        self.stats.snapshot().since(self.base)
+    }
+}
+
+fn update_source_state(
+    state: &Arc<Mutex<SourceState>>,
+    key: String,
+    title: String,
+    detail: String,
+    status: String,
+) {
+    let mut view = state.lock().unwrap();
+    if let Some(row) = view.rows.iter_mut().find(|row| row.key == key) {
+        row.title.clone_from(&title);
+        row.detail.clone_from(&detail);
+        row.status.clone_from(&status);
+    } else {
+        view.rows.push(SourceRow {
+            key,
+            title: title.clone(),
+            detail: detail.clone(),
+            status,
+        });
+    }
+    if !fancy() {
+        println!("• {title}");
+        for line in detail.lines() {
+            println!("  └ {line}");
+        }
+    }
+}
+
+fn source_ticker(
+    state: Arc<Mutex<SourceState>>,
+    stop: Arc<AtomicBool>,
+    stats: Arc<Stats>,
+    base: StatsSnapshot,
+) {
+    let mut previous_lines = 0usize;
+    let mut frame = 0usize;
+    loop {
+        let done = stop.load(Ordering::Relaxed);
+        let lines = render_source(&state.lock().unwrap(), &stats, base, frame);
+        let out = std::io::stdout();
+        let mut lock = out.lock();
+        if previous_lines > 0 {
+            let _ = write!(lock, "\x1b[{previous_lines}A");
+        }
+        let _ = write!(lock, "\r\x1b[J");
+        for line in &lines {
+            let _ = writeln!(lock, "{line}");
+        }
+        let _ = lock.flush();
+        previous_lines = lines.len();
+        if done {
+            break;
+        }
+        frame += 1;
+        thread::sleep(Duration::from_millis(TICK_MS));
+    }
+}
+
+fn render_source(
+    state: &SourceState,
+    stats: &Stats,
+    base: StatsSnapshot,
+    frame: usize,
+) -> Vec<String> {
+    let spinner = FRAMES[frame % FRAMES.len()];
+    let (root_glyph, root_title) = if state.done && state.succeeded {
+        (leaf("✓"), state.success_title.as_str())
+    } else if state.done {
+        (red("×"), state.failure_title.as_str())
+    } else {
+        (blue("•"), state.active_title.as_str())
+    };
+    let mut lines = vec![
+        format!("{root_glyph} {}", bold(root_title)),
+        format!("  {} {}", gray("└"), dim(&state.header)),
+        String::new(),
+    ];
+
+    for (row_index, row) in state.rows.iter().enumerate() {
+        if row_index > 0 {
+            lines.push(String::new());
+        }
+        let (glyph, title) = match row.status.as_str() {
+            "complete" => (leaf("✓"), row.title.clone()),
+            "warning" => (orange("!"), orange(&row.title)),
+            "failed" => (red("×"), red(&row.title)),
+            "active" => (dark_blue(spinner), blue(&row.title)),
+            _ => (gray("○"), dim(&row.title)),
+        };
+        lines.push(format!("  {glyph} {title}"));
+        let details = row
+            .detail
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect::<Vec<_>>();
+        for (index, detail) in details.iter().enumerate() {
+            let branch = if index + 1 == details.len() {
+                "└"
+            } else {
+                "├"
+            };
+            lines.push(format!(
+                "    {} {}",
+                gray(branch),
+                dim(&truncate(detail, 108))
+            ));
+        }
+    }
+
+    let snap = stats.snapshot().since(base);
+    let footer_glyph = if state.done && state.succeeded {
+        leaf("✓")
+    } else if state.done {
+        red("×")
+    } else {
+        dark_blue(spinner)
+    };
+    lines.push(String::new());
+    lines.push(format!(
+        "  {} {footer_glyph} {}",
+        gray("└"),
+        dim(&footer(snap, state.started.elapsed()))
+    ));
+    lines
+}
+
+// --- outreach view --------------------------------------------------------
+
+#[derive(Clone)]
+struct OutreachRow {
+    key: String,
+    name: String,
+    account: String,
+    phase: String,
+    state: String,
+}
+
+struct OutreachState {
+    header: String,
+    overall: String,
+    rows: Vec<OutreachRow>,
+    processed: usize,
+    accepted: usize,
+    rejected: usize,
+    stopped: usize,
+    total: usize,
+    started: Instant,
+    done: bool,
+    succeeded: bool,
+}
+
+/// Codex-like multi-line progress for the expensive outreach pipeline. Every
+/// recipient owns a row, so concurrent model calls no longer overwrite one
+/// opaque spinner message or sit at `0/N` for the entire review cycle.
+pub struct OutreachView {
+    state: Arc<Mutex<OutreachState>>,
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+    stats: Arc<Stats>,
+    base: StatsSnapshot,
+}
+
+#[derive(Clone, Copy)]
+pub enum OutreachCompletion {
+    Completed,
+    Stopped,
+}
+
+impl OutreachView {
+    pub fn start(header: String, stats: Arc<Stats>) -> Self {
+        let base = stats.snapshot();
+        let state = Arc::new(Mutex::new(OutreachState {
+            header,
+            overall: "Selecting recipients".into(),
+            rows: Vec::new(),
+            processed: 0,
+            accepted: 0,
+            rejected: 0,
+            stopped: 0,
+            total: 0,
+            started: Instant::now(),
+            done: false,
+            succeeded: false,
+        }));
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = if fancy() {
+            println!();
+            let state_t = Arc::clone(&state);
+            let stop_t = Arc::clone(&stop);
+            let stats_t = Arc::clone(&stats);
+            Some(thread::spawn(move || {
+                outreach_ticker(state_t, stop_t, stats_t, base)
+            }))
+        } else {
+            activity("Drafting outreach", &state.lock().unwrap().header);
+            None
+        };
+        Self {
+            state,
+            stop,
+            handle,
+            stats,
+            base,
+        }
+    }
+
+    pub fn reporter(&self) -> crate::outreach::PlanProgressReporter {
+        let state = Arc::clone(&self.state);
+        Arc::new(move |update| {
+            let mut view = state.lock().unwrap();
+            view.overall = update.phase.clone();
+            view.processed = update.processed;
+            view.accepted = update.accepted;
+            view.rejected = update.rejected;
+            view.stopped = update.stopped;
+            view.total = update.total;
+            for recipient in &update.roster {
+                if view.rows.iter().all(|row| row.key != recipient.key) {
+                    view.rows.push(OutreachRow {
+                        key: recipient.key.clone(),
+                        name: recipient.name.clone(),
+                        account: recipient.account.clone(),
+                        phase: "Queued".into(),
+                        state: "queued".into(),
+                    });
+                }
+            }
+            for key in &update.recipient_keys {
+                if let Some(row) = view.rows.iter_mut().find(|row| row.key == *key) {
+                    row.phase = update.phase.clone();
+                    row.state = update.state.clone();
+                    if !update.account.trim().is_empty() {
+                        row.account = update.account.clone();
+                    }
+                }
+            }
+            if !fancy() {
+                println!("• {}", outreach_update_line(&view, &update.recipient_keys));
+            }
+        })
+    }
+
+    pub fn finish(mut self, completion: OutreachCompletion) -> StatsSnapshot {
+        {
+            let mut state = self.state.lock().unwrap();
+            state.done = true;
+            let stopped_early = matches!(completion, OutreachCompletion::Stopped);
+            state.succeeded = !stopped_early && state.rejected == 0 && state.stopped == 0;
+            state.overall = if stopped_early || state.stopped > 0 {
+                "Outreach stopped before every recipient completed".into()
+            } else if state.accepted == 0 && state.rejected > 0 {
+                "Every outreach draft was rejected".into()
+            } else if state.rejected > 0 {
+                "Outreach finished with rejected drafts".into()
+            } else if state.accepted > 0 {
+                "Outreach drafts ready".into()
+            } else {
+                "No outreach drafts needed".into()
+            };
+        }
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+        if fancy() {
+            println!();
+        }
+        self.stats.snapshot().since(self.base)
+    }
+}
+
+fn outreach_update_line(state: &OutreachState, keys: &[String]) -> String {
+    let names = state
+        .rows
+        .iter()
+        .filter(|row| keys.contains(&row.key))
+        .map(|row| row.name.as_str())
+        .collect::<Vec<_>>()
+        .join(" + ");
+    if names.is_empty() {
+        format!(
+            "{} · {}/{} complete",
+            state.overall, state.processed, state.total
+        )
+    } else {
+        format!(
+            "{names} · {} · {}/{} complete",
+            state.overall, state.processed, state.total
+        )
+    }
+}
+
+fn outreach_ticker(
+    state: Arc<Mutex<OutreachState>>,
+    stop: Arc<AtomicBool>,
+    stats: Arc<Stats>,
+    base: StatsSnapshot,
+) {
+    let mut previous_lines = 0usize;
+    let mut frame = 0usize;
+    loop {
+        let done = stop.load(Ordering::Relaxed);
+        let lines = render_outreach(&state.lock().unwrap(), &stats, base, frame);
+        let out = std::io::stdout();
+        let mut lock = out.lock();
+        if previous_lines > 0 {
+            let _ = write!(lock, "\x1b[{previous_lines}A");
+        }
+        let _ = write!(lock, "\r\x1b[J");
+        for line in &lines {
+            let _ = writeln!(lock, "{line}");
+        }
+        let _ = lock.flush();
+        previous_lines = lines.len();
+        if done {
+            break;
+        }
+        frame += 1;
+        thread::sleep(Duration::from_millis(TICK_MS));
+    }
+}
+
+fn render_outreach(
+    state: &OutreachState,
+    stats: &Stats,
+    base: StatsSnapshot,
+    frame: usize,
+) -> Vec<String> {
+    let spinner = FRAMES[frame % FRAMES.len()];
+    let title = if state.done {
+        state.overall.as_str()
+    } else {
+        "Drafting outreach"
+    };
+    let title_glyph = if state.done && state.succeeded {
+        leaf("✓")
+    } else if state.done && (state.stopped > 0 || state.accepted > 0) {
+        orange("!")
+    } else if state.done {
+        red("×")
+    } else {
+        blue("•")
+    };
+    let mut lines = vec![
+        format!("{title_glyph} {}", bold(title)),
+        format!("  {} {}", gray("└"), dim(&state.header)),
+        String::new(),
+    ];
+    let mut previous_account: Option<&str> = None;
+    for row in &state.rows {
+        if previous_account != Some(row.account.as_str()) {
+            if previous_account.is_some() {
+                lines.push(String::new());
+            }
+            lines.push(format!(
+                "  {} {}",
+                gray("•"),
+                bold(&truncate(&row.account, 72))
+            ));
+        }
+        previous_account = Some(&row.account);
+        let (glyph, phase, detail) = match row.state.as_str() {
+            "accepted" => (leaf("✓"), leaf(&row.phase), None),
+            "rejected" => (
+                red("×"),
+                red("rejected; feedback saved"),
+                failure_detail(&row.phase),
+            ),
+            "stopped" => (
+                orange("!"),
+                orange("stopped; details below"),
+                failure_detail(&row.phase),
+            ),
+            "active" => {
+                let phase = row.phase.to_ascii_lowercase();
+                let color = if ["council", "review", "qa", "gate"]
+                    .iter()
+                    .any(|needle| phase.contains(needle))
+                {
+                    orange(&row.phase)
+                } else {
+                    blue(&row.phase)
+                };
+                (dark_blue(spinner), color, None)
+            }
+            _ => (gray("○"), dim(&row.phase), None),
+        };
+        lines.push(format!(
+            "    {} {}  {}",
+            glyph,
+            pad(&truncate(&row.name, 22), 22),
+            phase
+        ));
+        if let Some(detail) = detail {
+            for (index, part) in wrap_words(&detail, 86).into_iter().enumerate() {
+                lines.push(format!(
+                    "      {} {}",
+                    gray(if index == 0 { "└" } else { " " }),
+                    red(&part)
+                ));
+            }
+        }
+    }
+    let snapshot = stats.snapshot().since(base);
+    lines.push(String::new());
+    lines.push(format!(
+        "  {} {}  {}",
+        if state.done && state.succeeded {
+            leaf("✓")
+        } else if state.done && (state.stopped > 0 || state.accepted > 0) {
+            orange("!")
+        } else if state.done {
+            red("×")
+        } else {
+            gray(spinner)
+        },
+        dim(&format!(
+            "{}/{} ready · {} rejected · {} stopped",
+            state.accepted, state.total, state.rejected, state.stopped
+        )),
+        dim(&footer(snapshot, state.started.elapsed()))
+    ));
+    lines
+}
+
+// --- turn view (quiet structured router) ----------------------------------
+
+/// Keep routing responsive without exposing the model's chain-of-thought or an
+/// unreliable pre-action success claim. Once routing returns, `Agent` prints a
+/// deterministic intent derived from the accepted structured action.
 pub struct TurnView {
     spinner: Option<Spinner>,
-    phase: TurnPhase,
-    thought_since: Option<Instant>,
-    any_text: bool,
-    /// Accumulated tool-call JSON, scanned for the `plan` field as it streams.
-    json_buf: String,
-    /// Byte length of the decoded plan already printed.
-    plan_shown: usize,
-    /// A completed reasoning block needs a newline before the next one.
-    reasoning_needs_separator: bool,
-    /// Codex can provide its own reasoning summary before the structured plan.
-    /// When it does, avoid echoing the plan field as a second copy.
-    reasoning_from_backend: bool,
-    /// Whether the next streamed character begins a new visual line.
-    at_line_start: bool,
-    /// The not-yet-newline-terminated tail of the current line. Held back so the
-    /// completed line can be Markdown-rendered as a whole (no split `**` markers).
-    pending: String,
-    /// Whether `pending` is dimmed reasoning (vs. normal answer text).
-    pending_dim: bool,
 }
 
 impl Default for TurnView {
@@ -374,59 +955,21 @@ impl Default for TurnView {
 impl TurnView {
     pub fn new() -> Self {
         TurnView {
-            spinner: None,
-            phase: TurnPhase::Idle,
-            thought_since: None,
-            any_text: false,
-            json_buf: String::new(),
-            plan_shown: 0,
-            reasoning_needs_separator: false,
-            reasoning_from_backend: false,
-            at_line_start: true,
-            pending: String::new(),
-            pending_dim: false,
+            spinner: Some(Spinner::start("Understanding request")),
         }
     }
 
-    /// Feed one streaming event. Wire this straight into `Engine::stream`.
+    /// Feed one streaming event. Content is deliberately ignored: the router's
+    /// private reasoning is not part of the user transcript.
     pub fn on_event(&mut self, ev: StreamEvent) {
         match ev {
-            StreamEvent::BlockStart(kind) => match kind {
-                "thinking" => {
-                    self.thought_since.get_or_insert_with(Instant::now);
-                    if !matches!(self.phase, TurnPhase::Reasoning) {
-                        self.set_spinner("Working");
-                        self.phase = TurnPhase::Thinking;
-                    }
-                }
-                "tool_use" if !matches!(self.phase, TurnPhase::Reasoning) => {
-                    self.set_spinner("Working");
-                }
-                "text" => self.begin_text(),
-                _ => {}
-            },
-            // The decision object (incl. the `plan`) streams as partial JSON.
-            StreamEvent::ToolInputDelta(chunk) => {
-                self.json_buf.push_str(chunk);
-                self.stream_plan();
-            }
-            StreamEvent::TextDelta(s) => {
-                if !matches!(self.phase, TurnPhase::Text) {
-                    self.begin_text();
-                }
-                self.any_text = true;
-                self.write_stream(s, false);
-            }
-            // Claude currently redacts these; Codex emits completed reasoning
-            // summaries. Render whichever non-empty text the backend exposes.
-            StreamEvent::ThinkingDelta(s) => self.stream_reasoning(s),
-            StreamEvent::ToolUse { .. } => {}
-            StreamEvent::BlockStop => {
-                if matches!(self.phase, TurnPhase::Reasoning) {
-                    self.flush_pending();
-                    self.reasoning_needs_separator = true;
-                }
-            }
+            StreamEvent::BlockStart("tool_use") => self.set_spinner("Choosing action"),
+            StreamEvent::BlockStart(_) => self.set_spinner("Understanding request"),
+            StreamEvent::ToolInputDelta(_)
+            | StreamEvent::TextDelta(_)
+            | StreamEvent::ThinkingDelta(_)
+            | StreamEvent::ToolUse { .. }
+            | StreamEvent::BlockStop => {}
         }
     }
 
@@ -437,131 +980,11 @@ impl TurnView {
         }
     }
 
-    /// Print any newly-arrived characters of the streaming `plan` field, as dim
-    /// "reasoning" text under a header.
-    fn stream_plan(&mut self) {
-        if self.reasoning_from_backend {
-            return;
-        }
-        let Some((plan, _complete)) = json_string_prefix(&self.json_buf, "plan") else {
-            return;
-        };
-        // Ignore leading whitespace so reasoning never opens with a blank "• " line.
-        let plan = plan.trim_start();
-        if plan.len() <= self.plan_shown {
-            return;
-        }
-        if self.plan_shown == 0 {
-            if plan.is_empty() {
-                return; // hold off on the header until real content arrives
-            }
-            self.begin_reasoning();
-        }
-        let fresh = &plan[self.plan_shown..];
-        self.write_stream(fresh, true);
-        self.plan_shown = plan.len();
-    }
-
-    fn stream_reasoning(&mut self, text: &str) {
-        if text.is_empty() {
-            return;
-        }
-        self.reasoning_from_backend = true;
-        self.begin_reasoning();
-        self.write_stream(text, true);
-    }
-
-    fn begin_reasoning(&mut self) {
-        self.spinner.take();
-        self.thought_since.take(); // visible reasoning replaces the timing-only summary
-        if matches!(self.phase, TurnPhase::Reasoning) {
-            if self.reasoning_needs_separator {
-                if !self.at_line_start {
-                    println!();
-                }
-                print!("{}", dim("• "));
-                self.at_line_start = false;
-                self.reasoning_needs_separator = false;
-            }
-        } else {
-            print!("{}", dim("• "));
-            self.at_line_start = false;
-            self.phase = TurnPhase::Reasoning;
-        }
-    }
-
-    /// Buffer streamed text, emitting each completed (newline-terminated) line
-    /// through the Markdown renderer. The trailing partial line is held in
-    /// `pending` until its newline arrives (or the turn/block ends), so inline
-    /// markers like `**bold**` are never split mid-render.
-    fn write_stream(&mut self, text: &str, dimmed: bool) {
-        self.pending_dim = dimmed;
-        self.pending.push_str(text);
-        while let Some(nl) = self.pending.find('\n') {
-            let mut line: String = self.pending.drain(..=nl).collect();
-            line.pop(); // drop the trailing '\n'
-            if !line.is_empty() {
-                self.emit_line(&line, dimmed);
-            }
-            println!();
-            self.at_line_start = true;
-        }
-        let _ = std::io::stdout().flush();
-    }
-
-    /// Render and print one complete line (with its leading indent), no newline.
-    fn emit_line(&mut self, line: &str, dimmed: bool) {
-        if self.at_line_start {
-            print!("  ");
-        }
-        let rendered = markdown_line(line, !dimmed);
-        if dimmed {
-            print!("{}", dim(&rendered));
-        } else {
-            print!("{rendered}");
-        }
-        self.at_line_start = false;
-    }
-
-    /// Emit any buffered partial line (used at block/turn boundaries).
-    fn flush_pending(&mut self) {
-        if self.pending.is_empty() {
-            return;
-        }
-        let line = std::mem::take(&mut self.pending);
-        let dimmed = self.pending_dim;
-        self.emit_line(&line, dimmed);
-        let _ = std::io::stdout().flush();
-    }
-
-    fn begin_text(&mut self) {
-        self.spinner.take(); // stop + clear the spinner line
-        if matches!(self.phase, TurnPhase::Reasoning) {
-            self.flush_pending();
-            if !self.at_line_start {
-                println!();
-            }
-            println!();
-        } else if let Some(t) = self.thought_since.take() {
-            println!(
-                "{}",
-                dim(&format!("• Thought for {:.1}s", t.elapsed().as_secs_f32()))
-            );
-            println!();
-        }
-        print!("{}", dim("• "));
-        self.at_line_start = false;
-        self.phase = TurnPhase::Text;
-    }
-
-    /// Finish the turn; returns whether any visible answer text was streamed.
+    /// Finish routing. No model text was exposed, so the caller should render
+    /// either the structured reply or a concise deterministic action intent.
     pub fn finish(mut self) -> bool {
         self.spinner.take();
-        self.flush_pending();
-        if matches!(self.phase, TurnPhase::Reasoning | TurnPhase::Text) && !self.at_line_start {
-            println!();
-        }
-        self.any_text
+        false
     }
 }
 
@@ -569,6 +992,7 @@ impl TurnView {
 /// streaming buffer. Returns the decoded value so far and whether it's complete
 /// (closing quote seen). Handles the common escapes and tolerates a truncated
 /// tail (mid-escape / mid-value while still streaming).
+#[cfg(test)]
 fn json_string_prefix(buf: &str, key: &str) -> Option<(String, bool)> {
     let pat = format!("\"{key}\"");
     let after_key = buf.find(&pat)? + pat.len();
@@ -665,7 +1089,13 @@ fn json_string_prefix(buf: &str, key: &str) -> Option<(String, bool)> {
 #[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod turn_view_tests {
-    use super::{json_string_prefix, markdown_line, session_header_lines};
+    use std::time::Instant;
+
+    use super::{
+        json_string_prefix, markdown_line, render_outreach, render_source, session_header_lines,
+        OutreachRow, OutreachState, SourceRow, SourceState,
+    };
+    use crate::engine::{Stats, StatsSnapshot};
 
     #[test]
     fn markdown_strips_markers_when_emphasis_off() {
@@ -767,6 +1197,193 @@ mod turn_view_tests {
             Some(("go 🚀".to_string(), false))
         );
     }
+
+    #[test]
+    fn outreach_progress_keeps_each_recipient_and_truthful_counts_visible() {
+        let state = OutreachState {
+            header: "OutageHub · 7 touches each · drafts only".into(),
+            overall: "sales council vote".into(),
+            rows: vec![
+                OutreachRow {
+                    key: "cory".into(),
+                    name: "Cory".into(),
+                    account: "Conestoga Cold Storage".into(),
+                    phase: "sales council vote · round 1/3".into(),
+                    state: "active".into(),
+                },
+                OutreachRow {
+                    key: "derrick".into(),
+                    name: "Derrick".into(),
+                    account: "Conestoga Cold Storage".into(),
+                    phase: "ready in CRM".into(),
+                    state: "accepted".into(),
+                },
+            ],
+            processed: 1,
+            accepted: 1,
+            rejected: 0,
+            stopped: 0,
+            total: 2,
+            started: Instant::now(),
+            done: false,
+            succeeded: false,
+        };
+        let lines = render_outreach(&state, &Stats::default(), StatsSnapshot::default(), 0);
+        let output = lines.join("\n");
+        assert!(output.contains("Cory"));
+        assert!(output.contains("Derrick"));
+        assert!(output.contains("sales council vote"));
+        assert!(output.contains("1/2 ready · 0 rejected"));
+    }
+
+    #[test]
+    fn outreach_completion_does_not_call_all_rejected_copy_finished() {
+        let state = OutreachState {
+            header: "Wapahki · drafts only".into(),
+            overall: "Every outreach draft was rejected".into(),
+            rows: vec![OutreachRow {
+                key: "one".into(),
+                name: "Aldrin".into(),
+                account: "Delmar Foods".into(),
+                phase: "rejected: deterministic QA failed".into(),
+                state: "rejected".into(),
+            }],
+            processed: 1,
+            accepted: 0,
+            rejected: 1,
+            stopped: 0,
+            total: 1,
+            started: Instant::now(),
+            done: true,
+            succeeded: false,
+        };
+        let output =
+            render_outreach(&state, &Stats::default(), StatsSnapshot::default(), 0).join("\n");
+        assert!(output.contains("Every outreach draft was rejected"));
+        assert!(output.contains("0/1 ready · 1 rejected · 0 stopped"));
+        assert!(!output.contains("Outreach drafts finished"));
+    }
+
+    #[test]
+    fn outreach_rejection_keeps_the_full_reason_visible_under_the_recipient() {
+        let reason = "rejected: copy still failed after two targeted repair rounds: stage 1 asks more than one question | stage 5 is 46 words (needs 18–45) | the recipient has no self-interested reason to answer a seven-part research questionnaire";
+        let state = OutreachState {
+            header: "Wapahki · drafts only".into(),
+            overall: "Outreach finished with rejected drafts".into(),
+            rows: vec![OutreachRow {
+                key: "one".into(),
+                name: "Safiullah".into(),
+                account: "Give and Go Prepared Foods".into(),
+                phase: reason.into(),
+                state: "rejected".into(),
+            }],
+            processed: 1,
+            accepted: 0,
+            rejected: 1,
+            stopped: 0,
+            total: 1,
+            started: Instant::now(),
+            done: true,
+            succeeded: false,
+        };
+        let lines = render_outreach(&state, &Stats::default(), StatsSnapshot::default(), 0);
+        let output = lines.join("\n");
+        assert!(output.contains("Give and Go Prepared Foods"));
+        assert!(output.contains("rejected; feedback saved"));
+        assert!(output.contains("copy still failed after two targeted repair rounds"));
+        assert!(output.contains("seven-part research questionnaire"));
+        assert!(lines.iter().any(|line| line.trim_start().starts_with("└ ")));
+    }
+
+    #[test]
+    fn provider_limits_are_distinct_from_copy_rejections() {
+        let state = OutreachState {
+            header: "Wapahki · drafts only".into(),
+            overall: "Outreach stopped before every recipient completed".into(),
+            rows: vec![OutreachRow {
+                key: "one".into(),
+                name: "Arezou".into(),
+                account: "Freshstone".into(),
+                phase: "stopped; model usage limit reached".into(),
+                state: "stopped".into(),
+            }],
+            processed: 1,
+            accepted: 0,
+            rejected: 0,
+            stopped: 1,
+            total: 1,
+            started: Instant::now(),
+            done: true,
+            succeeded: false,
+        };
+        let output =
+            render_outreach(&state, &Stats::default(), StatsSnapshot::default(), 0).join("\n");
+        assert!(output.contains("stopped; model usage limit reached"));
+        assert!(output.contains("0 rejected · 1 stopped"));
+    }
+
+    #[test]
+    fn sourcing_progress_uses_stable_nested_milestones() {
+        let state = SourceState {
+            header: "Wapahki · 5 account target · 5 people each · active GTM play".into(),
+            active_title: "Sourcing companies".into(),
+            success_title: "Sourced companies".into(),
+            failure_title: "Sourcing stopped".into(),
+            rows: vec![
+                SourceRow {
+                    key: "icp".into(),
+                    title: "Built ICP".into(),
+                    detail: "12 keywords · 13 buyer titles\nEmployee ranges: 51,200, 201,500"
+                        .into(),
+                    status: "complete".into(),
+                },
+                SourceRow {
+                    key: "qualification".into(),
+                    title: "Qualifying root-cause fit".into(),
+                    detail: "3/10 reviewed · 1 qualified · 1 research-needed · 1 skipped".into(),
+                    status: "active".into(),
+                },
+            ],
+            started: Instant::now(),
+            done: false,
+            succeeded: false,
+        };
+        let output =
+            render_source(&state, &Stats::default(), StatsSnapshot::default(), 0).join("\n");
+        assert!(output.contains("Built ICP"));
+        assert!(output.contains("Employee ranges"));
+        assert!(output.contains("Qualifying root-cause fit"));
+        assert!(output.contains("research-needed"));
+        assert!(output.contains("├") && output.contains("└"));
+        assert!(output.contains("\n\n"));
+    }
+
+    #[test]
+    fn enrichment_progress_is_one_aggregate_milestone() {
+        let state = SourceState {
+            header: "Wapahki · 25 contacts · Apollo reveal and verification".into(),
+            active_title: "Enriching contacts".into(),
+            success_title: "Enriched contacts".into(),
+            failure_title: "Enrichment stopped".into(),
+            rows: vec![SourceRow {
+                key: "enrichment".into(),
+                title: "Revealing and verifying contacts".into(),
+                detail: "14/25 processed · 12 verified · 2 no email · 0 errors\nLatest: Arezou · verified".into(),
+                status: "active".into(),
+            }],
+            started: Instant::now(),
+            done: false,
+            succeeded: false,
+        };
+        let output =
+            render_source(&state, &Stats::default(), StatsSnapshot::default(), 0).join("\n");
+        assert_eq!(
+            output.matches("Revealing and verifying contacts").count(),
+            1
+        );
+        assert!(output.contains("14/25 processed · 12 verified"));
+        assert!(output.contains("Latest: Arezou · verified"));
+    }
 }
 
 // --- campaign view (live pipeline progress tree) ---------------------------
@@ -775,6 +1392,7 @@ enum Stage {
     Researching,
     Building,
     Done,
+    Failed,
 }
 
 struct AcctProg {
@@ -817,6 +1435,7 @@ impl CampaignView {
         let stop = Arc::new(AtomicBool::new(false));
 
         let handle = if fancy() {
+            println!();
             let (state_t, stop_t, stats_t) = (state.clone(), stop.clone(), stats.clone());
             Some(thread::spawn(move || {
                 ticker(state_t, stop_t, stats_t, base)
@@ -838,11 +1457,18 @@ impl CampaignView {
 
     /// Stop the render loop (leaving the final frame on screen) and return the
     /// token/cost/time totals for this campaign.
-    pub fn finish(mut self) -> StatsSnapshot {
-        self.state.lock().unwrap().stage = Stage::Done;
+    pub fn finish(mut self, succeeded: bool) -> StatsSnapshot {
+        self.state.lock().unwrap().stage = if succeeded {
+            Stage::Done
+        } else {
+            Stage::Failed
+        };
         self.stop.store(true, Ordering::Relaxed);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
+        }
+        if fancy() {
+            println!();
         }
         self.stats.snapshot().since(self.base)
     }
@@ -919,27 +1545,31 @@ fn render(
     frame_i: usize,
 ) -> Vec<String> {
     let sp = FRAMES[frame_i % FRAMES.len()];
-    let title = if matches!(state.stage, Stage::Done) {
-        "Ran campaign"
-    } else {
-        "Running campaign"
+    let title = match state.stage {
+        Stage::Done => "Ran campaign",
+        Stage::Failed => "Campaign failed",
+        Stage::Researching | Stage::Building => "Running campaign",
     };
     let mut lines = vec![
-        format!("{}{}", dim("• "), bold(title)),
+        format!("{}{}", blue("• "), bold(title)),
         format!("{}{}", dim("  └ "), dim(&state.header)),
     ];
 
     match state.stage {
         Stage::Researching => {
-            lines.push(format!("    {} {}", cyan(sp), dim("Researching accounts…")));
+            lines.push(format!(
+                "    {} {}",
+                dark_blue(sp),
+                blue("Researching accounts…")
+            ));
         }
-        Stage::Building | Stage::Done => {
+        Stage::Building | Stage::Done | Stage::Failed => {
             for a in &state.accounts {
                 let name = pad(&a.name, 30);
                 if a.contacts == 0 {
                     lines.push(format!(
                         "    {} {} {}",
-                        cyan(sp),
+                        dark_blue(sp),
                         name,
                         dim("Mapping contacts…")
                     ));
@@ -953,7 +1583,7 @@ fn render(
                 } else {
                     lines.push(format!(
                         "    {} {} {}",
-                        cyan(sp),
+                        dark_blue(sp),
                         name,
                         dim(&format!("{}/{} sequences", a.seqs_done, a.contacts))
                     ));
@@ -963,10 +1593,10 @@ fn render(
     }
 
     let snap = stats.snapshot().since(base);
-    let glyph = if matches!(state.stage, Stage::Done) {
-        leaf("✓")
-    } else {
-        gray(sp)
+    let glyph = match state.stage {
+        Stage::Done => leaf("✓"),
+        Stage::Failed => red("×"),
+        Stage::Researching | Stage::Building => gray(sp),
     };
     lines.push(format!(
         "    {} {}",
@@ -1009,4 +1639,44 @@ fn truncate(s: &str, max: usize) -> String {
     }
     let cut: String = s.chars().take(max.saturating_sub(1)).collect();
     format!("{}…", cut.trim_end())
+}
+
+fn failure_detail(phase: &str) -> Option<String> {
+    let detail = phase
+        .trim()
+        .strip_prefix("rejected:")
+        .or_else(|| phase.trim().strip_prefix("stopped:"))
+        .unwrap_or_else(|| phase.trim())
+        .trim();
+    if detail.is_empty()
+        || matches!(
+            detail,
+            "feedback saved" | "rejected; feedback saved" | "stopped; details below"
+        )
+    {
+        None
+    } else {
+        Some(detail.to_string())
+    }
+}
+
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(16);
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        let extra = usize::from(!current.is_empty());
+        if !current.is_empty() && current.chars().count() + extra + word.chars().count() > width {
+            lines.push(current);
+            current = String::new();
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
 }

@@ -37,3 +37,5 @@ mail-parser = "0.9"
 # IMAP polling for the reply-handling loop (sync client, run on a blocking task).
 imap = "2"
 native-tls = "0.2"
+# Gmail API body payloads are URL-safe base64.
+base64 = "0.22"

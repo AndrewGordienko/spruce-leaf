@@ -1,4 +1,4 @@
-//! The agent loop, on the `claude` CLI underbase.
+//! The agent loop, on a pluggable local-CLI underbase (Claude, Codex, or Grok).
 //!
 //! The CLI doesn't hand back API-style `tool_use` blocks, so instead of a raw
 //! tool loop we use a *structured router*: each user line is sent to the selected model with
@@ -51,20 +51,25 @@ pub struct Agent {
 
 #[derive(Deserialize)]
 struct Decision {
-    action: String,
-    /// First-person reasoning the model writes before deciding — streamed live
-    /// as the visible "thinking" for the turn.
-    #[serde(default)]
-    #[allow(dead_code)]
-    plan: String,
+    /// Conversational answer, used ONLY when there are no steps to run.
     #[serde(default)]
     reply: String,
+    /// The actions to run this turn, in order — one (or more) per brand, and they
+    /// may be different actions for different brands. Empty for a pure reply.
+    #[serde(default)]
+    steps: Vec<Step>,
+}
+
+/// One action for one brand within a turn.
+#[derive(Deserialize)]
+struct Step {
+    action: String,
+    #[serde(default)]
+    brand: String,
     #[serde(default)]
     thesis: String,
     #[serde(default)]
     query: String,
-    #[serde(default)]
-    brand: String,
     #[serde(default)]
     accounts: Option<u64>,
     #[serde(default)]
@@ -77,17 +82,153 @@ struct Decision {
     phone: bool,
     #[serde(default)]
     auto: bool,
+    /// Force Apollo for *new* accounts even when the CRM already has enough inventory.
+    #[serde(default)]
+    force_new: bool,
     #[serde(default)]
     enrich: bool,
     #[serde(default)]
     actionable: bool,
-    /// Re-draft existing (unsent) sequences to improve them instead of skipping
-    /// contacts who already have a draft. Reuses contacts already found; no
-    /// Apollo spend.
-    #[serde(default)]
-    replace: bool,
     #[serde(default)]
     opportunity_id: String,
+}
+
+#[derive(Debug)]
+struct PlanScopeAccount {
+    name: String,
+    requested: usize,
+    person_ids: Vec<String>,
+}
+
+#[derive(Debug)]
+struct PlanScope {
+    requested_people: usize,
+    selected_ids: std::collections::HashSet<String>,
+    pending_enrichment_ids: std::collections::HashSet<String>,
+    accounts: Vec<PlanScopeAccount>,
+}
+
+fn explicit_total_cap(input: &str) -> bool {
+    let normalized = input.to_ascii_lowercase();
+    normalized.contains("at most")
+        || normalized
+            .split(|character: char| !character.is_ascii_alphanumeric())
+            .any(|word| {
+                matches!(
+                    word,
+                    "total" | "overall" | "maximum" | "max" | "cap" | "capped" | "limit"
+                )
+            })
+}
+
+fn forbids_contact_enrichment(input: &str) -> bool {
+    let normalized = input.to_ascii_lowercase();
+    [
+        "no apollo",
+        "without apollo",
+        "don't enrich",
+        "do not enrich",
+        "without enrichment",
+        "no enrichment",
+        "verified only",
+    ]
+    .iter()
+    .any(|phrase| normalized.contains(phrase))
+}
+
+fn routed_total_limit(
+    input: &str,
+    accounts: Option<u64>,
+    contacts: Option<u64>,
+    limit: Option<u64>,
+) -> Option<usize> {
+    limit
+        .filter(|_| accounts.is_none() || contacts.is_none() || explicit_total_cap(input))
+        .map(|value| value.max(1) as usize)
+}
+
+fn select_plan_scope(
+    db: &SharedDb,
+    brand: &str,
+    account_limit: Option<usize>,
+    contacts_per_account: Option<usize>,
+    total_limit: Option<usize>,
+) -> Result<PlanScope> {
+    let leads = db.list_leads(Some(brand))?;
+    let people = db.list_people(Some(brand), None)?;
+    let account_count = account_limit.unwrap_or_else(|| {
+        if contacts_per_account.is_some() {
+            1
+        } else {
+            leads.len().max(1)
+        }
+    });
+    let per_account = contacts_per_account.unwrap_or(usize::MAX);
+    let total = total_limit.unwrap_or(usize::MAX);
+    let requested_people = match (contacts_per_account, total_limit) {
+        (Some(contacts), cap) => account_count
+            .saturating_mul(contacts)
+            .min(cap.unwrap_or(usize::MAX)),
+        (None, Some(cap)) => cap,
+        (None, None) => 0,
+    };
+    let mut selected_ids = std::collections::HashSet::new();
+    let mut pending_enrichment_ids = std::collections::HashSet::new();
+    let mut accounts = Vec::new();
+
+    for lead in leads.into_iter().take(account_count) {
+        let remaining = total.saturating_sub(selected_ids.len());
+        if remaining == 0 {
+            break;
+        }
+        let mut roster = people
+            .iter()
+            .filter(|person| person.lead_id == lead.id)
+            .cloned()
+            .collect::<Vec<_>>();
+        // This is the same order the CRM shows: workflow-primary contacts,
+        // verified identities, then the rest in stable database order.
+        roster.sort_by_key(|person| {
+            (
+                !person.primary,
+                !person.email_status.eq_ignore_ascii_case("verified"),
+                person.status.eq_ignore_ascii_case("suppressed"),
+            )
+        });
+        let take = roster
+            .into_iter()
+            .take(per_account.min(remaining))
+            .collect::<Vec<_>>();
+        let requested_for_account = contacts_per_account
+            .map(|_| per_account.min(remaining))
+            .unwrap_or(take.len());
+        let mut person_ids = Vec::new();
+        for person in take {
+            if person.status.eq_ignore_ascii_case("new")
+                && !person.email_status.eq_ignore_ascii_case("verified")
+            {
+                pending_enrichment_ids.insert(person.id.clone());
+            }
+            selected_ids.insert(person.id.clone());
+            person_ids.push(person.id);
+        }
+        accounts.push(PlanScopeAccount {
+            name: lead.name,
+            requested: requested_for_account,
+            person_ids,
+        });
+    }
+
+    Ok(PlanScope {
+        requested_people: if requested_people == 0 {
+            selected_ids.len()
+        } else {
+            requested_people
+        },
+        selected_ids,
+        pending_enrichment_ids,
+        accounts,
+    })
 }
 
 impl Agent {
@@ -160,8 +301,14 @@ impl Agent {
             .unwrap_or(self.port);
         let store = self.store.clone();
         let db = self.db.clone();
+        let businesses = self.businesses.clone();
+        let playbooks = self.playbooks.clone();
+        let library = self.library.clone();
         tokio::spawn(async move {
-            if let Err(error) = crate::crm::serve_on_listener(store, db, listener).await {
+            if let Err(error) =
+                crate::crm::serve_on_listener(store, db, businesses, playbooks, library, listener)
+                    .await
+            {
                 ui::activity("CRM server error", format!("{error:#}"));
             }
         });
@@ -222,6 +369,11 @@ impl Agent {
         self.playbooks.keys()
     }
 
+    /// Shared execution DB (mail, sequences, learnings). Used by REPL mail sync.
+    pub fn db(&self) -> &crate::db::SharedDb {
+        &self.db
+    }
+
     /// Switch the working brand if `key` is valid; returns whether it changed.
     /// Used by the router to follow a request to its brand — it does not pin.
     pub fn set_brand(&mut self, key: &str) -> bool {
@@ -269,9 +421,9 @@ impl Agent {
 
     /// Handle one line of user input; returns the text to show the user.
     ///
-    /// The router call is *streamed*: a live "thinking…" indicator plays while
-    /// the model reasons and picks an action, then its natural-language plan is
-    /// streamed token-by-token (Codex-style) before we execute the action.
+    /// The router call is streamed only into a quiet status indicator. Private
+    /// scratch-work is suppressed; after routing we render one deterministic,
+    /// truthful action intent before executing it.
     pub async fn handle(&mut self, input: &str) -> Result<String> {
         let prompt = self.build_prompt(input).await;
 
@@ -286,26 +438,138 @@ impl Agent {
                 &mut |ev| turn.on_event(ev),
             )
             .await?;
-        // Whether the model already streamed a visible answer for this turn.
+        // Router output is intentionally private, so conversational replies are
+        // rendered once from the accepted structured decision.
         let streamed = turn.finish();
 
-        // In auto mode the router follows each request to whichever brand it
-        // concerns; when the operator has pinned a brand we ignore the router's
-        // pick and stay put.
-        if !self.brand_pinned && !decision.brand.trim().is_empty() {
-            self.set_brand(decision.brand.trim());
+        // Pure conversational answer: no actions to run this turn. The model
+        // already streamed a visible reply, so don't reprint — but remember it.
+        if decision.steps.is_empty() {
+            let reply = if streamed {
+                String::new()
+            } else {
+                decision.reply.clone()
+            };
+            let memo = if reply.is_empty() {
+                decision.reply.clone()
+            } else {
+                reply.clone()
+            };
+            self.remember(input, &memo);
+            return Ok(reply);
         }
 
         // Guarantee the CRM we're about to open or cite is actually answering
         // before we do so — a sibling session may have owned the port and exited.
         self.ensure_crm_live().await;
 
-        // Reads scope to the pinned brand; otherwise to a brand named this turn;
+        // Run each step in order. One request may mix brands and actions freely:
+        // "full motion for gnk and outagehub", or "source gnk and draft wapahki".
+        let mut outputs = Vec::new();
+        for step in &decision.steps {
+            let (title, detail) = self.step_intent(step);
+            ui::action_intent(&title, &detail);
+            let reply = self.run_step(step, input).await;
+            if !reply.trim().is_empty() {
+                outputs.push(reply);
+            }
+        }
+        let combined = outputs.join("\n\n");
+        self.remember(input, &combined);
+        Ok(combined)
+    }
+
+    fn step_intent(&self, step: &Step) -> (String, String) {
+        let brand_key = if self.brand_pinned || step.brand.trim().is_empty() {
+            self.brand.as_str()
+        } else {
+            step.brand.trim()
+        };
+        let brand = self
+            .playbooks
+            .get(brand_key)
+            .map(|playbook| playbook.name.as_str())
+            .unwrap_or(brand_key);
+        match step.action.as_str() {
+            "plan_outreach" => {
+                let accounts = step.accounts.unwrap_or(0);
+                let contacts = step.contacts.unwrap_or(0);
+                let touches = step.touches.unwrap_or(7);
+                let scope = match (accounts, contacts) {
+                    (1, contacts) if contacts > 0 => {
+                        format!("{contacts} people from the first account")
+                    }
+                    (accounts, contacts) if accounts > 0 && contacts > 0 => {
+                        format!("{contacts} people from each of {accounts} accounts")
+                    }
+                    _ => "selected verified people".into(),
+                };
+                (
+                    "Drafting outreach".into(),
+                    format!(
+                        "{brand} · {scope} · {touches} touches each · {}",
+                        if step.auto {
+                            "auto-schedule"
+                        } else {
+                            "drafts only"
+                        }
+                    ),
+                )
+            }
+            "source_leads" => (
+                "Finding qualified companies".into(),
+                format!(
+                    "{brand} · {} companies · {} people each · active GTM play",
+                    step.accounts.unwrap_or(10),
+                    step.contacts.unwrap_or(3)
+                ),
+            ),
+            "run_full_motion" => (
+                "Running full motion".into(),
+                format!(
+                    "{brand} · {} accounts · {} people each · {} touches",
+                    step.accounts.unwrap_or(5),
+                    step.contacts.unwrap_or(5),
+                    step.touches.unwrap_or(7)
+                ),
+            ),
+            "enrich_people" => (
+                "Enriching contacts".into(),
+                format!("{brand} · up to {} people", step.limit.unwrap_or(50)),
+            ),
+            "approve_outreach" => (
+                "Approving reviewed drafts".into(),
+                format!("{brand} · eligible email touches only"),
+            ),
+            "open_crm" => ("Opening CRM".into(), self.crm_url()),
+            "open_gtm" => (
+                "Opening GTM Lab".into(),
+                format!("{brand} · signals and plays"),
+            ),
+            "search_knowledge" => ("Searching knowledge".into(), step.query.trim().to_string()),
+            action => (
+                action.replace('_', " "),
+                if brand.is_empty() {
+                    String::new()
+                } else {
+                    brand.to_string()
+                },
+            ),
+        }
+    }
+
+    /// Execute one routed action for one brand and return the text to show.
+    async fn run_step(&mut self, step: &Step, input: &str) -> String {
+        // In auto mode follow this step's brand; when pinned, ignore it and stay.
+        if !self.brand_pinned && !step.brand.trim().is_empty() {
+            self.set_brand(step.brand.trim());
+        }
+        // Reads scope to the pinned brand; otherwise to this step's brand;
         // otherwise they span the whole portfolio.
         let read_scope: Option<&str> = if self.brand_pinned {
             Some(self.brand.as_str())
         } else {
-            let named = decision.brand.trim();
+            let named = step.brand.trim();
             if named.is_empty() {
                 None
             } else {
@@ -313,93 +577,101 @@ impl Agent {
             }
         };
 
-        let reply = match decision.action.as_str() {
+        match step.action.as_str() {
             "run_campaign" => {
-                let thesis = if decision.thesis.trim().is_empty() {
+                let thesis = if step.thesis.trim().is_empty() {
                     input.to_string()
                 } else {
-                    decision.thesis.clone()
+                    step.thesis.clone()
                 };
-                let accounts = decision.accounts.unwrap_or(5).max(1) as usize;
-                let contacts = decision.contacts.unwrap_or(5).max(1) as usize;
-                let touches = decision.touches.unwrap_or(7).max(1) as usize;
+                let accounts = step.accounts.unwrap_or(5).max(1) as usize;
+                let contacts = step.contacts.unwrap_or(5).max(1) as usize;
+                let touches = step.touches.unwrap_or(7).max(1) as usize;
                 self.run_campaign(&thesis, accounts, contacts, touches)
                     .await
             }
             "source_leads" => {
-                let thesis = if decision.thesis.trim().is_empty() {
+                let thesis = if step.thesis.trim().is_empty() {
                     input.to_string()
                 } else {
-                    decision.thesis.clone()
+                    step.thesis.clone()
                 };
-                let accounts = decision.accounts.unwrap_or(10).max(1) as usize;
-                let contacts = decision.contacts.unwrap_or(3).max(1) as usize;
+                let accounts = step.accounts.unwrap_or(10).max(1) as usize;
+                let contacts = step.contacts.unwrap_or(3).max(1) as usize;
                 self.source_leads(&thesis, accounts, contacts).await
             }
             "run_full_motion" => {
-                let thesis = if decision.thesis.trim().is_empty() {
+                let thesis = if step.thesis.trim().is_empty() {
                     input.to_string()
                 } else {
-                    decision.thesis.clone()
+                    step.thesis.clone()
                 };
-                let accounts = decision.accounts.unwrap_or(5).max(1) as usize;
-                let contacts = decision.contacts.unwrap_or(5).max(1) as usize;
-                let touches = decision.touches.unwrap_or(7).max(1) as usize;
-                self.run_full_motion(&thesis, accounts, contacts, touches)
-                    .await
+                let accounts = step.accounts.unwrap_or(5).max(1) as usize;
+                let contacts = step.contacts.unwrap_or(5).max(1) as usize;
+                let touches = step.touches.unwrap_or(7).max(1) as usize;
+                self.run_full_motion(
+                    &thesis,
+                    accounts,
+                    contacts,
+                    touches,
+                    step.force_new,
+                    // Re-draft when the operator is asking for sequences again
+                    // (the common "write the 7-stage sequence" path) or when
+                    // they explicitly set replace.
+                    true,
+                )
+                .await
             }
             "enrich_people" => {
-                self.enrich_people(decision.limit.unwrap_or(50).max(1) as usize, decision.phone)
+                self.enrich_people(step.limit.unwrap_or(50).max(1) as usize, step.phone)
                     .await
             }
             "plan_outreach" => {
                 self.plan_outreach(
-                    decision.touches.unwrap_or(7).max(1) as usize,
-                    decision.auto,
-                    decision.replace,
+                    step.touches.unwrap_or(7).max(1) as usize,
+                    step.auto,
+                    step.accounts.map(|value| value.max(1) as usize),
+                    step.contacts.map(|value| value.max(1) as usize),
+                    routed_total_limit(input, step.accounts, step.contacts, step.limit),
+                    !forbids_contact_enrichment(input),
                 )
                 .await
             }
             "approve_outreach" => self.approve_outreach(),
             "discover_opportunities" => {
-                self.discover_opportunities(decision.limit.unwrap_or(20).max(1) as usize)
+                self.discover_opportunities(step.limit.unwrap_or(20).max(1) as usize)
                     .await
             }
-            "list_opportunities" => self.list_opportunities(read_scope, decision.actionable),
+            "list_opportunities" => self.list_opportunities(read_scope, step.actionable),
             "show_learnings" => {
-                self.show_learnings(read_scope, decision.limit.unwrap_or(30).max(1) as usize)
+                self.show_learnings(read_scope, step.limit.unwrap_or(30).max(1) as usize)
             }
             "resolve_opportunity_contacts" => {
                 self.resolve_opportunity_contacts(
-                    decision.opportunity_id.trim(),
-                    decision.contacts.unwrap_or(3).max(1) as usize,
-                    decision.enrich,
+                    step.opportunity_id.trim(),
+                    step.contacts.unwrap_or(3).max(1) as usize,
+                    step.enrich,
                 )
                 .await
             }
             "plan_funding_outreach" => {
                 self.plan_funding_outreach(
-                    decision.opportunity_id.trim(),
-                    decision.touches.unwrap_or(2).clamp(1, 3) as usize,
-                    decision.auto,
+                    step.opportunity_id.trim(),
+                    step.touches.unwrap_or(2).clamp(1, 3) as usize,
+                    step.auto,
                 )
                 .await
             }
-            "approve_funding_outreach" => {
-                self.approve_funding_outreach(decision.opportunity_id.trim())
-            }
-            "prepare_application" => {
-                self.prepare_application(decision.opportunity_id.trim())
-                    .await
-            }
+            "approve_funding_outreach" => self.approve_funding_outreach(step.opportunity_id.trim()),
+            "prepare_application" => self.prepare_application(step.opportunity_id.trim()).await,
             "show_funnel" => self.show_funnel(read_scope),
             "show_calendar" => self.show_calendar(),
             "list_accounts" => self.list_accounts(read_scope).await,
             "search_knowledge" => {
-                let q = if decision.query.trim().is_empty() {
+                let q = if step.query.trim().is_empty() {
                     input
                 } else {
-                    decision.query.trim()
+                    step.query.trim()
                 };
                 self.search_knowledge(q).await
             }
@@ -408,20 +680,19 @@ impl Agent {
                 ui::activity("Opened CRM dashboard", self.crm_url());
                 format!("Opened the CRM dashboard at {}", self.crm_url())
             }
-            // Plain conversational reply: the model already streamed it, so
-            // don't reprint — but keep the text for conversational memory.
-            _ if streamed => String::new(),
-            _ => decision.reply.clone(),
-        };
-
-        // Remember the substantive text even when we suppressed the reprint.
-        let memo = if reply.is_empty() {
-            decision.reply.clone()
-        } else {
-            reply.clone()
-        };
-        self.remember(input, &memo);
-        Ok(reply)
+            "open_gtm" => {
+                let brand = step.brand.trim();
+                let url = if brand.is_empty() {
+                    format!("{}/gtm", self.crm_url())
+                } else {
+                    format!("{}/gtm/{brand}", self.crm_url())
+                };
+                open_browser(&url);
+                ui::activity("Opened GTM engineering lab", &url);
+                format!("Opened the GTM engineering lab at {url}")
+            }
+            _ => String::new(),
+        }
     }
 
     async fn run_campaign(
@@ -459,7 +730,7 @@ impl Agent {
 
         // Stop the render thread (leaves the final frame on screen) before we
         // print anything else.
-        view.finish();
+        view.finish(result.is_ok());
 
         let campaign = match result {
             Ok(c) => c,
@@ -498,7 +769,14 @@ impl Agent {
             .map_err(|e| format!("Can't source: {e:#}"))?;
         let apollo = Apollo::from_env().map_err(|e| format!("Can't source: {e:#}"))?;
         let lib = self.library.read().await.clone();
-        let work = ui::Spinner::start("Searching Apollo");
+        let view = ui::SourceView::start(
+            format!(
+                "{} · {accounts} account target · {contacts} people each · active GTM play",
+                pb.name
+            ),
+            self.client.stats(),
+        );
+        let progress = view.reporter();
         let result = sourcing::source(
             &self.db,
             &self.client,
@@ -512,20 +790,12 @@ impl Agent {
             accounts,
             contacts,
             self.concurrency.max(1),
+            Some(progress),
         )
         .await;
-        drop(work);
+        view.finish(result.is_ok());
         match result {
-            Ok(s) => {
-                ui::activity(
-                    "Searched Apollo",
-                    format!(
-                        "{} organizations · {} qualified leads · {} people",
-                        s.orgs_found, s.leads_qualified, s.people_added
-                    ),
-                );
-                Ok(s)
-            }
+            Ok(s) => Ok(s),
             Err(e) => Err(format!("Sourcing failed: {e:#}")),
         }
     }
@@ -539,7 +809,7 @@ impl Agent {
                     ui::activity("Opened CRM dashboard", self.crm_url());
                 }
                 format!(
-                    "Sourced {} real organizations into {} qualified leads and {} people, now filed in the CRM at {}. Next, ask me to enrich their emails.",
+                    "Sourced {} real organizations into {} viable lead record(s) and {} people, now filed in the CRM at {}. Fully qualified and research-needed accounts remain visibly distinct. Next, ask me to enrich their emails.",
                     s.orgs_found, s.leads_qualified, s.people_added, self.crm_url()
                 )
             }
@@ -548,29 +818,44 @@ impl Agent {
     }
 
     /// Reveal + verify emails for pending people, returning the summary.
-    async fn do_enrich(&self, limit: usize, phone: bool) -> Result<enrich::EnrichSummary, String> {
+    async fn do_enrich(
+        &self,
+        limit: usize,
+        phone: bool,
+        only_person_ids: Option<&std::collections::HashSet<String>>,
+    ) -> Result<enrich::EnrichSummary, String> {
         let apollo = Apollo::from_env().map_err(|e| format!("Can't enrich: {e:#}"))?;
-        let work = ui::Spinner::start("Enriching people");
-        let result =
-            enrich::enrich_pending(&self.db, &apollo, Some(&self.brand), limit, phone).await;
-        drop(work);
+        let view = ui::SourceView::start_enrichment(
+            format!(
+                "{} · up to {limit} contacts · email reveal + verification{}",
+                self.playbooks
+                    .get(&self.brand)
+                    .map(|playbook| playbook.name.as_str())
+                    .unwrap_or(self.brand.as_str()),
+                if phone { " + phone" } else { "" }
+            ),
+            self.client.stats(),
+        );
+        let progress = view.enrich_reporter();
+        let result = enrich::enrich_pending(
+            &self.db,
+            &apollo,
+            Some(&self.brand),
+            limit,
+            phone,
+            only_person_ids,
+            Some(progress),
+        )
+        .await;
+        view.finish(result.is_ok());
         match result {
-            Ok(s) => {
-                ui::activity(
-                    "Enriched people",
-                    format!(
-                        "{} attempted · {} emails found · {} verified",
-                        s.attempted, s.emails_found, s.verified
-                    ),
-                );
-                Ok(s)
-            }
+            Ok(s) => Ok(s),
             Err(e) => Err(format!("Enrichment failed: {e:#}")),
         }
     }
 
     async fn enrich_people(&self, limit: usize, phone: bool) -> String {
-        match self.do_enrich(limit, phone).await {
+        match self.do_enrich(limit, phone, None).await {
             Ok(s) => format!(
                 "Enriched {} people: {} emails found, {} verified. Next, ask me to plan outreach.",
                 s.attempted, s.emails_found, s.verified
@@ -580,15 +865,20 @@ impl Agent {
     }
 
     /// Write sequences for verified people, returning the summary. `replace`
-    /// re-drafts existing (unsent) sequences to improve them; the agent always
-    /// sequences every verified contact already found (no Apollo spend), leaving
-    /// real send volume to the send-time account limits.
+    /// re-drafts existing (unsent) sequences to improve them. `per_account_cap` =
+    /// Some(n) fills each company up to n verified contacts (the full motion's
+    /// target); None sequences every verified contact found (the explicit sweep).
+    /// A scoped request may reveal only its selected, not-yet-verified people so
+    /// the requested account × contact cardinality does not silently collapse.
+    /// No account or people search occurs here; real send volume remains bounded
+    /// by send-time account limits.
     async fn do_plan(
         &self,
         touches: usize,
         auto: bool,
         replace: bool,
         only_person_ids: Option<&std::collections::HashSet<String>>,
+        per_account_cap: Option<usize>,
     ) -> Result<outreach::PlanSummary, String> {
         let pb = self
             .playbooks
@@ -599,7 +889,16 @@ impl Agent {
             .get(&self.brand)
             .map_err(|e| format!("Can't plan outreach: {e:#}"))?;
         let lib = self.library.read().await.clone();
-        let work = ui::Spinner::start("Drafting outreach");
+        let view =
+            ui::OutreachView::start(
+                format!(
+                "{} · {touches} touches each · {} · drafts stream into CRM before review finishes",
+                pb.name,
+                if auto { "auto-schedule eligible" } else { "drafts only" }
+            ),
+                self.client.stats(),
+            );
+        let progress = view.reporter();
         let result = outreach::plan_pending(
             &self.db,
             &self.client,
@@ -613,113 +912,321 @@ impl Agent {
             self.critique,
             None,
             replace,
-            true,
+            per_account_cap,
             only_person_ids,
+            Some(progress),
         )
         .await;
-        drop(work);
+        let stopped = result
+            .as_ref()
+            .map(|summary| summary.stopped_reason.is_some())
+            .unwrap_or(true);
+        view.finish(if stopped {
+            ui::OutreachCompletion::Stopped
+        } else {
+            ui::OutreachCompletion::Completed
+        });
         match result {
-            Ok(s) => {
-                ui::activity(
-                    "Drafted outreach",
-                    format!(
-                        "{} people · {} scheduled · {} drafts",
-                        s.people_planned, s.touches_scheduled, s.touches_drafted
-                    ),
-                );
-                Ok(s)
-            }
+            Ok(s) => Ok(s),
             Err(e) => Err(format!("Outreach planning failed: {e:#}")),
         }
     }
 
-    async fn plan_outreach(&self, touches: usize, auto: bool, replace: bool) -> String {
-        match self.do_plan(touches, auto, replace, None).await {
-            Ok(s) => format!(
-                "Planned {} people: {} email touches scheduled and {} touches left as drafts.{}",
-                s.people_planned,
-                s.touches_scheduled,
-                s.touches_drafted,
-                if auto {
-                    ""
-                } else {
-                    " Ask me to approve the email drafts when you're ready."
+    async fn plan_outreach(
+        &self,
+        touches: usize,
+        auto: bool,
+        account_limit: Option<usize>,
+        contacts_per_account: Option<usize>,
+        total_limit: Option<usize>,
+        fill_contact_coverage: bool,
+    ) -> String {
+        let scoped =
+            account_limit.is_some() || contacts_per_account.is_some() || total_limit.is_some();
+        let mut scope_note = String::new();
+        let only_person_ids = if scoped {
+            let scope = match select_plan_scope(
+                &self.db,
+                &self.brand,
+                account_limit,
+                contacts_per_account,
+                total_limit,
+            ) {
+                Ok(scope) => scope,
+                Err(error) => return format!("Can't resolve outreach scope: {error:#}"),
+            };
+            ui::activity(
+                "Resolved outreach scope",
+                format!(
+                    "{} requested · {} existing people selected across {} account(s)",
+                    scope.requested_people,
+                    scope.selected_ids.len(),
+                    scope.accounts.len()
+                ),
+            );
+            if !scope.pending_enrichment_ids.is_empty() && fill_contact_coverage {
+                ui::activity(
+                    "Completing contact coverage",
+                    format!(
+                        "{} selected people need verified email · up to {} Apollo reveal credits",
+                        scope.pending_enrichment_ids.len(),
+                        scope.pending_enrichment_ids.len()
+                    ),
+                );
+                match self
+                    .do_enrich(
+                        scope.pending_enrichment_ids.len(),
+                        false,
+                        Some(&scope.pending_enrichment_ids),
+                    )
+                    .await
+                {
+                    Ok(summary) if summary.stopped.is_some() => ui::activity(
+                        "Contact enrichment stopped early",
+                        format!(
+                            "{} attempted · {} verified · {} · continuing only with verified recipients",
+                            summary.attempted,
+                            summary.verified,
+                            summary.stopped.unwrap_or_default()
+                        ),
+                    ),
+                    Ok(_) => {}
+                    Err(error) => ui::activity(
+                        "Contact enrichment did not complete",
+                        format!("{error} · continuing only with verified recipients"),
+                    ),
                 }
-            ),
+            } else if !scope.pending_enrichment_ids.is_empty() {
+                ui::activity(
+                    "Contact enrichment skipped",
+                    format!(
+                        "{} selected identities still need verification · operator requested no Apollo/enrichment",
+                        scope.pending_enrichment_ids.len()
+                    ),
+                );
+            }
+
+            let mut verified = std::collections::HashSet::new();
+            let mut gaps = Vec::new();
+            for account in &scope.accounts {
+                let mut ready = 0usize;
+                for id in &account.person_ids {
+                    if self.db.get_person(id).ok().flatten().is_some_and(|person| {
+                        person.status.eq_ignore_ascii_case("verified")
+                            && person.email_status.eq_ignore_ascii_case("verified")
+                    }) {
+                        ready += 1;
+                        verified.insert(id.clone());
+                    }
+                }
+                if ready < account.requested {
+                    gaps.push(format!("{} {ready}/{}", account.name, account.requested));
+                }
+            }
+            scope_note = format!(
+                " Scope: {} requested, {} existing selected, {} verified for drafting across {} account(s).{}",
+                scope.requested_people,
+                scope.selected_ids.len(),
+                verified.len(),
+                scope.accounts.len(),
+                if gaps.is_empty() {
+                    String::new()
+                } else {
+                    format!(" Coverage still short: {}.", gaps.join("; "))
+                }
+            );
+            Some(verified)
+        } else {
+            None
+        };
+        match self
+            // Natural-language write/refine requests safely replace only unsent
+            // drafts; sent sequences remain protected by the persistence layer.
+            .do_plan(touches, auto, true, only_person_ids.as_ref(), None)
+            .await
+        {
+            Ok(s) => {
+                let stop = s
+                    .stopped_reason
+                    .as_ref()
+                    .map(|reason| {
+                        format!(
+                            " Drafting stopped early: {reason}. {} recipient(s) not completed.",
+                            s.people_stopped
+                        )
+                    })
+                    .unwrap_or_default();
+                let next = if auto {
+                    ""
+                } else if s.people_planned > 0 {
+                    " Review the accepted drafts in CRM; approval remains a separate action."
+                } else {
+                    " Nothing is approval-eligible; rejection feedback is preserved in CRM."
+                };
+                format!(
+                    "Drafted {} reviewed sequence(s): {} email touches scheduled, {} touches held as drafts, {} recipient(s) rejected.{stop}{scope_note}{next}",
+                    s.people_planned,
+                    s.touches_scheduled,
+                    s.touches_drafted,
+                    s.people_rejected,
+                )
+            }
             Err(e) => e,
         }
     }
 
-    /// Run the whole outbound motion from one request: source real leads →
-    /// reveal & verify their emails → draft the sequences. It stops before
-    /// anything is sent (sequences are held as drafts for approval). Enrichment
-    /// spends Apollo credits, so it's only reached when sourcing returned people.
+    /// Run the whole outbound motion from one request.
+    ///
+    /// **Reuse-first:** if the brand already has enough accounts/people on file,
+    /// Apollo is skipped entirely. We refresh why each company fits (doctrine
+    /// framing), enrich only contacts still missing verified email, and
+    /// (re)write the sequences for the selected set. Apollo is only called for
+    /// the shortfall — or when `force_new` is true.
     async fn run_full_motion(
         &self,
         thesis: &str,
         accounts: usize,
         contacts: usize,
         touches: usize,
+        force_new: bool,
+        replace_drafts: bool,
     ) -> String {
-        let before_ids: std::collections::HashSet<String> = self
-            .db
-            .list_people(Some(&self.brand), None)
-            .map(|people| people.into_iter().map(|person| person.id).collect())
-            .unwrap_or_default();
-
-        // 1. Source real accounts + people.
-        let src = match self.do_source(thesis, accounts, contacts).await {
-            Ok(s) => s,
-            Err(e) => return e,
+        // 1. Inventory already on file for this brand.
+        let mut reuse = match sourcing::select_reuse(&self.db, &self.brand, accounts, contacts) {
+            Ok(selection) => selection,
+            Err(e) => return format!("Can't inspect on-file inventory: {e:#}"),
         };
-        // Exactly the people this run added — drafting is scoped to these so the
-        // full motion never re-drafts the brand's whole accumulated backlog.
-        let new_ids: std::collections::HashSet<String> = self
-            .db
-            .list_people(Some(&self.brand), None)
-            .map(|people| {
-                people
-                    .into_iter()
-                    .filter(|person| !before_ids.contains(&person.id))
-                    .map(|person| person.id)
-                    .collect()
-            })
-            .unwrap_or_default();
-        let new_people = new_ids.len();
 
-        // Nothing to enrich → stop before spending credits, but still show the CRM.
-        if new_people == 0 {
-            if src.leads_qualified > 0 {
-                open_browser(&self.crm_url());
-                ui::activity("Opened CRM dashboard", self.crm_url());
+        let mut src = sourcing::SourceSummary::default();
+        let need_apollo = force_new || reuse.accounts_shortfall > 0;
+
+        if need_apollo {
+            let want = if force_new {
+                accounts
+            } else {
+                reuse.accounts_shortfall.max(1)
+            };
+            ui::activity(
+                if force_new {
+                    "Sourcing new accounts"
+                } else {
+                    "Filling account shortfall"
+                },
+                format!(
+                    "Apollo for {want} account(s) · on-file already has {} with people",
+                    reuse.accounts_selected
+                ),
+            );
+            match self.do_source(thesis, want, contacts).await {
+                Ok(s) => src = s,
+                Err(e) => {
+                    // If we already have reusable inventory, keep going; only hard-fail
+                    // when there is nothing to work from.
+                    if reuse.person_ids.is_empty() {
+                        return e;
+                    }
+                    ui::activity(
+                        "Apollo shortfall skipped",
+                        format!("{e} — continuing with on-file accounts"),
+                    );
+                }
             }
-            return format!(
-                "Sourced {} orgs → {} qualified leads, but 0 contacts came back, so I stopped before spending any enrichment credits. A tighter, single-vertical thesis usually returns real people — want me to re-source narrower?",
-                src.orgs_found, src.leads_qualified
+            // Re-rank after any new rows land so the working set includes them.
+            if let Ok(updated) = sourcing::select_reuse(&self.db, &self.brand, accounts, contacts) {
+                reuse = updated;
+            }
+        } else {
+            ui::activity(
+                "Reusing on-file inventory",
+                format!(
+                    "selected {}/{} account(s) · {}/{} people ({} verified of {} on file) · Apollo skipped",
+                    reuse.accounts_selected,
+                    reuse.accounts_on_file,
+                    reuse.people_selected,
+                    reuse.people_on_file,
+                    reuse.verified_selected,
+                    reuse.verified_on_file
+                ),
             );
         }
 
-        // 2. Reveal + verify emails for the freshly-sourced people (spends credits).
-        let enr = match self.do_enrich(new_people, false).await {
-            Ok(s) => s,
-            Err(e) => {
-                open_browser(&self.crm_url());
-                return format!(
-                    "Sourced {} people into the CRM at {}, but enrichment stopped: {e}",
-                    src.people_added,
-                    self.crm_url()
-                );
+        if reuse.lead_ids.is_empty() || reuse.person_ids.is_empty() {
+            open_browser(&self.crm_url());
+            return format!(
+                "No reusable accounts/people on file for {} and sourcing did not add any. Everything's in the CRM at {}. Try a tighter thesis or say \"new companies\" to force Apollo.",
+                self.brand,
+                self.crm_url()
+            );
+        }
+
+        // 2. Refresh commercial framing on the selected accounts (no Apollo) so
+        // sequences are written against an up-to-date "why this company".
+        let refreshed = self.do_refresh_context(thesis, &reuse.lead_ids).await;
+
+        // 3. Enrich only selected people still missing a verified email.
+        let need_enrich = self
+            .db
+            .list_people(Some(&self.brand), Some("new"))
+            .map(|people| {
+                people
+                    .into_iter()
+                    .filter(|p| reuse.person_ids.contains(&p.id))
+                    .count()
+            })
+            .unwrap_or(0);
+        let enr = if need_enrich > 0 {
+            match self
+                .do_enrich(need_enrich, false, Some(&reuse.person_ids))
+                .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    // Verified people can still be sequenced; only hard-stop when
+                    // nobody in the set is verified.
+                    if reuse.verified_selected == 0 {
+                        open_browser(&self.crm_url());
+                        return format!(
+                            "Refreshed framing for {} account(s) but enrichment stopped before any verified emails: {e}",
+                            reuse.accounts_selected
+                        );
+                    }
+                    ui::activity(
+                        "Enrichment partial",
+                        format!("{e} — drafting verified contacts only"),
+                    );
+                    enrich::EnrichSummary::default()
+                }
+            }
+        } else {
+            ui::activity(
+                "Enrichment skipped",
+                format!(
+                    "{} selected contact(s) already verified · 0 Apollo reveal credits",
+                    reuse.verified_selected
+                ),
+            );
+            enrich::EnrichSummary {
+                verified: reuse.verified_selected,
+                ..Default::default()
             }
         };
 
-        // 3. Draft the sequences (auto=false → held for approval, nothing sends).
-        //    Scoped to this run's people so we don't re-draft the whole backlog.
-        let pln = match self.do_plan(touches, false, false, Some(&new_ids)).await {
+        // 4. Draft / re-draft sequences only for the selected working set.
+        let pln = match self
+            .do_plan(
+                touches,
+                false,
+                replace_drafts,
+                Some(&reuse.person_ids),
+                Some(contacts),
+            )
+            .await
+        {
             Ok(s) => s,
             Err(e) => {
                 open_browser(&self.crm_url());
                 return format!(
-                    "Sourced and enriched into the CRM at {}, but drafting the sequences stopped: {e}",
+                    "Inventory ready in the CRM at {}, but drafting the sequences stopped: {e}",
                     self.crm_url()
                 );
             }
@@ -729,23 +1236,108 @@ impl Agent {
         ui::activity("Opened CRM dashboard", self.crm_url());
 
         if pln.people_planned == 0 {
+            if let Some(reason) = &pln.stopped_reason {
+                return format!(
+                    "Drafting stopped after the working set was prepared: {reason}. {} contact(s) were not completed and {} copy draft(s) were rejected before the stop. Nothing was sent. Existing feedback is in the CRM at {}.",
+                    pln.people_stopped,
+                    pln.people_rejected,
+                    self.crm_url(),
+                );
+            }
+            if pln.people_rejected > 0 {
+                return format!(
+                    "Drafting reached {} verified contact(s), but every sequence was rejected by copy review. The recipient-specific reasons are saved in the CRM at {}. Nothing was sent.",
+                    pln.people_rejected,
+                    self.crm_url(),
+                );
+            }
             return format!(
-                "Sourced {orgs} orgs → {leads} leads → {people} people, but only {verified} had a verifiable email, so there was no one with a confirmed address to sequence yet. Everything's in the CRM at {url}. Want me to widen sourcing or relax the verified-email gate?",
+                "The working set contains {accounts_sel} account(s) / {people_sel} selected people \
+                 (Apollo orgs={orgs}, new leads={leads}, refreshed={refreshed}, newly verified={verified}), \
+                 but no new sequence was needed. The selected contacts either lack a verified email or already have an active/sent sequence. CRM: {url}.",
+                accounts_sel = reuse.accounts_selected,
+                people_sel = reuse.people_selected,
                 orgs = src.orgs_found,
                 leads = src.leads_qualified,
-                people = src.people_added,
+                refreshed = refreshed,
                 verified = enr.verified,
                 url = self.crm_url(),
             );
         }
 
+        if let Some(reason) = &pln.stopped_reason {
+            return format!(
+                "Drafting stopped early: {reason}. Saved {} sequence(s) that had already passed; {} contact(s) were not completed and {} draft(s) were rejected. Nothing was sent. CRM: {}.",
+                pln.people_planned,
+                pln.people_stopped,
+                pln.people_rejected,
+                self.crm_url(),
+            );
+        }
+
+        let apollo_note = if src.orgs_found == 0 && src.leads_qualified == 0 {
+            "Apollo skipped (reused on-file inventory)".to_string()
+        } else {
+            format!(
+                "Apollo: {} org(s) seen · {} new lead(s) · {} people added",
+                src.orgs_found, src.leads_qualified, src.people_added
+            )
+        };
+
         format!(
-            "Full motion done: {planned} sequence(s) drafted for {verified} verified contacts across {leads} account(s), all in the CRM at {url}. Nothing has been sent — say \"approve\" to schedule.",
+            "Full motion done: {planned} sequence(s) for {accounts_sel} account(s) \
+             ({people_sel} contacts, {verified_sel} verified). {apollo_note}. \
+             Refreshed framing on {refreshed} account(s). Nothing sent — say \"approve\" to schedule. CRM: {url}.",
             planned = pln.people_planned,
-            verified = enr.verified,
-            leads = src.leads_qualified,
+            accounts_sel = reuse.accounts_selected,
+            people_sel = reuse.people_selected,
+            verified_sel = reuse.verified_selected.max(enr.verified),
+            apollo_note = apollo_note,
+            refreshed = refreshed,
             url = self.crm_url(),
         )
+    }
+
+    /// Refresh doctrine framing for leads already on file (no Apollo).
+    async fn do_refresh_context(&self, thesis: &str, lead_ids: &[String]) -> usize {
+        if lead_ids.is_empty() {
+            return 0;
+        }
+        let pb = match self.playbooks.get(&self.brand) {
+            Ok(p) => p,
+            Err(_) => return 0,
+        };
+        let business = match self.businesses.get(&self.brand) {
+            Ok(b) => b,
+            Err(_) => return 0,
+        };
+        let lib = self.library.read().await.clone();
+        let work = ui::Spinner::start("Refreshing account framing");
+        let result = sourcing::refresh_lead_context(
+            &self.db,
+            &self.client,
+            pb,
+            &business.operating_context(),
+            &lib,
+            thesis,
+            lead_ids,
+            self.concurrency.max(1),
+        )
+        .await;
+        drop(work);
+        match result {
+            Ok(n) => {
+                ui::activity(
+                    "Refreshed account framing",
+                    format!("{n} account(s) · why-them updated for copy · no Apollo"),
+                );
+                n
+            }
+            Err(e) => {
+                ui::activity("Framing refresh skipped", format!("{e:#}"));
+                0
+            }
+        }
     }
 
     fn approve_outreach(&self) -> String {
@@ -1086,7 +1678,7 @@ impl Agent {
             .data
             .accounts
             .iter()
-            .filter(|a| scope.map_or(true, |brand| a.brand == brand))
+            .filter(|a| scope.is_none_or(|brand| a.brand == brand))
             .collect();
         if real.is_empty() && research.is_empty() {
             ui::activity("Read CRM", "No accounts found");
@@ -1224,20 +1816,25 @@ impl Agent {
             "This is a multi-brand PORTFOLIO, not a single fixed brand. For each request, infer which brand it concerns from its wording and the portfolio list, and set `brand` to that brand — do not stay on the current working brand out of inertia. Leave `brand` empty only for portfolio-wide reads (show_funnel, list_accounts, list_opportunities, show_learnings), which then span every brand.".to_string()
         };
         format!(
-            "Route one terminal request to exactly one structured action. Write `plan` first as one first-person sentence (max 20 words), then fill only fields needed by the action.\n\n\
+            "Turn the request directly into an ordered list of `steps` to run this turn. Each step is exactly ONE action for ONE brand. Do not narrate your analysis or claim an action has completed.\n\n\
+MULTIPLE brands or things in one request → emit one step per (brand, action), in the user's order. Examples:\n\
+- 'full motion for gnk and outagehub and wapahki' → three run_full_motion steps, brand gnk / outagehub / wapahki.\n\
+- 'source 10 for gnk, then draft wapahki' → a source_leads step (brand gnk) and a plan_outreach step (brand wapahki).\n\
+- Different actions for different brands in one message are fine; each step carries its own brand and its own fields.\n\
+For a pure conversational answer (no action to run), leave `steps` empty and put the answer in `reply`.\n\n\
 {brand_mode}\n\n\
-Actions:\n\
+Actions (each is a step's `action`):\n\
 - run_campaign: hypothetical research-only campaign; no Apollo.\n\
-- source_leads: ONLY finds and qualifies Apollo accounts+people, then stops — it writes NO emails. Use only when the request is purely to find companies/people. set thesis/accounts/contacts (defaults 10/3).\n\
-- run_full_motion: the end-to-end motion — source, enrich, AND draft the sequences in one request (never sends). Use this whenever ONE request asks to both find companies/people AND write/draft/create outreach or a sequence. set thesis/accounts/contacts/touches (defaults 5/5/7).\n\
+- source_leads: ONLY finds and qualifies Apollo accounts+people, then stops — it writes NO emails. Use only when the request is purely to find companies/people and they want NEW Apollo search. set thesis/accounts/contacts (defaults 10/3).\n\
+- run_full_motion: end-to-end motion for a brand (never sends). REUSE-FIRST: if the CRM already has enough accounts/people for that brand, it SKIPS Apollo, refreshes why those companies fit, and rewrites the sequences — cheaper and preferred when the operator says find N companies + write the sequence for a brand that already has inventory. set thesis/accounts/contacts/touches (defaults 5/5/7). set force_new=true ONLY when they explicitly ask for new/fresh/more companies not already on file.\n\
 - enrich_people: reveal/verify sourced emails; phone only when explicit.\n\
-- plan_outreach: draft or re-draft sequences for contacts ALREADY found (no Apollo spend). set replace=true to rewrite/improve existing drafts; auto only when explicit.\n\
+- plan_outreach: draft or re-draft sequences for contacts ALREADY found (no account/people search). A scoped request may reveal only those selected contacts whose email is still missing, because an email sequence must not silently shrink; skip that reveal when the operator says no Apollo/no enrichment/verified only. For 'first N people in the first company', set accounts=1 and contacts=N. accounts limits companies in current CRM order; contacts limits people per company. OMIT limit unless the user explicitly says total/overall/at most/cap. Existing unsent drafts are safely replaced; auto only when explicit.\n\
 - approve_outreach: only after explicit approval — this is what actually schedules drafts to send.\n\
 - discover_opportunities, list_opportunities (actionable when requested), resolve_opportunity_contacts (enrich only with explicit credit authorization), plan_funding_outreach (auto only when explicit), approve_funding_outreach (reviewed opportunity_id + explicit approval), prepare_application: the funding/procurement motion; set opportunity_id where needed.\n\
-- show_funnel, show_calendar, list_accounts, list_opportunities, show_learnings, open_crm: direct read/open actions (leave brand empty to span all brands).\n\
+- show_funnel, show_calendar, list_accounts, list_opportunities, show_learnings, open_crm, open_gtm: direct read/open actions (leave a step's brand empty to span all brands). Use open_gtm when the operator asks to inspect signals, root-cause qualification, active plays, experiments, proofs, or attributed outcomes.\n\
 - search_knowledge: put the topic in query.\n\
-- reply: everything else; at most two short plain-text sentences.\n\n\
-Available brands: {brands}. Drafting always HOLDS sequences for review; nothing sends until approve_outreach. Do not ask for confirmation when the action performs the request. Apollo identities are real but commercial conclusions remain hypotheses. Never claim funding eligibility without every mandatory criterion, invent evidence, or treat every instrument as a grant.",
+Gmail is linked outside the router via /login <brand> (browser OAuth) and /mail-sync; do not invent credentials. When the user asks to check inbox/sent or what is working, prefer show_learnings after they have synced mail, and remind them to /login + /mail-sync if nothing is linked.\n\n\
+Available brands: {brands}. Drafting always HOLDS sequences for review; nothing sends until approve_outreach. Do not ask for confirmation when a step performs the request. Apollo identities are real but commercial conclusions remain hypotheses. Never claim funding eligibility without every mandatory criterion, invent evidence, or treat every instrument as a grant.",
             brands = self.brand_keys().join(" | "),
         )
     }
@@ -1252,33 +1849,41 @@ Available brands: {brands}. Drafting always HOLDS sequences for review; nothing 
 }
 
 fn decision_schema(brands: &[&str]) -> Value {
+    let step = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["action"],
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["run_campaign", "source_leads", "run_full_motion", "enrich_people", "plan_outreach", "approve_outreach", "discover_opportunities", "list_opportunities", "resolve_opportunity_contacts", "plan_funding_outreach", "approve_funding_outreach", "prepare_application", "show_funnel", "show_calendar", "list_accounts", "show_learnings", "open_crm", "open_gtm", "search_knowledge"]
+            },
+            "brand": { "type": "string", "enum": brands, "description": "The brand this step concerns. Leave empty only for portfolio-wide reads (they span all brands)." },
+            "thesis": { "type": "string", "description": "The workflow/market to target for sourcing/campaign steps." },
+            "query": { "type": "string", "description": "For search_knowledge: the topic to look up in the ingested books." },
+            "accounts": { "type": "integer", "description": "For plan_outreach, number of existing companies in current CRM order to scope. Set 1 for 'the first company'." },
+            "contacts": { "type": "integer", "description": "For plan_outreach, number of visible-order verified people per selected company. Set 3 for 'first 3 people'." },
+            "touches": { "type": "integer" },
+            "limit": { "type": "integer", "description": "Optional TOTAL contact cap for plan_outreach. Set only when the user explicitly says total, overall, at most, maximum, limit, or cap; otherwise omit." },
+            "phone": { "type": "boolean" },
+            "auto": { "type": "boolean" },
+            "force_new": { "type": "boolean", "description": "For run_full_motion: force Apollo to find new accounts even when the CRM already has enough. Default false (reuse on-file inventory)." },
+            "enrich": { "type": "boolean", "description": "Reveal Apollo opportunity-contact emails now; costs credits." },
+            "actionable": { "type": "boolean", "description": "For opportunity lists, exclude closed, ineligible, lost, and expired records." },
+            "opportunity_id": { "type": "string", "description": "Persisted opportunity id for contact, outreach, or application actions." }
+        }
+    });
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["plan", "action", "reply"],
+        "required": ["steps", "reply"],
         "properties": {
-            "plan": {
-                "type": "string",
-                "description": "Write this FIRST: ONE short first-person sentence (≤20 words) of what you'll do and why. Shown live as your thinking. Not a multi-step plan, not a list, not user-facing prose, not a summary of the answer."
+            "steps": {
+                "type": "array",
+                "items": step,
+                "description": "Ordered actions to run this turn — one (or more) per brand, possibly different actions per brand. Empty for a pure conversational reply."
             },
-            "action": {
-                "type": "string",
-                "enum": ["run_campaign", "source_leads", "run_full_motion", "enrich_people", "plan_outreach", "approve_outreach", "discover_opportunities", "list_opportunities", "resolve_opportunity_contacts", "plan_funding_outreach", "approve_funding_outreach", "prepare_application", "show_funnel", "show_calendar", "list_accounts", "show_learnings", "open_crm", "search_knowledge", "reply"]
-            },
-            "reply": { "type": "string", "description": "Message to show the user: at most two short plain-text sentences, no markdown/lists/emoji, no re-asking to confirm steps the action already does." },
-            "thesis": { "type": "string", "description": "For run_campaign: the workflow/market to target." },
-            "query": { "type": "string", "description": "For search_knowledge: the topic to look up in the ingested books." },
-            "brand": { "type": "string", "enum": brands, "description": "The brand this request concerns; set it per request. Leave empty for portfolio-wide reads (they span all brands)." },
-            "accounts": { "type": "integer" },
-            "contacts": { "type": "integer" },
-            "touches": { "type": "integer" },
-            "limit": { "type": "integer" },
-            "phone": { "type": "boolean" },
-            "auto": { "type": "boolean" }
-            ,"replace": { "type": "boolean", "description": "For plan_outreach: re-draft/improve existing unsent sequences instead of skipping contacts who already have one. Reuses contacts already found; no Apollo spend." }
-            ,"enrich": { "type": "boolean", "description": "Reveal Apollo opportunity-contact emails now; costs credits." }
-            ,"actionable": { "type": "boolean", "description": "For opportunity lists, exclude closed, ineligible, lost, and expired records." }
-            ,"opportunity_id": { "type": "string", "description": "Persisted opportunity id for contact, outreach, or application actions." }
+            "reply": { "type": "string", "description": "Conversational answer, used ONLY when steps is empty: at most two short plain-text sentences, no markdown/lists/emoji." }
         }
     })
 }
@@ -1297,14 +1902,101 @@ pub fn open_browser(url: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::decision_schema;
+    use super::{
+        decision_schema, forbids_contact_enrichment, routed_total_limit, select_plan_scope,
+    };
+    use crate::db::{Db, Lead, Person};
 
     #[test]
-    fn decision_schema_requires_a_visible_plan() {
+    fn decision_schema_does_not_request_router_scratch_work() {
         let schema = decision_schema(&["test-brand"]);
         let required = schema["required"].as_array().expect("required fields");
 
-        assert!(required.iter().any(|field| field == "plan"));
-        assert_eq!(schema["properties"]["plan"]["type"], "string");
+        assert!(required.iter().all(|field| field != "plan"));
+        assert!(schema["properties"].get("plan").is_none());
+    }
+
+    #[test]
+    fn decision_schema_routes_a_list_of_per_brand_steps() {
+        let schema = decision_schema(&["gnk", "outagehub", "wapahki"]);
+        // A turn is a list of steps, so several brands/actions run in one request.
+        assert_eq!(schema["properties"]["steps"]["type"], "array");
+        let step = &schema["properties"]["steps"]["items"];
+        assert_eq!(step["type"], "object");
+        // Each step carries its own action and brand.
+        assert_eq!(step["properties"]["action"]["type"], "string");
+        assert_eq!(step["properties"]["brand"]["enum"][0], "gnk");
+        // `reply` is only for the no-steps conversational path — not a step action.
+        let step_actions = step["properties"]["action"]["enum"]
+            .as_array()
+            .expect("step actions");
+        assert!(step_actions.iter().all(|action| action != "reply"));
+    }
+
+    #[test]
+    fn router_cannot_silently_collapse_account_times_contact_scope() {
+        let input = "write the first 2 people for the first 5 companies";
+        assert_eq!(routed_total_limit(input, Some(5), Some(2), Some(1)), None);
+        assert_eq!(
+            routed_total_limit(
+                "write 2 people for 5 companies, capped at 6 total",
+                Some(5),
+                Some(2),
+                Some(6)
+            ),
+            Some(6)
+        );
+        assert!(forbids_contact_enrichment(
+            "refine the same scope without Apollo"
+        ));
+        assert!(!forbids_contact_enrichment(
+            "write the first 2 people for the first 5 companies"
+        ));
+    }
+
+    #[test]
+    fn scoped_plan_selects_visible_people_before_email_enrichment() {
+        let db = Db::open(":memory:").expect("open db");
+        let lead_id = db
+            .upsert_lead(&Lead {
+                brand: "wapahki".into(),
+                apollo_org_id: "scope-org".into(),
+                name: "Scope Foods".into(),
+                ..Default::default()
+            })
+            .expect("insert lead");
+        let primary_id = db
+            .upsert_person(&Person {
+                lead_id: lead_id.clone(),
+                brand: "wapahki".into(),
+                apollo_person_id: "scope-primary".into(),
+                name: "Primary Operator".into(),
+                primary: true,
+                status: "new".into(),
+                email_status: "unknown".into(),
+                ..Default::default()
+            })
+            .expect("insert primary");
+        let verified_id = db
+            .upsert_person(&Person {
+                lead_id,
+                brand: "wapahki".into(),
+                apollo_person_id: "scope-verified".into(),
+                name: "Verified Operator".into(),
+                status: "verified".into(),
+                email_status: "verified".into(),
+                email: "verified@example.com".into(),
+                ..Default::default()
+            })
+            .expect("insert verified");
+
+        let scope =
+            select_plan_scope(&db, "wapahki", Some(1), Some(2), None).expect("select scope");
+        assert_eq!(scope.requested_people, 2);
+        assert_eq!(scope.selected_ids.len(), 2);
+        assert!(scope.selected_ids.contains(&primary_id));
+        assert!(scope.selected_ids.contains(&verified_id));
+        assert_eq!(scope.pending_enrichment_ids.len(), 1);
+        assert!(scope.pending_enrichment_ids.contains(&primary_id));
     }
 }

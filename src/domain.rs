@@ -86,7 +86,7 @@ pub struct Touch {
     pub stage: u32,
     /// Days after the start of the sequence that this touch fires.
     pub day_offset: u32,
-    /// "email" | "linkedin" | "call".
+    /// "email" | "linkedin" | "linkedin_request" | "linkedin_or_email".
     pub channel: String,
     /// Empty for channels without a subject.
     pub subject: String,

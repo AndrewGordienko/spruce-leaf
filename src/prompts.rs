@@ -177,14 +177,16 @@ ACCOUNT CONTEXT (your research — most of this stays OUT of the email):\n\
   Hardest buyer question: {hard_q}\n\
   Observed facts (only THESE may be stated as fact): {facts}\n\n\
 Number the touches 1..{n}. The sequence is ONE unfolding investigation, each touch adding a new \
-angle — not restatements. Match the channel and ask to {name}'s vantage. Use email/linkedin/call. \
-For each touch set: day_offset from the start; channel; subject (empty string for non-email); the \
+angle — not restatements. Match the channel and ask to {name}'s vantage. Use email and LinkedIn only. \
+For each touch set: day_offset from the start; channel; subject (empty string for a connection request); the \
 body copy; purpose (which move this is — observation / diagnostic / consequence / artifact / \
 hard-question / routing / close); and goal.\n\n\
-If writing seven touches, use this channel pattern: email, linkedin, email, call, email, linkedin, \
-email. Finish by day 21. Touch 1 email is 40–75 words including the signature; later emails are \
-15–45 words; LinkedIn notes are 12–30 words; calls are short talk tracks. Touch 7 is 15–30 words \
-with no question. Mention {brand} only in touch 1. Use at most one \
+If writing seven touches, use these exact channel/day pairs: email/0, email/3, \
+linkedin_request/5, email/9, linkedin_or_email/13, email/17, linkedin_or_email/21. \
+The connection request is 8–24 words with no pitch or meeting ask. Conditional touches are short \
+LinkedIn DMs when connected and email fallbacks otherwise. Finish by day 21. Touch 1 email is \
+40–75 words including the signature; later emails are 15–45 words; touch 7 has no question. \
+Mention {brand} only in touch 1. Use at most one \
 question, one CTA, one verified account fact, and one short sentence about {brand} per touch. \
 Subjects are 2–4 plain words. Do not use fake familiarity, explain your strategy, dump the \
 research, or assert limitations of the recipient's tools.\n\n\

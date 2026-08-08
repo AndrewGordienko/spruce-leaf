@@ -6,8 +6,8 @@
 //! sequence for each, and files everything in a local CRM at
 //! http://localhost:<port>.
 //!
-//! Reasoning runs through an authenticated local Codex or Claude CLI, so no
-//! model API key is needed. The outreach doctrine lives in editable
+//! Reasoning runs through an authenticated local Claude, Codex, or Grok CLI, so
+//! no model API key is needed. The outreach doctrine lives in editable
 //! `playbooks/*.toml`, one per brand.
 //!
 //! Subcommands:
@@ -26,7 +26,10 @@ mod db;
 mod domain;
 mod engine;
 mod enrich;
+mod gmail;
 mod google_calendar;
+mod google_oauth;
+mod gtm;
 mod inbox;
 mod jobs;
 mod knowledge;
@@ -43,6 +46,7 @@ mod report;
 mod research;
 mod send;
 mod sourcing;
+mod storage;
 mod synthesis;
 mod triage;
 mod ui;
@@ -86,8 +90,8 @@ struct Cli {
     #[arg(long, global = true, default_value = "businesses")]
     businesses: String,
 
-    /// Authenticated local CLI to use for model reasoning.
-    #[arg(long, global = true, value_enum, default_value_t = Backend::Claude)]
+    /// Inference provider. OpenAI uses the Responses API; others use local CLIs.
+    #[arg(long, global = true, value_enum, default_value_t = Backend::Openai)]
     backend: Backend,
 
     /// Model override for the selected backend. Omit to use its default.
@@ -142,6 +146,9 @@ enum Command {
     /// Serve only the CRM dashboard (no agent).
     Crm,
 
+    /// Open the GTM engineering lab: signals, plays, experiments, outcomes, and proofs.
+    Gtm,
+
     /// Ingest business/sales books into the knowledge library (.txt/.md/.pdf).
     Ingest {
         /// Files or directories of books to ingest.
@@ -178,6 +185,15 @@ enum Command {
     Plan {
         #[arg(long, default_value_t = 7, value_parser = positive_usize)]
         touches: usize,
+        /// Limit planning to the first N existing companies in CRM order.
+        #[arg(long, value_parser = positive_usize)]
+        accounts: Option<usize>,
+        /// Limit planning to the first N visible verified people per company.
+        #[arg(long, value_parser = positive_usize)]
+        contacts: Option<usize>,
+        /// Optional total contact cap across the selected companies.
+        #[arg(long, value_parser = positive_usize)]
+        limit: Option<usize>,
         /// Schedule email touches immediately instead of leaving them as drafts.
         #[arg(long)]
         auto: bool,
@@ -274,6 +290,25 @@ enum Command {
     /// Configure + health-check per-brand sending mailboxes from env.
     Mailboxes,
 
+    /// Browser OAuth: link a brand Gmail account (opens Chrome; no App Passwords).
+    Login {
+        /// Brand key: gnk | wapahki | outagehub
+        brand: String,
+    },
+
+    /// Show which brand Gmail accounts are linked via OAuth.
+    MailStatus,
+
+    /// Pull recent Gmail inbox+sent into conversations and learnings.
+    MailSync {
+        /// Limit to one brand (default: every linked brand).
+        #[arg(long)]
+        brand: Option<String>,
+        /// Max messages per label (inbox/sent). Default 40.
+        #[arg(long, default_value_t = 40)]
+        limit: usize,
+    },
+
     /// Add an email (or @domain) to the active brand's suppression list.
     Suppress { email: String },
 
@@ -344,13 +379,49 @@ fn main() -> Result<()> {
 
     match command {
         Command::Crm => {
-            let endpoint = ensure_crm_server(&rt, &store, &db, cli.port)?;
+            let playbooks = Arc::new(load_playbooks(&cli)?);
+            let businesses = Arc::new(load_businesses(&cli)?);
+            let endpoint = ensure_crm_server(
+                &rt,
+                &store,
+                &db,
+                &businesses,
+                &playbooks,
+                &library,
+                CrmStartPolicy::viewer(cli.port),
+            )?;
             let url = endpoint.url();
             if endpoint.reused {
                 println!("\u{2713} using the CRM already running at {url}");
             } else {
                 println!("\u{1F332} CRM dashboard at {url}  (ctrl-c to stop)");
+                println!("         Strategy board: {url}/strategy");
+                println!("         GTM Lab:        {url}/gtm");
             }
+            // Open the strategy board first — the business side of the SDR —
+            // so operators see goals and doctrine before the pipeline sheet.
+            agent::open_browser(&format!("{url}/strategy"));
+            if endpoint.reused {
+                return Ok(());
+            }
+            rt.block_on(std::future::pending::<()>());
+            Ok(())
+        }
+
+        Command::Gtm => {
+            let playbooks = Arc::new(load_playbooks(&cli)?);
+            let businesses = Arc::new(load_businesses(&cli)?);
+            let endpoint = ensure_crm_server(
+                &rt,
+                &store,
+                &db,
+                &businesses,
+                &playbooks,
+                &library,
+                CrmStartPolicy::viewer(cli.port),
+            )?;
+            let url = format!("{}/gtm/{}", endpoint.url(), cli.brand);
+            println!("\u{2713} GTM Lab ready at {url}");
             agent::open_browser(&url);
             if endpoint.reused {
                 return Ok(());
@@ -465,6 +536,7 @@ fn main() -> Result<()> {
                 accounts,
                 contacts,
                 cli.concurrency,
+                None,
             ))?;
             println!(
                 "\u{2713} {} orgs \u{2192} {} qualified leads, {} people.\n  next: spruce-leaf --brand {} enrich",
@@ -485,6 +557,8 @@ fn main() -> Result<()> {
                 Some(&cli.brand),
                 limit,
                 phone,
+                None,
+                None,
             ))?;
             println!(
                 "\u{2713} attempted {}, emails found {}, verified {} (~{} Apollo credits).{}\n  next: spruce-leaf --brand {} plan",
@@ -503,6 +577,9 @@ fn main() -> Result<()> {
 
         Command::Plan {
             touches,
+            accounts,
+            contacts,
+            limit,
             auto,
             person,
             replace_drafts,
@@ -513,6 +590,42 @@ fn main() -> Result<()> {
             let businesses = load_businesses(&cli)?;
             let business = businesses.get(&cli.brand)?;
             let lib = rt.block_on(async { library.read().await.clone() });
+            let scoped = accounts.is_some() || contacts.is_some() || limit.is_some();
+            let only_person_ids = if scoped {
+                let leads = db.list_leads(Some(&cli.brand))?;
+                let people = db.list_people(Some(&cli.brand), Some("verified"))?;
+                let account_count = accounts.unwrap_or_else(|| {
+                    if contacts.is_some() {
+                        1
+                    } else {
+                        leads.len().max(1)
+                    }
+                });
+                let per_account = contacts.unwrap_or(usize::MAX);
+                let total = limit.unwrap_or(usize::MAX);
+                let mut selected = Vec::new();
+                for lead in leads.into_iter().take(account_count) {
+                    let mut account_people = people
+                        .iter()
+                        .filter(|person| person.lead_id == lead.id)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    account_people.sort_by_key(|person| !person.primary);
+                    selected.extend(account_people.into_iter().take(per_account));
+                    if selected.len() >= total {
+                        break;
+                    }
+                }
+                selected.truncate(total);
+                Some(
+                    selected
+                        .into_iter()
+                        .map(|person| person.id)
+                        .collect::<std::collections::HashSet<_>>(),
+                )
+            } else {
+                None
+            };
             let s = rt.block_on(outreach::plan_pending(
                 &db,
                 &client,
@@ -526,21 +639,37 @@ fn main() -> Result<()> {
                 critique,
                 person.as_deref(),
                 replace_drafts,
-                false,
+                if scoped {
+                    None
+                } else {
+                    Some(
+                        business
+                            .account_limits
+                            .max_active_contacts_per_account
+                            .clamp(1, 2),
+                    )
+                },
+                only_person_ids.as_ref(),
                 None,
             ))?;
             println!(
-                "\u{2713} planned {} people: {} touches scheduled, {} drafted, {} rejected, {} old draft sequence(s) replaced/pruned.{}",
+                "{} planned {} people: {} touches scheduled, {} drafted, {} rejected, {} stopped, {} old draft sequence(s) replaced/pruned.{}{}",
+                if s.stopped_reason.is_some() { "!" } else { "\u{2713}" },
                 s.people_planned,
                 s.touches_scheduled,
                 s.touches_drafted,
                 s.people_rejected,
+                s.people_stopped,
                 s.sequences_replaced,
                 if auto {
                     ""
                 } else {
                     "\n  approve with: spruce-leaf approve"
-                }
+                },
+                s.stopped_reason
+                    .as_ref()
+                    .map(|reason| format!("\n  stopped early: {reason}"))
+                    .unwrap_or_default(),
             );
             Ok(())
         }
@@ -809,6 +938,45 @@ fn main() -> Result<()> {
             Ok(())
         }
 
+        Command::Login { brand } => {
+            let playbooks = load_playbooks(&cli)?;
+            if playbooks.get(&brand).is_err() {
+                anyhow::bail!(
+                    "unknown brand '{brand}'. Available: {}",
+                    playbooks.keys().join(", ")
+                );
+            }
+            println!("Opening browser to link Gmail for {brand}…");
+            let set = rt.block_on(google_oauth::login_brand(&brand, |url| {
+                agent::open_browser(url);
+            }))?;
+            println!(
+                "\u{2713} {brand} linked as {}  (tokens in .spruce/google/{brand}.json)",
+                set.email
+            );
+            println!("Next: spruce-leaf mail-sync --brand {brand}");
+            Ok(())
+        }
+
+        Command::MailStatus => {
+            let playbooks = load_playbooks(&cli)?;
+            println!("Gmail OAuth status:");
+            println!(
+                "{}",
+                google_oauth::GoogleTokenSet::status_report(&playbooks.keys())
+            );
+            Ok(())
+        }
+
+        Command::MailSync { brand, limit } => {
+            let summaries = rt.block_on(gmail::sync_all(&db, brand.as_deref(), limit))?;
+            println!(
+                "\u{2713} Gmail sync complete:\n{}",
+                gmail::format_sync_report(&summaries)
+            );
+            Ok(())
+        }
+
         Command::Mailboxes => {
             let playbooks = load_playbooks(&cli)?;
             let n = mailbox::load_from_env(&db, &playbooks.keys())?;
@@ -988,11 +1156,21 @@ fn main() -> Result<()> {
             // Validate the requested brand up front.
             playbooks.get(&cli.brand)?;
             businesses.get(&cli.brand)?;
-            let endpoint = ensure_crm_server(&rt, &store, &db, cli.port)?;
+            let endpoint = ensure_crm_server(
+                &rt,
+                &store,
+                &db,
+                &businesses,
+                &playbooks,
+                &library,
+                CrmStartPolicy::interactive(cli.port),
+            )?;
             if endpoint.reused {
                 eprintln!("\u{2713} reusing CRM at {}", endpoint.url());
             } else {
                 eprintln!("\u{2713} CRM ready at {}", endpoint.url());
+                eprintln!("         Strategy board: {}/strategy", endpoint.url());
+                eprintln!("         GTM Lab:        {}/gtm", endpoint.url());
             }
             let agent = agent::Agent::new(
                 client,
@@ -1023,6 +1201,28 @@ struct CrmEndpoint {
 impl CrmEndpoint {
     fn url(self) -> String {
         format!("http://127.0.0.1:{}", self.port)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CrmStartPolicy {
+    preferred_port: Option<u16>,
+    allow_reuse: bool,
+}
+
+impl CrmStartPolicy {
+    fn viewer(preferred_port: Option<u16>) -> Self {
+        Self {
+            preferred_port,
+            allow_reuse: true,
+        }
+    }
+
+    fn interactive(preferred_port: Option<u16>) -> Self {
+        Self {
+            preferred_port,
+            allow_reuse: false,
+        }
     }
 }
 
@@ -1127,16 +1327,21 @@ fn ensure_crm_server(
     rt: &tokio::runtime::Runtime,
     store: &crm::SharedStore,
     db: &db::SharedDb,
-    preferred_port: Option<u16>,
+    businesses: &Arc<Businesses>,
+    playbooks: &Arc<Playbooks>,
+    library: &knowledge::SharedLibrary,
+    policy: CrmStartPolicy,
 ) -> Result<CrmEndpoint> {
-    let first = preferred_port.unwrap_or(DEFAULT_CRM_PORT);
-    let existing_ports = if preferred_port.is_some() {
-        vec![first]
-    } else {
-        crm::port_candidates(first)
-    };
-    if let Some(port) = existing_ports.into_iter().find(|port| is_spruce_crm(*port)) {
-        return Ok(CrmEndpoint { port, reused: true });
+    let first = policy.preferred_port.unwrap_or(DEFAULT_CRM_PORT);
+    if policy.allow_reuse {
+        let existing_ports = if policy.preferred_port.is_some() {
+            vec![first]
+        } else {
+            crm::port_candidates(first)
+        };
+        if let Some(port) = existing_ports.into_iter().find(|port| is_spruce_crm(*port)) {
+            return Ok(CrmEndpoint { port, reused: true });
+        }
     }
 
     let listener = bind_available_crm_listener(first)?;
@@ -1146,8 +1351,13 @@ fn ensure_crm_server(
         .port();
     let store = store.clone();
     let db = db.clone();
+    let businesses = businesses.clone();
+    let playbooks = playbooks.clone();
+    let library = library.clone();
     rt.spawn(async move {
-        if let Err(error) = crm::serve_on_listener(store, db, listener).await {
+        if let Err(error) =
+            crm::serve_on_listener(store, db, businesses, playbooks, library, listener).await
+        {
             eprintln!("CRM server error: {error:#}");
         }
     });
@@ -1155,11 +1365,16 @@ fn ensure_crm_server(
     // otherwise advertise a dead port and every "in the CRM at …" message would
     // be a lie. Wait for the health endpoint to actually answer before we call it
     // ready — the socket is already listening, so this resolves in a few ms.
+    let mut ready = false;
     for _ in 0..40 {
         if is_spruce_crm(port) {
+            ready = true;
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
+    }
+    if !ready {
+        anyhow::bail!("CRM failed to become healthy at http://127.0.0.1:{port}");
     }
     Ok(CrmEndpoint {
         port,
@@ -1175,29 +1390,16 @@ fn is_spruce_crm(port: u16) -> bool {
     crm::is_live(port)
 }
 
-#[allow(dead_code)]
-fn spawn_server(
-    rt: &tokio::runtime::Runtime,
-    store: &crm::SharedStore,
-    db: &db::SharedDb,
-    port: u16,
-) {
-    let store = store.clone();
-    let db = db.clone();
-    rt.spawn(async move {
-        if let Err(e) = crm::serve(store, db, port).await {
-            eprintln!("CRM server error: {e:#}");
-        }
-    });
-}
-
 /// Build the selected local-CLI engine and preflight that it is available.
 fn make_engine(rt: &tokio::runtime::Runtime, cli: &Cli) -> Result<Engine> {
     let engine = Engine::new(cli.backend, cli.model.clone());
     let version = rt.block_on(engine.check())?;
+    // Print as `backend · version` so a version string that already names the
+    // product (e.g. `2.1.170 (Claude Code)`) is not double-tagged as `(claude)`.
     eprintln!(
-        "\u{2713} using {version} ({}) as the reasoning engine",
-        engine.backend().as_str()
+        "\u{2713} reasoning engine: {} · {}",
+        engine.backend().as_str(),
+        version
     );
     Ok(engine)
 }
@@ -1283,7 +1485,7 @@ mod startup_tests {
             let _ = stream.read(&mut request);
             stream
                 .write_all(
-                    b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{\"app\":\"spruce-leaf\"}",
+                    b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{\"app\":\"spruce-leaf\",\"protocol\":2}",
                 )
                 .expect("write health response");
         });

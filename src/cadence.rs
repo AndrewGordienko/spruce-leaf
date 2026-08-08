@@ -94,8 +94,29 @@ pub async fn tick(
         };
         let profile = businesses.get(&touch.brand)?;
 
-        // Only email real, verified, still-engageable recipients.
-        if !touch.channel.eq_ignore_ascii_case("email") {
+        // Conditional touches become a manual LinkedIn task when the operator
+        // has marked the connection accepted. Unknown/requested/not-connected
+        // safely fall back to the reviewed email version.
+        let conditional = touch.channel.eq_ignore_ascii_case("linkedin_or_email");
+        if conditional && person.linkedin_status == "connected" {
+            if !cfg.dry_run {
+                db.set_touch_status(
+                    &touch.id,
+                    "draft",
+                    "",
+                    "",
+                    "LinkedIn connected: send this touch manually as a DM",
+                )?;
+            } else {
+                eprintln!(
+                    "  · would hold [{}] stage {} for LinkedIn DM to {}",
+                    touch.brand, touch.stage, person.name
+                );
+            }
+            continue;
+        }
+        // Only email-capable touches reach SMTP.
+        if !touch.channel.eq_ignore_ascii_case("email") && !conditional {
             continue;
         }
         if person.email.trim().is_empty() || person.email_status != "verified" {
@@ -275,6 +296,12 @@ pub async fn tick(
             in_reply_to,
             references: Vec::new(),
         };
+
+        // `due_touches` is a snapshot. Another daemon may have read the same
+        // row, so live delivery must win an atomic claim before sending.
+        if !cfg.dry_run && !db.claim_touch_for_send(&touch.id)? {
+            continue;
+        }
 
         match send::send_email(&mailbox, &out, cfg.dry_run).await {
             Ok(_) if cfg.dry_run => {
@@ -479,6 +506,9 @@ async fn tick_conversation_replies(
             in_reply_to,
             references: message.references.clone(),
         };
+        if !cfg.dry_run && !db.claim_conversation_message_for_send(&message.id)? {
+            continue;
+        }
         match send::send_email(&mailbox, &outgoing, cfg.dry_run).await {
             Ok(_) if cfg.dry_run => {
                 eprintln!(
@@ -681,6 +711,10 @@ async fn tick_opportunity_outreach(
             in_reply_to: db.previous_opportunity_message_id(&contact.id, touch.stage)?,
             references: Vec::new(),
         };
+
+        if !cfg.dry_run && !db.claim_opportunity_touch_for_send(&touch.id)? {
+            continue;
+        }
 
         match send::send_email(&mailbox, &out, cfg.dry_run).await {
             Ok(_) if cfg.dry_run => {

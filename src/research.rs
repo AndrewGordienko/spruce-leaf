@@ -67,6 +67,9 @@ impl CompanyBrief {
         for sig in &self.signals {
             s.push_str(&format!("- signal: {sig}\n"));
         }
+        for source in &self.sources {
+            s.push_str(&format!("- source URL: {source}\n"));
+        }
         if !self.problem_hypothesis.trim().is_empty() {
             s.push_str(&format!(
                 "- possible fit to our motion: {}\n",

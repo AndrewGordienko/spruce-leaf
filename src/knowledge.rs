@@ -204,6 +204,7 @@ impl Library {
             }
             Library::default()
         };
+        lib.repair_generic_titles();
         lib.path = path;
         lib.build_index();
         Ok(lib)
@@ -211,7 +212,7 @@ impl Library {
 
     pub fn save(&self) -> Result<()> {
         let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(&self.path, json)
+        crate::storage::atomic_write(&self.path, json)
             .with_context(|| format!("writing knowledge library {}", self.path.display()))
     }
 
@@ -253,6 +254,40 @@ impl Library {
         self.c_index = Bm25::build(&c_docs);
     }
 
+    /// Skill repositories conventionally name every entrypoint `SKILL.md`.
+    /// Use the parent directory as the visible source title so retrieval and
+    /// the Strategy board say `campaign-copywriting`, not 28 copies of `SKILL`.
+    fn repair_generic_titles(&mut self) {
+        let mut renamed = HashMap::new();
+        for book in &mut self.books {
+            if !matches!(book.title.as_str(), "SKILL" | "Skill") {
+                continue;
+            }
+            let source = Path::new(&book.source);
+            let Some(parent) = source.parent() else {
+                continue;
+            };
+            let title = title_from_component(parent.file_name().and_then(|name| name.to_str()));
+            if !title.is_empty() {
+                book.title = title.clone();
+                renamed.insert(book.id.clone(), title);
+            }
+        }
+        if renamed.is_empty() {
+            return;
+        }
+        for chunk in &mut self.chunks {
+            if let Some(title) = renamed.get(&chunk.book_id) {
+                chunk.book_title = title.clone();
+            }
+        }
+        for principle in &mut self.principles {
+            if let Some(title) = renamed.get(&principle.book_id) {
+                principle.book_title = title.clone();
+            }
+        }
+    }
+
     // --- Retrieval ---------------------------------------------------------
 
     /// Retrieve the most relevant principles (primary) and passages (grounding)
@@ -264,12 +299,35 @@ impl Library {
             .into_iter()
             .filter_map(|(i, _)| self.principles.get(i).cloned())
             .collect();
-        let chunks = self
-            .c_index
-            .search(query, n_chunks)
-            .into_iter()
-            .filter_map(|(i, _)| self.chunks.get(i).cloned())
-            .collect();
+        // Raw-only books and installed skills still carry useful guidance
+        // before distillation. Diversify supporting passages by source just as
+        // we diversify principle cards, otherwise two lexically similar chunks
+        // from one skill can crowd every other source out of a small prompt.
+        let ranked_chunks = self.c_index.search(query, n_chunks.saturating_mul(8));
+        let mut chunks = Vec::new();
+        let mut chunk_books = HashSet::new();
+        for &(index, _) in &ranked_chunks {
+            if chunks.len() >= n_chunks {
+                break;
+            }
+            let Some(chunk) = self.chunks.get(index) else {
+                continue;
+            };
+            if chunk_books.insert(chunk.book_id.clone()) {
+                chunks.push(chunk.clone());
+            }
+        }
+        for &(index, _) in &ranked_chunks {
+            if chunks.len() >= n_chunks {
+                break;
+            }
+            let Some(chunk) = self.chunks.get(index) else {
+                continue;
+            };
+            if !chunks.iter().any(|existing| existing.id == chunk.id) {
+                chunks.push(chunk.clone());
+            }
+        }
         Retrieved { principles, chunks }
     }
 
@@ -335,12 +393,31 @@ impl Library {
                 }
             }
         }
-        let chunks = self
-            .c_index
-            .search(query, n_chunks)
-            .into_iter()
-            .filter_map(|(i, _)| self.chunks.get(i).cloned())
-            .collect();
+        let ranked_chunks = self.c_index.search(query, n_chunks.saturating_mul(8));
+        let mut chunks = Vec::new();
+        let mut chunk_books = HashSet::new();
+        for &(index, _) in &ranked_chunks {
+            if chunks.len() >= n_chunks {
+                break;
+            }
+            let Some(chunk) = self.chunks.get(index) else {
+                continue;
+            };
+            if chunk_books.insert(chunk.book_id.clone()) {
+                chunks.push(chunk.clone());
+            }
+        }
+        for &(index, _) in &ranked_chunks {
+            if chunks.len() >= n_chunks {
+                break;
+            }
+            let Some(chunk) = self.chunks.get(index) else {
+                continue;
+            };
+            if !chunks.iter().any(|existing| existing.id == chunk.id) {
+                chunks.push(chunk.clone());
+            }
+        }
         Retrieved { principles, chunks }
     }
 
@@ -1082,7 +1159,19 @@ fn title_from_path(path: &Path) -> String {
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("Untitled");
-    let cleaned = stem.replace(['_', '-'], " ");
+    if stem.eq_ignore_ascii_case("skill") {
+        if let Some(parent) = path.parent() {
+            let title = title_from_component(parent.file_name().and_then(|name| name.to_str()));
+            if !title.is_empty() {
+                return title;
+            }
+        }
+    }
+    title_from_component(Some(stem))
+}
+
+fn title_from_component(value: Option<&str>) -> String {
+    let cleaned = value.unwrap_or("Untitled").replace(['_', '-'], " ");
     cleaned
         .split_whitespace()
         .map(|w| {
@@ -1119,7 +1208,9 @@ fn snippet(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{core_principle_ids, core_strategy_block, Library, Principle};
+    use super::{
+        core_principle_ids, core_strategy_block, title_from_path, Chunk, Library, Principle,
+    };
     use crate::engine::{Backend, Engine};
 
     #[test]
@@ -1162,6 +1253,47 @@ mod tests {
             .map(|principle| principle.book_id.as_str())
             .collect::<std::collections::HashSet<_>>();
         assert_eq!(books.len(), 2);
+    }
+
+    #[test]
+    fn stage_retrieval_diversifies_raw_supporting_passages() {
+        let chunk = |id: &str, book_id: &str| {
+            Chunk {
+            id: id.to_string(),
+            book_id: book_id.to_string(),
+            book_title: book_id.to_string(),
+            ordinal: 0,
+            heading: "Cold outreach".into(),
+            text: "Cold outreach should ask about actual past workflow and give the recipient a reason to answer.".into(),
+        }
+        };
+        let mut library = Library {
+            chunks: vec![
+                chunk("a-1", "book-a"),
+                chunk("a-2", "book-a"),
+                chunk("b-1", "book-b"),
+            ],
+            ..Default::default()
+        };
+        library.build_index();
+
+        let retrieved = library.retrieve_stage("cold outreach past workflow", "sequence", 0, 2);
+        let books = retrieved
+            .chunks
+            .iter()
+            .map(|chunk| chunk.book_id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(books.len(), 2);
+    }
+
+    #[test]
+    fn skill_entrypoints_use_the_skill_directory_as_the_source_title() {
+        assert_eq!(
+            title_from_path(std::path::Path::new(
+                "/tmp/skills/campaign-copywriting/SKILL.md"
+            )),
+            "Campaign Copywriting"
+        );
     }
 
     #[tokio::test]
