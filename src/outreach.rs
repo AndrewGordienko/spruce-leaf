@@ -1549,17 +1549,53 @@ async fn review_and_edit_sequence_lean(
         findings.extend(semantic_after);
     }
 
-    let reviews = final_review
-        .expect("three-pass editor exits only after accepting or returning an error")
-        .reviews
-        .into_iter()
-        .map(|edit| TouchReview {
+    let _editor_review =
+        final_review.expect("three-pass editor exits only after accepting or returning an error");
+    // A writer/editor approving its own rewrite is not an independent quality
+    // signal. The final verifier uses the full model, sees the exact current
+    // wording, and is forbidden to edit it.
+    report_review_progress(progress, "running independent final verification");
+    let verification = request_copy_review_full(
+        client,
+        &pb.review_system_prompt(shared),
+        pb,
+        account,
+        contact,
+        sequence,
+        &[],
+        expected_touches,
+        true,
+        knowledge,
+    )
+    .await?;
+    validate_editor_stages(&verification, sequence)?;
+    let mut reviews = Vec::with_capacity(verification.reviews.len());
+    for edit in verification.reviews {
+        if !edit.passes
+            || edit.score < 85
+            || !edit.issues.is_empty()
+            || !edit.revised_subject.trim().is_empty()
+            || !edit.revised_body.trim().is_empty()
+        {
+            let detail = if edit.issues.is_empty() {
+                "did not clear independent verification".to_string()
+            } else {
+                edit.issues.join("; ")
+            };
+            return Err(anyhow!(
+                "stage {} rejected by independent final verification (score {}): {}",
+                edit.stage,
+                edit.score,
+                detail
+            ));
+        }
+        reviews.push(TouchReview {
             stage: edit.stage,
-            passes: edit.passes,
+            passes: true,
             score: edit.score,
-            issues: edit.issues,
-        })
-        .collect::<Vec<_>>();
+            issues: Vec::new(),
+        });
+    }
     report_review_progress(progress, "copy QA passed");
     Ok(reviews)
 }
