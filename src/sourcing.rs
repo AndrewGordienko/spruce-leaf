@@ -150,20 +150,67 @@ pub async fn source(
         icp.employee_ranges.join(", "),
     );
 
-    // 2. real organizations (overfetch so qualification can be selective).
-    let orgs = apollo
-        .search_organizations(&OrgFilters {
-            keywords: icp.keywords.clone(),
-            employee_ranges: icp.employee_ranges.clone(),
-            locations: icp.locations.clone(),
-            page: 1,
-            per_page: (n_accounts * 2).clamp(10, 100) as u32,
-            ..Default::default()
-        })
-        .await?;
-    eprintln!("  · Apollo returned {} organizations", orgs.len());
+    // 2. Real organizations (overfetch so qualification can be selective). Reuse
+    // across runs: never re-qualify a company we've already judged. Rejects live
+    // in the learning store; companies we already qualified are Lead rows on file.
+    // Combining both lets `source` spend its qualification budget only on genuinely
+    // NEW companies — and page deeper when a page is all-known, so a re-run ADDS
+    // leads instead of stalling on the same top results.
+    const MAX_SOURCE_PAGES: u32 = 5;
+    let mut seen: std::collections::HashSet<String> = db
+        .learning_keys(&pb.key, "qualification_skip")
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let on_file = db.list_leads(Some(&pb.key)).unwrap_or_default();
+    for lead in &on_file {
+        let key = lead_dedup_key(lead);
+        if !key.is_empty() {
+            seen.insert(key);
+        }
+    }
+
+    let want_candidates = (n_accounts * 2).clamp(10, 100);
+    let per_page = want_candidates as u32;
+    let mut fresh: Vec<ApolloOrg> = Vec::new();
+    let mut orgs_found = 0usize;
+    let mut skipped_known = 0usize;
+    for page in 1..=MAX_SOURCE_PAGES {
+        let page_orgs = apollo
+            .search_organizations(&OrgFilters {
+                keywords: icp.keywords.clone(),
+                employee_ranges: icp.employee_ranges.clone(),
+                locations: icp.locations.clone(),
+                page,
+                per_page,
+                ..Default::default()
+            })
+            .await?;
+        if page_orgs.is_empty() {
+            break;
+        }
+        orgs_found += page_orgs.len();
+        for org in page_orgs {
+            let key = org_learning_key(&org);
+            // Skip anything already judged; `insert` returning false also guards
+            // the same company reappearing across pages.
+            if !key.is_empty() && !seen.insert(key) {
+                skipped_known += 1;
+                continue;
+            }
+            fresh.push(org);
+        }
+        if fresh.len() >= want_candidates {
+            break;
+        }
+    }
+    eprintln!(
+        "  · Apollo returned {orgs_found} org(s); {} new to qualify ({skipped_known} already judged, {} qualified on file)",
+        fresh.len(),
+        on_file.len(),
+    );
     let mut summary = SourceSummary {
-        orgs_found: orgs.len(),
+        orgs_found,
         ..Default::default()
     };
 
@@ -196,32 +243,7 @@ pub async fn source(
         .playbook_block();
     let knowledge = format!("{}\n\n{}", core_strategy_block("companies"), retrieved);
 
-    // Drop organizations we've already rejected for this brand in earlier runs —
-    // re-researching and re-qualifying a known reject is exactly the wasted work
-    // the operator flagged. A future run that clears the learning can resurface
-    // them; for now, prior judgment carries forward.
-    let known_rejects = db
-        .learning_keys(&pb.key, "qualification_skip")
-        .unwrap_or_default();
-    let orgs = if known_rejects.is_empty() {
-        orgs
-    } else {
-        let before = orgs.len();
-        let kept: Vec<_> = orgs
-            .into_iter()
-            .filter(|org| {
-                let key = org_learning_key(org);
-                key.is_empty() || !known_rejects.contains(&key)
-            })
-            .collect();
-        let dropped = before - kept.len();
-        if dropped > 0 {
-            eprintln!("  · skipped {dropped} previously-rejected org(s) from prior learnings");
-        }
-        kept
-    };
-
-    let mut candidates = orgs.into_iter();
+    let mut candidates = fresh.into_iter();
     let mut quals = Vec::new();
     let mut qualified = 0usize;
     // Each candidate is I/O-bound (website reads + an LLM qualification call), so
@@ -882,6 +904,16 @@ fn org_learning_key(org: &ApolloOrg) -> String {
         org.id.clone()
     } else {
         org.domain()
+    }
+}
+
+/// Dedup handle for a stored Lead, mirroring [`org_learning_key`] so a company
+/// already qualified in an earlier run is recognized and never re-qualified.
+fn lead_dedup_key(lead: &Lead) -> String {
+    if !lead.apollo_org_id.trim().is_empty() {
+        lead.apollo_org_id.clone()
+    } else {
+        lead.domain.clone()
     }
 }
 
