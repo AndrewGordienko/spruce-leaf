@@ -17,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::{Duration, Utc};
 use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -1164,27 +1164,24 @@ async fn write_account_sequences(
         &lead.name,
         people,
     );
-    let recipients = people
-        .iter()
-        .map(|person| {
-            json!({
-                "person_key": person.id,
-                "name": person.name,
-                "first_name": person.first_name,
-                "title": person.title,
-                "vantage": person.vantage,
-                "likely_access_internal_only": person.can_observe,
-                "why_this_person_internal_only": person.why_them,
-                "ask_scope": recipient_ask_scope(person),
-                "route_to": person.route_to,
-                "sequence_plan": plans.get(&person.id),
-                "private_gtm_action_context": gtm_contexts
-                    .get(&person.id)
-                    .map(GtmActionContext::prompt_block)
-                    .unwrap_or_else(|| "GTM ACTION STATE: unavailable".into()),
-            })
+    let recipient_payload = |person: &crate::db::Person| {
+        json!({
+            "person_key": person.id,
+            "name": person.name,
+            "first_name": person.first_name,
+            "title": person.title,
+            "vantage": person.vantage,
+            "likely_access_internal_only": person.can_observe,
+            "why_this_person_internal_only": person.why_them,
+            "ask_scope": recipient_ask_scope(person),
+            "route_to": person.route_to,
+            "sequence_plan": plans.get(&person.id),
+            "private_gtm_action_context": gtm_contexts
+                .get(&person.id)
+                .map(GtmActionContext::prompt_block)
+                .unwrap_or_else(|| "GTM ACTION STATE: unavailable".into()),
         })
-        .collect::<Vec<_>>();
+    };
     let writer_account = if lean {
         planner_account_brief(&account)
     } else {
@@ -1203,28 +1200,71 @@ async fn write_account_sequences(
     } else {
         knowledge.writer.block.clone()
     };
-    let user = format!(
-        "Write one {n}-touch no-reply sequence for each recipient. {planning_contract} Think through the buyer-safe brief and private GTM action context, then write the messages in Andrew's voice. The play is a policy and hypothesis, never a fixed email template. Return exactly one sequence for every person_key and copy person_key exactly. For seven touches use these exact channels and day offsets: email/0, email/3, linkedin_request/5, email/9, linkedin_or_email/13, email/17, linkedin_or_email/21. A linkedin_request is a short personalized connection note with no pitch, meeting ask, greeting, or signature. A linkedin_or_email touch must work as either a natural LinkedIn DM or a very short email: include a 1-3 word lowercase fallback email subject with no number or question mark and Andrew's exact email signature, but keep the body concise enough for LinkedIn. Every email subject follows that same rule. Never reveal play labels, experiment arms, confidence scores, internal hypotheses, or strategy language.\n\nBUYER-SAFE ACCOUNT BRIEF:\n{account}\n\nRECIPIENTS (private context; never quote its labels):\n{recipients}\n\nVERIFIED SELLER CONTEXT:\n{business_context}\n\nRETRIEVED KNOWLEDGE:\n{knowledge}",
-        account = serde_json::to_string_pretty(&writer_account).unwrap_or_default(),
-        recipients = serde_json::to_string_pretty(&recipients).unwrap_or_default(),
-        knowledge = writer_knowledge,
-    );
-    let batch = client
-        .structured_bulk::<BatchCopy>(
-            "outreach.write_account",
-            system,
-            &user,
-            batch_sequence_schema(n, people.len()),
+    let writer_user = |recipients: &[Value]| {
+        format!(
+            "Write one {n}-touch no-reply sequence for each recipient. {planning_contract} Think through the buyer-safe brief and private GTM action context, then write the messages in Andrew's voice. The play is a policy and hypothesis, never a fixed email template. Return exactly one sequence for every person_key and copy person_key exactly. For seven touches use these exact channels and day offsets: email/0, email/3, linkedin_request/5, email/9, linkedin_or_email/13, email/17, linkedin_or_email/21. A linkedin_request is a short personalized connection note with no pitch, meeting ask, greeting, or signature. A linkedin_or_email touch must work as either a natural LinkedIn DM or a very short email: include a 1-3 word lowercase fallback email subject with no number or question mark and Andrew's exact email signature, but keep the body concise enough for LinkedIn. Every email subject follows that same rule. Never reveal play labels, experiment arms, confidence scores, internal hypotheses, or strategy language.\n\nBUYER-SAFE ACCOUNT BRIEF:\n{account}\n\nRECIPIENTS (private context; never quote its labels):\n{recipients}\n\nVERIFIED SELLER CONTEXT:\n{business_context}\n\nRETRIEVED KNOWLEDGE:\n{knowledge}",
+            account = serde_json::to_string_pretty(&writer_account).unwrap_or_default(),
+            recipients = serde_json::to_string_pretty(recipients).unwrap_or_default(),
+            knowledge = writer_knowledge,
         )
-        .await?;
+    };
+    // Direct API calls write one recipient at a time, concurrently. Batching
+    // several people into one generation was slightly cheaper but produced the
+    // same polished skeleton for every contact. Account research is still done
+    // once; only the final act of writing is isolated.
+    let requests = if lean {
+        people
+            .iter()
+            .map(|person| {
+                let recipients = vec![recipient_payload(person)];
+                (vec![person.id.clone()], writer_user(&recipients))
+            })
+            .collect::<Vec<_>>()
+    } else {
+        let recipients = people.iter().map(recipient_payload).collect::<Vec<_>>();
+        vec![(
+            people.iter().map(|person| person.id.clone()).collect(),
+            writer_user(&recipients),
+        )]
+    };
+    let written = futures::future::join_all(requests.into_iter().map(|(person_ids, user)| {
+        let progress = progress.clone();
+        let account_name = lead.name.clone();
+        let people_for_progress = people
+            .iter()
+            .filter(|person| person_ids.contains(&person.id))
+            .cloned()
+            .collect::<Vec<_>>();
+        async move {
+            progress.group(
+                &format!("writing focused touches 1–{n}"),
+                &account_name,
+                &people_for_progress,
+            );
+            let result = client
+                .structured_bulk::<BatchCopy>(
+                    "outreach.write_account",
+                    system,
+                    &user,
+                    batch_sequence_schema(n, person_ids.len()),
+                )
+                .await;
+            (person_ids, result)
+        }
+    }))
+    .await;
     let expected = people
         .iter()
         .map(|person| person.id.as_str())
         .collect::<HashSet<_>>();
     let mut raw_by_person = HashMap::new();
-    for raw in batch.sequences {
-        if expected.contains(raw.person_key.as_str()) {
-            raw_by_person.entry(raw.person_key.clone()).or_insert(raw);
+    for (requested_people, result) in written {
+        let batch = result
+            .with_context(|| format!("writing focused copy for {}", requested_people.join(", ")))?;
+        for raw in batch.sequences {
+            if expected.contains(raw.person_key.as_str()) {
+                raw_by_person.entry(raw.person_key.clone()).or_insert(raw);
+            }
         }
     }
     if raw_by_person.len() != people.len() {
@@ -1519,7 +1559,12 @@ async fn review_and_edit_sequence_lean(
             .reviews
             .iter()
             .filter(|review| repair_all || affected.contains(&review.stage))
-            .filter(|review| !review.passes || review.score < 85 || !review.issues.is_empty())
+            // Luna is a bounded repair worker here, not the final quality
+            // authority. It sometimes returns passes=true and 90/100 while
+            // leaving a stale issue that contradicts the revised text and
+            // Rust's own counts. Keep real failures; the independent full-model
+            // verifier and ten-lens council judge passing revisions afterward.
+            .filter(|review| !review.passes || review.score < 85)
             .map(|review| {
                 format!(
                     "stage {} scored {}: {}",
