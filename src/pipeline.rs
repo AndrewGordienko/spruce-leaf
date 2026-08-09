@@ -115,7 +115,7 @@ async fn plan_account(
             enforce_email_signatures(&mut sequence, &run.pb.signature);
             let reviewer_knowledge =
                 role_knowledge(run, &run.shared.personas.reviewer, &account.hypothesis);
-            let reviews = outreach::review_and_edit_sequence(
+            let reviews = outreach::review_and_edit_sequence_lean(
                 run.client,
                 run.pb,
                 run.shared,

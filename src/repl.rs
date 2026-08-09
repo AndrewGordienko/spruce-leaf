@@ -445,7 +445,7 @@ fn model_command(agent: &Agent, cmd: &str) {
     ui::activity(
         "Switched model",
         format!(
-            "{} · {}\nFallback is enabled for interactive calls and disabled for bulk work",
+            "{} · {}\nOne-call fallback is available for routing; it never changes the bulk-work provider",
             agent.backend(),
             agent.model()
         ),

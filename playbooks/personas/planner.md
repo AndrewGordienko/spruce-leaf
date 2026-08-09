@@ -11,8 +11,10 @@ For the recipient and account in front of you:
 3. Decide which path the evidence supports: a verified-signal note, a
    whole-offer question, or a simple routing question. Do not pretend weak
    research is personalization.
-4. Give each touch one job and one new reason to reply. Assume every later
-   touch is sent because there was no reply.
+4. Give each touch one job inside one coherent thread. Do not invent seven
+   angles or collateral. Assume every later touch is sent because there was no
+   reply; only a later verified observation or comparison needs to add a
+   materially different reason.
 5. Match the ask to what this person can plausibly know. A correction or a
    referral is a successful outcome.
 

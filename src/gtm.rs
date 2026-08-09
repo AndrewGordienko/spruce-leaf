@@ -282,6 +282,16 @@ impl GtmActionContext {
         self.state == "action_ready"
     }
 
+    /// A multi-touch sequence is a commercial action, not a research artifact.
+    /// Only a fully supported action may enter the copywriter. `discovery_ready`
+    /// is retained for research/routing UX, but must never be upgraded into a
+    /// sequence merely because a plausible title was found.
+    /// Discovery-ready context may support one manually reviewed routing note,
+    /// but never an automated no-reply sequence.
+    pub fn sequence_ready_for(&self, touches: usize) -> bool {
+        self.action_ready() || (touches == 1 && self.state == "discovery_ready")
+    }
+
     /// Private context for the planner/writer. This is decision infrastructure,
     /// never prose to paste into a buyer-facing message.
     pub fn prompt_block(&self) -> String {
@@ -348,6 +358,43 @@ impl GtmActionContext {
             },
         )
     }
+
+    /// Small, buyer-safe decision brief for the copywriter.
+    ///
+    /// The full GTM block contains experiment assignments, proof concepts,
+    /// success metrics, and kill conditions. Those are useful to a strategist
+    /// but repeatedly pulled cold copy toward internal-memo language and
+    /// premature pilots. The writer needs only the evidence strength, the
+    /// observations it may rely on, and the smallest outcome the evidence can
+    /// support.
+    pub fn copy_prompt_block(&self) -> String {
+        let mut seen = std::collections::HashSet::new();
+        let evidence = self
+            .observations
+            .iter()
+            .filter(|observation| {
+                matches!(observation.status.as_str(), "observed" | "verified")
+                    && seen.insert(observation.definition_key.clone())
+            })
+            .take(4)
+            .map(|observation| format!("- {}", observation.evidence))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let action = match self.state.as_str() {
+            "action_ready" => "The account has enough sourced evidence for one narrow commercial note. Use only a supplied observation as the company-specific signal. Lead with a role-relevant implication and a credible point of view. A cold outcome may be a short working conversation, interest, correction, or referral; it is not yet a pilot or proof. Never invent collateral or claim an asset exists unless verified seller context explicitly supplies it.",
+            "discovery_ready" => "The company fit and this recipient's operating vantage are sourced, but the internal workflow problem is not public evidence. At most, write one manual hypothesis-safe routing note. State only supplied company facts. Never claim that work is manual, expensive, recurring, fragmented, or cross-system. Never propose a proof, pilot, integration, or product evaluation.",
+            _ => "The account does not yet have enough sourced evidence for a multi-touch sequence. Hold it for research or use one manual routing note; do not manufacture discovery questions or explain a proof, integration, pilot, or product.",
+        };
+        format!(
+            "COPY DECISION STATE: {state}\nPERMITTED ACTION: {action}\nSOURCE-BACKED OBSERVATIONS:\n{evidence}\nTreat everything else as a question, not account reality.",
+            state = self.state,
+            evidence = if evidence.is_empty() {
+                "- none".to_string()
+            } else {
+                evidence
+            },
+        )
+    }
 }
 
 /// Resolve the current versioned play, live evidence, and stable experiment arm
@@ -366,6 +413,30 @@ pub fn prepare_action(
         .iter()
         .map(|observation| observation.definition_key.clone())
         .collect::<Vec<_>>();
+    // The play asks whether a reachable workflow owner exists at the account,
+    // while contact mapping records the stronger, person-specific vantage
+    // observation. Treat the selected person's live vantage as satisfying the
+    // account requirement. Without this bridge, a company could have five
+    // verified process owners and still be permanently held as "no owner".
+    let has_reachable_channel = person.email_status.eq_ignore_ascii_case("verified")
+        || !person.linkedin_url.trim().is_empty();
+    let has_workflow_vantage = matches!(
+        person.vantage.trim().to_ascii_lowercase().as_str(),
+        "process_owner"
+            | "operator"
+            | "operational_executive"
+            | "economic_buyer"
+            | "technical_evaluator"
+    );
+    if has_reachable_channel
+        && has_workflow_vantage
+        && observations.iter().any(|observation| {
+            observation.definition_key == "contact.workflow_vantage"
+                && observation.person_id == person.id
+        })
+    {
+        matched_signal_keys.push("account.reachable_workflow_owner".into());
+    }
     matched_signal_keys.sort();
     matched_signal_keys.dedup();
 
@@ -377,6 +448,11 @@ pub fn prepare_action(
             .count();
         if matched >= play.minimum_signal_matches.max(1) as usize {
             "action_ready"
+        } else if brand == "gnk"
+            && matched_signal_keys.contains(&"account.fit_evidence".to_string())
+            && matched_signal_keys.contains(&"account.reachable_workflow_owner".to_string())
+        {
+            "discovery_ready"
         } else {
             "research_required"
         }
@@ -464,6 +540,24 @@ pub fn default_signal_definitions() -> Vec<SignalDefinition> {
             freshness_seconds: 90 * 86_400,
             evidence_required: true,
             minimum_confidence: 0.60,
+            version: 1,
+            status: "active".into(),
+            ..Default::default()
+        });
+        definitions.push(SignalDefinition {
+            brand: brand.into(),
+            key: "account.job_posting_workflow_evidence".into(),
+            name: "Job-posting workflow evidence".into(),
+            description: "A current first-party job posting explicitly names a system, workflow, responsibility, or investment relevant to the active motion. It does not prove pain, urgency, budget, buying intent, or recipient ownership.".into(),
+            topic: "account_fit".into(),
+            entity_type: "account".into(),
+            value_type: "text".into(),
+            source_kind: "official_job_posting".into(),
+            owner: "internal_gtm_engineering".into(),
+            refresh_cadence: "monthly while role is live".into(),
+            freshness_seconds: 30 * 86_400,
+            evidence_required: true,
+            minimum_confidence: 0.70,
             version: 1,
             status: "active".into(),
             ..Default::default()
@@ -603,8 +697,131 @@ pub fn seed_defaults(db: &SharedDb) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{customer_development_missing, customer_development_stage};
-    use crate::db::CustomerDevelopmentRecord;
+    use super::{
+        customer_development_missing, customer_development_stage, default_signal_definitions,
+        prepare_action, seed_defaults, GtmActionContext, SignalCandidate,
+    };
+    use crate::db::{CustomerDevelopmentRecord, Db, Lead, Person, SignalObservation};
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    fn remove_temp_db(path: &std::path::Path) {
+        for candidate in [
+            path.to_path_buf(),
+            std::path::PathBuf::from(format!("{}-wal", path.display())),
+            std::path::PathBuf::from(format!("{}-shm", path.display())),
+        ] {
+            let _ = std::fs::remove_file(candidate);
+        }
+    }
+
+    #[test]
+    fn selected_contact_vantage_satisfies_reachable_owner_requirement() {
+        let path = std::env::temp_dir().join(format!(
+            "spruce-vantage-readiness-test-{}.sqlite",
+            Uuid::new_v4()
+        ));
+        let db = Arc::new(Db::open(&path).expect("open temp db"));
+        seed_defaults(&db).expect("seed GTM defaults");
+        let lead_id = db
+            .upsert_lead(&Lead {
+                brand: "gnk".into(),
+                apollo_org_id: "org-vantage-ready".into(),
+                name: "Example".into(),
+                ..Default::default()
+            })
+            .expect("lead");
+        let person_id = db
+            .upsert_person(&Person {
+                lead_id: lead_id.clone(),
+                brand: "gnk".into(),
+                apollo_person_id: "person-vantage-ready".into(),
+                name: "Pat Operator".into(),
+                title: "Claims Operations Manager".into(),
+                vantage: "process_owner".into(),
+                can_observe: "Owns the recurring claims review workflow".into(),
+                email: "pat@example.com".into(),
+                email_status: "verified".into(),
+                status: "verified".into(),
+                ..Default::default()
+            })
+            .expect("person");
+        db.record_signal_candidates(
+            "gnk",
+            &lead_id,
+            &[
+                SignalCandidate {
+                    definition_key: "account.fit_evidence".into(),
+                    evidence: "The company operates specialty claims.".into(),
+                    confidence: 0.9,
+                    ..Default::default()
+                },
+                SignalCandidate {
+                    definition_key: "account.expensive_recurring_workflow".into(),
+                    evidence: "Adjusters manually review every exception, adding handling time."
+                        .into(),
+                    confidence: 0.9,
+                    ..Default::default()
+                },
+            ],
+            "test",
+        )
+        .expect("signals");
+        let person = db.get_person(&person_id).unwrap().unwrap();
+        let context = prepare_action(&db, "gnk", &lead_id, &person).expect("action context");
+
+        assert!(context
+            .matched_signal_keys
+            .contains(&"account.reachable_workflow_owner".to_string()));
+        assert!(context.action_ready());
+
+        let discovery_lead_id = db
+            .upsert_lead(&Lead {
+                brand: "gnk".into(),
+                apollo_org_id: "org-vantage-discovery".into(),
+                name: "Discovery Example".into(),
+                ..Default::default()
+            })
+            .expect("discovery lead");
+        let discovery_person_id = db
+            .upsert_person(&Person {
+                lead_id: discovery_lead_id.clone(),
+                brand: "gnk".into(),
+                apollo_person_id: "person-vantage-discovery".into(),
+                name: "Dana Operator".into(),
+                title: "Operations Manager".into(),
+                vantage: "process_owner".into(),
+                email: "dana@example.com".into(),
+                email_status: "verified".into(),
+                status: "verified".into(),
+                ..Default::default()
+            })
+            .expect("discovery person");
+        db.record_signal_candidates(
+            "gnk",
+            &discovery_lead_id,
+            &[SignalCandidate {
+                definition_key: "account.fit_evidence".into(),
+                evidence: "The company publicly documents a complex operations function.".into(),
+                confidence: 0.9,
+                ..Default::default()
+            }],
+            "test",
+        )
+        .expect("discovery signal");
+        let discovery_person = db.get_person(&discovery_person_id).unwrap().unwrap();
+        let discovery = prepare_action(&db, "gnk", &discovery_lead_id, &discovery_person)
+            .expect("discovery context");
+        assert_eq!(discovery.state, "discovery_ready");
+        assert!(discovery.sequence_ready_for(1));
+        assert!(!discovery.sequence_ready_for(2));
+        assert!(!discovery.action_ready());
+        assert!(discovery
+            .copy_prompt_block()
+            .contains("Never claim that work is manual"));
+        drop(db);
+        remove_temp_db(&path);
+    }
 
     #[test]
     fn customer_development_advances_on_evidence_not_activity() {
@@ -659,5 +876,41 @@ mod tests {
                 "explicit agreement to material LOI terms",
             ]
         );
+    }
+
+    #[test]
+    fn job_posting_signal_is_short_lived_and_cannot_claim_pain() {
+        let definitions = default_signal_definitions();
+        let signal = definitions
+            .iter()
+            .find(|definition| {
+                definition.brand == "wapahki"
+                    && definition.key == "account.job_posting_workflow_evidence"
+            })
+            .expect("job-posting signal");
+
+        assert_eq!(signal.source_kind, "official_job_posting");
+        assert_eq!(signal.freshness_seconds, 30 * 86_400);
+        assert!(signal.description.contains("does not prove pain"));
+    }
+
+    #[test]
+    fn copy_context_exposes_evidence_but_not_internal_proof_machinery() {
+        let context = GtmActionContext {
+            state: "action_ready".into(),
+            observations: vec![SignalObservation {
+                evidence: "Official site names five production formats.".into(),
+                status: "observed".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let brief = context.copy_prompt_block();
+        assert!(brief.contains("Official site names five production formats"));
+        assert!(brief.contains("role-relevant implication and a credible point of view"));
+        assert!(brief.contains("Never invent collateral"));
+        assert!(!brief.contains("FORWARD-DEPLOYED PROOF"));
+        assert!(!brief.contains("EXPERIMENT"));
+        assert!(!brief.contains("KILL CONDITION"));
     }
 }

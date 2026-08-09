@@ -91,8 +91,8 @@ pub struct Touch {
     /// Empty for channels without a subject.
     pub subject: String,
     pub body: String,
-    /// Which move in the 7-touch progression this is (observation, diagnostic,
-    /// consequence, artifact, hard question, routing, close).
+    /// Which move in the sequence this is (observation, diagnostic, useful
+    /// contribution, hard question, routing, or close).
     pub purpose: String,
     /// What this specific touch is trying to achieve.
     pub goal: String,

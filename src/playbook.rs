@@ -203,6 +203,34 @@ fn read_text(path: &Path) -> Result<String> {
     std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))
 }
 
+/// Keep the editable role files authoritative without pasting a thousand-word
+/// doctrine into every short-copy call. The opening paragraphs contain the
+/// role's priorities; later material remains a human reference and regression
+/// corpus. Stop at a paragraph boundary so the excerpt is coherent.
+fn compact_persona_excerpt(persona: &str, max_words: usize) -> String {
+    let mut excerpt = String::new();
+    let mut words = 0usize;
+    for paragraph in persona.split("\n\n") {
+        let paragraph = paragraph.trim();
+        if paragraph.is_empty() || paragraph.starts_with('#') {
+            continue;
+        }
+        let paragraph_words = paragraph.split_whitespace().count();
+        if !excerpt.is_empty() && words + paragraph_words > max_words {
+            break;
+        }
+        if !excerpt.is_empty() {
+            excerpt.push_str("\n\n");
+        }
+        excerpt.push_str(paragraph);
+        words += paragraph_words;
+        if words >= max_words {
+            break;
+        }
+    }
+    excerpt
+}
+
 impl Playbook {
     /// The full forbidden-phrase list for this brand (shared + brand-specific).
     pub fn forbidden<'a>(&'a self, shared: &'a Shared) -> Vec<&'a str> {
@@ -227,7 +255,7 @@ impl Playbook {
     /// Compact company qualification prompt, focused on evidence boundaries.
     pub fn qualification_system_prompt(&self) -> String {
         format!(
-            "You qualify real companies for {name}. Motion: {motion}. Separate supported facts, reasonable inferences, and a falsifiable workflow hypothesis. A company qualifies only when at least {signals} independent signals support one specific recurring workflow and the company is realistically winnable. Never invent systems, customers, volumes, savings, urgency, or dollar impact. Name the mechanism, a measurable non-dollar consequence, the strongest objection, and what would falsify the thesis. Return only the requested structured data.",
+            "You qualify real companies for {name}. Motion: {motion}. Separate supported facts, reasonable inferences, and a falsifiable workflow hypothesis. A company qualifies only when at least {signals} independent signals support one specific recurring workflow and the company is realistically winnable. A first-party job description supports only the investment, system, workflow, or responsibility it explicitly names; it cannot prove pain, urgency, budget, buying intent, or that the recipient owns it. Never invent systems, customers, volumes, savings, urgency, or dollar impact. Name the mechanism, a measurable non-dollar consequence, the strongest objection, and what would falsify the thesis. Return only the requested structured data.",
             name = self.name,
             motion = self.motion,
             signals = self.min_signals,
@@ -244,16 +272,14 @@ impl Playbook {
 
     /// Compact copy prompt used only for buyer-facing writing.
     ///
-    /// The planner gets the full operating doctrine. Repeating that strategy
-    /// memo in the writer prompt made the model turn a short note into a polished
-    /// internal brief. The writer instead gets the buyer-facing constraints,
-    /// evidence boundary, and voice it can actually use in copy.
+    /// Buyer-facing roles get compact contracts. Repeating the full strategy
+    /// memo made a short note read like a polished internal brief.
     pub fn copy_system_prompt(&self, shared: &Shared) -> String {
         self.compact_role_system_prompt("WRITER", &shared.personas.writer, shared)
     }
 
     pub fn planning_system_prompt(&self, shared: &Shared) -> String {
-        self.role_system_prompt("PLANNER", &shared.personas.planner, shared)
+        self.compact_role_system_prompt("PLANNER", &shared.personas.planner, shared)
     }
 
     pub fn review_system_prompt(&self, shared: &Shared) -> String {
@@ -269,11 +295,19 @@ impl Playbook {
             .join("\n");
         let subjects = self.subject_examples.join(" | ");
         let forbidden = self.forbidden(shared).join(", ");
+        let role_contract = if role == "WRITER" {
+            "Write like one founder contacting one operator. Use only supplied evidence, test one operating decision, keep inference explicitly uncertain, and make one role-appropriate ask. Concrete nouns and natural speech beat frameworks. A correction or route is useful, but the note still needs a recipient-relevant reason to answer."
+        } else if role == "PLANNER" {
+            "Choose the commercial angle before copy is written. Compare three distinct first-touch approaches against the verified trigger, recipient vantage, strongest objection, and easiest useful reply. Select one coherent thread; do not blend candidates or plan filler stages. Hold when the evidence cannot support a natural note."
+        } else {
+            "Act as a skeptical recipient and independent copy chief. Passing means Andrew could send the exact words unchanged: evidence-safe, specific, natural aloud, easy to answer, and appropriate to the recipient's vantage. Reject polished research blurbs, repeated retreats, invented value, and vague capability language."
+        };
+        let persona_excerpt = compact_persona_excerpt(persona, 120);
         format!(
-            "=== {role} PERSONA (editable file) ===\n{persona}\n\n\
+            "=== {role} CONTRACT ===\n{role_contract}\n\n\
+             === EDITABLE PERSONA EXCERPT ===\n{persona_excerpt}\n\n\
              === {name} BUYER-FACING CONSTRAINTS ===\n\
              Seller context (state at most once and only when useful): {intro}\n\
-             Commercial motion being tested privately: {motion}\n\
              Email 1 length: {min}-{max} words including signature.\n\
              Required signature: {signature}\n\
              Brand requirements:\n{requirements}\n\
@@ -281,51 +315,16 @@ impl Playbook {
              Forbidden buyer-facing phrases: {forbidden}\n\n\
              Do not expose the commercial motion, planning labels, or internal doctrine. Return only the requested structured data.",
             role = role,
-            persona = persona.trim(),
+            role_contract = role_contract,
+            persona_excerpt = persona_excerpt,
             name = self.name,
             intro = self.one_liner,
-            motion = self.motion,
             min = self.min_words,
             max = self.max_words,
             signature = self.signature,
             requirements = requirements,
             subjects = subjects,
             forbidden = forbidden,
-        )
-    }
-
-    fn role_system_prompt(&self, role: &str, persona: &str, shared: &Shared) -> String {
-        let requirements = self
-            .requirements
-            .iter()
-            .map(|rule| format!("- {rule}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let subjects = self.subject_examples.join(" | ");
-        let forbidden = self.forbidden(shared).join(", ");
-        format!(
-            "=== {role} PERSONA (editable file) ===\n{persona}\n\n\
-             === SHARED OUTREACH DOCTRINE (editable TOML) ===\n{shared_doctrine}\n\n\
-             === {name} BRAND DOCTRINE (editable TOML) ===\n\
-             Seller: {intro}\nMotion: {motion}\n\
-             Email 1 length: {min}-{max} words including signature.\n\
-             Required signature: {signature}\n\
-             Brand requirements:\n{requirements}\n\
-             Subject style examples: {subjects}\n\
-             Forbidden buyer-facing phrases: {forbidden}\n\n{brand_doctrine}",
-            role = role,
-            persona = persona.trim(),
-            shared_doctrine = shared.doctrine.trim(),
-            name = self.name,
-            intro = self.one_liner,
-            motion = self.motion,
-            min = self.min_words,
-            max = self.max_words,
-            signature = self.signature,
-            requirements = requirements,
-            subjects = subjects,
-            forbidden = forbidden,
-            brand_doctrine = self.doctrine.trim(),
         )
     }
 
@@ -559,14 +558,30 @@ mod tests {
         let reviewer = gnk.review_system_prompt(&playbooks.shared);
         assert!(gnk.icp_system_prompt().split_whitespace().count() < 100);
         assert!(gnk.qualification_system_prompt().split_whitespace().count() < 150);
-        assert!(copy.contains("Founder-led outreach writer persona"));
-        assert!(planner.contains("Outreach planner persona"));
-        assert!(reviewer.contains("Skeptical-recipient and copy-chief persona"));
+        assert!(copy.contains("Write like one founder contacting one operator"));
+        assert!(copy.contains("The recipient does not owe Andrew market research"));
+        assert!(planner.contains("Choose the commercial angle before copy is written"));
+        assert!(planner.contains("Your output is a private plan"));
+        assert!(reviewer.contains("Act as a skeptical recipient"));
+        assert!(reviewer.contains("Correctness is not sendability"));
         assert!(copy.contains("=== GnK BUYER-FACING CONSTRAINTS"));
+        assert!(copy.split_whitespace().count() < 1_000);
+        assert!(reviewer.split_whitespace().count() < 1_000);
         assert!(!copy.contains("=== SHARED OUTREACH DOCTRINE"));
         assert!(!reviewer.contains("=== SHARED OUTREACH DOCTRINE"));
-        assert!(planner.contains("=== SHARED OUTREACH DOCTRINE"));
-        assert!(planner.contains("=== GnK BRAND DOCTRINE"));
+        assert!(!planner.contains("=== SHARED OUTREACH DOCTRINE"));
+        assert!(planner.split_whitespace().count() < 1_000);
+        assert_eq!((gnk.min_words, gnk.max_words), (70, 130));
+        let outagehub = playbooks.get("outagehub").expect("outagehub");
+        assert_eq!((outagehub.min_words, outagehub.max_words), (90, 140));
+        assert!(outagehub
+            .copy_system_prompt(&playbooks.shared)
+            .contains("matches reported events to locations"));
+        let wapahki = playbooks.get("wapahki").expect("wapahki");
+        assert_eq!((wapahki.min_words, wapahki.max_words), (100, 160));
+        assert!(wapahki
+            .review_system_prompt(&playbooks.shared)
+            .contains("skeptical recipient"));
         assert_eq!(playbooks.shared.personas.critics.len(), 10);
         assert_eq!(playbooks.shared.personas.critics[0].id, "01_alex_hormozi");
     }

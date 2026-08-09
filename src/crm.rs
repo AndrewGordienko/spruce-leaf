@@ -348,6 +348,41 @@ struct ExecutionPerson {
     applied_principles: Vec<String>,
 }
 
+fn complete_reviewed_sequence(touches: &[Touch]) -> bool {
+    matches!(touches.len(), 1 | 4 | 7)
+        && (1..=touches.len() as i64).all(|stage| {
+            touches.iter().any(|touch| {
+                touch.stage == stage
+                    && touch.review_passes == Some(true)
+                    && !touch.body.trim().is_empty()
+                    && touch.body.trim() != "Writing draft…"
+            })
+        })
+}
+
+fn ready_execution_person(db: &SharedDb, person: &Person) -> Result<Option<ExecutionPerson>> {
+    let Some(sequence_id) = db.active_sequence_for_person(&person.id)? else {
+        return Ok(None);
+    };
+    let current_policy = db
+        .sequence_gtm_attribution(&sequence_id)?
+        .is_some_and(|sequence| {
+            sequence.copy_policy_version == crate::db::CURRENT_COPY_POLICY_VERSION
+        });
+    if !current_policy {
+        return Ok(None);
+    }
+    let touches = db.list_touches_for_sequence(&sequence_id)?;
+    if !complete_reviewed_sequence(&touches) {
+        return Ok(None);
+    }
+    Ok(Some(ExecutionPerson {
+        person: person.clone(),
+        touches,
+        applied_principles: db.active_sequence_principles_for_person(&person.id)?,
+    }))
+}
+
 /// Deliberately excludes SMTP/IMAP credentials from the dashboard/API.
 #[derive(Debug, Serialize)]
 struct PublicMailbox {
@@ -382,11 +417,9 @@ fn execution_dashboard(db: &SharedDb, brand: Option<&str>) -> Result<ExecutionDa
     for lead in db.list_leads(brand)? {
         let mut account_people = Vec::new();
         for person in people.iter().filter(|p| p.lead_id == lead.id) {
-            account_people.push(ExecutionPerson {
-                person: person.clone(),
-                touches: db.list_touches_for_person(&person.id)?,
-                applied_principles: db.active_sequence_principles_for_person(&person.id)?,
-            });
+            if let Some(entry) = ready_execution_person(db, person)? {
+                account_people.push(entry);
+            }
         }
         accounts.push(ExecutionAccount {
             lead,
@@ -451,10 +484,12 @@ fn brand_tab_counts(db: &SharedDb) -> Vec<(&'static BrandMeta, usize)> {
     BRANDS
         .iter()
         .map(|meta| {
-            let contacts = db
-                .list_people(Some(meta.key), None)
-                .map(|people| people.len())
-                .unwrap_or(0);
+            let contacts = db.list_people(Some(meta.key), None).map_or(0, |people| {
+                people
+                    .iter()
+                    .filter(|person| ready_execution_person(db, person).ok().flatten().is_some())
+                    .count()
+            });
             (meta, contacts)
         })
         .collect()
@@ -1271,7 +1306,10 @@ fn render_html(
     let live_accounts = execution
         .map(|dashboard| dashboard.accounts.as_slice())
         .unwrap_or_default();
-    let use_live = !live_accounts.is_empty();
+    // The pipeline is a deliverable view. When the execution DB is available,
+    // never fall back to research-store contacts merely because no full reviewed
+    // sequence is ready yet.
+    let use_live = execution.is_some();
     let research: Vec<CrmAccount> = crm
         .accounts
         .iter()
@@ -1300,7 +1338,7 @@ fn render_html(
             .iter()
             .flat_map(|account| &account.people)
             .flat_map(|entry| &entry.touches)
-            .filter(|touch| !touch.due_at.is_empty())
+            .filter(|touch| touch.status == "scheduled")
             .count()
     } else {
         0
@@ -1837,7 +1875,7 @@ fn render_strategy_hub(
     b.push_str(
         "<section class=\"strategy-panel\"><div class=\"strategy-panel-head\">\
          <h2>Agent personas &amp; retrieved knowledge</h2>\
-         <p>Planner, writer, and reviewer reason independently. Every email then faces a ten-lens sales council. The roles receive different retrievals from the books and installed outreach skills; Rust keeps orchestration and deterministic safety checks.</p></div>\
+         <p>The writer receives a compact evidence brief. A separate reviewer grades each touch and the campaign as a whole; deterministic checks enforce channels, evidence boundaries, and delivery safety. The optional ten-lens council is an audit mode, not the production default.</p></div>\
          <div class=\"doctrine-grid\">",
     );
     for (name, source, persona) in [
@@ -1868,8 +1906,8 @@ fn render_strategy_hub(
     }
     b.push_str("</div>");
     b.push_str(
-        "<div class=\"strategy-panel-head council-head\"><h3>Ten-lens sales council</h3>\
-         <p>Each critic votes on every email's current wording. Dissent goes back to the editor; after three rounds without unanimous 85+ approval, the sequence is rejected.</p></div>\
+        "<div class=\"strategy-panel-head council-head\"><h3>Optional ten-lens audit</h3>\
+         <p>Available for deliberate comparison runs. Production uses one independent sequence-level verifier so simulated unanimity does not flatten the copy.</p></div>\
          <div class=\"doctrine-grid\">",
     );
     for critic in &playbooks.shared.personas.critics {
@@ -1898,7 +1936,7 @@ fn render_strategy_hub(
         titles.sort_unstable();
         titles.dedup();
         b.push_str(&format!(
-            "<p class=\"strategy-meta\"><b>{}</b> sources (<b>{}</b> distilled, <b>{}</b> raw-only) · <b>{}</b> distilled principles · <b>{}</b> passages. Planning, writing, and review each retrieve six cross-source principles plus four source-diverse supporting passages; the sales council receives a broader 14-principle, 10-passage retrieval. Raw-only sources are searchable, but should be distilled before their guidance can be cited as a reusable principle.</p>\
+            "<p class=\"strategy-meta\"><b>{}</b> sources (<b>{}</b> distilled, <b>{}</b> raw-only) · <b>{}</b> distilled principles · <b>{}</b> passages. Outreach roles receive small stage-specific retrievals; the writer gets at most four principles and one passage, while the verifier gets at most three principles and no passages. Raw-only sources are searchable, but should be distilled before their guidance can be cited as reusable guidance.</p>\
              <details class=\"doctrine-full\"><summary>Knowledge sources currently loaded</summary><div class=\"prose\">{}</div></details>",
             library.books.len(),
             distilled_sources,
@@ -2686,7 +2724,7 @@ const SHARED_STRATEGY_PILLARS: &[(&str, &str)] = &[
     ),
     (
         "One ask per touch",
-        "The sequence is one unfolding investigation across mixed channels, not seven paraphrases of the same pitch. Each touch adds a new reason to reply.",
+        "The sequence is one unfolding investigation across mixed channels, not a stack of paraphrases. Each touch adds a new reason to reply.",
     ),
     (
         "Pre-send discipline",
@@ -2963,8 +3001,30 @@ fn render_execution(b: &mut String, dashboard: &ExecutionDashboard) {
 }
 
 fn render_people_sheet(b: &mut String, accounts: &[ExecutionAccount]) {
+    let max_stage = accounts
+        .iter()
+        .flat_map(|account| &account.people)
+        .flat_map(|entry| &entry.touches)
+        .map(|touch| touch.stage)
+        .max()
+        .unwrap_or(4)
+        .clamp(4, 7);
     b.push_str("<div class=\"desktop-pipeline\">");
-    render_sheet_head(b);
+    render_sheet_head(b, max_stage);
+
+    let ready_people = accounts
+        .iter()
+        .map(|account| account.people.len())
+        .sum::<usize>();
+    if ready_people == 0 {
+        b.push_str(
+            &format!(
+                "<tr><td class=\"empty-sheet\" colspan=\"{}\"><strong>No reviewed sequences ready yet</strong>\
+             <span>Partial, rejected, and older drafts stay hidden until every touch in the current sequence passes the copy gate.</span></td></tr>",
+                4 + max_stage
+            ),
+        );
+    }
 
     for (account_index, account) in accounts.iter().enumerate() {
         let mut people = account.people.iter().collect::<Vec<_>>();
@@ -2977,39 +3037,42 @@ fn render_people_sheet(b: &mut String, accounts: &[ExecutionAccount]) {
         });
         let people = people.into_iter().take(5).collect::<Vec<_>>();
 
-        for slot in 0..5 {
-            let entry = people.get(slot).copied();
+        for (slot, entry) in people.iter().copied().enumerate() {
             let stripe = if account_index % 2 == 1 { " alt" } else { "" };
             let start = if slot == 0 { " account-start" } else { "" };
             b.push_str(&format!("<tr class=\"contact-row{stripe}{start}\">"));
 
             if slot == 0 {
-                render_company_cell(b, &account.lead, stripe);
-                render_lead_context_cell(b, &account.lead, stripe);
+                render_company_cell(b, &account.lead, stripe, people.len());
+                render_lead_context_cell(b, &account.lead, stripe, people.len());
             }
 
-            if let Some(entry) = entry {
-                render_person_cell(b, &entry.person);
-                render_why_cell(b, &entry.person.why_them, &entry.person.can_observe);
-                for stage in 1..=7 {
-                    match entry.touches.iter().find(|touch| touch.stage == stage) {
-                        Some(touch) => render_touch_cell(b, touch),
-                        None => render_missing_touch(b, stage),
-                    }
+            render_person_cell(b, &entry.person);
+            render_why_cell(b, &entry.person.why_them, &entry.person.can_observe);
+            for stage in 1..=max_stage {
+                match entry.touches.iter().find(|touch| touch.stage == stage) {
+                    Some(touch) => render_touch_cell(b, touch),
+                    None => render_missing_touch(b, stage),
                 }
-            } else {
-                render_empty_contact_row(b, slot + 1);
             }
             b.push_str("</tr>");
         }
     }
 
     b.push_str("</tbody></table></div>");
-    render_mobile_people_cards(b, accounts);
+    render_mobile_people_cards(b, accounts, max_stage);
 }
 
-fn render_mobile_people_cards(b: &mut String, accounts: &[ExecutionAccount]) {
+fn render_mobile_people_cards(b: &mut String, accounts: &[ExecutionAccount], max_stage: i64) {
     b.push_str("<section class=\"mobile-pipeline\" aria-label=\"Account pipeline\">");
+    if accounts.iter().all(|account| account.people.is_empty()) {
+        b.push_str(
+            "<div class=\"mobile-empty\"><strong>No reviewed sequences ready yet</strong>\
+             <span>Partial, rejected, and older drafts stay hidden until every touch in the current sequence passes the copy gate.</span></div>",
+        );
+        b.push_str("</section>");
+        return;
+    }
     for account in accounts {
         let people = account.people.iter().take(5).collect::<Vec<_>>();
         let touch_count = people
@@ -3043,14 +3106,14 @@ fn render_mobile_people_cards(b: &mut String, accounts: &[ExecutionAccount]) {
         ));
 
         for entry in people {
-            render_mobile_person(b, entry);
+            render_mobile_person(b, entry, max_stage);
         }
         b.push_str("</div></details>");
     }
     b.push_str("</section>");
 }
 
-fn render_mobile_person(b: &mut String, entry: &ExecutionPerson) {
+fn render_mobile_person(b: &mut String, entry: &ExecutionPerson, max_stage: i64) {
     let person = &entry.person;
     let sent = entry
         .touches
@@ -3106,7 +3169,7 @@ fn render_mobile_person(b: &mut String, entry: &ExecutionPerson) {
         ));
     }
     b.push_str("<div class=\"mobile-touches\">");
-    for stage in 1..=7 {
+    for stage in 1..=max_stage {
         if let Some(touch) = entry.touches.iter().find(|touch| touch.stage == stage) {
             render_mobile_touch(b, touch, person);
         } else {
@@ -3124,16 +3187,11 @@ fn render_mobile_touch(b: &mut String, touch: &Touch, person: &Person) {
     } else {
         touch.status.as_str()
     };
-    let copy = if touch.subject.trim().is_empty() {
-        preview(&touch.body, 120)
-    } else {
-        preview(&format!("{} — {}", touch.subject, touch.body), 120)
-    };
     b.push_str(&format!(
-        "<details class=\"mobile-touch {state}\" data-open-id=\"mobile-touch-{id}\"><summary>\
-         <span class=\"touch-tag\">{channel} · T{stage}</span><time>{due}</time><p>{copy}</p>\
-         </summary><div class=\"touch-full\"><span class=\"touch-state\">{state}</span>{subject}\
-         <div class=\"message\">{body}</div>{purpose}{goal}{qa}",
+        "<article class=\"mobile-touch {state} touch-inline\" data-touch-id=\"{id}\">\
+         <div class=\"touch-head\"><span class=\"touch-tag\">{channel} · T{stage}</span>\
+         <span class=\"touch-state\">{state}</span><time>{due}</time></div>{subject}\
+         <div class=\"message\">{body}</div><details class=\"touch-meta\"><summary>Review details</summary>{purpose}{goal}{qa}</details>",
         state = esc(state),
         id = esc(&touch.id),
         channel = esc(channel_label(&touch.channel)),
@@ -3143,7 +3201,6 @@ fn render_mobile_touch(b: &mut String, touch: &Touch, person: &Person) {
             &touch.recipient_timezone,
             touch.day_offset
         )),
-        copy = esc(&copy),
         subject = if touch.subject.trim().is_empty() {
             String::new()
         } else {
@@ -3170,22 +3227,28 @@ fn render_mobile_touch(b: &mut String, touch: &Touch, person: &Person) {
             esc(channel_label(&touch.channel)),
         ));
     }
-    b.push_str("</div></details>");
+    b.push_str("</article>");
 }
 
-fn render_sheet_head(b: &mut String) {
+fn render_sheet_head(b: &mut String, max_stage: i64) {
     b.push_str(
         "<table class=\"crm-sheet\"><colgroup><col class=\"c-company\"><col class=\"c-context\">\
-         <col class=\"c-person\"><col class=\"c-why\"><col class=\"c-touch\"><col class=\"c-touch\">\
-         <col class=\"c-touch\"><col class=\"c-touch\"><col class=\"c-touch\"><col class=\"c-touch\">\
-         <col class=\"c-touch\"></colgroup><thead><tr><th class=\"pin\">Company</th>\
-         <th>Company context</th><th>Name</th><th>Internal role fit (not sent)</th>\
-         <th>T1</th><th>T2</th><th>T3</th><th>T4</th><th>T5</th><th>T6</th><th>T7</th>\
-         </tr></thead><tbody>",
+         <col class=\"c-person\"><col class=\"c-why\">",
     );
+    for _ in 1..=max_stage {
+        b.push_str("<col class=\"c-touch\">");
+    }
+    b.push_str(
+        "</colgroup><thead><tr><th class=\"pin\">Company</th><th>Company context</th>\
+         <th>Name</th><th>Internal role fit (not sent)</th>",
+    );
+    for stage in 1..=max_stage {
+        b.push_str(&format!("<th>T{stage}</th>"));
+    }
+    b.push_str("</tr></thead><tbody>");
 }
 
-fn render_company_cell(b: &mut String, lead: &Lead, stripe: &str) {
+fn render_company_cell(b: &mut String, lead: &Lead, stripe: &str, rows: usize) {
     let details = [lead.industry.as_str(), lead.hq.as_str()]
         .into_iter()
         .filter(|value| !value.trim().is_empty())
@@ -3201,15 +3264,16 @@ fn render_company_cell(b: &mut String, lead: &Lead, stripe: &str) {
         )
     };
     b.push_str(&format!(
-        "<td class=\"company pin{stripe}\" rowspan=\"5\"><span class=\"brand-tag {brand}\">{brand}</span>\
+        "<td class=\"company pin{stripe}\" rowspan=\"{rows}\"><span class=\"brand-tag {brand}\">{brand}</span>\
          <strong>{name}</strong><small>{details}</small>{domain}</td>",
         brand = esc(&lead.brand),
         name = esc(&lead.name),
         details = esc(&details),
+        rows = rows,
     ));
 }
 
-fn render_lead_context_cell(b: &mut String, lead: &Lead, stripe: &str) {
+fn render_lead_context_cell(b: &mut String, lead: &Lead, stripe: &str, rows: usize) {
     let hypothesis = first_non_empty(&[&lead.hypothesis, &lead.thesis]);
     let observed = lead
         .observed_facts
@@ -3218,12 +3282,13 @@ fn render_lead_context_cell(b: &mut String, lead: &Lead, stripe: &str) {
         .unwrap_or("");
     let signal = lead.signals.first().map(String::as_str).unwrap_or("");
     b.push_str(&format!(
-        "<td class=\"context{stripe}\" rowspan=\"5\">{hypothesis}{observed}{signal}{measure}{mechanism}</td>",
+        "<td class=\"context{stripe}\" rowspan=\"{rows}\">{hypothesis}{observed}{signal}{measure}{mechanism}</td>",
         hypothesis = context_line("Hypothesis", hypothesis),
         observed = context_line("Observed", observed),
         signal = context_line("Signal", signal),
         measure = context_line("Measure", &lead.consequence_metric),
         mechanism = context_line("How", &lead.mechanism),
+        rows = rows,
     ));
 }
 
@@ -3303,23 +3368,18 @@ fn render_touch_cell(b: &mut String, touch: &Touch) {
     } else {
         touch.status.as_str()
     };
-    let copy = if touch.subject.trim().is_empty() {
-        preview(&touch.body, 150)
-    } else {
-        preview(&format!("{} — {}", touch.subject, touch.body), 150)
-    };
     let due = display_due(&touch.due_at, &touch.recipient_timezone, touch.day_offset);
     b.push_str(&format!(
-        "<td class=\"touch {state}\" data-touch-id=\"{id}\"><details data-open-id=\"touch-{id}\"><summary><span class=\"touch-tag\">{channel} · T{stage}</span>\
-         {written}<time>{due}</time><p>{copy}</p></summary><div class=\"touch-full\"><span class=\"touch-state\">{state}</span>\
-         {subject}<div class=\"message\">{body}</div>{purpose}{goal}{qa}</div></details></td>",
+        "<td class=\"touch {state}\" data-touch-id=\"{id}\"><article class=\"touch-inline\">\
+         <div class=\"touch-head\"><span class=\"touch-tag\">{channel} · T{stage}</span><span class=\"touch-state\">{state}</span>\
+         {written}<time>{due}</time></div>{subject}<div class=\"message\">{body}</div>\
+         <details class=\"touch-meta\"><summary>Review details</summary>{purpose}{goal}{qa}</details></article></td>",
         state = esc(state),
         id = esc(&touch.id),
         channel = esc(channel_label(&touch.channel)),
         stage = touch.stage,
         written = written_at_html(&touch.created_at),
         due = esc(&due),
-        copy = esc(&copy),
         subject = if touch.subject.trim().is_empty() {
             String::new()
         } else {
@@ -3365,7 +3425,7 @@ fn render_empty_contact_row(b: &mut String, slot: usize) {
 
 fn render_research_sheet(b: &mut String, accounts: &[CrmAccount]) {
     b.push_str("<div class=\"desktop-pipeline\">");
-    render_sheet_head(b);
+    render_sheet_head(b, 7);
     for (account_index, account) in accounts.iter().enumerate() {
         let contacts = account.contacts.iter().take(5).collect::<Vec<_>>();
         for slot in 0..5 {
@@ -3465,22 +3525,16 @@ fn render_mobile_research_cards(b: &mut String, accounts: &[CrmAccount]) {
             ));
             for stage in 1..=7 {
                 if let Some(touch) = contact.touches.iter().find(|touch| touch.stage == stage) {
-                    let copy = if touch.subject.trim().is_empty() {
-                        preview(&touch.body, 120)
-                    } else {
-                        preview(&format!("{} — {}", touch.subject, touch.body), 120)
-                    };
                     b.push_str(&format!(
-                        "<details class=\"mobile-touch {state}\" data-open-id=\"research-touch-{contact}-{stage}\">\
-                         <summary><span class=\"touch-tag\">{channel} · T{stage}</span>\
-                         <time>Day {day} · not scheduled</time><p>{copy}</p></summary>\
-                         <div class=\"touch-full\">{subject}<div class=\"message\">{body}</div>{purpose}{goal}</div></details>",
+                        "<article class=\"mobile-touch {state} touch-inline\" data-touch-id=\"research-touch-{contact}-{stage}\">\
+                         <div class=\"touch-head\"><span class=\"touch-tag\">{channel} · T{stage}</span>\
+                         <time>Day {day} · not scheduled</time></div>{subject}<div class=\"message\">{body}</div>\
+                         <details class=\"touch-meta\"><summary>Plan details</summary>{purpose}{goal}</details></article>",
                         state = touch.status.label(),
                         contact = esc(&contact.id),
                         stage = touch.stage,
                         channel = esc(channel_label(&touch.channel)),
                         day = touch.day_offset,
-                        copy = esc(&copy),
                         subject = if touch.subject.trim().is_empty() {
                             String::new()
                         } else {
@@ -3507,21 +3561,15 @@ fn render_mobile_research_cards(b: &mut String, accounts: &[CrmAccount]) {
 }
 
 fn render_research_touch(b: &mut String, touch: &CrmTouch) {
-    let copy = if touch.subject.trim().is_empty() {
-        preview(&touch.body, 150)
-    } else {
-        preview(&format!("{} — {}", touch.subject, touch.body), 150)
-    };
     b.push_str(&format!(
-        "<td class=\"touch {state}\"><details><summary><span class=\"touch-tag\">{channel} · T{stage}</span>\
-         {written}<time>Day {day} · time not scheduled</time><p>{copy}</p></summary><div class=\"touch-full\">\
-         {subject}<div class=\"message\">{body}</div>{purpose}{goal}</div></details></td>",
+        "<td class=\"touch {state}\"><article class=\"touch-inline\"><div class=\"touch-head\">\
+         <span class=\"touch-tag\">{channel} · T{stage}</span>{written}<time>Day {day} · time not scheduled</time></div>\
+         {subject}<div class=\"message\">{body}</div><details class=\"touch-meta\"><summary>Plan details</summary>{purpose}{goal}</details></article></td>",
         state = touch.status.label(),
         channel = esc(channel_label(&touch.channel)),
         stage = touch.stage,
         written = written_at_html(&touch.created_at),
         day = touch.day_offset,
-        copy = esc(&copy),
         subject = if touch.subject.trim().is_empty() {
             String::new()
         } else {
@@ -3535,10 +3583,10 @@ fn render_research_touch(b: &mut String, touch: &CrmTouch) {
 
 fn render_empty_sheet(b: &mut String) {
     b.push_str("<div class=\"desktop-pipeline\">");
-    render_sheet_head(b);
+    render_sheet_head(b, 4);
     b.push_str(
-        "<tr><td class=\"empty-sheet\" colspan=\"11\"><strong>No companies yet</strong>\
-         <span>Source a campaign and the company, five contacts, reply rationale, and T1–T7 schedule will appear here.</span></td></tr>\
+        "<tr><td class=\"empty-sheet\" colspan=\"8\"><strong>No companies yet</strong>\
+         <span>Source a campaign and the company, primary contact, reply rationale, and current touch schedule will appear here.</span></td></tr>\
          </tbody></table></div><section class=\"mobile-pipeline mobile-empty\"><strong>No companies yet</strong>\
          <span>Ask Spruce Leaf to source accounts and they will appear here.</span></section>",
     );
@@ -3890,7 +3938,7 @@ body { color: var(--ink); background: var(--paper); font: 13px/1.45 var(--font);
 .top-stats strong { color: var(--ink); font-size: 14px; margin-right: 3px; }
 .sheet-scroll { flex: 1 1 auto; min-height: 0; overflow: auto; }
 .crm-sheet { border-collapse: separate; border-spacing: 0; table-layout: fixed; width: max-content; min-width: 100%; }
-.c-company { width: 210px; }.c-context { width: 360px; }.c-person { width: 220px; }.c-why { width: 280px; }.c-touch { width: 230px; }
+.c-company { width: 210px; }.c-context { width: 360px; }.c-person { width: 220px; }.c-why { width: 280px; }.c-touch { width: 300px; }
 .crm-sheet th {
   position: sticky; top: 0; z-index: 8; height: 36px; padding: 0 10px; text-align: left;
   color: var(--muted); background: #f2f6fc; border-bottom: 1px solid var(--line); border-right: 1px solid var(--line);
@@ -3936,8 +3984,7 @@ body { color: var(--ink); background: var(--paper); font: 13px/1.45 var(--font);
 .why small b { color: var(--muted); }
 .muted { color: var(--faint); }
 .empty-person { background-image: repeating-linear-gradient(135deg, transparent, transparent 6px, rgba(95,99,104,.025) 6px, rgba(95,99,104,.025) 12px) !important; }
-.touch { cursor: pointer; }
-.touch summary { list-style: none; }.touch summary::-webkit-details-marker { display: none; }
+.touch { cursor: default; }
 .touch-tag {
   display: inline-block; padding: 1px 6px; border: 1px solid #d2e3fc; border-radius: 4px;
   color: var(--blue); background: var(--blue-tint); font-size: 9.5px; font-weight: 750; letter-spacing: .025em; text-transform: uppercase;
@@ -3948,14 +3995,19 @@ body { color: var(--ink); background: var(--paper); font: 13px/1.45 var(--font);
 .touch.writing .touch-tag { color: #3c6fd1; border-color: #c9dafb; background: #edf3ff; }
 .touch.reviewing { background: #fbf8ff !important; }
 .touch.reviewing .touch-tag { color: #7651b6; border-color: #ddcff4; background: #f3edff; }
-.touch.writing summary p, .touch.reviewing summary p { color: var(--faint); }
 @keyframes draft-shimmer { from { background-position: 180% 0; } to { background-position: -40% 0; } }
 .touch time { display: block; margin: 5px 0 4px; color: var(--blue-strong); font-size: 10.5px; font-weight: 650; }
 .touch time.written-at { margin: 6px 0 0; color: var(--faint); font-size: 9.5px; font-weight: 550; }
 .touch time.written-at + time { margin-top: 2px; }
-.touch summary p { margin: 0; color: var(--muted); font-size: 11px; line-height: 1.42; }
 .touch:hover { background: var(--blue-tint) !important; }
-.touch details[open] { min-width: 360px; }
+.touch-head { min-height: 24px; }
+.touch-inline > .subject { display: block; margin: 8px 0 6px; color: var(--ink); font-size: 11.5px; }
+.touch-inline > .message { color: var(--ink); white-space: normal; font-size: 11.5px; line-height: 1.52; overflow-wrap: anywhere; }
+.touch-meta { margin-top: 10px; padding-top: 7px; border-top: 1px solid var(--line); }
+.touch-meta > summary { cursor: pointer; list-style: none; color: var(--faint); font-size: 9.5px; font-weight: 650; text-transform: uppercase; }
+.touch-meta > summary::-webkit-details-marker { display: none; }
+.touch-meta > summary::before { content: '+ '; }
+.touch-meta[open] > summary::before { content: '− '; }
 .touch-full { margin-top: 9px; padding-top: 8px; border-top: 1px solid var(--line); }
 .touch-full .subject { display: block; margin-bottom: 5px; font-size: 11.5px; }
 .touch-full .message { color: var(--ink); white-space: normal; font-size: 11.5px; line-height: 1.5; }
@@ -3969,7 +4021,7 @@ body { color: var(--ink); background: var(--paper); font: 13px/1.45 var(--font);
 .empty-sheet span { font-size: 12px; }
 @media (max-width: 760px) {
   .topbar { padding: 0 12px; }.topbar p { display: none; }.top-stats { gap: 10px; font-size: 10px; }
-  .c-company { width: 170px; }.c-context { width: 300px; }.c-person { width: 190px; }.c-why { width: 230px; }.c-touch { width: 210px; }
+  .c-company { width: 170px; }.c-context { width: 300px; }.c-person { width: 190px; }.c-why { width: 230px; }.c-touch { width: 280px; }
 }
 
 /* ---- Portfolio: brand tabs + sub bar + hub cards --------------------- */
@@ -4307,6 +4359,11 @@ a.brand-lockup { text-decoration: none; color: var(--ink); flex: 0 0 auto; }
 .mobile-contact-body > .email { margin-top: 10px; }
 .mobile-touches { display: grid; gap: 8px; margin-top: 12px; }
 .mobile-touch { border-radius: 9px; }
+.mobile-touch.touch-inline { padding: 11px; }
+.mobile-touch.touch-inline .touch-head { min-height: 22px; }
+.mobile-touch.touch-inline .touch-head time { float: right; max-width: 58%; margin: 1px 0 0; }
+.mobile-touch.touch-inline > .subject { margin-top: 9px; font-size: 12px; }
+.mobile-touch.touch-inline > .message { font-size: 12px; line-height: 1.55; }
 .mobile-touch > summary { min-height: 56px; padding: 10px 11px; cursor: pointer; list-style: none; }
 .mobile-touch > summary time {
   float: right; max-width: 58%; margin: 1px 0 0; color: var(--blue-strong);
@@ -4487,7 +4544,7 @@ mod tests {
         assert!(hub.contains("Hypothesis-led discovery"));
         assert!(hub.contains("Agent personas &amp; retrieved knowledge"));
         assert!(hub.contains("playbooks/personas/writer.md"));
-        assert!(hub.contains("Ten-lens sales council"));
+        assert!(hub.contains("Optional ten-lens audit"));
         assert!(hub.contains("Alex Hormozi value-and-offer lens"));
         assert!(hub.contains("Wapahki"));
         assert!(hub.contains("GnK"));
@@ -4661,18 +4718,23 @@ mod tests {
                 person_id: person_id.clone(),
                 lead_id: lead_id.clone(),
                 brand: "gnk".into(),
+                copy_policy_version: crate::db::CURRENT_COPY_POLICY_VERSION,
                 status: "active".into(),
                 ..Default::default()
             })
             .expect("insert sequence");
-        for (channel, stage) in [("email", 1), ("linkedin_request", 2)] {
+        for (index, channel) in ["email", "email", "linkedin_request", "email"]
+            .iter()
+            .enumerate()
+        {
+            let stage = index as i64 + 1;
             db.insert_touch(&Touch {
                 sequence_id: sequence_id.clone(),
                 person_id: person_id.clone(),
                 lead_id: lead_id.clone(),
                 brand: "gnk".into(),
                 stage,
-                channel: channel.into(),
+                channel: (*channel).into(),
                 body: format!("A {channel} touch"),
                 status: "draft".into(),
                 due_at: if stage == 1 {
@@ -4701,13 +4763,13 @@ mod tests {
         assert_eq!(
             db.approve_touches(Some("gnk"), Some(&person_id))
                 .expect("approve"),
-            1
+            3
         );
         let touches = db
             .list_touches_for_person(&person_id)
             .expect("list touches");
         assert_eq!(touches[0].status, "scheduled");
-        assert_eq!(touches[1].status, "draft");
+        assert_eq!(touches[2].status, "draft");
 
         let dashboard = execution_dashboard(&db, Some("gnk")).expect("build dashboard");
         let json = serde_json::to_string(&dashboard).expect("serialize dashboard");
@@ -4736,16 +4798,21 @@ mod tests {
         assert!(html.contains("href=\"/strategy/gnk\""));
         assert!(html.contains("Company context"));
         assert!(html.contains("Internal role fit (not sent)"));
+        assert!(html.contains("<th>T4</th>"));
+        assert!(!html.contains("<th>T5</th>"));
         assert!(html.contains("Real Logistics"));
         assert!(html.contains("Alex Rivera"));
         assert!(html.contains("alex@example.com"));
-        assert!(html.contains("Contact 5"));
+        assert!(!html.contains("Contact 5"));
         assert!(html.contains("Fri 7 Aug · 5:00 AM EDT"));
         assert!(html.contains("class=\"written-at\""));
         assert!(html.contains("Drafted "));
         assert!(html.contains("A email touch"));
         assert!(html.contains("setInterval(refreshPipeline, 3000)"));
         assert!(html.contains("data-touch-id="));
+        assert!(html.contains("class=\"touch-inline\""));
+        assert!(html.contains("<div class=\"message\">A email touch"));
+        assert!(!html.contains("data-open-id=\"touch-"));
         // Desktop keeps the dense sheet; phone widths receive an outcome-oriented
         // account/contact card view with the same controls and copy.
         assert!(html.contains("class=\"desktop-pipeline\""));
@@ -4766,5 +4833,67 @@ mod tests {
         ] {
             let _ = std::fs::remove_file(candidate);
         }
+    }
+
+    #[test]
+    fn pipeline_hides_people_until_the_current_sequence_is_complete() {
+        let db = Db::open(":memory:").expect("open memory db");
+        let lead_id = db
+            .upsert_lead(&Lead {
+                brand: "gnk".into(),
+                apollo_org_id: "hidden-org".into(),
+                name: "Hidden Until Ready Ltd".into(),
+                ..Default::default()
+            })
+            .expect("insert lead");
+        let person_id = db
+            .upsert_person(&Person {
+                lead_id: lead_id.clone(),
+                brand: "gnk".into(),
+                apollo_person_id: "hidden-person".into(),
+                name: "Partial Draft Person".into(),
+                ..Default::default()
+            })
+            .expect("insert person");
+        let sequence_id = db
+            .create_sequence(&Sequence {
+                person_id: person_id.clone(),
+                lead_id: lead_id.clone(),
+                brand: "gnk".into(),
+                copy_policy_version: crate::db::CURRENT_COPY_POLICY_VERSION,
+                status: "active".into(),
+                ..Default::default()
+            })
+            .expect("insert sequence");
+        for stage in 1..=6 {
+            db.insert_touch(&Touch {
+                sequence_id: sequence_id.clone(),
+                person_id: person_id.clone(),
+                lead_id: lead_id.clone(),
+                brand: "gnk".into(),
+                stage,
+                channel: "email".into(),
+                body: format!("Reviewed stage {stage}"),
+                status: "draft".into(),
+                review_passes: Some(true),
+                ..Default::default()
+            })
+            .expect("insert partial touch");
+        }
+
+        let dashboard = execution_dashboard(&db, Some("gnk")).expect("dashboard");
+        assert_eq!(dashboard.accounts.len(), 1);
+        assert!(dashboard.accounts[0].people.is_empty());
+        assert_eq!(brand_tab_counts(&db)[1].1, 0);
+        let html = render_html(
+            &Crm::default(),
+            Some(&dashboard),
+            brand_meta("gnk"),
+            &brand_tab_counts(&db),
+            None,
+        );
+        assert!(!html.contains("Partial Draft Person"));
+        assert!(!html.contains("Not written"));
+        assert!(html.contains("No reviewed sequences ready yet"));
     }
 }

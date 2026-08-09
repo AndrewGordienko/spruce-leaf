@@ -766,10 +766,26 @@ async fn decide(
         "SENT_OFFERED_SLOTS": sent_slots,
         "AVAILABLE_SLOTS": slots,
     });
+    let proof_guidance = customer_development
+        .filter(|record| {
+            matches!(
+                crate::gtm::customer_development_stage(record),
+                "evidence_shared"
+                    | "evaluation_agreed"
+                    | "design_partner"
+                    | "loi_candidate"
+                    | "conditional_loi"
+                    | "paid_pilot"
+                    | "deployment"
+            )
+        })
+        .map(|_| core_strategy_block("proof"))
+        .unwrap_or_default();
     let user = format!(
-        "Analyse the newest inbound message and decide the next bounded action. A correction or referral is useful evidence; do not force a meeting or a proof. A proof is ready only when a specific problem, bounded sample/data, and observable success measure are established. Draft a reply only when a human response is useful.\n\n{}\n\n{}",
+        "Analyse the newest inbound message and decide the next bounded action. A correction or referral is useful evidence; do not force a meeting or a proof. A proof is ready only when a specific problem, bounded sample/data, and observable success measure are established. Draft a reply only when a human response is useful.\n\n{}\n\n{}\n\n{}",
         serde_json::to_string_pretty(&context).unwrap_or_default(),
         core_strategy_block("replies"),
+        proof_guidance,
     );
     client
         .structured_stage("reply.compose", &system, &user, schema())

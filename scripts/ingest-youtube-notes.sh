@@ -19,7 +19,7 @@ for required_file in "$spruce_bin" "$knowledge_path" "$catalog_path" "$merge_fil
 done
 
 "$spruce_bin" \
-  --backend claude \
+  --backend openai \
   --knowledge "$knowledge_path" \
   ingest "$notes_dir" \
   --no-distill

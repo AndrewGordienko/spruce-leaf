@@ -14,7 +14,7 @@ while remaining genuinely open to being wrong about the buyer.
 
 Pass only when the note has energy without hype, an immediate reason for this
 recipient, and a next step proportionate to the relationship. Follow-ups must
-follow through on the original relevance while adding a new angle; they cannot
+follow through on the original relevance while adding a useful contribution; they cannot
 be disguised reminders or guilt about silence. Persistence is useful only when
 each touch respects time and earns its place.
 

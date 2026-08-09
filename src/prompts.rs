@@ -181,18 +181,22 @@ angle — not restatements. Match the channel and ask to {name}'s vantage. Use e
 For each touch set: day_offset from the start; channel; subject (empty string for a connection request); the \
 body copy; purpose (which move this is — observation / diagnostic / consequence / artifact / \
 hard-question / routing / close); and goal.\n\n\
-If writing seven touches, use these exact channel/day pairs: email/0, email/3, \
+If writing four touches, use these exact channel/day pairs: email/0, email/3, \
+linkedin_request/7, email/14. If writing seven touches for a deliberate legacy comparison, use: email/0, email/3, \
 linkedin_request/5, email/9, linkedin_or_email/13, email/17, linkedin_or_email/21. \
 The connection request is 8–24 words with no pitch or meeting ask. Conditional touches are short \
 LinkedIn DMs when connected and email fallbacks otherwise. Finish by day 21. Touch 1 email is \
-40–75 words including the signature; later emails are 15–45 words; touch 7 has no question. \
+{min}–{max} words including the greeting and signature; later emails are shorter but substantive; touch 7 has no question. \
 Mention {brand} only in touch 1. Use at most one \
 question, one CTA, one verified account fact, and one short sentence about {brand} per touch. \
-Subjects are 1–3 plain lowercase words with no numbers or question marks. Do not use fake familiarity, explain your strategy, dump the \
+Subjects are 2–6 plain lowercase words with no numbers or question marks. Do not use fake familiarity, explain your strategy, dump the \
 research, or assert limitations of the recipient's tools.\n\n\
 Follow the length band, the voice, the forbidden list, and the pre-send test from the doctrine. \
-Center the operating decision, not {brand}. Keep the whole sequence on ONE problem thread. A \
-correction or a referral is a successful outcome.",
+Center the operating decision, not {brand}. In four touches, T2 sharpens the mechanism, T3 is a \
+natural connection request, and T4 contributes a useful distinction or answers the hard buyer \
+question before closing. In the legacy sequence, T4 contributes value, T5 answers the hard buyer \
+question, T6 routes once, and T7 closes. Keep the whole sequence on ONE problem thread. No more \
+than three touches may primarily retreat, request correction/referral, or close.",
         name = contact.name,
         title = contact.title,
         vantage = contact.vantage,
@@ -205,6 +209,8 @@ correction or a referral is a successful outcome.",
         hard_q = account.hard_buyer_question,
         facts = account.observed_facts.join(" | "),
         brand = pb.name,
+        min = pb.min_words,
+        max = pb.max_words,
     );
     with_knowledge(base, knowledge, true)
 }

@@ -16,6 +16,7 @@
 //!   5. upsert into the SQLite spine
 
 use anyhow::Result;
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures::stream::{self, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -883,6 +884,11 @@ fn enforce_play_qualification(
         allowed_signal_keys.contains(signal.definition_key.trim())
             && !signal.evidence.trim().is_empty()
             && signal.confidence >= 0.60
+            && credible_canonical_signal(
+                play.map(|play| play.brand.as_str()).unwrap_or_default(),
+                &signal.definition_key,
+                &signal.evidence,
+            )
     });
     let mut matched = qualification
         .structured_signals
@@ -965,6 +971,83 @@ fn enforce_play_qualification(
             reasons.push("no source-backed account-fit evidence".into());
         }
         qualification.reject_reason = reasons.join("; ");
+    }
+}
+
+/// Canonical signals are stronger than topical resemblance. In particular,
+/// GnK's old qualifier repeatedly relabeled "has a Claims department" as an
+/// expensive recurring workflow and "has several portals" as human
+/// reconciliation. Those facts can support account fit, but not the operating
+/// condition the play needs before multi-touch outreach.
+fn credible_canonical_signal(brand: &str, key: &str, evidence: &str) -> bool {
+    if !brand.eq_ignore_ascii_case("gnk") {
+        return true;
+    }
+    let text = evidence.to_ascii_lowercase();
+    let has = |terms: &[&str]| terms.iter().any(|term| text.contains(term));
+    match key.trim() {
+        "account.expensive_recurring_workflow" => {
+            has(&[
+                "workflow",
+                "process",
+                "claim",
+                "case",
+                "exception",
+                "investigation",
+                "decision",
+                "handoff",
+                "reconciliation",
+                "review",
+            ]) && has(&[
+                "manual",
+                "repeated",
+                "recurring",
+                " each ",
+                " per ",
+                "daily",
+                "weekly",
+                "monthly",
+                "every ",
+                "volume",
+                "queue",
+            ]) && has(&[
+                "backlog",
+                "delay",
+                "rework",
+                "hours",
+                " time",
+                "risk",
+                "loss",
+                "reserve",
+                "settlement",
+                "legal cost",
+                "severity",
+                "capacity",
+                "bottleneck",
+                "cost",
+            ])
+        }
+        "account.cross_system_reconciliation" => {
+            has(&["system", "portal", "record", "document", "source"])
+                && has(&[
+                    "reconcil",
+                    "assembl",
+                    "stitch",
+                    "manually pull",
+                    "manual pull",
+                    "re-key",
+                    "rekey",
+                    "copy between",
+                    "compare across",
+                    "cross-system",
+                    "across systems",
+                ])
+        }
+        // Account qualification happens before contact mapping, so the model
+        // cannot prove reachability from company facts. Contact sourcing may
+        // record this separately once a real person and vantage exist.
+        "account.reachable_workflow_owner" => false,
+        _ => true,
     }
 }
 
@@ -1295,8 +1378,12 @@ async fn qualify_org(
          guess in inferences. consequence_metric is a measurable consequence, NOT dollars. If at \
          least {min} independent signals don't support the hypothesis, set qualified=false with a \
          one-line reject_reason. Preserve the readable `signals` list, and also map every supported \
-         observation you can to `structured_signals` using the canonical catalog. Never invent a \
-         signal merely to satisfy the catalog. Missing public evidence is an `evidence_gap`, never \
+         observation you can to `structured_signals` using the canonical catalog. Every canonical \
+         signal needs its own direct Apollo or first-party website evidence. A technology name, broad \
+         product range, company scale, or the existence of several portals does not by itself prove \
+         a manual workflow, cross-system reconciliation, pain, material consequence, or reachable \
+         workflow owner. Do not relabel one generic fact as several independent required signals, and \
+         never invent a signal merely to satisfy the catalog. Missing public evidence is an `evidence_gap`, never \
          a `disqualifier`; reserve disqualifiers for affirmative evidence that the company cannot \
          realistically run, buy, or validate the motion. A plausible manufacturer with account-fit \
          evidence and one supported workflow signal may remain a discovery candidate even when the \
@@ -1343,7 +1430,7 @@ async fn assign_vantage(
         doctrine = core_strategy_block("people"),
     );
     client
-        .structured_fast::<VantageDoc>("source.vantage", system, &user, vantage_schema())
+        .structured_bulk::<VantageDoc>("source.vantage", system, &user, vantage_schema())
         .await
 }
 
@@ -1760,6 +1847,7 @@ async fn hydrate_org(apollo: &Apollo, org: ApolloOrg) -> ApolloOrg {
 /// more verified contacts, richer doctrine, more recent update.
 pub fn select_reuse(
     db: &SharedDb,
+    pb: &Playbook,
     brand: &str,
     n_accounts: usize,
     n_contacts: usize,
@@ -1790,31 +1878,64 @@ pub fn select_reuse(
     let mut ranked = leads
         .into_iter()
         .filter_map(|lead| {
-            let roster = by_lead.get(&lead.id)?;
+            if pb
+                .max_employees
+                .is_some_and(|max| lead.headcount > 0 && lead.headcount > max)
+            {
+                return None;
+            }
+            let roster = by_lead
+                .get(&lead.id)?
+                .iter()
+                .filter(|person| reusable_workflow_contact(person))
+                .cloned()
+                .collect::<Vec<_>>();
             if roster.is_empty() {
                 return None;
             }
-            let score = reuse_lead_score(&lead, roster);
-            Some((score, lead, roster.clone()))
+            let ready = roster
+                .iter()
+                .filter(|person| {
+                    crate::gtm::prepare_action(db, brand, &lead.id, person)
+                        .is_ok_and(|context| context.sequence_ready_for(2))
+                })
+                .count();
+            let has_contact_coverage = roster.len() >= n_contacts;
+            let score = reuse_lead_score(&lead, &roster);
+            Some((ready, has_contact_coverage, score, lead, roster))
         })
         .collect::<Vec<_>>();
     ranked.sort_by(|left, right| {
         right
             .0
             .cmp(&left.0)
-            .then_with(|| left.1.name.cmp(&right.1.name))
+            .then_with(|| right.1.cmp(&left.1))
+            .then_with(|| right.2.cmp(&left.2))
+            .then_with(|| left.3.name.cmp(&right.3.name))
     });
 
     let accounts_on_file = ranked.len();
+    // An account with one historical contact, or no evidence-ready contact at
+    // all, is inventory but not coverage for a "N people per company" motion.
+    // Treat it as a shortfall so the full motion sources replacements instead
+    // of selecting weak rows and holding them only after the expensive refresh.
+    let reusable_accounts = ranked
+        .iter()
+        .filter(|(ready, covered, _, _, _)| *ready > 0 && *covered)
+        .count();
     let mut selection = ReuseSelection {
         accounts_on_file,
         people_on_file,
         verified_on_file,
-        accounts_shortfall: n_accounts.saturating_sub(accounts_on_file),
+        accounts_shortfall: n_accounts.saturating_sub(reusable_accounts),
         ..Default::default()
     };
 
-    for (_score, lead, mut roster) in ranked.into_iter().take(n_accounts) {
+    for (_ready, _covered, _score, lead, mut roster) in ranked
+        .into_iter()
+        .filter(|(ready, covered, _, _, _)| *ready > 0 && *covered)
+        .take(n_accounts)
+    {
         roster.sort_by(|left, right| {
             reuse_person_score(right)
                 .cmp(&reuse_person_score(left))
@@ -1832,6 +1953,29 @@ pub fn select_reuse(
         }
     }
     Ok(selection)
+}
+
+fn reusable_workflow_contact(person: &Person) -> bool {
+    let vantage = person.vantage.to_ascii_lowercase();
+    if !matches!(
+        vantage.as_str(),
+        "process_owner" | "operator" | "operational_executive"
+    ) {
+        return false;
+    }
+    // Legacy contact maps occasionally promoted finance titles to
+    // `process_owner` merely because they could see aggregate cost. That is a
+    // later-stage buying vantage, not someone to interview about the workflow.
+    let title = person.title.to_ascii_lowercase();
+    ![
+        "chief financial",
+        "cfo",
+        "finance",
+        "financial controller",
+        "accounting",
+    ]
+    .iter()
+    .any(|term| title.contains(term))
 }
 
 fn reuse_lead_score(lead: &Lead, people: &[Person]) -> i64 {
@@ -1897,6 +2041,16 @@ pub async fn refresh_lead_context(
     }
     let active_play = db.current_gtm_play(&pb.key)?;
     let gtm_play_context = crate::gtm::sourcing_play_block(active_play.as_ref());
+    // A refresh must be capable of learning something new. Reinterpreting the
+    // same legacy CRM notes made weak hypotheses look more polished without
+    // making them more true. Re-read the official site before reassessment;
+    // this is best-effort and never spends Apollo credits.
+    let researcher = if research::enabled() {
+        ResearchClient::from_env().ok()
+    } else {
+        None
+    };
+    let researcher_ref = researcher.as_ref();
     let system = format!(
         "You refresh commercial framing for companies already qualified for {name}. Motion: {motion}. \
          Keep the company; rewrite why it fits now. Separate supported facts, inferences, and a \
@@ -1916,8 +2070,26 @@ pub async fn refresh_lead_context(
     let knowledge = format!("{}\n\n{}", core_strategy_block("companies"), retrieved);
     let concurrency = concurrency.max(1);
 
+    let refresh_ttl_secs = std::env::var("SPRUCE_ACCOUNT_REFRESH_TTL_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .unwrap_or(6 * 60 * 60)
+        .max(0);
+    let refresh_cutoff = Utc::now() - ChronoDuration::seconds(refresh_ttl_secs);
     let mut leads = Vec::new();
     for id in lead_ids {
+        let recently_refreshed = refresh_ttl_secs > 0
+            && db
+                .list_active_signal_observations(Some(&pb.key), Some(id), None)?
+                .iter()
+                .any(|observation| {
+                    observation.source_name == "source.refresh"
+                        && DateTime::parse_from_rfc3339(&observation.observed_at)
+                            .is_ok_and(|observed| observed.with_timezone(&Utc) >= refresh_cutoff)
+                });
+        if recently_refreshed {
+            continue;
+        }
         if let Some(lead) = db.get_lead(id)? {
             leads.push(lead);
         }
@@ -1933,6 +2105,25 @@ pub async fn refresh_lead_context(
         let thesis = thesis.to_string();
         let gtm_play_context = gtm_play_context.clone();
         async move {
+            let website_research = match researcher_ref {
+                Some(researcher) => {
+                    let org = ApolloOrg {
+                        id: lead.apollo_org_id.clone(),
+                        name: lead.name.clone(),
+                        website_url: format!("https://{}", lead.domain),
+                        primary_domain: lead.domain.clone(),
+                        industry: lead.industry.clone(),
+                        estimated_num_employees: lead.headcount,
+                        annual_revenue_printed: lead.revenue.clone(),
+                        ..Default::default()
+                    };
+                    research::research_company(client, researcher, pb, &org)
+                        .await
+                        .map(|brief| brief.as_facts_block())
+                        .unwrap_or_default()
+                }
+                None => String::new(),
+            };
             let refresh = refresh_one_lead(
                 client,
                 &system,
@@ -1941,6 +2132,7 @@ pub async fn refresh_lead_context(
                 &gtm_play_context,
                 &thesis,
                 &lead,
+                &website_research,
                 &knowledge,
             )
             .await;
@@ -1954,32 +2146,57 @@ pub async fn refresh_lead_context(
     let mut refreshed = 0usize;
     for (mut lead, result) in results {
         match result {
-            Ok(doc) => {
+            Ok(mut doc) => {
+                doc.structured_signals.retain(|signal| {
+                    credible_canonical_signal(&pb.key, &signal.definition_key, &signal.evidence)
+                });
+                doc.matched_signal_keys = doc
+                    .structured_signals
+                    .iter()
+                    .map(|signal| signal.definition_key.trim().to_string())
+                    .collect::<HashSet<_>>()
+                    .into_iter()
+                    .collect();
+                doc.matched_signal_keys.sort();
                 let structured_signals = doc.structured_signals.clone();
-                let assessment = active_play.as_ref().map(|play| AccountPlayAssessment {
-                    lead_id: lead.id.clone(),
-                    brand: pb.key.clone(),
-                    play_id: play.id.clone(),
-                    play_version: play.version,
-                    status: if doc.play_fit_score >= 65
-                        && !doc.root_cause.trim().is_empty()
-                        && doc.disqualifiers.is_empty()
-                    {
-                        "qualified".into()
-                    } else {
-                        "research_needed".into()
-                    },
-                    fit_score: doc.play_fit_score,
-                    matched_signal_keys: doc.matched_signal_keys.clone(),
-                    symptom: doc.symptom.clone(),
-                    root_cause: doc.root_cause.clone(),
-                    current_workaround: doc.current_workaround.clone(),
-                    why_now: doc.why_now.clone(),
-                    proof_fit: doc.proof_fit.clone(),
-                    evidence_gaps: doc.evidence_gaps.clone(),
-                    disqualifiers: doc.disqualifiers.clone(),
-                    source: "source.refresh".into(),
-                    ..Default::default()
+                let assessment = active_play.as_ref().map(|play| {
+                    let matched = structured_signals
+                        .iter()
+                        .map(|signal| signal.definition_key.trim())
+                        .filter(|key| {
+                            play.required_signal_keys
+                                .iter()
+                                .any(|required| required == key)
+                        })
+                        .collect::<HashSet<_>>()
+                        .len();
+                    AccountPlayAssessment {
+                        lead_id: lead.id.clone(),
+                        brand: pb.key.clone(),
+                        play_id: play.id.clone(),
+                        play_version: play.version,
+                        status: if matched >= play.minimum_signal_matches.max(1) as usize
+                            && doc.play_fit_score >= 65
+                            && !doc.root_cause.trim().is_empty()
+                            && !doc.proof_fit.trim().is_empty()
+                            && doc.disqualifiers.is_empty()
+                        {
+                            "qualified".into()
+                        } else {
+                            "research_needed".into()
+                        },
+                        fit_score: doc.play_fit_score,
+                        matched_signal_keys: doc.matched_signal_keys.clone(),
+                        symptom: doc.symptom.clone(),
+                        root_cause: doc.root_cause.clone(),
+                        current_workaround: doc.current_workaround.clone(),
+                        why_now: doc.why_now.clone(),
+                        proof_fit: doc.proof_fit.clone(),
+                        evidence_gaps: doc.evidence_gaps.clone(),
+                        disqualifiers: doc.disqualifiers.clone(),
+                        source: "source.refresh".into(),
+                        ..Default::default()
+                    }
                 });
                 apply_lead_refresh(&mut lead, doc, thesis);
                 let lead_id = db.upsert_lead(&lead)?;
@@ -2019,6 +2236,7 @@ async fn refresh_one_lead(
     gtm_play_context: &str,
     thesis: &str,
     lead: &Lead,
+    website_research: &str,
     knowledge: &str,
 ) -> Result<LeadRefresh> {
     let facts = json!({
@@ -2041,16 +2259,31 @@ async fn refresh_one_lead(
         format!("{}\n\n", business_context.trim())
     };
     let signal_catalog = crate::gtm::signal_catalog_prompt(&pb.key);
+    let website_block = if website_research.trim().is_empty() {
+        "OFFICIAL-SITE RESEARCH: unavailable or too thin; do not infer missing facts.\n\n"
+            .to_string()
+    } else {
+        format!("OFFICIAL-SITE RESEARCH:\n{}\n\n", website_research.trim())
+    };
     let user = format!(
         "{context_block}{gtm_play_context}\n\nThis company is ALREADY on file. Reassess it against the active play and refresh the commercial \
          framing so outreach copy can explain exactly why THIS company is a fit for the thesis and \
          for the business goals above. Do not reject the company. Prefer keeping prior observed_facts \
          that still hold; tighten or replace weak inferences/hypothesis/mechanism.\n\n\
-         THESIS: {thesis}\n\nON-FILE ACCOUNT:\n{facts}\n\n{knowledge}\n\n\
-         Rules: observed_facts must stay grounded in the on-file fields above (and prior facts). \
+         THESIS: {thesis}\n\nON-FILE ACCOUNT:\n{facts}\n\n{website_block}{knowledge}\n\n\
+         Rules: observed_facts must stay grounded in the on-file fields above, prior facts, or the \
+         new official-site research. Inside that research, only `what they do`, `fact`, and a \
+         narrowly bounded explicit hiring signal are observations; `signal`, `possible fit`, and \
+         `why` remain analyst hypotheses. Put the supporting official URL in source_url for every \
+         structured signal derived from the new website evidence. \
          Never invent customers, systems, volumes, or dollar figures. consequence_metric is measurable \
          and non-dollar. why_this_company: one plain sentence a founder could say out loud. Preserve \
          readable `signals` and map supported evidence to `structured_signals` using only the catalog. \
+         Every structured signal's evidence must quote or closely paraphrase a prior_observed_fact; \
+         prior_inferences, prior_hypothesis, prior_signals, technology lists, and generic company breadth \
+         cannot independently prove a manual workflow, cross-system reconciliation, pain, consequence, \
+         or reachable owner. One fact may not be relabeled as several independent required signals. If \
+         the observed facts do not support a canonical signal, omit it and name the gap. \
          Separate symptom from root cause, describe the current workaround without asserting guesses \
          as fact, state why the bounded proof fits, and score the account against the same 100-point \
          play-fit rubric used during sourcing. Unknowns go in evidence_gaps; hard blockers go in \
@@ -2149,9 +2382,33 @@ mod tests {
     use std::collections::HashSet;
 
     use super::{
-        clamp_employee_ranges, enforce_play_qualification, reuse_lead_score, reuse_person_score,
-        OrgQual,
+        clamp_employee_ranges, credible_canonical_signal, enforce_play_qualification,
+        reusable_workflow_contact, reuse_lead_score, reuse_person_score, OrgQual,
     };
+
+    #[test]
+    fn gnk_signals_require_operating_evidence_not_department_or_portal_presence() {
+        assert!(!credible_canonical_signal(
+            "gnk",
+            "account.expensive_recurring_workflow",
+            "The website presents Claims as a dedicated operating function."
+        ));
+        assert!(!credible_canonical_signal(
+            "gnk",
+            "account.cross_system_reconciliation",
+            "The website exposes several separately named portals and systems."
+        ));
+        assert!(credible_canonical_signal(
+            "gnk",
+            "account.expensive_recurring_workflow",
+            "Adjusters manually review each exception, adding hours of handling time."
+        ));
+        assert!(credible_canonical_signal(
+            "gnk",
+            "account.cross_system_reconciliation",
+            "Staff assemble the decision record manually across three systems."
+        ));
+    }
     use crate::db::{Lead, Person};
     use crate::gtm::{default_plays, SignalCandidate};
 
@@ -2214,6 +2471,28 @@ mod tests {
         let thin = Lead::default();
         let people = vec![primary];
         assert!(reuse_lead_score(&rich, &people) > reuse_lead_score(&thin, &people));
+    }
+
+    #[test]
+    fn reuse_excludes_later_stage_buyers_and_misclassified_finance_titles() {
+        let operator = Person {
+            title: "Claims Operations Manager".into(),
+            vantage: "process_owner".into(),
+            ..Default::default()
+        };
+        let cfo = Person {
+            title: "Chief Financial Officer".into(),
+            vantage: "economic_buyer".into(),
+            ..Default::default()
+        };
+        let mislabeled_controller = Person {
+            title: "Financial Controller".into(),
+            vantage: "process_owner".into(),
+            ..Default::default()
+        };
+        assert!(reusable_workflow_contact(&operator));
+        assert!(!reusable_workflow_contact(&cfo));
+        assert!(!reusable_workflow_contact(&mislabeled_controller));
     }
 
     #[test]

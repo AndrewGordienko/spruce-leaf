@@ -28,6 +28,10 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Increment when the buyer-facing copy contract changes materially. The CRM
+/// only presents sequences approved under the current policy.
+pub const CURRENT_COPY_POLICY_VERSION: i64 = 8;
+
 /// A real company sourced from Apollo and (optionally) qualified against a brand
 /// thesis. Everything the model *guesses* stays in the inference/hypothesis
 /// fields; the fact fields hold only what Apollo/verification could support.
@@ -132,8 +136,9 @@ pub struct Sequence {
     pub experiment_arm: String,
     pub experiment_assignment_id: String,
     pub signal_observation_ids: Vec<String>,
-    /// research_required | action_ready | no_play
+    /// research_required | discovery_ready | action_ready | no_play
     pub gtm_state: String,
+    pub copy_policy_version: i64,
     pub status: String,
     pub current_stage: i64,
     pub created_at: String,
@@ -721,6 +726,7 @@ impl Db {
             ("sequences", "experiment_assignment_id", "TEXT DEFAULT ''"),
             ("sequences", "signal_observation_ids", "TEXT DEFAULT '[]'"),
             ("sequences", "gtm_state", "TEXT DEFAULT ''"),
+            ("sequences", "copy_policy_version", "INTEGER DEFAULT 0"),
             ("touches", "recipient_timezone", "TEXT DEFAULT ''"),
             ("touches", "scheduled_rule", "TEXT DEFAULT ''"),
             ("touches", "schedule_reason", "TEXT DEFAULT ''"),
@@ -738,6 +744,23 @@ impl Db {
         ] {
             ensure_column(&conn, table, column, definition)?;
         }
+        // One-time lineage cleanup for databases created before official-site
+        // refreshes became canonical. History stays queryable; only active
+        // readiness stops counting older model summaries as current evidence.
+        conn.execute(
+            "UPDATE signal_observations AS old
+             SET status='superseded',updated_at=?1
+             WHERE old.person_id=''
+               AND old.source_name IN ('source.qualify','account_research','legacy_account_research')
+               AND old.status IN ('observed','verified')
+               AND EXISTS (
+                 SELECT 1 FROM signal_observations fresh
+                 WHERE fresh.brand=old.brand AND fresh.lead_id=old.lead_id
+                   AND fresh.source_name='source.refresh'
+                   AND fresh.observed_at>=old.observed_at
+               )",
+            params![now()],
+        )?;
         Ok(())
     }
 
@@ -779,24 +802,8 @@ impl Db {
             "UPDATE leads SET timezone=?2 WHERE id=?1",
             params![id, lead.timezone],
         )?;
-        for evidence in &lead.signals {
-            if evidence.trim().is_empty() {
-                continue;
-            }
-            let _ = record_signal_observation_conn(
-                &conn,
-                &SignalObservation {
-                    brand: lead.brand.clone(),
-                    definition_key: "account.fit_evidence".into(),
-                    lead_id: id.clone(),
-                    source_name: "account_research".into(),
-                    evidence: evidence.trim().to_string(),
-                    confidence: 0.70,
-                    status: "observed".into(),
-                    ..Default::default()
-                },
-            );
-        }
+        // `lead.signals` are internal research notes, not evidence observations.
+        // Only source-qualified SignalCandidate rows may influence GTM readiness.
         Ok(id)
     }
 
@@ -1057,11 +1064,16 @@ impl Db {
         } else {
             s.id.clone()
         };
+        let copy_policy_version = if s.copy_policy_version <= 0 {
+            CURRENT_COPY_POLICY_VERSION
+        } else {
+            s.copy_policy_version
+        };
         conn.execute(
             "INSERT INTO sequences (id,person_id,lead_id,brand,thesis,applied_principles,\
              play_id,play_version,experiment_id,experiment_arm,experiment_assignment_id,\
-             signal_observation_ids,gtm_state,status,current_stage,created_at) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+             signal_observation_ids,gtm_state,copy_policy_version,status,current_stage,created_at) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
             params![
                 id,
                 s.person_id,
@@ -1076,6 +1088,7 @@ impl Db {
                 s.experiment_assignment_id,
                 js(&s.signal_observation_ids),
                 s.gtm_state,
+                copy_policy_version,
                 status_or(&s.status, "active"),
                 s.current_stage,
                 now()
@@ -1252,8 +1265,12 @@ impl Db {
             }
         }
         let promoted = tx.execute(
-            "UPDATE sequences SET status='active',applied_principles=?2 WHERE id=?1 AND status='building'",
-            params![sequence_id, js(applied_principles)],
+            "UPDATE sequences SET status='active',applied_principles=?2,copy_policy_version=?3 WHERE id=?1 AND status='building'",
+            params![
+                sequence_id,
+                js(applied_principles),
+                CURRENT_COPY_POLICY_VERSION
+            ],
         )?;
         if promoted == 0 {
             anyhow::bail!("the building sequence is no longer promotable");
@@ -1271,6 +1288,39 @@ impl Db {
         )?;
         conn.execute(
             "UPDATE sequences SET status='rejected' WHERE id=?1 AND status='building'",
+            params![sequence_id],
+        )?;
+        Ok(())
+    }
+
+    /// A valid abstention: evidence or recipient fit was insufficient to write.
+    /// Preserve the checkpoint and reason without calling it failed copy.
+    pub fn hold_building_sequence(&self, sequence_id: &str, reason: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE touches SET status='blocked',review_passes=0,review_issues=?2,error=?3
+             WHERE sequence_id=?1 AND status IN ('writing','reviewing')",
+            params![sequence_id, js(&vec![reason.to_string()]), reason],
+        )?;
+        conn.execute(
+            "UPDATE sequences SET status='held' WHERE id=?1 AND status='building'",
+            params![sequence_id],
+        )?;
+        Ok(())
+    }
+
+    /// Stop an incomplete generation because the model provider was
+    /// unavailable. This is deliberately distinct from copy rejection: no
+    /// reviewer saw bad copy, and a later run may safely retry the recipient.
+    pub fn stop_building_sequence(&self, sequence_id: &str, reason: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE touches SET status='blocked',review_passes=0,review_issues=?2,error=?3
+             WHERE sequence_id=?1 AND status IN ('writing','reviewing')",
+            params![sequence_id, js(&vec![reason.to_string()]), reason],
+        )?;
+        conn.execute(
+            "UPDATE sequences SET status='stopped' WHERE id=?1 AND status='building'",
             params![sequence_id],
         )?;
         Ok(())
@@ -1301,7 +1351,7 @@ impl Db {
              JOIN sequences s ON s.id=t.sequence_id \
              JOIN people p ON p.id=t.person_id \
              WHERE t.status='scheduled' AND t.due_at<=?1 \
-               AND s.status='active' \
+               AND s.status='active' AND s.copy_policy_version=?3 \
                AND p.status NOT IN ('replied','unsubscribed','bounced','suppressed') \
                AND (?2 IS NULL OR t.brand=?2) \
                AND NOT EXISTS ( \
@@ -1310,9 +1360,12 @@ impl Db {
                      AND lower(prior.channel) IN ('email','linkedin_or_email') \
                      AND prior.status NOT IN ('sent','skipped','cancelled','replied') \
                ) \
-             ORDER BY t.due_at ASC LIMIT ?3",
+             ORDER BY t.due_at ASC LIMIT ?4",
         )?;
-        let rows = stmt.query_map(params![now(), brand, limit], |r| Ok(row_to_touch(r)))?;
+        let rows = stmt.query_map(
+            params![now(), brand, CURRENT_COPY_POLICY_VERSION, limit],
+            |r| Ok(row_to_touch(r)),
+        )?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -1324,11 +1377,16 @@ impl Db {
     pub fn claim_touch_for_send(&self, id: &str) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         Ok(conn.execute(
-            "UPDATE touches SET status='sending',error='' WHERE id=?1 AND status='scheduled'",
-            params![id],
+            "UPDATE touches SET status='sending',error='' WHERE id=?1 AND status='scheduled'
+             AND EXISTS (
+               SELECT 1 FROM sequences s WHERE s.id=touches.sequence_id
+                 AND s.status='active' AND s.copy_policy_version=?2
+             )",
+            params![id, CURRENT_COPY_POLICY_VERSION],
         )? == 1)
     }
 
+    #[cfg(test)]
     pub fn list_touches_for_person(&self, person_id: &str) -> Result<Vec<Touch>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -1339,6 +1397,14 @@ impl Db {
              ) ORDER BY stage ASC",
         )?;
         let rows = stmt.query_map(params![person_id], |r| Ok(row_to_touch(r)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn list_touches_for_sequence(&self, sequence_id: &str) -> Result<Vec<Touch>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT * FROM touches WHERE sequence_id=?1 ORDER BY stage ASC")?;
+        let rows = stmt.query_map(params![sequence_id], |r| Ok(row_to_touch(r)))?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -1421,7 +1487,7 @@ impl Db {
         Ok((regular + opportunities + conversations).max(0) as usize)
     }
 
-    /// Distinct people at one account (lead) whose *first* touch (stage 0) was
+    /// Distinct people at one account (lead) whose *first* touch (stage 1) was
     /// actually sent within the window — i.e. the number of new conversational
     /// fronts opened at that account today. This is the quantity the
     /// per-account/day throttle bounds so a blast of cold emails can't land on
@@ -1437,7 +1503,7 @@ impl Db {
         let end = end.to_rfc3339();
         let n: i64 = conn.query_row(
             "SELECT COUNT(DISTINCT person_id) FROM touches
-             WHERE lead_id=?1 AND stage=0 AND status='sent'
+             WHERE lead_id=?1 AND stage=1 AND status='sent'
                AND sent_at>=?2 AND sent_at<?3",
             params![lead_id, start, end],
             |r| r.get(0),
@@ -1451,9 +1517,15 @@ impl Db {
     pub fn account_engaged_people(&self, lead_id: &str) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
         let n: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM people
-             WHERE lead_id=?1 AND status IN ('contacted','replied','meeting_booked')",
-            params![lead_id],
+            "SELECT COUNT(DISTINCT p.id) FROM people p
+             WHERE p.lead_id=?1 AND (
+               p.status IN ('replied','meeting_booked') OR EXISTS (
+                 SELECT 1 FROM sequences s
+                 WHERE s.person_id=p.id AND s.status IN ('building','active')
+                   AND s.copy_policy_version=?2
+               )
+             )",
+            params![lead_id, CURRENT_COPY_POLICY_VERSION],
             |r| r.get(0),
         )?;
         Ok(n.max(0) as usize)
@@ -1754,8 +1826,12 @@ impl Db {
              AND (lower(channel)='email' OR (lower(channel)='linkedin_or_email' AND \
                   COALESCE((SELECT linkedin_status FROM people WHERE people.id=touches.person_id),'unknown')<>'connected')) \
              AND review_passes=1 \
+             AND EXISTS (
+               SELECT 1 FROM sequences s WHERE s.id=touches.sequence_id
+                 AND s.status='active' AND s.copy_policy_version=?3
+             ) \
              AND (?1 IS NULL OR brand=?1) AND (?2 IS NULL OR person_id=?2)",
-            params![brand, person_id],
+            params![brand, person_id, CURRENT_COPY_POLICY_VERSION],
         )?;
         Ok(n)
     }
@@ -1764,8 +1840,10 @@ impl Db {
         let conn = self.conn.lock().unwrap();
         Ok(conn
             .query_row(
-                "SELECT id FROM sequences WHERE person_id=?1 AND status='active' LIMIT 1",
-                params![person_id],
+                "SELECT id FROM sequences WHERE person_id=?1 AND status='active'
+                 ORDER BY CASE WHEN copy_policy_version=?2 THEN 0 ELSE 1 END,
+                          created_at DESC LIMIT 1",
+                params![person_id, CURRENT_COPY_POLICY_VERSION],
                 |r| r.get(0),
             )
             .optional()?)
@@ -3021,6 +3099,19 @@ impl Db {
         source_name: &str,
     ) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
+        if source_name == "source.refresh" {
+            // An official-site refresh is the canonical account snapshot. Keep
+            // prior rows for audit, but remove stale qualification and legacy
+            // research from the active evidence set.
+            conn.execute(
+                "UPDATE signal_observations
+                 SET status='superseded',updated_at=?1
+                 WHERE brand=?2 AND lead_id=?3 AND person_id=''
+                   AND source_name IN ('source.refresh','source.qualify','account_research','legacy_account_research')
+                   AND status IN ('observed','verified')",
+                params![now(), brand, lead_id],
+            )?;
+        }
         let mut recorded = 0usize;
         for candidate in candidates {
             if candidate.definition_key.trim().is_empty() || candidate.evidence.trim().is_empty() {
@@ -3128,6 +3219,68 @@ impl Db {
                 if record_signal_observation_conn(&conn, &observation).is_ok() {
                     inserted += 1;
                 }
+            }
+        }
+        // Contacts created before the versioned signal system already carry a
+        // researched role/vantage, but had no person-level observation. The
+        // CRM could display a verified process owner while the readiness gate
+        // saw no reachable owner at all. Backfill only identity, title, mapped
+        // vantage, and channel verification here; never copy the old
+        // `can_observe` hypothesis into evidence.
+        let mut stmt = conn.prepare(
+            "SELECT id,lead_id,brand,title,vantage,email_status,linkedin_url,updated_at
+             FROM people WHERE vantage<>''",
+        )?;
+        let people = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        for (person_id, lead_id, brand, title, vantage, email_status, linkedin_url, observed_at) in
+            people
+        {
+            let reachable =
+                email_status.eq_ignore_ascii_case("verified") || !linkedin_url.trim().is_empty();
+            let evidence = format!(
+                "{} — CRM contact mapped as {}; {}",
+                title.trim(),
+                vantage.trim(),
+                if reachable {
+                    "a verified email or LinkedIn profile is on file"
+                } else {
+                    "identity is on file but no verified outreach channel is available"
+                }
+            );
+            let observation = SignalObservation {
+                brand,
+                definition_key: "contact.workflow_vantage".into(),
+                lead_id,
+                person_id,
+                source_name: "legacy_contact_vantage".into(),
+                value_json: serde_json::json!({
+                    "legacy": true,
+                    "vantage": vantage,
+                    "reachable": reachable,
+                })
+                .to_string(),
+                evidence,
+                confidence: 0.70,
+                observed_at,
+                status: "observed".into(),
+                ..Default::default()
+            };
+            if record_signal_observation_conn(&conn, &observation).is_ok() {
+                inserted += 1;
             }
         }
         Ok(inserted)
@@ -4096,6 +4249,7 @@ fn row_to_sequence(r: &Row) -> Sequence {
         experiment_assignment_id: g(r, "experiment_assignment_id"),
         signal_observation_ids: jd(&g(r, "signal_observation_ids")),
         gtm_state: g(r, "gtm_state"),
+        copy_policy_version: r.get("copy_policy_version").unwrap_or(0),
         status: g(r, "status"),
         current_stage: r.get("current_stage").unwrap_or(0),
         created_at: g(r, "created_at"),
@@ -4903,6 +5057,7 @@ CREATE TABLE IF NOT EXISTS sequences (
     brand TEXT NOT NULL,
     thesis TEXT,
     applied_principles TEXT DEFAULT '[]',
+    copy_policy_version INTEGER DEFAULT 0,
     status TEXT DEFAULT 'active',
     current_stage INTEGER DEFAULT 0,
     created_at TEXT
@@ -5348,7 +5503,7 @@ mod tests {
     use super::{
         AccountPlayAssessment, ApplicationBrief, ConversationMessage, CustomerDevelopmentRecord,
         Db, GtmExperiment, Job, Lead, Mailbox, Meeting, Opportunity, OpportunityContact,
-        OpportunityTouch, Person, Sequence, Touch,
+        OpportunityTouch, Person, Sequence, Touch, CURRENT_COPY_POLICY_VERSION,
     };
     use chrono::{TimeZone, Utc};
     use uuid::Uuid;
@@ -5361,6 +5516,62 @@ mod tests {
         ] {
             let _ = std::fs::remove_file(candidate);
         }
+    }
+
+    #[test]
+    fn legacy_contact_vantage_is_backfilled_for_readiness() {
+        let path = std::env::temp_dir().join(format!(
+            "spruce-contact-vantage-backfill-test-{}.sqlite",
+            Uuid::new_v4()
+        ));
+        let db = Db::open(&path).expect("open temp db");
+        let shared = std::sync::Arc::new(db);
+        crate::gtm::seed_defaults(&shared).expect("seed defaults");
+        let lead_id = shared
+            .upsert_lead(&Lead {
+                brand: "gnk".into(),
+                apollo_org_id: "org-legacy-vantage".into(),
+                ..Default::default()
+            })
+            .expect("lead");
+        let person_id = shared
+            .upsert_person(&Person {
+                lead_id: lead_id.clone(),
+                brand: "gnk".into(),
+                apollo_person_id: "person-legacy-vantage".into(),
+                title: "Claims Operations Manager".into(),
+                vantage: "process_owner".into(),
+                email_status: "verified".into(),
+                ..Default::default()
+            })
+            .expect("person");
+        {
+            let conn = shared.conn.lock().unwrap();
+            conn.execute(
+                "DELETE FROM signal_observations WHERE person_id=?1",
+                rusqlite::params![person_id],
+            )
+            .expect("simulate pre-signal contact");
+        }
+        assert!(shared
+            .list_active_signal_observations(Some("gnk"), Some(&lead_id), Some(&person_id))
+            .unwrap()
+            .is_empty());
+
+        shared
+            .backfill_legacy_signal_observations()
+            .expect("backfill");
+        let observations = shared
+            .list_active_signal_observations(Some("gnk"), Some(&lead_id), Some(&person_id))
+            .unwrap();
+        assert!(observations
+            .iter()
+            .any(|observation| observation.definition_key == "contact.workflow_vantage"));
+        assert!(observations
+            .iter()
+            .all(|observation| !observation.evidence.contains("can_observe")));
+        drop(shared);
+        remove_temp_db(&path);
     }
 
     #[test]
@@ -5406,7 +5617,7 @@ mod tests {
         );
         assert_eq!(db.account_engaged_people(&lead_id).unwrap(), 0);
 
-        // Open person 0 with a stage-0 send timestamped inside the target day.
+        // Open person 0 with a stage-1 send timestamped inside the target day.
         let seq0 = db
             .create_sequence(&Sequence {
                 person_id: person_ids[0].clone(),
@@ -5422,7 +5633,7 @@ mod tests {
                 person_id: person_ids[0].clone(),
                 lead_id: lead_id.clone(),
                 brand: "gnk".into(),
-                stage: 0,
+                stage: 1,
                 channel: "email".into(),
                 status: "sent".into(),
                 due_at: "2026-08-07T09:00:00Z".into(),
@@ -5458,7 +5669,7 @@ mod tests {
                 person_id: person_ids[1].clone(),
                 lead_id: lead_id.clone(),
                 brand: "gnk".into(),
-                stage: 0,
+                stage: 1,
                 channel: "email".into(),
                 status: "sent".into(),
                 due_at: "2026-08-01T09:00:00Z".into(),
@@ -5963,10 +6174,27 @@ mod tests {
         let db = Db::open(":memory:").expect("open memory db");
         {
             let conn = db.conn.lock().expect("lock db");
+            conn.execute(
+                "INSERT INTO sequences
+                   (id,person_id,lead_id,brand,copy_policy_version,status,created_at)
+                 VALUES ('sequence-claim','person-claim','lead-claim','gnk',?1,'active','now')",
+                rusqlite::params![CURRENT_COPY_POLICY_VERSION],
+            )
+            .expect("seed current sequence");
+            conn.execute(
+                "INSERT INTO sequences
+                   (id,person_id,lead_id,brand,copy_policy_version,status,created_at)
+                 VALUES ('sequence-stale','person-claim','lead-stale','gnk',?1,'active','now')",
+                rusqlite::params![CURRENT_COPY_POLICY_VERSION - 1],
+            )
+            .expect("seed stale sequence");
             conn.execute_batch(
                 "INSERT INTO touches
                    (id,sequence_id,person_id,lead_id,brand,status)
                  VALUES ('touch-claim','sequence-claim','person-claim','lead-claim','gnk','scheduled');
+                 INSERT INTO touches
+                   (id,sequence_id,person_id,lead_id,brand,status)
+                 VALUES ('touch-stale','sequence-stale','person-stale','lead-stale','gnk','scheduled');
                  INSERT INTO conversations
                    (id,brand,person_id,status,created_at,updated_at)
                  VALUES ('conversation-claim','gnk','person-claim','open','now','now');
@@ -5986,8 +6214,13 @@ mod tests {
             .expect("seed claim rows");
         }
 
+        assert_eq!(
+            db.active_sequence_for_person("person-claim").unwrap(),
+            Some("sequence-claim".to_string())
+        );
         assert!(db.claim_touch_for_send("touch-claim").unwrap());
         assert!(!db.claim_touch_for_send("touch-claim").unwrap());
+        assert!(!db.claim_touch_for_send("touch-stale").unwrap());
         assert!(db
             .claim_conversation_message_for_send("message-claim")
             .unwrap());
@@ -6290,9 +6523,10 @@ mod tests {
         let observations = db
             .list_active_signal_observations(Some("outagehub"), Some(&lead_id), None)
             .expect("list observations");
-        assert!(observations
-            .iter()
-            .any(|observation| observation.definition_key == "account.fit_evidence"));
+        assert!(
+            observations.is_empty(),
+            "internal lead.signals must not become active evidence without source qualification"
+        );
 
         db.upsert_account_play_assessment(&AccountPlayAssessment {
             lead_id: lead_id.clone(),

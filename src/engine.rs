@@ -11,7 +11,7 @@
 //! Every call also accrues token/cost/latency into a shared [`Stats`] so the UI
 //! can print a footer.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
@@ -26,7 +26,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 
 /// Which provider supplies model inference.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, clap::ValueEnum)]
 pub enum Backend {
     Openai,
     Codex,
@@ -166,6 +166,28 @@ impl Stats {
         stages.entry(stage.to_string()).or_default().failures += 1;
     }
 
+    fn record_billed_failure(&self, stage: &str, outcome: &CallOutcome) {
+        self.failures.fetch_add(1, Ordering::Relaxed);
+        self.input_tokens
+            .fetch_add(outcome.input_tokens, Ordering::Relaxed);
+        self.cached_input_tokens
+            .fetch_add(outcome.cached_input_tokens, Ordering::Relaxed);
+        self.cache_write_input_tokens
+            .fetch_add(outcome.cache_write_input_tokens, Ordering::Relaxed);
+        self.output_tokens
+            .fetch_add(outcome.output_tokens, Ordering::Relaxed);
+        self.cost_micro_usd
+            .fetch_add((outcome.cost_usd * 1_000_000.0) as u64, Ordering::Relaxed);
+        let mut stages = self.stages.lock().unwrap_or_else(|lock| lock.into_inner());
+        let stats = stages.entry(stage.to_string()).or_default();
+        stats.failures += 1;
+        stats.input_tokens += outcome.input_tokens;
+        stats.cached_input_tokens += outcome.cached_input_tokens;
+        stats.cache_write_input_tokens += outcome.cache_write_input_tokens;
+        stats.output_tokens += outcome.output_tokens;
+        stats.cost_micro_usd += (outcome.cost_usd * 1_000_000.0) as u64;
+    }
+
     /// Cumulative per-stage usage for the current process, sorted by stage name.
     pub fn stage_snapshot(&self) -> BTreeMap<String, StageStats> {
         self.stages
@@ -281,7 +303,7 @@ pub enum StreamEvent<'a> {
 }
 
 /// What a completed call yielded, regardless of output format.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct CallOutcome {
     pub result_text: String,
     pub structured: Option<Value>,
@@ -294,6 +316,20 @@ pub struct CallOutcome {
     pub duration_ms: u64,
     pub is_error: bool,
 }
+
+#[derive(Debug)]
+struct BilledCallError {
+    message: String,
+    usage: CallOutcome,
+}
+
+impl std::fmt::Display for BilledCallError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for BilledCallError {}
 
 #[derive(Clone, Debug)]
 struct ModelSelection {
@@ -315,9 +351,13 @@ struct ModelState {
 
 impl ModelState {
     fn active(&self) -> ModelSelection {
+        self.selection(self.backend)
+    }
+
+    fn selection(&self, backend: Backend) -> ModelSelection {
         ModelSelection {
-            backend: self.backend,
-            model: match self.backend {
+            backend,
+            model: match backend {
                 Backend::Openai => self.openai_model.clone(),
                 Backend::Codex => self.codex_model.clone(),
                 Backend::Claude => self.claude_model.clone(),
@@ -338,6 +378,14 @@ impl ModelState {
     }
 }
 
+#[derive(Clone, Copy)]
+struct TurnBudget {
+    base: StatsSnapshot,
+    max_attempts: u64,
+    max_output_tokens: u64,
+    max_cost_usd: f64,
+}
+
 /// An automatic provider change caused by the active CLI exhausting its usage.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelSwitch {
@@ -356,6 +404,20 @@ pub struct Engine {
     http: reqwest::Client,
     openai_api_key: Option<String>,
     openai_base_url: String,
+    /// Sol/high and Sol/xhigh calls are expensive, long-lived requests. Letting
+    /// every account and recipient fan-out hit the API at once produced a
+    /// thundering herd of connection failures. Queue frontier work globally;
+    /// fast Luna routing remains unconstrained.
+    frontier_limiter: Arc<tokio::sync::Semaphore>,
+    /// A real quota response opens a session-local circuit. Queued work for
+    /// that provider then fails locally instead of spending dozens more HTTP
+    /// attempts to rediscover the same zero-credit state.
+    exhausted_backends: Mutex<HashSet<Backend>>,
+    /// One natural-language turn has a bounded inference envelope. This is a
+    /// final safety rail, not a target: normal outreach should finish far below
+    /// it, while runaway retries/planners stop before consuming an open-ended
+    /// amount of paid inference.
+    turn_budget: Mutex<Option<TurnBudget>>,
     /// Metadata-only audit trail. Prompts and model output are never logged.
     usage_log: Mutex<Option<PathBuf>>,
 }
@@ -368,6 +430,11 @@ impl Engine {
             .filter(|s| *s > 0)
             .unwrap_or(240);
         let openai_default = default_openai_model();
+        let frontier_concurrency = std::env::var("SPRUCE_OPENAI_FRONTIER_CONCURRENCY")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(2)
+            .clamp(1, 8);
         Self {
             models: RwLock::new(ModelState {
                 backend,
@@ -406,6 +473,9 @@ impl Engine {
                 .map(|value| value.trim_end_matches('/').to_string())
                 .filter(|value| !value.is_empty())
                 .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
+            frontier_limiter: Arc::new(tokio::sync::Semaphore::new(frontier_concurrency)),
+            exhausted_backends: Mutex::new(HashSet::new()),
+            turn_budget: Mutex::new(None),
             usage_log: Mutex::new(Some(
                 std::env::var("SPRUCE_USAGE_LOG")
                     .ok()
@@ -420,6 +490,67 @@ impl Engine {
         self.stats.clone()
     }
 
+    /// Start a fresh cost/token/attempt envelope for one user turn.
+    pub fn begin_turn_budget(&self) {
+        let max_attempts = std::env::var("SPRUCE_TURN_MAX_MODEL_ATTEMPTS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(100)
+            .max(1);
+        let max_output_tokens = std::env::var("SPRUCE_TURN_MAX_OUTPUT_TOKENS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(120_000)
+            .max(1_000);
+        let max_cost_usd = std::env::var("SPRUCE_TURN_MAX_COST_USD")
+            .ok()
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .unwrap_or(2.0);
+        *self
+            .turn_budget
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner()) = Some(TurnBudget {
+            base: self.stats.snapshot(),
+            max_attempts,
+            max_output_tokens,
+            max_cost_usd,
+        });
+    }
+
+    fn check_turn_budget(&self) -> Result<()> {
+        let budget = *self
+            .turn_budget
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner());
+        let Some(budget) = budget else {
+            return Ok(());
+        };
+        let used = self.stats.snapshot().since(budget.base);
+        if used.attempts >= budget.max_attempts {
+            bail!(
+                "Spruce per-turn model-attempt ceiling reached ({} attempts; limit {})",
+                used.attempts,
+                budget.max_attempts
+            );
+        }
+        if used.output_tokens >= budget.max_output_tokens {
+            bail!(
+                "Spruce per-turn output-token ceiling reached ({} tokens; limit {})",
+                used.output_tokens,
+                budget.max_output_tokens
+            );
+        }
+        if used.cost_usd >= budget.max_cost_usd {
+            bail!(
+                "Spruce per-turn model-cost ceiling reached (${:.2}; limit ${:.2})",
+                used.cost_usd,
+                budget.max_cost_usd
+            );
+        }
+        Ok(())
+    }
+
     pub fn backend(&self) -> Backend {
         self.selection().backend
     }
@@ -430,10 +561,19 @@ impl Engine {
             .unwrap_or_else(|| "default".to_string())
     }
 
-    /// Direct API inference uses a deliberately lean outreach topology: one
-    /// account writer plus one bounded review per recipient.
+    /// Production separates angle selection from realization. Folding both into
+    /// one call is cheaper, but it made the writer defend its first idea instead
+    /// of choosing among distinct angles.
     pub fn prefers_lean_outreach(&self) -> bool {
-        self.backend() == Backend::Openai
+        if std::env::var("SPRUCE_FOLD_OUTREACH_PLANNER")
+            .ok()
+            .is_some_and(|value| matches!(value.trim(), "1" | "true" | "on"))
+        {
+            return true;
+        }
+        std::env::var("SPRUCE_SEPARATE_OUTREACH_PLANNER")
+            .ok()
+            .is_some_and(|value| value.trim() != "1")
     }
 
     /// Select a provider while preserving its last model override.
@@ -443,6 +583,10 @@ impl Engine {
             state.backend = backend;
             state.generation = state.generation.wrapping_add(1);
         }
+        self.exhausted_backends
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner())
+            .remove(&backend);
     }
 
     /// Select a provider and set (or clear) its model override.
@@ -459,6 +603,10 @@ impl Engine {
         if changed {
             state.generation = state.generation.wrapping_add(1);
         }
+        self.exhausted_backends
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner())
+            .remove(&backend);
     }
 
     /// Drain provider-switch notices for a UI to render after the active turn.
@@ -481,8 +629,23 @@ impl Engine {
     /// changing the user's selected model for substantive work.
     fn selection_for(&self, fast: bool) -> ModelSelection {
         let mut selection = self.selection();
+        self.apply_fast_model(&mut selection, fast);
+        selection
+    }
+
+    fn selection_for_backend(&self, backend: Backend, fast: bool) -> ModelSelection {
+        let mut selection = self
+            .models
+            .read()
+            .unwrap_or_else(|lock| lock.into_inner())
+            .selection(backend);
+        self.apply_fast_model(&mut selection, fast);
+        selection
+    }
+
+    fn apply_fast_model(&self, selection: &mut ModelSelection, fast: bool) {
         if !fast {
-            return selection;
+            return;
         }
         selection.fast = true;
         let key = match selection.backend {
@@ -497,8 +660,62 @@ impl Engine {
             .filter(|value| !value.is_empty())
             .or_else(|| (selection.backend == Backend::Openai).then(|| "gpt-5.6-luna".to_string()))
             .or_else(|| (selection.backend == Backend::Claude).then(|| "haiku".to_string()))
-            .or(selection.model);
+            .or_else(|| selection.model.clone());
+    }
+
+    /// A cheap router may borrow the alternate provider for this one call, but
+    /// it must not mutate the provider selected for the expensive action the
+    /// router is about to launch.
+    fn temporary_fallback(&self, failed: &ModelSelection, fast: bool) -> ModelSelection {
+        self.selection_for_backend(failed.backend.other(), fast)
+    }
+
+    /// Use the frontier model only for the few outreach stages where taste,
+    /// synthesis, and skeptical-recipient judgment materially change the
+    /// result. Routing, extraction, and mechanical cleanup stay on the normal
+    /// or fast lane. This keeps Sol spend focused instead of multiplying it
+    /// across every CRM operation.
+    fn selection_for_stage(&self, stage: &str, fast: bool) -> ModelSelection {
+        let mut selection = self.selection_for(fast);
+        if !fast
+            && selection.backend == Backend::Openai
+            && (is_outreach_quality_stage(stage) || is_outreach_strategy_stage(stage))
+        {
+            let model_keys: &[&str] = match stage {
+                "outreach.write_account" => {
+                    &["SPRUCE_OPENAI_WRITER_MODEL", "SPRUCE_OPENAI_COPY_MODEL"]
+                }
+                "outreach.review_edit" => {
+                    &["SPRUCE_OPENAI_EDITOR_MODEL", "SPRUCE_OPENAI_COPY_MODEL"]
+                }
+                "outreach.verify_final" | "outreach.eval_pairwise" => {
+                    &["SPRUCE_OPENAI_VERIFIER_MODEL", "SPRUCE_OPENAI_COPY_MODEL"]
+                }
+                _ if is_outreach_quality_stage(stage) => &["SPRUCE_OPENAI_COPY_MODEL"],
+                _ => &["SPRUCE_OPENAI_STRATEGY_MODEL"],
+            };
+            selection.model = model_keys
+                .iter()
+                .find_map(|key| std::env::var(key).ok())
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .or(selection.model);
+        }
         selection
+    }
+
+    /// Human-readable model lane shown before costly outreach drafting begins.
+    pub fn outreach_quality_label(&self) -> String {
+        let selection = self.selection_for_stage("outreach.write_account", false);
+        let model = selection.model.unwrap_or_else(|| "default".to_string());
+        if selection.backend == Backend::Openai {
+            format!(
+                "{model} · {}",
+                openai_reasoning_effort("outreach.write_account", false)
+            )
+        } else {
+            model
+        }
     }
 
     /// Switch only if the failed call still represents the active selection.
@@ -549,40 +766,47 @@ impl Engine {
         {
             let _ = std::fs::create_dir_all(parent);
         }
-        let (status, input, cached, cache_write, output, cost, error_kind, error) = match result {
-            Ok(outcome) => (
-                "completed",
-                outcome.input_tokens,
-                outcome.cached_input_tokens,
-                outcome.cache_write_input_tokens,
-                outcome.output_tokens,
-                outcome.cost_usd,
-                "",
-                String::new(),
-            ),
-            Err(error) => {
-                let error_kind = if is_usage_exhausted(error) {
-                    "usage_exhausted"
-                } else {
-                    "provider_error"
-                };
-                (
-                    "failed",
-                    0,
-                    0,
-                    0,
-                    0,
-                    0.0,
-                    error_kind,
-                    error
-                        .to_string()
-                        .lines()
-                        .next()
-                        .unwrap_or_default()
-                        .to_string(),
-                )
-            }
-        };
+        let (status, input, cached, cache_write, output, cost, service_tier, error_kind, error) =
+            match result {
+                Ok(outcome) => (
+                    "completed",
+                    outcome.input_tokens,
+                    outcome.cached_input_tokens,
+                    outcome.cache_write_input_tokens,
+                    outcome.output_tokens,
+                    outcome.cost_usd,
+                    outcome.service_tier.as_str(),
+                    "",
+                    String::new(),
+                ),
+                Err(error) => {
+                    let error_kind = if is_usage_exhausted(error) {
+                        "usage_exhausted"
+                    } else if is_generation_incomplete(error) {
+                        "generation_incomplete"
+                    } else if is_retryable_provider_error(error) {
+                        "transient_provider_error"
+                    } else {
+                        "provider_error"
+                    };
+                    let billed = error.downcast_ref::<BilledCallError>();
+                    (
+                        "failed",
+                        billed.map_or(0, |failure| failure.usage.input_tokens),
+                        billed.map_or(0, |failure| failure.usage.cached_input_tokens),
+                        billed.map_or(0, |failure| failure.usage.cache_write_input_tokens),
+                        billed.map_or(0, |failure| failure.usage.output_tokens),
+                        billed.map_or(0.0, |failure| failure.usage.cost_usd),
+                        billed.map_or("", |failure| failure.usage.service_tier.as_str()),
+                        error_kind,
+                        format!("{error:#}")
+                            .lines()
+                            .next()
+                            .unwrap_or_default()
+                            .to_string(),
+                    )
+                }
+            };
         let event = serde_json::json!({
             "ts": chrono::Utc::now().to_rfc3339(),
             "stage": stage,
@@ -597,7 +821,7 @@ impl Engine {
             "cache_write_input_tokens": cache_write,
             "output_tokens": output,
             "cost_usd": cost,
-            "service_tier": result.as_ref().ok().map(|outcome| outcome.service_tier.as_str()).unwrap_or(""),
+            "service_tier": service_tier,
             "error_kind": error_kind,
             "error": error,
         });
@@ -997,6 +1221,44 @@ impl Engine {
         schema: Option<&Value>,
         fallback: bool,
     ) -> Result<CallOutcome> {
+        self.check_turn_budget()?;
+        if self
+            .exhausted_backends
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner())
+            .contains(&selection.backend)
+        {
+            bail!(
+                "{} usage exhausted earlier in this session; queued paid work was stopped locally",
+                selection.backend
+            );
+        }
+        let _frontier_permit = if selection.backend == Backend::Openai
+            && (is_outreach_quality_stage(stage) || is_outreach_strategy_stage(stage))
+        {
+            Some(
+                self.frontier_limiter
+                    .acquire()
+                    .await
+                    .map_err(|_| anyhow!("OpenAI frontier request queue closed"))?,
+            )
+        } else {
+            None
+        };
+        // Quota can be exhausted while this request waits for a frontier
+        // permit. Recheck after the queue, before recording or sending it.
+        if self
+            .exhausted_backends
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner())
+            .contains(&selection.backend)
+        {
+            bail!(
+                "{} usage exhausted earlier in this session; queued paid work was stopped locally",
+                selection.backend
+            );
+        }
+        self.check_turn_budget()?;
         let prompt_chars = request_chars(system, user, schema);
         self.stats.record_attempt(stage, prompt_chars, fallback);
         let work = async {
@@ -1015,9 +1277,21 @@ impl Engine {
             }
         };
         let result = self.with_timeout(selection.backend, work).await;
+        if result.as_ref().is_err_and(is_usage_exhausted) {
+            self.exhausted_backends
+                .lock()
+                .unwrap_or_else(|lock| lock.into_inner())
+                .insert(selection.backend);
+        }
         match &result {
             Ok(outcome) => self.stats.record_success(stage, outcome),
-            Err(_) => self.stats.record_failure(stage),
+            Err(error) => {
+                if let Some(failure) = error.downcast_ref::<BilledCallError>() {
+                    self.stats.record_billed_failure(stage, &failure.usage);
+                } else {
+                    self.stats.record_failure(stage);
+                }
+            }
         }
         self.log_usage(stage, selection, prompt_chars, fallback, &result);
         result
@@ -1032,19 +1306,24 @@ impl Engine {
         allow_fallback: bool,
         fast: bool,
     ) -> Result<CallOutcome> {
-        let selection = self.selection_for(fast);
+        let selection = self.selection_for_stage(stage, fast);
         // Transient CLI failures (a bare non-zero exit or a timeout — usually the
         // local CLI choking under concurrent load, not a bad prompt) are retried a
         // few times with backoff before we give up on the call. Deterministic
         // failures (schema/parse) and genuine usage exhaustion are handled below,
         // not retried here — they would fail identically.
+        let max_retries = if selection.backend != Backend::Openai && is_long_bulk_stage(stage) {
+            0
+        } else {
+            MAX_TRANSIENT_RETRIES
+        };
         let mut attempt = 0u32;
         let first = loop {
             let outcome = self
                 .call_once(stage, &selection, system, user, schema, false)
                 .await;
             match &outcome {
-                Err(error) if attempt < MAX_TRANSIENT_RETRIES && is_transient_cli_error(error) => {
+                Err(error) if attempt < max_retries && is_retryable_provider_error(error) => {
                     attempt += 1;
                     tokio::time::sleep(transient_backoff(attempt)).await;
                     continue;
@@ -1054,10 +1333,11 @@ impl Engine {
         };
         match first {
             Err(error) if allow_fallback && is_usage_exhausted(&error) => {
-                let mut fallback = self.fallback_after(&selection);
-                if fast {
-                    fallback = self.selection_for(true);
-                }
+                let fallback = if fast {
+                    self.temporary_fallback(&selection, true)
+                } else {
+                    self.fallback_after(&selection)
+                };
                 self.call_once(stage, &fallback, system, user, schema, true)
                     .await
                     .with_context(|| {
@@ -1122,7 +1402,8 @@ impl Engine {
         user: &str,
         schema: Value,
     ) -> Result<T> {
-        self.structured_with(stage, system, user, schema, true, true)
+        let allow_fallback = matches!(stage, "interactive.router" | "reply.triage");
+        self.structured_with(stage, system, user, schema, allow_fallback, true)
             .await
     }
 
@@ -1206,16 +1487,36 @@ impl Engine {
         allow_fallback: bool,
         fast: bool,
     ) -> Result<CallOutcome> {
-        let selection = self.selection_for(fast);
-        match self
-            .stream_once(stage, &selection, system, user, schema, on_event, false)
-            .await
+        let selection = self.selection_for_stage(stage, fast);
+        self.check_turn_budget()?;
+        let first = if self
+            .exhausted_backends
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner())
+            .contains(&selection.backend)
         {
+            Err(anyhow!(
+                "{} usage exhausted earlier in this session; queued paid work was stopped locally",
+                selection.backend
+            ))
+        } else {
+            self.stream_once(stage, &selection, system, user, schema, on_event, false)
+                .await
+        };
+        if first.as_ref().is_err_and(is_usage_exhausted) {
+            self.exhausted_backends
+                .lock()
+                .unwrap_or_else(|lock| lock.into_inner())
+                .insert(selection.backend);
+        }
+        match first {
             Err(error) if allow_fallback && is_usage_exhausted(&error) => {
-                let mut fallback = self.fallback_after(&selection);
-                if fast {
-                    fallback = self.selection_for(true);
-                }
+                let fallback = if fast {
+                    self.temporary_fallback(&selection, true)
+                } else {
+                    self.fallback_after(&selection)
+                };
+                self.check_turn_budget()?;
                 self.stream_once(stage, &fallback, system, user, schema, on_event, true)
                     .await
                     .with_context(|| {
@@ -1529,6 +1830,71 @@ fn default_openai_model() -> String {
         .unwrap_or_else(|| "gpt-5.6-terra".to_string())
 }
 
+fn is_outreach_quality_stage(stage: &str) -> bool {
+    matches!(
+        stage,
+        "outreach.write_account"
+            | "outreach.review_edit"
+            | "outreach.verify_final"
+            | "outreach.eval_pairwise"
+    )
+}
+
+fn is_outreach_strategy_stage(stage: &str) -> bool {
+    matches!(
+        stage,
+        "source.qualify" | "source.refresh" | "source.vantage" | "outreach.plan"
+    )
+}
+
+fn is_long_bulk_stage(stage: &str) -> bool {
+    is_outreach_quality_stage(stage) || is_outreach_strategy_stage(stage)
+}
+
+fn openai_reasoning_effort(stage: &str, fast: bool) -> String {
+    let (keys, default_effort): (&[&str], &str) = if fast {
+        (&["SPRUCE_OPENAI_FAST_REASONING_EFFORT"], "none")
+    } else if stage == "outreach.write_account" {
+        (
+            &[
+                "SPRUCE_OPENAI_WRITER_REASONING_EFFORT",
+                "SPRUCE_OPENAI_COPY_REASONING_EFFORT",
+            ],
+            "high",
+        )
+    } else if stage == "outreach.review_edit" {
+        (
+            &[
+                "SPRUCE_OPENAI_EDITOR_REASONING_EFFORT",
+                "SPRUCE_OPENAI_COPY_REASONING_EFFORT",
+            ],
+            "medium",
+        )
+    } else if matches!(stage, "outreach.verify_final" | "outreach.eval_pairwise") {
+        (
+            &[
+                "SPRUCE_OPENAI_VERIFIER_REASONING_EFFORT",
+                "SPRUCE_OPENAI_COPY_REASONING_EFFORT",
+            ],
+            "medium",
+        )
+    } else if is_outreach_strategy_stage(stage) {
+        (&["SPRUCE_OPENAI_STRATEGY_REASONING_EFFORT"], "medium")
+    } else {
+        (&["SPRUCE_OPENAI_REASONING_EFFORT"], "low")
+    };
+    keys.iter()
+        .find_map(|key| std::env::var(key).ok())
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| {
+            matches!(
+                value.as_str(),
+                "none" | "low" | "medium" | "high" | "xhigh" | "max"
+            )
+        })
+        .unwrap_or_else(|| default_effort.to_string())
+}
+
 fn openai_request(
     stage: &str,
     selection: &ModelSelection,
@@ -1541,22 +1907,7 @@ fn openai_request(
         .as_deref()
         .filter(|model| !model.trim().is_empty())
         .unwrap_or("gpt-5.6-terra");
-    let effort_key = if selection.fast {
-        "SPRUCE_OPENAI_FAST_REASONING_EFFORT"
-    } else {
-        "SPRUCE_OPENAI_REASONING_EFFORT"
-    };
-    let default_effort = if selection.fast { "none" } else { "low" };
-    let effort = std::env::var(effort_key)
-        .ok()
-        .map(|value| value.trim().to_ascii_lowercase())
-        .filter(|value| {
-            matches!(
-                value.as_str(),
-                "none" | "low" | "medium" | "high" | "xhigh" | "max"
-            )
-        })
-        .unwrap_or_else(|| default_effort.to_string());
+    let effort = openai_reasoning_effort(stage, selection.fast);
     let max_output_tokens = std::env::var("SPRUCE_OPENAI_MAX_OUTPUT_TOKENS")
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
@@ -1607,8 +1958,9 @@ fn openai_output_cap(stage: &str) -> u64 {
         | "source.refresh"
         | "outreach.plan"
         | "outreach.review_edit"
-        | "outreach.verify_final" => 4_096,
-        "outreach.write_account" => 8_192,
+        | "outreach.verify_final"
+        | "outreach.eval_pairwise" => 4_096,
+        "outreach.write_account" => 6_144,
         _ => 16_384,
     }
 }
@@ -1626,12 +1978,43 @@ fn parse_openai_response(
             error["code"].as_str().unwrap_or("unknown"),
         );
     }
+    let input_tokens = payload["usage"]["input_tokens"].as_u64().unwrap_or(0);
+    let cached_input_tokens = payload["usage"]["input_tokens_details"]["cached_tokens"]
+        .as_u64()
+        .unwrap_or(0);
+    let cache_write_input_tokens = payload["usage"]["input_tokens_details"]["cache_write_tokens"]
+        .as_u64()
+        .unwrap_or(0);
+    let output_tokens = payload["usage"]["output_tokens"].as_u64().unwrap_or(0);
+    let model = payload["model"].as_str().unwrap_or_default();
+    let service_tier = payload["service_tier"].as_str().unwrap_or("default");
+    let usage = || CallOutcome {
+        input_tokens,
+        cached_input_tokens,
+        cache_write_input_tokens,
+        output_tokens,
+        cost_usd: openai_cost(
+            model,
+            service_tier,
+            input_tokens,
+            cached_input_tokens,
+            cache_write_input_tokens,
+            output_tokens,
+        ),
+        service_tier: service_tier.to_string(),
+        duration_ms: elapsed.as_millis() as u64,
+        ..Default::default()
+    };
     let status = payload["status"].as_str().unwrap_or("completed");
     if status != "completed" {
         let reason = payload["incomplete_details"]["reason"]
             .as_str()
             .unwrap_or("response did not complete");
-        bail!("OpenAI response status was {status}: {reason}");
+        return Err(BilledCallError {
+            message: format!("OpenAI response status was {status}: {reason}"),
+            usage: usage(),
+        }
+        .into());
     }
 
     let mut text_parts = Vec::new();
@@ -1666,35 +2049,10 @@ fn parse_openai_response(
     } else {
         None
     };
-    let input_tokens = payload["usage"]["input_tokens"].as_u64().unwrap_or(0);
-    let cached_input_tokens = payload["usage"]["input_tokens_details"]["cached_tokens"]
-        .as_u64()
-        .unwrap_or(0);
-    let cache_write_input_tokens = payload["usage"]["input_tokens_details"]["cache_write_tokens"]
-        .as_u64()
-        .unwrap_or(0);
-    let output_tokens = payload["usage"]["output_tokens"].as_u64().unwrap_or(0);
-    let model = payload["model"].as_str().unwrap_or_default();
-    let service_tier = payload["service_tier"].as_str().unwrap_or("default");
-
     Ok(CallOutcome {
         result_text,
         structured,
-        input_tokens,
-        cached_input_tokens,
-        cache_write_input_tokens,
-        output_tokens,
-        cost_usd: openai_cost(
-            model,
-            service_tier,
-            input_tokens,
-            cached_input_tokens,
-            cache_write_input_tokens,
-            output_tokens,
-        ),
-        service_tier: service_tier.to_string(),
-        duration_ms: elapsed.as_millis() as u64,
-        is_error: false,
+        ..usage()
     })
 }
 
@@ -1772,13 +2130,27 @@ pub(crate) fn is_usage_exhausted(error: &anyhow::Error) -> bool {
     usage_exhausted_message(&message)
 }
 
+pub(crate) fn is_run_budget_exhausted(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .map(ToString::to_string)
+        .any(|message| message.contains("Spruce per-turn"))
+}
+
+pub(crate) fn is_generation_incomplete(error: &anyhow::Error) -> bool {
+    error.chain().map(ToString::to_string).any(|message| {
+        let message = message.to_ascii_lowercase();
+        message.contains("response status was incomplete") || message.contains("max_output_tokens")
+    })
+}
+
 /// How many times to retry a transient CLI failure before giving up on a call.
 const MAX_TRANSIENT_RETRIES: u32 = 2;
 
 /// A transient provider failure worth retrying: process/network overload, a
 /// timeout, or a retryable API status — not a deterministic prompt/schema error
 /// and not genuine usage exhaustion (which has cross-provider fallback).
-fn is_transient_cli_error(error: &anyhow::Error) -> bool {
+pub(crate) fn is_retryable_provider_error(error: &anyhow::Error) -> bool {
     if is_usage_exhausted(error) {
         return false;
     }
@@ -2076,32 +2448,37 @@ fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::{
-        dispatch, dispatch_codex, is_transient_cli_error, make_codex_schema_strict, openai_cost,
-        openai_request, parse_openai_response, usage_exhausted_message, Backend, CallOutcome,
-        Engine, ModelSelection, Stats, StreamEvent,
+        dispatch, dispatch_codex, is_generation_incomplete, is_retryable_provider_error,
+        is_run_budget_exhausted, make_codex_schema_strict, openai_cost, openai_request,
+        parse_openai_response, usage_exhausted_message, Backend, CallOutcome, Engine,
+        ModelSelection, Stats, StreamEvent,
     };
     use serde_json::json;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
-    fn transient_cli_errors_retry_but_deterministic_and_quota_do_not() {
-        // A bare non-zero CLI exit or a timeout is transient → retry.
-        assert!(is_transient_cli_error(&anyhow::anyhow!(
+    fn transient_provider_errors_retry_but_deterministic_and_quota_do_not() {
+        // A bare non-zero CLI exit, timeout, or pre-response API transport
+        // failure is transient and should be retried.
+        assert!(is_retryable_provider_error(&anyhow::anyhow!(
             "claude CLI exited with exit status: 1:"
         )));
-        assert!(is_transient_cli_error(&anyhow::anyhow!(
+        assert!(is_retryable_provider_error(&anyhow::anyhow!(
             "interactive.router call timed out after 240s — the CLI is hung or rate-limited"
         )));
+        assert!(is_retryable_provider_error(&anyhow::anyhow!(
+            "writing focused copy: sending OpenAI Responses API request"
+        )));
         // Genuine usage exhaustion has its own cross-provider fallback, not this retry.
-        assert!(!is_transient_cli_error(&anyhow::anyhow!(
+        assert!(!is_retryable_provider_error(&anyhow::anyhow!(
             "claude CLI exited with 1: usage limit reached"
         )));
         // Deterministic failures would fail identically, so they must not retry.
-        assert!(!is_transient_cli_error(&anyhow::anyhow!(
+        assert!(!is_retryable_provider_error(&anyhow::anyhow!(
             "writer did not cite any retrieved business-knowledge principle"
         )));
-        assert!(!is_transient_cli_error(&anyhow::anyhow!(
+        assert!(!is_retryable_provider_error(&anyhow::anyhow!(
             "parsing claude CLI output as JSON"
         )));
     }
@@ -2154,9 +2531,9 @@ mod tests {
         );
 
         assert_eq!(request["model"], "gpt-5.6-terra");
-        assert_eq!(request["reasoning"]["effort"], "low");
+        assert_eq!(request["reasoning"]["effort"], "high");
         assert_eq!(request["service_tier"], "default");
-        assert_eq!(request["max_output_tokens"], 8_192);
+        assert_eq!(request["max_output_tokens"], 6_144);
         assert_eq!(request["prompt_cache_options"]["mode"], "explicit");
         assert!(request.get("prompt_cache_key").is_none());
         assert_eq!(request["store"], false);
@@ -2196,6 +2573,31 @@ mod tests {
         assert_eq!(outcome.cache_write_input_tokens, 100);
         assert_eq!(outcome.duration_ms, 42);
         assert!((outcome.cost_usd - 0.00391).abs() < 0.0000001);
+    }
+
+    #[test]
+    fn incomplete_openai_response_preserves_billed_usage() {
+        let payload = json!({
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "model": "gpt-5.6-terra",
+            "service_tier": "default",
+            "usage": {
+                "input_tokens": 5000,
+                "input_tokens_details": {"cached_tokens": 1000, "cache_write_tokens": 0},
+                "output_tokens": 4096
+            }
+        });
+        let error = parse_openai_response(&payload, true, Duration::from_millis(42))
+            .expect_err("incomplete response must not become copy");
+        let billed = error
+            .downcast_ref::<super::BilledCallError>()
+            .expect("billed error metadata");
+
+        assert!(is_generation_incomplete(&error));
+        assert_eq!(billed.usage.input_tokens, 5000);
+        assert_eq!(billed.usage.output_tokens, 4096);
+        assert!(billed.usage.cost_usd > 0.0);
     }
 
     #[tokio::test]
@@ -2471,6 +2873,57 @@ mod tests {
         assert_eq!(economy.model.as_deref(), Some("gpt-5.6-luna"));
         assert!(economy.fast);
         assert_eq!(engine.model_label(), "gpt-5.6-terra");
+    }
+
+    #[test]
+    fn outreach_lanes_preserve_the_selected_model_by_default() {
+        let engine = Engine::new(Backend::Openai, Some("gpt-5.6-terra".to_string()));
+        let quality = engine.selection_for_stage("outreach.write_account", false);
+        assert_eq!(quality.model.as_deref(), Some("gpt-5.6-terra"));
+        assert!(!quality.fast);
+
+        let ordinary = engine.selection_for_stage("source.website_research", false);
+        assert_eq!(ordinary.model.as_deref(), Some("gpt-5.6-terra"));
+
+        let strategy = engine.selection_for_stage("source.refresh", false);
+        assert_eq!(strategy.model.as_deref(), Some("gpt-5.6-terra"));
+    }
+
+    #[test]
+    fn fast_fallback_does_not_mutate_the_bulk_provider() {
+        let engine = Engine::new(Backend::Openai, Some("gpt-5.6-terra".to_string()));
+        let failed = engine.selection_for(true);
+        let fallback = engine.temporary_fallback(&failed, true);
+
+        assert_eq!(fallback.backend, Backend::Claude);
+        assert_eq!(fallback.model.as_deref(), Some("haiku"));
+        assert_eq!(engine.backend(), Backend::Openai);
+        assert!(engine.take_model_switches().is_empty());
+    }
+
+    #[test]
+    fn turn_budget_stops_new_calls_after_the_cost_ceiling() {
+        let engine = Engine::new(Backend::Openai, Some("gpt-5.6-terra".to_string()));
+        let base = engine.stats.snapshot();
+        *engine
+            .turn_budget
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner()) = Some(super::TurnBudget {
+            base,
+            max_attempts: 80,
+            max_output_tokens: 80_000,
+            max_cost_usd: 0.01,
+        });
+        engine.stats.record_success(
+            "test",
+            &CallOutcome {
+                cost_usd: 0.02,
+                ..Default::default()
+            },
+        );
+
+        let error = engine.check_turn_budget().expect_err("budget should stop");
+        assert!(is_run_budget_exhausted(&error));
     }
 
     #[test]

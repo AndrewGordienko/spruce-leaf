@@ -656,6 +656,7 @@ struct OutreachState {
     processed: usize,
     accepted: usize,
     rejected: usize,
+    held: usize,
     stopped: usize,
     total: usize,
     started: Instant,
@@ -690,6 +691,7 @@ impl OutreachView {
             processed: 0,
             accepted: 0,
             rejected: 0,
+            held: 0,
             stopped: 0,
             total: 0,
             started: Instant::now(),
@@ -726,6 +728,7 @@ impl OutreachView {
             view.processed = update.processed;
             view.accepted = update.accepted;
             view.rejected = update.rejected;
+            view.held = update.held;
             view.stopped = update.stopped;
             view.total = update.total;
             for recipient in &update.roster {
@@ -860,8 +863,14 @@ fn render_outreach(
         format!("  {} {}", gray("└"), dim(&state.header)),
         String::new(),
     ];
+    // Repainting more rows than the terminal viewport can hold makes ANSI
+    // cursor-up drift after the terminal scrolls: every spinner frame then
+    // becomes permanent transcript output. Keep the live block compact and
+    // show the complete roster once in the final frame.
+    let visible_rows = visible_outreach_rows(state, 6);
+    let hidden_rows = state.rows.len().saturating_sub(visible_rows.len());
     let mut previous_account: Option<&str> = None;
-    for row in &state.rows {
+    for row in visible_rows {
         if previous_account != Some(row.account.as_str()) {
             if previous_account.is_some() {
                 lines.push(String::new());
@@ -880,6 +889,7 @@ fn render_outreach(
                 red("rejected; feedback saved"),
                 failure_detail(&row.phase),
             ),
+            "held" => (orange("○"), orange(&row.phase), None),
             "stopped" => (
                 orange("!"),
                 orange("stopped; details below"),
@@ -915,6 +925,15 @@ fn render_outreach(
             }
         }
     }
+    if hidden_rows > 0 {
+        lines.push(format!(
+            "  {} {}",
+            gray("└"),
+            dim(&format!(
+                "{hidden_rows} queued or completed recipient(s) hidden while live"
+            ))
+        ));
+    }
     let snapshot = stats.snapshot().since(base);
     lines.push(String::new());
     lines.push(format!(
@@ -929,12 +948,48 @@ fn render_outreach(
             gray(spinner)
         },
         dim(&format!(
-            "{}/{} ready · {} rejected · {} stopped",
-            state.accepted, state.total, state.rejected, state.stopped
+            "{}/{} ready · {} held · {} rejected · {} stopped",
+            state.accepted, state.total, state.held, state.rejected, state.stopped
         )),
         dim(&footer(snapshot, state.started.elapsed()))
     ));
     lines
+}
+
+fn visible_outreach_rows(state: &OutreachState, limit: usize) -> Vec<&OutreachRow> {
+    if state.done || state.rows.len() <= limit {
+        return state.rows.iter().collect();
+    }
+
+    let mut keys = Vec::new();
+    let mut add = |row: &OutreachRow| {
+        if keys.len() < limit && !keys.iter().any(|key| key == &row.key) {
+            keys.push(row.key.clone());
+        }
+    };
+
+    // Active work is always visible. Then retain the newest decisions so the
+    // user can see useful progress, and use any remaining room for what is next.
+    for row in state.rows.iter().filter(|row| row.state == "active") {
+        add(row);
+    }
+    for row in state.rows.iter().rev().filter(|row| {
+        matches!(
+            row.state.as_str(),
+            "accepted" | "held" | "rejected" | "stopped"
+        )
+    }) {
+        add(row);
+    }
+    for row in state.rows.iter().filter(|row| row.state == "queued") {
+        add(row);
+    }
+
+    state
+        .rows
+        .iter()
+        .filter(|row| keys.contains(&row.key))
+        .collect()
 }
 
 // --- turn view (quiet structured router) ----------------------------------
@@ -1093,7 +1148,7 @@ mod turn_view_tests {
 
     use super::{
         json_string_prefix, markdown_line, render_outreach, render_source, session_header_lines,
-        OutreachRow, OutreachState, SourceRow, SourceState,
+        visible_outreach_rows, OutreachRow, OutreachState, SourceRow, SourceState,
     };
     use crate::engine::{Stats, StatsSnapshot};
 
@@ -1201,7 +1256,7 @@ mod turn_view_tests {
     #[test]
     fn outreach_progress_keeps_each_recipient_and_truthful_counts_visible() {
         let state = OutreachState {
-            header: "OutageHub · 7 touches each · drafts only".into(),
+            header: "OutageHub · 4 touches each · drafts only".into(),
             overall: "sales council vote".into(),
             rows: vec![
                 OutreachRow {
@@ -1222,6 +1277,7 @@ mod turn_view_tests {
             processed: 1,
             accepted: 1,
             rejected: 0,
+            held: 0,
             stopped: 0,
             total: 2,
             started: Instant::now(),
@@ -1233,7 +1289,49 @@ mod turn_view_tests {
         assert!(output.contains("Cory"));
         assert!(output.contains("Derrick"));
         assert!(output.contains("sales council vote"));
-        assert!(output.contains("1/2 ready · 0 rejected"));
+        assert!(output.contains("1/2 ready · 0 held · 0 rejected"));
+    }
+
+    #[test]
+    fn live_outreach_view_is_bounded_but_final_view_is_complete() {
+        let rows = (0..25)
+            .map(|index| OutreachRow {
+                key: format!("person-{index}"),
+                name: format!("Person {index}"),
+                account: format!("Account {}", index / 5),
+                phase: if index < 3 {
+                    "writing".into()
+                } else {
+                    "Queued".into()
+                },
+                state: if index < 3 {
+                    "active".into()
+                } else {
+                    "queued".into()
+                },
+            })
+            .collect::<Vec<_>>();
+        let mut state = OutreachState {
+            header: "GnK · 5×5×7".into(),
+            overall: "writing".into(),
+            rows,
+            processed: 0,
+            accepted: 0,
+            rejected: 0,
+            held: 0,
+            stopped: 0,
+            total: 25,
+            started: Instant::now(),
+            done: false,
+            succeeded: false,
+        };
+        assert_eq!(visible_outreach_rows(&state, 6).len(), 6);
+        let live =
+            render_outreach(&state, &Stats::default(), StatsSnapshot::default(), 0).join("\n");
+        assert!(live.contains("19 queued or completed recipient(s) hidden while live"));
+
+        state.done = true;
+        assert_eq!(visible_outreach_rows(&state, 6).len(), 25);
     }
 
     #[test]
@@ -1251,6 +1349,7 @@ mod turn_view_tests {
             processed: 1,
             accepted: 0,
             rejected: 1,
+            held: 0,
             stopped: 0,
             total: 1,
             started: Instant::now(),
@@ -1260,7 +1359,7 @@ mod turn_view_tests {
         let output =
             render_outreach(&state, &Stats::default(), StatsSnapshot::default(), 0).join("\n");
         assert!(output.contains("Every outreach draft was rejected"));
-        assert!(output.contains("0/1 ready · 1 rejected · 0 stopped"));
+        assert!(output.contains("0/1 ready · 0 held · 1 rejected · 0 stopped"));
         assert!(!output.contains("Outreach drafts finished"));
     }
 
@@ -1280,6 +1379,7 @@ mod turn_view_tests {
             processed: 1,
             accepted: 0,
             rejected: 1,
+            held: 0,
             stopped: 0,
             total: 1,
             started: Instant::now(),
@@ -1310,6 +1410,7 @@ mod turn_view_tests {
             processed: 1,
             accepted: 0,
             rejected: 0,
+            held: 0,
             stopped: 1,
             total: 1,
             started: Instant::now(),

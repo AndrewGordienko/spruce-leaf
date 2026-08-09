@@ -8,16 +8,33 @@ cd "$repo_root"
 manifest_path=${1:-knowledge-sources/youtube-episodes.tsv}
 output_dir=${2:-.spruce/videos}
 selected_tier=${YOUTUBE_NOTES_TIER:-core}
-model_name=${YOUTUBE_NOTES_MODEL:-sonnet}
+model_name=${YOUTUBE_NOTES_MODEL:-gpt-5.6-terra}
 max_caption_chars=${YOUTUBE_NOTES_MAX_CAPTION_CHARS:-260000}
 schema_path=knowledge-sources/youtube-note-schema.json
 
-for required_command in yt-dlp jq claude; do
+for required_command in yt-dlp jq curl; do
   if ! command -v "$required_command" >/dev/null 2>&1; then
     echo "missing required command: $required_command" >&2
     exit 1
   fi
 done
+
+if [[ -z "${OPENAI_API_KEY:-}" && -f .env ]]; then
+  while IFS='=' read -r dotenv_key dotenv_value; do
+    [[ "$dotenv_key" == "OPENAI_API_KEY" ]] || continue
+    dotenv_value=${dotenv_value%$'\r'}
+    dotenv_value=${dotenv_value#\"}
+    dotenv_value=${dotenv_value%\"}
+    export OPENAI_API_KEY=$dotenv_value
+    break
+  done < .env
+fi
+if [[ -z "${OPENAI_API_KEY:-}" ]]; then
+  echo "OPENAI_API_KEY is required (environment or .env)" >&2
+  exit 1
+fi
+openai_base_url=${SPRUCE_OPENAI_BASE_URL:-${OPENAI_BASE_URL:-https://api.openai.com/v1}}
+openai_base_url=${openai_base_url%/}
 
 if [[ ! -f "$manifest_path" ]]; then
   echo "manifest not found: $manifest_path" >&2
@@ -33,7 +50,6 @@ notes_dir="$output_dir/notes"
 principles_dir="$output_dir/principles"
 mkdir -p "$notes_dir" "$principles_dir"
 
-schema_json=$(jq -c . "$schema_path")
 system_prompt='You convert official public YouTube captions into concise, original research notes for a B2B sales knowledge base. Paraphrase; do not reproduce the transcript and do not quote the speakers. Extract durable, specific operating principles that can change account selection, stakeholder selection, discovery, offer design, objection handling, negotiation, or outreach. Do not turn a personal anecdote into a universal law. Treat revenue, conversion, growth, and case-study numbers as speaker claims that need independent verification. Prefer fewer high-confidence principles over filler. Timestamps must point near the supporting discussion in the supplied timed captions.'
 
 render_note() {
@@ -119,7 +135,9 @@ while IFS=$'\t' read -r video_id speaker tier focus; do
     trap 'rm -rf -- "$episode_tmp"' EXIT
 
     metadata_path="$episode_tmp/metadata.json"
+    request_path="$episode_tmp/request.json"
     result_path="$episode_tmp/result.json"
+    structured_path="$episode_tmp/structured.json"
     transcript_path="$episode_tmp/timed-captions.txt"
 
     yt-dlp --skip-download --no-warnings --dump-single-json "$video_url" > "$metadata_path"
@@ -174,28 +192,67 @@ while IFS=$'\t' read -r video_id speaker tier focus; do
       coverage_note="even timeline sample: retained one minute out of every $sample_stride minutes because the full caption text exceeded the model context budget"
     fi
 
-    {
-      echo "SOURCE METADATA"
-      jq -r '
-        "Title: \(.title)\nChannel: \(.channel)\nPublished: \(.upload_date)\nDuration seconds: \(.duration)\nURL: \(.webpage_url)"
-      ' "$metadata_path"
-      echo "Speaker: $speaker"
-      echo "Requested focus: $focus"
-      echo "Caption coverage: $coverage_note"
-      echo
-      echo "TIMED CAPTIONS"
-      echo "Each line begins with seconds from the start. Produce only the requested structured notes."
-      cat "$transcript_path"
-    } | claude \
-      -p \
-      --model "$model_name" \
-      --system-prompt "$system_prompt" \
-      --json-schema "$schema_json" \
-      --output-format json > "$result_path"
+    jq -n \
+      --arg model "$model_name" \
+      --arg instructions "$system_prompt" \
+      --arg speaker "$speaker" \
+      --arg focus "$focus" \
+      --arg coverage "$coverage_note" \
+      --rawfile captions "$transcript_path" \
+      --slurpfile metadata "$metadata_path" \
+      --slurpfile schema "$schema_path" '
+        {
+          model: $model,
+          instructions: $instructions,
+          input: (
+            "SOURCE METADATA\n"
+            + "Title: " + ($metadata[0].title // "") + "\n"
+            + "Channel: " + ($metadata[0].channel // "") + "\n"
+            + "Published: " + ($metadata[0].upload_date // "") + "\n"
+            + "Duration seconds: " + (($metadata[0].duration // 0) | tostring) + "\n"
+            + "URL: " + ($metadata[0].webpage_url // "") + "\n"
+            + "Speaker: " + $speaker + "\n"
+            + "Requested focus: " + $focus + "\n"
+            + "Caption coverage: " + $coverage + "\n\n"
+            + "TIMED CAPTIONS\n"
+            + "Each line begins with seconds from the start. Produce only the requested structured notes.\n"
+            + $captions
+          ),
+          reasoning: {effort: "low"},
+          service_tier: "default",
+          max_output_tokens: 8192,
+          text: {
+            verbosity: "low",
+            format: {
+              type: "json_schema",
+              name: "youtube_note",
+              strict: true,
+              schema: $schema[0]
+            }
+          },
+          store: false,
+          prompt_cache_options: {mode: "explicit"},
+          metadata: {application: "spruce-leaf", stage: "youtube.note"}
+        }
+      ' > "$request_path"
 
-    if [[ $(jq -r '.is_error // false' "$result_path") == "true" ]]; then
-      jq -r '.result // "Claude returned an unknown error"' "$result_path" >&2
+    curl --fail-with-body --silent --show-error \
+      -H "Authorization: Bearer $OPENAI_API_KEY" \
+      -H "Content-Type: application/json" \
+      --data-binary "@$request_path" \
+      "$openai_base_url/responses" > "$result_path"
+
+    api_error=$(jq -r '.error.message // empty' "$result_path")
+    if [[ -n "$api_error" ]]; then
+      echo "OpenAI returned an error: $api_error" >&2
       exit 4
+    fi
+
+    jq -r '[.output[]?.content[]? | select(.type == "output_text") | .text] | join("\n")' \
+      "$result_path" > "$structured_path"
+    if [[ ! -s "$structured_path" ]] || ! jq empty "$structured_path"; then
+      echo "OpenAI response did not contain valid structured output for $video_id" >&2
+      exit 5
     fi
 
     jq \
@@ -205,7 +262,7 @@ while IFS=$'\t' read -r video_id speaker tier focus; do
       --arg tier "$tier" \
       --arg note_source "$note_path" \
       --slurpfile metadata "$metadata_path" '
-        .structured_output
+        .
         + {
             video_id: $video_id,
             speaker: $speaker,
@@ -219,7 +276,7 @@ while IFS=$'\t' read -r video_id speaker tier focus; do
             source_url: $metadata[0].webpage_url,
             source_kind: "official-youtube-captions-derived-summary"
           }
-      ' "$result_path" > "$principle_path"
+      ' "$structured_path" > "$principle_path"
 
     render_note "$principle_path" "$note_path" "$video_url"
   ); then

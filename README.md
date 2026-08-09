@@ -1,8 +1,8 @@
 # spruce-leaf
 
 A **"Codex for sales."** Launch it, type what you're hunting for, and it runs the whole
-play: find accounts with an expensive workflow, the people positioned to see that workflow,
-and a hypothesis-led outreach sequence for each — grounded in a library of real sales books —
+play: find accounts with an expensive workflow, map the people positioned to see that workflow,
+and activate one primary contact with a hypothesis-led outreach sequence — grounded in a library of real sales books —
 then files everything in a local CRM.
 
 It's a Rust CLI with a provider-neutral reasoning engine. Each line you type goes directly to the
@@ -10,9 +10,33 @@ OpenAI Responses API by default, or to the optional Claude, Codex, or Grok local
 Apollo sourcing, contact enrichment, verified outreach planning, approval, and funnel reporting.
 
 Set `OPENAI_API_KEY` for the default backend. The normal model is `gpt-5.6-terra`; lightweight
-routing uses `gpt-5.6-luna`. Select Sol explicitly for unusually hard work with
-`--model gpt-5.6-sol`. Authenticated `claude`, `codex`, and `grok` CLIs remain available through
+routing uses `gpt-5.6-luna`. Outreach writing defaults to `high`; copy repair and independent final
+verification default to `medium`. Account qualification, contact-vantage selection, hypothesis
+refresh, and outreach angle planning use the selected model at `medium`. Sol remains an explicit opt-in, not a hidden default:
+the earlier Sol/xhigh lane spent thousands of reasoning tokens per short email without reliably
+improving the buyer-facing copy. Override the lanes with
+`SPRUCE_OPENAI_WRITER_MODEL`, `SPRUCE_OPENAI_EDITOR_MODEL`, `SPRUCE_OPENAI_VERIFIER_MODEL`
+and their matching `*_REASONING_EFFORT` keys. `SPRUCE_OPENAI_COPY_MODEL` and
+`SPRUCE_OPENAI_COPY_REASONING_EFFORT` remain fallbacks for all three lanes. Use
+`SPRUCE_OPENAI_STRATEGY_MODEL`, and `SPRUCE_OPENAI_STRATEGY_REASONING_EFFORT`. Selecting Sol explicitly
+with `--model gpt-5.6-sol` still applies it to other substantive work. Authenticated `claude`, `codex`, and `grok` CLIs remain available through
 `--backend`. Apollo and mailbox credentials are still required for real sourcing and delivery.
+Frontier outreach calls are globally limited to two concurrent requests; tune this cautiously with
+`SPRUCE_OPENAI_FRONTIER_CONCURRENCY`. A turn also stops at 100 model attempts, 120,000 output tokens,
+or $2.00 of measured model cost by default. Override those safety rails with
+`SPRUCE_TURN_MAX_MODEL_ATTEMPTS`, `SPRUCE_TURN_MAX_OUTPUT_TOKENS`, and
+`SPRUCE_TURN_MAX_COST_USD`. Router fallback is one-call-only: it never silently changes the provider
+used by the bulk action it routes.
+Automatic account-framing refreshes reuse source-backed research for six hours by default; tune with
+`SPRUCE_ACCOUNT_REFRESH_TTL_SECS` or set it to `0` to force every re-read.
+
+Bulk outreach now activates one primary person per account and drafts at most four eager touches.
+Discovery-ready accounts are held for research unless the request is a single manual routing note;
+only action-ready evidence can produce a multi-touch campaign. Set `SPRUCE_EAGER_FULL_SEQUENCE=1`
+only for a deliberate legacy seven-touch comparison. Run `cargo run -- eval-outreach --double-blind`
+to compare copy against the pairwise corpus before promoting a prompt or model change.
+Angle selection and copy realization are separate calls by default. Set
+`SPRUCE_FOLD_OUTREACH_PLANNER=1` only for a measured lower-cost comparison.
 
 ## The doctrine model
 
@@ -22,9 +46,11 @@ commercial **hypothesis** being tested, its **mechanism**, a **measurable conseq
 dollar figure), the one narrow **system concept** to offer, the **hard buyer question**, and the
 **kill condition**. Contacts are chosen by **vantage point** (what they can observe/decide/route),
 not seniority. Every sequence gets deterministic sendability checks and structured review. The
-direct API path uses one account-level plan/write call plus one editor pass and, only when needed,
-up to two stage-scoped repair passes per recipient. Every provider then runs the configured
-ten-lens sales council; Rust independently reruns the sendability rules.
+normal path creates an independent angle plan for the primary contact, realizes the copy in a
+separate call, runs deterministic checks, then uses a separate final verifier. Verifier feedback can trigger
+up to two stage-scoped rewrites; rejected copy never becomes an active draft. The older ten-lens
+sales council remains available for deliberate audits with `SPRUCE_SALES_COUNCIL=1`, but is off on
+the normal API path because it duplicates the independent verifier at much higher token cost.
 
 The doctrine itself lives in editable **`playbooks/*.toml`** — a shared spine plus one file per
 brand (`gnk`, `wapahki`, `outagehub`) — so you can tune voice, length, forbidden phrases, and
@@ -36,14 +62,12 @@ file per critic.
 ## Knowledge ("SecondBrain")
 
 Ingest business/sales books once; spruce-leaf parses them, distills each into compact **principle
-cards** (via the selected backend), and retrieves the handful relevant to each pipeline stage (BM25,
-no extra keys) so outputs are grounded in — and cite — real playbooks instead of the model's unaided
-priors. Strategy-producing calls also receive a compact, always-on twelve-book doctrine; retrieved
-cards favor different source books before repeating one source, so a single title cannot dominate.
-For API outreach, planning and writing knowledge are retrieved separately but combined into one
-Terra account-level generation call; each recipient then receives one concurrent Luna reviewer call. Local CLI outreach
-keeps the roles separate. The planner/writer output must cite at least one retrieved library
-principle; citations are stored on the sequence.
+cards** (via the selected backend), and retrieves only the few relevant to each pipeline stage
+(BM25, no extra keys). Planning, writing, editing, and verification receive compact role-specific
+context; the full book doctrine is not repeated inside every short-copy call. Retrieved cards favor
+different source books before repeating one source, so a single title cannot dominate. Applied
+principle IDs are stored on the sequence when a retrieved principle materially changes the work.
+Model and reasoning lanes for writing, editing, and verification are independently configurable.
 
 ```sh
 spruce-leaf ingest ./books                 # .txt / .md / .pdf, file or directory
@@ -59,11 +83,11 @@ flag to distill reusable principle cards.
 
 The YouTube workflow builds copyright-safe research notes from official captions: it keeps
 paraphrased summaries, timestamped principles, claims-to-verify, and source URLs, then deletes the
-temporary caption files. The local manifest currently contains 13 core and 8 extended
-Hormozi/Serhant interviews.
+temporary caption files. The local manifest currently contains 14 core and 8 extended
+sales/GTM interviews.
 
 ```sh
-# Build or resume the 13 core episode notes, then merge them into the library.
+# Build or resume the 14 core episode notes, then merge them into the library.
 YOUTUBE_NOTES_TIER=core scripts/build-youtube-notes.sh
 scripts/ingest-youtube-notes.sh
 
@@ -74,6 +98,19 @@ scripts/ingest-youtube-notes.sh
 
 Episode metadata lives in `knowledge-sources/youtube-episodes.tsv`. Generated notes and their
 catalog live under `.spruce/videos/`; full transcripts are never retained.
+
+## AI-native GTM intelligence
+
+Spruce Leaf follows the pattern visible in current AI-company hiring: agents maintain context,
+research signals, CRM records, and draft candidates; a human owns discovery, trust, interpretation,
+and commitments; technical proof begins only after confirmed pain and feeds its learning back into
+the targeting system. The dated source memo is in `docs/modern-ai-gtm.md`.
+
+Official-site research now checks a company's careers or jobs page as a best-effort source. A live
+first-party role may support a 30-day `account.job_posting_workflow_evidence` signal when it explicitly
+names a relevant system, workflow, responsibility, or investment. It can never prove pain, urgency,
+budget, buying intent, or that the selected recipient owns the workflow. Set `SPRUCE_JOB_SIGNALS=0`
+to skip the extra careers-page read when latency matters more than the additional evidence.
 
 ## Setup
 
@@ -220,7 +257,7 @@ $ cargo run
 • I’ll map the account pattern, then find the people closest to the workflow.
 
 • Sourcing companies
-  └ GnK · 5 account target · 5 people each · active GTM play
+  └ GnK · 5 account target · map up to 5 people each · activate 1 primary · active GTM play
 
   ✓ Built ICP
     └ 9 keywords · 8 buyer titles · 3 size bands
@@ -246,9 +283,10 @@ concurrently. The composer supports history, paste, an empty-state hint, and
 Tab completion for slash commands.
 
 Qualification distinguishes negative evidence from missing evidence. Accounts that fully satisfy
-the active play are `qualified`; plausible accounts with two supported play signals and no hard
-blocker are retained as `research_needed`, so discovery copy tests the missing task/exception signal
-without claiming it. Affirmative mismatches are rejected. Each pass also persists recurring ICP and
+the active play are `qualified`; plausible accounts with partial support and no hard blocker are
+retained as `research_needed`, but bulk multi-touch drafting holds them instead of turning missing
+evidence into copy. A single manual routing note remains possible. Affirmative mismatches are
+rejected. Each pass also persists recurring ICP and
 contact-coverage failure patterns and injects them into the next ICP build; legacy two-signal rejects
 from the older hard gate are automatically reconsidered once.
 
@@ -294,19 +332,27 @@ strongest qualified candidates it found—not simply five outage-sensitive compa
 inherits the exact play version, evidence IDs, and experiment arm that selected each account.
 
 When you already have companies and people on file (for example after an earlier OutageHub run),
-asking for “5 companies, 5 people, 7-stage sequence” **does not re-search Apollo**. Spruce Leaf:
+asking for “5 companies with up to 5 mapped people and outreach” **does not re-search Apollo**.
+Spruce Leaf:
 
 1. picks the strongest on-file accounts/contacts for that brand,
 2. refreshes why each company fits (hypothesis / mechanism / “why them” — no Apollo),
 3. reveals emails only for contacts still missing a verified address,
-4. rewrites the multi-touch sequences against that updated framing.
+4. activates the strongest workflow owner at each account and writes a four-touch sequence only
+   when the evidence is action-ready.
+
+Current-policy drafts that already passed review are preserved on an ordinary
+retry. Say `rewrite`, `redraft`, `refine`, or `replace drafts` when you
+intentionally want accepted unsent copy regenerated too.
 
 Apollo runs only for an account shortfall, or when you explicitly ask for **new/fresh** companies
 (`force_new`). That keeps re-runs cheap and keeps sequences aligned with the current business
 profile and playbook.
 
-The working-set IDs are enforced during enrichment: a 5-account × 5-person request reveals those
-five selected contacts at each account, rather than the first 25 unenriched rows in database order.
+The working-set IDs are enforced during enrichment: a 5-account × 5-person mapping request reveals
+those five selected contacts at each account, rather than the first 25 unenriched rows in database
+order. Outreach then activates one primary person per account instead of launching five parallel
+threads.
 The same cardinality contract applies to scoped re-drafting. A request for 5 accounts × 2 people
 cannot be silently reduced by a router-supplied total limit; Spruce Leaf resolves the ten visible
 people first, reports the exact scope, and reveals email only for selected identities that are still
@@ -422,13 +468,13 @@ attendee. The live autopilot daemon may complete that guarded booking automatica
 mode and one-shot `inbox` record it as pending unless `inbox --book` is explicit; use
 `book-meetings` to approve pending inserts.
 
-### Seven-touch email and LinkedIn cadence
+### Short email and LinkedIn cadence
 
-New seven-touch plans use one 21-day cadence: email on days 0 and 3, a
-personalized LinkedIn connection request on day 5, email on day 9, a conditional
-LinkedIn/email touch on day 13, email on day 17, and a conditional close on day
-21. There are no new call touches. Connection requests are short and contain no
-pitch or meeting ask.
+New plans default to four touches: email on days 0 and 3, a personalized LinkedIn
+connection request on day 7, and email on day 14. Longer follow-up should be
+earned by a live thread, not prewritten as filler. Legacy seven-touch generation
+is available only behind `SPRUCE_EAGER_FULL_SEQUENCE=1`. There are no call
+touches. Connection requests are short and contain no pitch or meeting ask.
 
 Spruce Leaf does not scrape LinkedIn connection state. The CRM therefore exposes
 an explicit status beside each person. A conditional touch is held as a manual

@@ -37,6 +37,7 @@ mod mailbox;
 mod metrics;
 mod opportunity;
 mod outreach;
+mod outreach_eval;
 mod pipeline;
 mod playbook;
 mod prompts;
@@ -136,7 +137,7 @@ enum Command {
         accounts: usize,
         #[arg(long, default_value_t = 5, value_parser = positive_usize)]
         contacts: usize,
-        #[arg(long, default_value_t = 7, value_parser = positive_usize)]
+        #[arg(long, default_value_t = 4, value_parser = positive_usize)]
         touches: usize,
         /// Optionally also write a standalone Markdown brief to this path.
         #[arg(long)]
@@ -181,14 +182,15 @@ enum Command {
         phone: bool,
     },
 
-    /// Write outreach sequences for verified people and schedule the touches.
+    /// Write reviewed outreach drafts for verified primary contacts.
     Plan {
-        #[arg(long, default_value_t = 7, value_parser = positive_usize)]
+        /// Requested touch count; execution normalizes to 1 or 4 (7 only in legacy mode).
+        #[arg(long, default_value_t = 4, value_parser = positive_usize)]
         touches: usize,
         /// Limit planning to the first N existing companies in CRM order.
         #[arg(long, value_parser = positive_usize)]
         accounts: Option<usize>,
-        /// Limit planning to the first N visible verified people per company.
+        /// Candidate-contact cap per company; bulk planning still activates one primary person.
         #[arg(long, value_parser = positive_usize)]
         contacts: Option<usize>,
         /// Optional total contact cap across the selected companies.
@@ -203,6 +205,15 @@ enum Command {
         /// Replace an existing active sequence only when it has no sent touches.
         #[arg(long)]
         replace_drafts: bool,
+    },
+
+    /// Blind pairwise evaluation against a human-labeled outreach JSONL corpus.
+    EvalOutreach {
+        #[arg(long, default_value = "evals/outreach-gold.jsonl")]
+        corpus: String,
+        /// Judge each pair in both orders and require an order-consistent verdict.
+        #[arg(long)]
+        double_blind: bool,
     },
 
     /// Approve drafted email touches so the cadence engine may send them.
@@ -671,6 +682,19 @@ fn main() -> Result<()> {
                     .map(|reason| format!("\n  stopped early: {reason}"))
                     .unwrap_or_default(),
             );
+            Ok(())
+        }
+
+        Command::EvalOutreach {
+            corpus,
+            double_blind,
+        } => {
+            let client = make_engine(&rt, &cli)?;
+            rt.block_on(outreach_eval::run(
+                &client,
+                Path::new(&corpus),
+                double_blind,
+            ))?;
             Ok(())
         }
 

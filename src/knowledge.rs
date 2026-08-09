@@ -50,6 +50,7 @@ const CORE_BUSINESS_DOCTRINE: &str = "\
 - [core:hundred-million-offers] $100M Offers — increase the buyer's desired outcome and confidence while reducing delay, effort, risk, and unnecessary complexity.\n\
 - [core:atomic-habits] Atomic Habits — turn strategy into an easy-to-repeat system with obvious cues, fast feedback, and an environment that supports the desired behaviour.";
 
+#[cfg(test)]
 const CORE_PRINCIPLE_IDS: [&str; 12] = [
     "core:lean-startup",
     "core:zero-to-one",
@@ -65,6 +66,7 @@ const CORE_PRINCIPLE_IDS: [&str; 12] = [
     "core:atomic-habits",
 ];
 
+#[cfg(test)]
 pub fn core_principle_ids() -> &'static [&'static str] {
     &CORE_PRINCIPLE_IDS
 }
@@ -91,6 +93,9 @@ pub fn core_strategy_block(stage: &str) -> String {
         }
         "replies" => {
             "Treat the reply as evidence, answer the person's actual intent, and ask only for the smallest useful next commitment."
+        }
+        "proof" => {
+            "Build the proof from buyer-supplied materials, their current workflow, and their own pain language. Show the complete trigger-to-outcome path including exceptions and human judgment; offer a small number of implementation paths; collaborate on controls; and state price, resources, success criteria, and stop conditions transparently. Never substitute a generic feature demo. [enterprise-poc-eight-moves]"
         }
         "experiments" => {
             "Name the hypothesis, leading measure, decision threshold, owner, review date, and what result would cause a change."
