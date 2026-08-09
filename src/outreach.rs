@@ -1408,8 +1408,11 @@ async fn write_account_sequences(
         "Follow each recipient's supplied private sequence_plan."
     };
     let writer_knowledge = knowledge.writer.block.clone();
+    let brand_trigger_contract = brand_trigger_contract(&pb.key);
     let writer_instructions = format!(
         r#"Write one {n}-touch no-reply sequence for each recipient. {planning_contract}
+
+{brand_trigger_contract}
 
 Think through the buyer-safe brief and copy decision context. Return exactly one result for every person_key. First choose send_decision. Use send only when verified facts support the trigger, the title can credibly answer the ask, and one natural first note can test the hypothesis without pretending it is true. Otherwise choose hold_for_research, explain the missing evidence privately in decision_reason, and return no touches. Abstention is better than filler. For a send decision, privately state the operating decision, mechanism to test, strongest objection, recipient's reason to reply, and supported give-back. Never invent collateral, customer proof, or prior analysis.
 
@@ -1422,6 +1425,7 @@ For four touches use email/0, email/3, linkedin_request/7, email/14. For seven t
 Purpose and goal are private CRM notes, never substitutes for buyer-facing prose. Before returning, read the whole sequence as the recipient. Remove generic lessons, fragments, surveys, framework language, and repeated retreat lines. In four touches, at most one touch may mainly say Andrew may be wrong, invite a correction/referral, or close; in the legacy seven-touch shape the maximum is three. Rewrite any excess around mechanism, useful contribution, and the hard buyer objection. Never reveal play labels, experiment arms, confidence scores, or internal hypotheses."#,
         n = n,
         planning_contract = planning_contract,
+        brand_trigger_contract = brand_trigger_contract,
     );
     let writer_user = |recipients: &[Value]| {
         format!(
@@ -1643,6 +1647,14 @@ Purpose and goal are private CRM notes, never substitutes for buyer-facing prose
         failures,
         stopped_reason,
     })
+}
+
+fn brand_trigger_contract(brand: &str) -> &'static str {
+    if brand == "outagehub" {
+        "OUTAGEHUB EVIDENCE BOUNDARY: A stable sourced fact about the prospect's site/network footprint, continuity responsibility, field service, or central operations can be the trigger. A recent utility outage at one of its facilities is not required. Never hold an otherwise supported note merely because no live incident was supplied, and never invent one."
+    } else {
+        ""
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4006,17 +4018,26 @@ fn review_edit_schema(n: usize) -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        affected_stages, apply_targeted_repairs, business_copy_context, copy_sentence_count,
-        format_progress_status, is_email_capable_channel, is_retreat_or_route_touch,
-        mentions_outreach_asset, normalize_dashes, normalize_principle_ids,
-        normalize_thread_subjects, provisional_channel, provisional_day_offset,
-        select_people_for_planning, sequence_quality_issues, touch_question_limit, touch_word_band,
-        word_set_similarity, CopySequence, CopyTouch, EditDoc, EditReview, PlanProgressRecipient,
-        PlanProgressUpdate, TouchReview,
+        affected_stages, apply_targeted_repairs, brand_trigger_contract, business_copy_context,
+        copy_sentence_count, format_progress_status, is_email_capable_channel,
+        is_retreat_or_route_touch, mentions_outreach_asset, normalize_dashes,
+        normalize_principle_ids, normalize_thread_subjects, provisional_channel,
+        provisional_day_offset, select_people_for_planning, sequence_quality_issues,
+        touch_question_limit, touch_word_band, word_set_similarity, CopySequence, CopyTouch,
+        EditDoc, EditReview, PlanProgressRecipient, PlanProgressUpdate, TouchReview,
     };
     use crate::business::Businesses;
     use crate::db::Person;
     use crate::playbook::Playbooks;
+
+    #[test]
+    fn outagehub_does_not_require_a_live_outage_as_the_copy_trigger() {
+        let contract = brand_trigger_contract("outagehub");
+        assert!(contract.contains("recent utility outage"));
+        assert!(contract.contains("is not required"));
+        assert!(contract.contains("stable sourced fact"));
+        assert!(brand_trigger_contract("gnk").is_empty());
+    }
 
     #[test]
     fn progress_status_exposes_phase_recipient_and_count() {

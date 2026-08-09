@@ -61,7 +61,7 @@ struct Decision {
 }
 
 /// One action for one brand within a turn.
-#[derive(Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct Step {
     action: String,
     #[serde(default)]
@@ -546,7 +546,7 @@ impl Agent {
         let prompt = self.build_prompt(input).await;
 
         let mut turn = ui::TurnView::new();
-        let decision: Decision = self
+        let mut decision: Decision = self
             .client
             .structured_fast_streamed(
                 "interactive.router",
@@ -556,6 +556,7 @@ impl Agent {
                 &mut |ev| turn.on_event(ev),
             )
             .await?;
+        coalesce_full_motion_steps(&mut decision.steps, &self.brand);
         // Router output is intentionally private, so conversational replies are
         // rendered once from the accepted structured decision.
         let streamed = turn.finish();
@@ -2437,12 +2438,13 @@ impl Agent {
 MULTIPLE brands or things in one request → emit one step per (brand, action), in the user's order. Examples:\n\
 - 'full motion for gnk and outagehub and wapahki' → three run_full_motion steps, brand gnk / outagehub / wapahki.\n\
 - 'source 10 for gnk, then draft wapahki' → a source_leads step (brand gnk) and a plan_outreach step (brand wapahki).\n\
+- Finding/sourcing companies or people AND writing/drafting their outreach for the SAME brand is ONE run_full_motion step, never separate source_leads + plan_outreach steps. The phrase 'one primary person' describes activation, while contacts still preserves the requested mapped people per company.\n\
 - Different actions for different brands in one message are fine; each step carries its own brand and its own fields.\n\
 For a pure conversational answer (no action to run), leave `steps` empty and put the answer in `reply`.\n\n\
 {brand_mode}\n\n\
 Actions (each is a step's `action`):\n\
 - run_campaign: hypothetical research-only campaign; no Apollo.\n\
-- source_leads: ONLY finds and qualifies Apollo accounts+people, then stops — it writes NO emails. Use only when the request is purely to find companies/people and they want NEW Apollo search. set thesis/accounts/contacts (defaults 10/3).\n\
+- source_leads: ONLY finds and qualifies Apollo accounts+people, then stops — it writes NO emails. Use only when the request is purely to find companies/people and contains no request to write, draft, sequence, or perform outreach. set thesis/accounts/contacts (defaults 10/3).\n\
 - run_full_motion: end-to-end motion for a brand (never sends). The requested account count is a FULFILLMENT CONTRACT: persist through adaptive sourcing passes, contact shortfalls, weak hypotheses, and rejected copy; save misses as targeting corrections, retry rejected copy with its feedback, and replace any account that still lacks a current reviewed sequence. Stop short only at a real provider/model-budget/search-exhaustion safety boundary and report filled/requested exactly. REUSE-FIRST: if the CRM already has enough accounts/people for that brand, it SKIPS Apollo, refreshes why those companies fit, and writes missing, rejected, or stale sequences. Current-policy reviewed drafts are preserved unless the operator explicitly asks to rewrite/redraft/refine/replace them. set thesis/accounts/contacts/touches (defaults 5/5/4). Bulk activation still chooses one primary contact per account. set force_new=true ONLY when they explicitly ask for new/fresh/more companies not already on file.\n\
 - enrich_people: reveal/verify sourced emails; phone only when explicit.\n\
 - plan_outreach: draft sequences for contacts ALREADY found (no account/people search). A scoped request may reveal only those selected contacts whose email is still missing, because an email sequence must not silently shrink; skip that reveal when the operator says no Apollo/no enrichment/verified only. IMPORTANT SCOPE: 'first N people' with NO company/account count means N people TOTAL in CRM order: set limit=N and OMIT accounts/contacts. 'first N people in the first company' means accounts=1, contacts=N. 'N people for each of M companies' means accounts=M, contacts=N. contacts is always PER selected company, never a bare total. Preserve current-policy reviewed drafts on ordinary retries; safely replace unsent drafts only when the operator explicitly says rewrite/redraft/refine/replace. auto only when explicit.\n\
@@ -2505,6 +2507,76 @@ fn decision_schema(brands: &[&str]) -> Value {
     })
 }
 
+/// The model router occasionally represents one end-to-end request as
+/// `source_leads` followed by `plan_outreach`. That bypasses the fulfillment
+/// loop because both standalone actions are intentionally bounded one-shots.
+/// Collapse the pair deterministically whenever it targets the same brand.
+fn coalesce_full_motion_steps(steps: &mut Vec<Step>, fallback_brand: &str) {
+    let mut consumed = std::collections::HashSet::<usize>::new();
+    let mut normalized = Vec::with_capacity(steps.len());
+
+    for index in 0..steps.len() {
+        if consumed.contains(&index) {
+            continue;
+        }
+        let action = steps[index].action.as_str();
+        if !matches!(action, "source_leads" | "plan_outreach") {
+            normalized.push(steps[index].clone());
+            continue;
+        }
+        let counterpart = if action == "source_leads" {
+            "plan_outreach"
+        } else {
+            "source_leads"
+        };
+        let brand = effective_step_brand(&steps[index], fallback_brand);
+        let pair = steps.iter().enumerate().find(|(candidate, step)| {
+            *candidate != index
+                && !consumed.contains(candidate)
+                && step.action == counterpart
+                && effective_step_brand(step, fallback_brand) == brand
+        });
+        let Some((pair_index, pair_step)) = pair else {
+            normalized.push(steps[index].clone());
+            continue;
+        };
+
+        let (source, plan) = if action == "source_leads" {
+            (&steps[index], pair_step)
+        } else {
+            (pair_step, &steps[index])
+        };
+        let mut full = source.clone();
+        full.action = "run_full_motion".into();
+        if full.brand.trim().is_empty() {
+            full.brand = plan.brand.clone();
+        }
+        if full.thesis.trim().is_empty() {
+            full.thesis = plan.thesis.clone();
+        }
+        full.accounts = source.accounts.or(plan.accounts);
+        // The source step carries the mapping coverage requested by the user;
+        // the planning step may say one because activation is one primary.
+        full.contacts = source.contacts.or(plan.contacts);
+        full.touches = plan.touches.or(source.touches);
+        full.auto = plan.auto;
+        full.force_new = true;
+        normalized.push(full);
+        consumed.insert(index);
+        consumed.insert(pair_index);
+    }
+
+    *steps = normalized;
+}
+
+fn effective_step_brand<'a>(step: &'a Step, fallback_brand: &'a str) -> &'a str {
+    if step.brand.trim().is_empty() {
+        fallback_brand
+    } else {
+        step.brand.trim()
+    }
+}
+
 /// Best-effort open of a URL in the default browser.
 pub fn open_browser(url: &str) {
     #[cfg(target_os = "macos")]
@@ -2520,8 +2592,9 @@ pub fn open_browser(url: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        decision_schema, forbids_contact_enrichment, requests_copy_replacement, routed_total_limit,
-        select_plan_scope, unqualified_people_total,
+        coalesce_full_motion_steps, decision_schema, forbids_contact_enrichment,
+        requests_copy_replacement, routed_total_limit, select_plan_scope, unqualified_people_total,
+        Step,
     };
     use crate::db::{Db, Lead, Person};
 
@@ -2549,6 +2622,60 @@ mod tests {
             .as_array()
             .expect("step actions");
         assert!(step_actions.iter().all(|action| action != "reply"));
+    }
+
+    #[test]
+    fn same_brand_source_then_draft_is_forced_through_full_motion() {
+        let mut steps = vec![
+            Step {
+                action: "source_leads".into(),
+                brand: "outagehub".into(),
+                thesis: "Canadian distributed operations".into(),
+                accounts: Some(3),
+                contacts: Some(2),
+                ..Default::default()
+            },
+            Step {
+                action: "plan_outreach".into(),
+                brand: "outagehub".into(),
+                accounts: Some(3),
+                contacts: Some(1),
+                touches: Some(4),
+                ..Default::default()
+            },
+        ];
+
+        coalesce_full_motion_steps(&mut steps, "gnk");
+
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].action, "run_full_motion");
+        assert_eq!(steps[0].brand, "outagehub");
+        assert_eq!(steps[0].accounts, Some(3));
+        assert_eq!(steps[0].contacts, Some(2));
+        assert_eq!(steps[0].touches, Some(4));
+        assert!(steps[0].force_new);
+    }
+
+    #[test]
+    fn different_brand_source_and_draft_remain_independent_steps() {
+        let mut steps = vec![
+            Step {
+                action: "source_leads".into(),
+                brand: "gnk".into(),
+                ..Default::default()
+            },
+            Step {
+                action: "plan_outreach".into(),
+                brand: "outagehub".into(),
+                ..Default::default()
+            },
+        ];
+
+        coalesce_full_motion_steps(&mut steps, "wapahki");
+
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].action, "source_leads");
+        assert_eq!(steps[1].action, "plan_outreach");
     }
 
     #[test]
