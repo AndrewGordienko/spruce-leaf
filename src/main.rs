@@ -137,7 +137,7 @@ enum Command {
         accounts: usize,
         #[arg(long, default_value_t = 5, value_parser = positive_usize)]
         contacts: usize,
-        #[arg(long, default_value_t = 4, value_parser = positive_usize)]
+        #[arg(long, default_value_t = 7, value_parser = positive_usize)]
         touches: usize,
         /// Optionally also write a standalone Markdown brief to this path.
         #[arg(long)]
@@ -184,8 +184,8 @@ enum Command {
 
     /// Write reviewed outreach drafts for verified primary contacts.
     Plan {
-        /// Requested touch count; execution normalizes to 1 or 4 (7 only in legacy mode).
-        #[arg(long, default_value_t = 4, value_parser = positive_usize)]
+        /// Requested touch count; defaults to the full seven-touch sequence.
+        #[arg(long, default_value_t = 7, value_parser = positive_usize)]
         touches: usize,
         /// Limit planning to the first N existing companies in CRM order.
         #[arg(long, value_parser = positive_usize)]

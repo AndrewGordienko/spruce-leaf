@@ -25,6 +25,17 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 
+#[derive(Debug)]
+struct OpenAiBackgroundPollError(String);
+
+impl std::fmt::Display for OpenAiBackgroundPollError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for OpenAiBackgroundPollError {}
+
 /// Which provider supplies model inference.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, clap::ValueEnum)]
 pub enum Backend {
@@ -705,6 +716,39 @@ impl Engine {
         selection
     }
 
+    /// If the dedicated frontier writer lane is temporarily unavailable, keep
+    /// the job moving on the user's normal OpenAI model. This is a stage-local
+    /// fallback: it does not change the selected model for the session and it
+    /// never crosses providers for bulk work.
+    fn transient_stage_fallback(
+        &self,
+        stage: &str,
+        failed: &ModelSelection,
+    ) -> Option<ModelSelection> {
+        if stage != "outreach.write_account"
+            || failed.backend != Backend::Openai
+            || !failed
+                .model
+                .as_deref()
+                .is_some_and(|model| model.starts_with("gpt-5.6-sol"))
+        {
+            return None;
+        }
+        let mut fallback = self.selection_for(false);
+        fallback.model = std::env::var("SPRUCE_OPENAI_WRITER_FALLBACK_MODEL")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                fallback
+                    .model
+                    .clone()
+                    .filter(|model| !model.starts_with("gpt-5.6-sol"))
+            })
+            .or_else(|| Some("gpt-5.6-terra".to_string()));
+        (fallback.backend == Backend::Openai && fallback.model != failed.model).then_some(fallback)
+    }
+
     /// Human-readable model lane shown before costly outreach drafting begins.
     pub fn outreach_quality_label(&self) -> String {
         let selection = self.selection_for_stage("outreach.write_account", false);
@@ -1192,7 +1236,98 @@ impl Engine {
                 payload["error"]["code"].as_str().unwrap_or("unknown"),
             );
         }
+        let payload = if openai_uses_background(stage, selection) {
+            self.poll_openai_response(api_key, payload).await?
+        } else {
+            payload
+        };
         parse_openai_response(&payload, schema.is_some(), started.elapsed())
+    }
+
+    /// Long-running reasoning requests are created once and then retrieved by
+    /// response id. A failed poll must never restart the generation: doing so
+    /// both wastes spend and can create several independent copies of the same
+    /// answer. Short GET failures therefore retry here, against the same id.
+    async fn poll_openai_response(&self, api_key: &str, mut payload: Value) -> Result<Value> {
+        self.poll_openai_response_inner(api_key, &mut payload)
+            .await
+            .map_err(|error| {
+                anyhow::Error::new(OpenAiBackgroundPollError(format!(
+                    "OpenAI background response could not be retrieved safely: {error:#}"
+                )))
+            })?;
+        Ok(payload)
+    }
+
+    async fn poll_openai_response_inner(&self, api_key: &str, payload: &mut Value) -> Result<()> {
+        let initial_status = payload["status"].as_str().unwrap_or("unknown");
+        if !matches!(initial_status, "queued" | "in_progress") {
+            return Ok(());
+        }
+        let response_id = payload["id"]
+            .as_str()
+            .filter(|id| !id.trim().is_empty())
+            .ok_or_else(|| anyhow!("OpenAI background response did not include an id"))?
+            .to_string();
+        let url = format!("{}/responses/{response_id}", self.openai_base_url);
+        let mut consecutive_failures = 0u32;
+
+        loop {
+            let status = payload["status"].as_str().unwrap_or("unknown");
+            if !matches!(status, "queued" | "in_progress") {
+                return Ok(());
+            }
+
+            tokio::time::sleep(openai_background_poll_interval()).await;
+            let response = match self.http.get(&url).bearer_auth(api_key).send().await {
+                Ok(response) => response,
+                Err(error) if consecutive_failures < MAX_BACKGROUND_POLL_RETRIES => {
+                    consecutive_failures += 1;
+                    tokio::time::sleep(transient_backoff(consecutive_failures)).await;
+                    let _ = error;
+                    continue;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "retrieving OpenAI background response {response_id} after {} retries",
+                            MAX_BACKGROUND_POLL_RETRIES
+                        )
+                    });
+                }
+            };
+            let http_status = response.status();
+            let body = response
+                .text()
+                .await
+                .with_context(|| format!("reading OpenAI background response {response_id}"))?;
+
+            if (http_status.as_u16() == 429 || http_status.is_server_error())
+                && consecutive_failures < MAX_BACKGROUND_POLL_RETRIES
+            {
+                consecutive_failures += 1;
+                tokio::time::sleep(transient_backoff(consecutive_failures)).await;
+                continue;
+            }
+
+            *payload = serde_json::from_str(&body).with_context(|| {
+                format!(
+                    "OpenAI background response {response_id} returned non-JSON HTTP {http_status}: {}",
+                    body.chars().take(500).collect::<String>()
+                )
+            })?;
+            if !http_status.is_success() {
+                bail!(
+                    "OpenAI background response {response_id} returned HTTP {http_status}: {} (type: {}, code: {})",
+                    payload["error"]["message"]
+                        .as_str()
+                        .unwrap_or("unknown OpenAI API error"),
+                    payload["error"]["type"].as_str().unwrap_or("unknown"),
+                    payload["error"]["code"].as_str().unwrap_or("unknown"),
+                );
+            }
+            consecutive_failures = 0;
+        }
     }
 
     /// Run provider work under the configured wall-clock cap. CLI children are
@@ -1200,17 +1335,37 @@ impl Engine {
     async fn with_timeout<T>(
         &self,
         backend: Backend,
+        timeout: Duration,
+        background_response: bool,
         fut: impl std::future::Future<Output = Result<T>>,
     ) -> Result<T> {
-        match tokio::time::timeout(self.call_timeout, fut).await {
+        match tokio::time::timeout(timeout, fut).await {
             Ok(res) => res,
+            Err(_) if background_response => Err(anyhow::Error::new(
+                OpenAiBackgroundPollError(format!(
+                    "OpenAI background response timed out after {}s; the existing generation was not restarted (raise SPRUCE_OPENAI_BACKGROUND_TIMEOUT_SECS to allow longer)",
+                    timeout.as_secs()
+                )),
+            )),
             Err(_) => bail!(
                 "{} call timed out after {}s — the provider did not complete \
                  (raise SPRUCE_MODEL_TIMEOUT_SECS to allow longer)",
                 backend.as_str(),
-                self.call_timeout.as_secs()
+                timeout.as_secs()
             ),
         }
+    }
+
+    fn timeout_for(&self, stage: &str, selection: &ModelSelection) -> Duration {
+        if openai_uses_background(stage, selection) {
+            let seconds = std::env::var("SPRUCE_OPENAI_BACKGROUND_TIMEOUT_SECS")
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(900);
+            return self.call_timeout.max(Duration::from_secs(seconds));
+        }
+        self.call_timeout
     }
 
     async fn call_once(
@@ -1277,7 +1432,14 @@ impl Engine {
                 }
             }
         };
-        let result = self.with_timeout(selection.backend, work).await;
+        let result = self
+            .with_timeout(
+                selection.backend,
+                self.timeout_for(stage, selection),
+                openai_uses_background(stage, selection),
+                work,
+            )
+            .await;
         if result.as_ref().is_err_and(is_usage_exhausted) {
             self.exhausted_backends
                 .lock()
@@ -1324,13 +1486,40 @@ impl Engine {
                 .call_once(stage, &selection, system, user, schema, false)
                 .await;
             match &outcome {
-                Err(error) if attempt < max_retries && is_retryable_provider_error(error) => {
+                Err(error) if attempt < max_retries && is_safe_to_retry_provider_request(error) => {
                     attempt += 1;
                     tokio::time::sleep(transient_backoff(attempt)).await;
                     continue;
                 }
                 _ => break outcome,
             }
+        };
+        let first = match first {
+            Err(error)
+                if is_safe_to_retry_provider_request(&error)
+                    || is_generation_incomplete(&error) =>
+            {
+                if let Some(fallback) = self.transient_stage_fallback(stage, &selection) {
+                    let first_failure = if is_generation_incomplete(&error) {
+                        "did not finish within its output allowance"
+                    } else {
+                        "remained unavailable after bounded retries"
+                    };
+                    self.call_once(stage, &fallback, system, user, schema, true)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "{} ({}) {first_failure}; writer fallback {} also failed",
+                                selection.backend,
+                                selection.model.as_deref().unwrap_or("default"),
+                                fallback.model.as_deref().unwrap_or("default")
+                            )
+                        })
+                } else {
+                    Err(error)
+                }
+            }
+            result => result,
         };
         match first {
             Err(error) if allow_fallback && is_usage_exhausted(&error) => {
@@ -1584,7 +1773,14 @@ impl Engine {
                 }
             }
         };
-        let result = self.with_timeout(selection.backend, work).await;
+        let result = self
+            .with_timeout(
+                selection.backend,
+                self.timeout_for(stage, selection),
+                openai_uses_background(stage, selection),
+                work,
+            )
+            .await;
         match &result {
             Ok(outcome) => self.stats.record_success(stage, outcome),
             Err(error) => {
@@ -1902,6 +2098,38 @@ fn openai_reasoning_effort(stage: &str, fast: bool) -> String {
         .unwrap_or_else(|| default_effort.to_string())
 }
 
+/// Synchronous HTTP connections are a poor fit for long reasoning runs: an
+/// intermediary can close an otherwise healthy request before the model
+/// finishes. OpenAI background responses return an id immediately and let us
+/// poll that same generation to completion. Operators can explicitly disable
+/// this for a compatible proxy with SPRUCE_OPENAI_BACKGROUND_MODE=off.
+fn openai_uses_background(stage: &str, selection: &ModelSelection) -> bool {
+    if selection.backend != Backend::Openai || selection.fast {
+        return false;
+    }
+    if let Ok(value) = std::env::var("SPRUCE_OPENAI_BACKGROUND_MODE") {
+        return matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        );
+    }
+    selection
+        .model
+        .as_deref()
+        .is_some_and(|model| model.starts_with("gpt-5.6-sol"))
+        || openai_reasoning_effort(stage, selection.fast) == "xhigh"
+}
+
+#[cfg(not(test))]
+fn openai_background_poll_interval() -> Duration {
+    Duration::from_secs(2)
+}
+
+#[cfg(test)]
+fn openai_background_poll_interval() -> Duration {
+    Duration::from_millis(1)
+}
+
 fn openai_request(
     stage: &str,
     selection: &ModelSelection,
@@ -1938,7 +2166,7 @@ fn openai_request(
         });
     }
 
-    serde_json::json!({
+    let mut request = serde_json::json!({
         "model": model,
         "instructions": system,
         "input": user,
@@ -1952,7 +2180,11 @@ fn openai_request(
         // until a measured reusable prefix justifies an explicit breakpoint.
         "prompt_cache_options": { "mode": "explicit" },
         "metadata": { "application": "spruce-leaf", "stage": stage },
-    })
+    });
+    if openai_uses_background(stage, selection) {
+        request["background"] = Value::Bool(true);
+    }
+    request
 }
 
 fn openai_output_cap(stage: &str) -> u64 {
@@ -1967,7 +2199,10 @@ fn openai_output_cap(stage: &str) -> u64 {
         | "outreach.review_edit"
         | "outreach.verify_final"
         | "outreach.eval_pairwise" => 4_096,
-        "outreach.write_account" => 6_144,
+        // xhigh reasoning tokens count against this allowance. Seven complete
+        // touches plus strict JSON need headroom after the model has reasoned;
+        // 6,144 repeatedly terminated valid Sol runs before the closing JSON.
+        "outreach.write_account" => 12_288,
         _ => 16_384,
     }
 }
@@ -2180,12 +2415,19 @@ pub(crate) fn is_generation_incomplete(error: &anyhow::Error) -> bool {
 /// How many times to retry a transient CLI failure before giving up on a call.
 const MAX_TRANSIENT_RETRIES: u32 = 2;
 
+/// Poll failures target an already-created response id, so they can retry more
+/// generously without creating duplicate generations or duplicate spend.
+const MAX_BACKGROUND_POLL_RETRIES: u32 = 5;
+
 /// A transient provider failure worth retrying: process/network overload, a
 /// timeout, or a retryable API status — not a deterministic prompt/schema error
 /// and not genuine usage exhaustion (which has cross-provider fallback).
 pub(crate) fn is_retryable_provider_error(error: &anyhow::Error) -> bool {
     if is_usage_exhausted(error) {
         return false;
+    }
+    if error.downcast_ref::<OpenAiBackgroundPollError>().is_some() {
+        return true;
     }
     let message = error
         .chain()
@@ -2211,6 +2453,14 @@ pub(crate) fn is_retryable_provider_error(error: &anyhow::Error) -> bool {
     ]
     .iter()
     .any(|needle| message.contains(needle))
+}
+
+/// Once OpenAI has returned a background response id, retrying the POST would
+/// create a second paid generation. Such failures still count as provider
+/// stops to outreach, but only pre-id transport errors may restart a request.
+fn is_safe_to_retry_provider_request(error: &anyhow::Error) -> bool {
+    is_retryable_provider_error(error)
+        && error.downcast_ref::<OpenAiBackgroundPollError>().is_none()
 }
 
 fn transient_backoff(attempt: u32) -> std::time::Duration {
@@ -2482,9 +2732,9 @@ fn dispatch(
 mod tests {
     use super::{
         dispatch, dispatch_codex, is_generation_incomplete, is_retryable_provider_error,
-        is_run_budget_exhausted, make_codex_schema_strict, openai_cost, openai_request,
-        parse_openai_response, usage_exhausted_message, Backend, CallOutcome, Engine,
-        ModelSelection, Stats, StreamEvent,
+        is_run_budget_exhausted, is_safe_to_retry_provider_request, make_codex_schema_strict,
+        openai_cost, openai_request, parse_openai_response, usage_exhausted_message, Backend,
+        CallOutcome, Engine, ModelSelection, OpenAiBackgroundPollError, Stats, StreamEvent,
     };
     use serde_json::json;
     use std::time::Duration;
@@ -2514,6 +2764,11 @@ mod tests {
         assert!(!is_retryable_provider_error(&anyhow::anyhow!(
             "parsing claude CLI output as JSON"
         )));
+
+        let background_poll: anyhow::Error =
+            OpenAiBackgroundPollError("poll connection reset".into()).into();
+        assert!(is_retryable_provider_error(&background_poll));
+        assert!(!is_safe_to_retry_provider_request(&background_poll));
     }
 
     #[test]
@@ -2566,10 +2821,11 @@ mod tests {
         assert_eq!(request["model"], "gpt-5.6-terra");
         assert_eq!(request["reasoning"]["effort"], "xhigh");
         assert_eq!(request["service_tier"], "default");
-        assert_eq!(request["max_output_tokens"], 6_144);
+        assert_eq!(request["max_output_tokens"], 12_288);
         assert_eq!(request["prompt_cache_options"]["mode"], "explicit");
         assert!(request.get("prompt_cache_key").is_none());
         assert_eq!(request["store"], false);
+        assert_eq!(request["background"], true);
         assert_eq!(request["text"]["format"]["type"], "json_schema");
         assert_eq!(request["text"]["format"]["strict"], true);
         assert_eq!(
@@ -2761,6 +3017,122 @@ mod tests {
             .expect("OpenAI request succeeds");
         server.await.expect("mock server task");
         assert_eq!(outcome.structured, Some(json!({"ok": true})));
+    }
+
+    #[tokio::test]
+    async fn openai_frontier_writer_creates_once_then_polls_the_same_background_response() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock API");
+        let address = listener.local_addr().expect("mock address");
+        let server = tokio::spawn(async move {
+            for request_number in 0..2 {
+                let (mut stream, _) = listener.accept().await.expect("accept request");
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let read = stream.read(&mut chunk).await.expect("read request");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                    let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n")
+                    else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .starts_with("content-length:")
+                                .then(|| line.split_once(':')?.1.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= header_end + 4 + content_length {
+                        break;
+                    }
+                }
+                let request_text = String::from_utf8_lossy(&request);
+                let body =
+                    if request_number == 0 {
+                        assert!(request_text.starts_with("POST /v1/responses HTTP/1.1"));
+                        assert!(request_text.contains("\"background\":true"));
+                        json!({
+                            "id": "resp_spruce_test",
+                            "status": "queued",
+                            "model": "gpt-5.6-sol"
+                        })
+                    } else {
+                        assert!(
+                            request_text.starts_with("GET /v1/responses/resp_spruce_test HTTP/1.1")
+                        );
+                        json!({
+                            "id": "resp_spruce_test",
+                            "status": "completed",
+                            "model": "gpt-5.6-sol",
+                            "service_tier": "default",
+                            "output": [{
+                                "type": "message",
+                                "content": [{"type": "output_text", "text": "{\"ok\":true}"}]
+                            }],
+                            "usage": {"input_tokens": 20, "output_tokens": 5}
+                        })
+                    }
+                    .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write response");
+            }
+        });
+
+        let mut engine = Engine::new(Backend::Openai, Some("gpt-5.6-terra".into()));
+        engine.openai_api_key = Some("test-key".into());
+        engine.openai_base_url = format!("http://{address}/v1");
+        let selection = ModelSelection {
+            backend: Backend::Openai,
+            model: Some("gpt-5.6-sol".into()),
+            generation: 0,
+            fast: false,
+        };
+        let outcome = engine
+            .call_openai(
+                "outreach.write_account",
+                &selection,
+                "Return the schema.",
+                "Go",
+                Some(&json!({
+                    "type": "object",
+                    "properties": {"ok": {"type": "boolean"}}
+                })),
+            )
+            .await
+            .expect("background OpenAI request succeeds");
+        server.await.expect("mock server task");
+        assert_eq!(outcome.structured, Some(json!({"ok": true})));
+    }
+
+    #[tokio::test]
+    async fn background_timeout_is_a_provider_stop_but_never_restarts_the_post() {
+        let engine = Engine::new(Backend::Openai, Some("gpt-5.6-terra".into()));
+        let error = engine
+            .with_timeout(Backend::Openai, Duration::from_millis(1), true, async {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Ok::<(), anyhow::Error>(())
+            })
+            .await
+            .expect_err("background call should hit the test timeout");
+
+        assert!(is_retryable_provider_error(&error));
+        assert!(!is_safe_to_retry_provider_request(&error));
+        assert!(format!("{error:#}").contains("existing generation was not restarted"));
     }
 
     #[test]
@@ -2964,6 +3336,20 @@ mod tests {
 
         let strategy = engine.selection_for_stage("source.refresh", false);
         assert_eq!(strategy.model.as_deref(), Some("gpt-5.6-terra"));
+
+        let fallback = engine
+            .transient_stage_fallback("outreach.write_account", &quality)
+            .expect("frontier writer has a bounded normal-model fallback");
+        assert_eq!(fallback.model.as_deref(), Some("gpt-5.6-terra"));
+        assert_eq!(engine.model_label(), "gpt-5.6-terra");
+
+        let sol_selected = Engine::new(Backend::Openai, Some("gpt-5.6-sol".to_string()));
+        let failed = sol_selected.selection_for_stage("outreach.write_account", false);
+        let fallback = sol_selected
+            .transient_stage_fallback("outreach.write_account", &failed)
+            .expect("an explicitly selected Sol writer still has a Terra fallback");
+        assert_eq!(fallback.model.as_deref(), Some("gpt-5.6-terra"));
+        assert_eq!(sol_selected.model_label(), "gpt-5.6-sol");
     }
 
     #[test]

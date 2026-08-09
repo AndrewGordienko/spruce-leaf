@@ -3918,7 +3918,23 @@ fn model_stop_reason(error: &anyhow::Error) -> String {
     } else if crate::engine::is_usage_exhausted(error) {
         usage_stop_reason(error)
     } else {
-        "OpenAI request path remained unavailable after bounded retries; drafting stopped safely and can be retried without treating the copy as rejected".into()
+        let detail = format!("{error:#}");
+        let lower = detail.to_ascii_lowercase();
+        if lower.contains("tls close_notify") || lower.contains("peer closed connection") {
+            "OpenAI closed the response connection before completion after bounded retries; drafting stopped safely and the copy was not rejected".into()
+        } else if lower.contains("timed out after") {
+            format!(
+                "{}; drafting stopped safely and the copy was not rejected",
+                first_line(&detail)
+            )
+        } else if lower.contains("http 429") {
+            "OpenAI remained rate-limited after bounded retries; drafting stopped safely and the copy was not rejected".into()
+        } else {
+            format!(
+                "OpenAI request failed after bounded retries: {}; the copy was not rejected",
+                first_line(&detail)
+            )
+        }
     }
 }
 
@@ -3930,6 +3946,12 @@ fn model_stop_phase(detail: &str) -> String {
         "generation incomplete at output boundary".into()
     } else if lower.contains("usage") && (lower.contains("limit") || lower.contains("exhaust")) {
         "stopped; model usage limit reached".into()
+    } else if lower.contains("tls close_notify") || lower.contains("peer closed connection") {
+        "stopped; response connection closed after retries".into()
+    } else if lower.contains("timed out after") {
+        "stopped; model timed out after retries".into()
+    } else if lower.contains("http 429") {
+        "stopped; provider rate-limited after retries".into()
     } else {
         "stopped; provider unavailable after retries".into()
     }
