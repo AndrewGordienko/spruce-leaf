@@ -38,6 +38,8 @@ use crate::playbook::{self, Playbook, SalesCriticPersona, Shared};
 #[derive(Debug, Default)]
 pub struct PlanSummary {
     pub people_planned: usize,
+    /// Accounts for which this run produced a current reviewed sequence.
+    pub planned_lead_ids: Vec<String>,
     pub touches_scheduled: usize,
     pub touches_drafted: usize,
     pub sequences_replaced: usize,
@@ -1086,6 +1088,8 @@ pub async fn plan_pending(
         summary.sequences_replaced += usize::from(draft.sequence_replaced);
         summary.people_planned += 1;
     }
+    summary.planned_lead_ids = planned_by_lead.keys().cloned().collect();
+    summary.planned_lead_ids.sort();
 
     // A bulk replacement also retires unsent legacy sequences for lower-priority
     // contacts at each successfully replanned account. Otherwise the CRM would
@@ -1388,6 +1392,9 @@ async fn write_account_sequences(
             "verified_person_insights": Vec::<String>::new(),
             "ask_scope": recipient_ask_scope(person),
             "sequence_plan": plans.get(&person.id),
+            "previous_rejection_feedback_internal_only": db
+                .latest_rejected_sequence_feedback(&person.id)
+                .unwrap_or_default(),
             "copy_decision_context": gtm_contexts
                 .get(&person.id)
                 .map(GtmActionContext::copy_prompt_block)
@@ -1405,6 +1412,8 @@ async fn write_account_sequences(
         r#"Write one {n}-touch no-reply sequence for each recipient. {planning_contract}
 
 Think through the buyer-safe brief and copy decision context. Return exactly one result for every person_key. First choose send_decision. Use send only when verified facts support the trigger, the title can credibly answer the ask, and one natural first note can test the hypothesis without pretending it is true. Otherwise choose hold_for_research, explain the missing evidence privately in decision_reason, and return no touches. Abstention is better than filler. For a send decision, privately state the operating decision, mechanism to test, strongest objection, recipient's reason to reply, and supported give-back. Never invent collateral, customer proof, or prior analysis.
+
+If previous_rejection_feedback_internal_only is nonempty, this is a whole-sequence rewrite after a failed review. Treat every saved finding as a hard defect to remove, reconsider the structure that produced it, and return genuinely revised copy. Do not quote or mention the feedback to the recipient.
 
 T1 must use the brand-specific word band. It cannot be a compressed diagnostic question followed by a vague capability sentence. Connect one verified trigger to a specific operating decision, frame the plausible mechanism as uncertainty, make the consequence or useful distinction concrete, explain one narrow seller capability only when helpful, and end with one role-matched ask. A direct workflow owner may be asked for a short conversation to compare the precise hypothesis with actual work; a router may only be asked to route.
 

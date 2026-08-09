@@ -1502,216 +1502,406 @@ impl Agent {
         force_new: bool,
         replace_drafts: bool,
     ) -> String {
-        // 1. Inventory already on file for this brand.
+        let accounts = accounts.max(1);
+        let contacts = contacts.max(1);
+        let effective_touches = if touches.max(1) == 1 {
+            1
+        } else if touches >= 7
+            && std::env::var("SPRUCE_EAGER_FULL_SEQUENCE")
+                .ok()
+                .is_some_and(|value| matches!(value.trim(), "1" | "true" | "on"))
+        {
+            7
+        } else {
+            4
+        };
+        let max_source_passes = std::env::var("SPRUCE_FULL_MOTION_SOURCE_PASSES")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(8)
+            .clamp(1, 20);
+        // This is deliberately larger than the account target: failed copy and
+        // unverifiable contacts must have room to be replaced. The engine's own
+        // model/cost budget remains the ultimate safety boundary.
+        let max_motion_rounds = std::env::var("SPRUCE_FULL_MOTION_ROUNDS")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or_else(|| accounts.saturating_mul(4).saturating_add(4))
+            .clamp(1, 1000);
+
         let pb = match self.playbooks.get(&self.brand) {
             Ok(playbook) => playbook,
             Err(error) => return format!("Can't load {} playbook: {error:#}", self.brand),
         };
-        let mut reuse = match sourcing::select_reuse(&self.db, pb, &self.brand, accounts, contacts)
-        {
-            Ok(selection) => selection,
-            Err(e) => return format!("Can't inspect on-file inventory: {e:#}"),
-        };
+        let mut excluded = std::collections::HashSet::<String>::new();
+        if force_new {
+            if let Ok(leads) = self.db.list_leads(Some(&self.brand)) {
+                excluded.extend(leads.into_iter().map(|lead| lead.id));
+            }
+        }
+        let mut fulfilled = std::collections::HashSet::<String>::new();
+        let mut source_total = sourcing::SourceSummary::default();
+        let mut source_passes = 0usize;
+        let mut consecutive_empty_source_passes = 0usize;
+        let mut terminal_reason = None::<String>;
+        let mut motion_rounds = 0usize;
+        let mut refreshed_total = 0usize;
+        let mut verified_total = 0usize;
+        let mut people_selected_total = 0usize;
+        let mut people_planned_total = 0usize;
+        let mut people_rejected_total = 0usize;
+        let mut people_held_total = 0usize;
+        let mut people_stopped_total = 0usize;
+        let mut touches_drafted_total = 0usize;
+        let mut touches_scheduled_total = 0usize;
 
-        let mut src = sourcing::SourceSummary::default();
-        let need_apollo = force_new || reuse.accounts_shortfall > 0;
-
-        if need_apollo {
-            let want = if force_new {
-                accounts
-            } else {
-                reuse.accounts_shortfall.max(1)
+        while fulfilled.len() < accounts && motion_rounds < max_motion_rounds {
+            motion_rounds += 1;
+            let remaining = accounts.saturating_sub(fulfilled.len());
+            let mut blocked = excluded.clone();
+            blocked.extend(fulfilled.iter().cloned());
+            let mut reuse = match sourcing::select_reuse_excluding(
+                &self.db,
+                pb,
+                &self.brand,
+                remaining,
+                contacts,
+                &blocked,
+            ) {
+                Ok(selection) => selection,
+                Err(error) => {
+                    terminal_reason =
+                        Some(format!("could not inspect on-file inventory: {error:#}"));
+                    break;
+                }
             };
-            ui::activity(
-                if force_new {
-                    "Sourcing new accounts"
-                } else {
-                    "Filling account shortfall"
-                },
-                format!(
-                    "Apollo for {want} account(s) · on-file already has {} with people",
-                    reuse.accounts_selected
-                ),
-            );
-            match self.do_source(thesis, want, contacts).await {
-                Ok(s) => src = s,
-                Err(e) => {
-                    // If we already have reusable inventory, keep going; only hard-fail
-                    // when there is nothing to work from.
-                    if reuse.person_ids.is_empty() {
-                        return e;
-                    }
-                    ui::activity(
-                        "Apollo shortfall skipped",
-                        format!("{e} — continuing with on-file accounts"),
-                    );
-                }
-            }
-            // Re-rank after any new rows land so the working set includes them.
-            if let Ok(updated) =
-                sourcing::select_reuse(&self.db, pb, &self.brand, accounts, contacts)
-            {
-                reuse = updated;
-            }
-        } else {
-            ui::activity(
-                "Reusing on-file inventory",
-                format!(
-                    "selected {}/{} account(s) · {}/{} people ({} verified of {} on file) · Apollo skipped",
-                    reuse.accounts_selected,
-                    reuse.accounts_on_file,
-                    reuse.people_selected,
-                    reuse.people_on_file,
-                    reuse.verified_selected,
-                    reuse.verified_on_file
-                ),
-            );
-        }
-
-        if reuse.lead_ids.is_empty() || reuse.person_ids.is_empty() {
-            open_browser(&self.crm_url());
-            return format!(
-                "No reusable accounts/people on file for {} and sourcing did not add any. Everything's in the CRM at {}. Try a tighter thesis or say \"new companies\" to force Apollo.",
-                self.brand,
-                self.crm_url()
-            );
-        }
-
-        // 2. Refresh commercial framing on the selected accounts (no Apollo) so
-        // sequences are written against an up-to-date "why this company".
-        let refreshed = self.do_refresh_context(thesis, &reuse.lead_ids).await;
-
-        // 3. Enrich only selected people still missing a verified email.
-        let need_enrich = self
-            .db
-            .list_people(Some(&self.brand), Some("new"))
-            .map(|people| {
-                people
-                    .into_iter()
-                    .filter(|p| reuse.person_ids.contains(&p.id))
-                    .count()
-            })
-            .unwrap_or(0);
-        let enr = if need_enrich > 0 {
-            match self
-                .do_enrich(need_enrich, false, Some(&reuse.person_ids))
-                .await
-            {
-                Ok(s) => s,
-                Err(e) => {
-                    // Verified people can still be sequenced; only hard-stop when
-                    // nobody in the set is verified.
-                    if reuse.verified_selected == 0 {
-                        open_browser(&self.crm_url());
-                        return format!(
-                            "Refreshed framing for {} account(s) but enrichment stopped before any verified emails: {e}",
-                            reuse.accounts_selected
-                        );
-                    }
-                    ui::activity(
-                        "Enrichment partial",
-                        format!("{e} — drafting verified contacts only"),
-                    );
-                    enrich::EnrichSummary::default()
-                }
-            }
-        } else {
-            ui::activity(
-                "Enrichment skipped",
-                format!(
-                    "{} selected contact(s) already verified · 0 Apollo reveal credits",
-                    reuse.verified_selected
-                ),
-            );
-            enrich::EnrichSummary {
-                verified: reuse.verified_selected,
-                ..Default::default()
-            }
-        };
-
-        // 4. Draft / re-draft sequences only for the selected working set.
-        let pln = match self
-            .do_plan(
-                touches,
-                false,
-                replace_drafts,
-                Some(&reuse.person_ids),
-                Some(contacts),
-            )
-            .await
-        {
-            Ok(s) => s,
-            Err(e) => {
-                open_browser(&self.crm_url());
-                return format!(
-                    "Inventory ready in the CRM at {}, but drafting the sequences stopped: {e}",
-                    self.crm_url()
+            if motion_rounds == 1 {
+                ui::activity(
+                    "Inspected on-file inventory",
+                    format!(
+                        "{} eligible account(s) · {} account slot(s) short · {} mapped people ({} verified)",
+                        reuse.accounts_on_file,
+                        reuse.accounts_shortfall,
+                        reuse.people_on_file,
+                        reuse.verified_on_file,
+                    ),
                 );
             }
-        };
+
+            // Keep widening and re-deriving the ICP within this same motion.
+            // Each failed qualification pass is persisted as a correction and
+            // therefore changes the next pass instead of repeating it blindly.
+            while reuse.accounts_selected < remaining
+                && source_passes < max_source_passes
+                && terminal_reason.is_none()
+            {
+                let want = remaining.saturating_sub(reuse.accounts_selected).max(1);
+                source_passes += 1;
+                ui::activity(
+                    if source_passes == 1 {
+                        if force_new {
+                            "Sourcing new accounts"
+                        } else {
+                            "Filling account shortfall"
+                        }
+                    } else {
+                        "Adaptive sourcing pass"
+                    },
+                    format!(
+                        "pass {source_passes}/{max_source_passes} · need {want} more account slot(s) · prior misses refine the next ICP"
+                    ),
+                );
+                match self.do_source(thesis, want, contacts).await {
+                    Ok(pass) => {
+                        source_total.orgs_found += pass.orgs_found;
+                        source_total.candidates_new += pass.candidates_new;
+                        source_total.leads_qualified += pass.leads_qualified;
+                        source_total.people_added += pass.people_added;
+                        if pass.candidates_new == 0 {
+                            consecutive_empty_source_passes += 1;
+                        } else {
+                            consecutive_empty_source_passes = 0;
+                        }
+                    }
+                    Err(error) => {
+                        terminal_reason = Some(error);
+                        break;
+                    }
+                }
+
+                reuse = match sourcing::select_reuse_excluding(
+                    &self.db,
+                    pb,
+                    &self.brand,
+                    remaining,
+                    contacts,
+                    &blocked,
+                ) {
+                    Ok(selection) => selection,
+                    Err(error) => {
+                        terminal_reason = Some(format!(
+                            "could not inspect newly sourced inventory: {error:#}"
+                        ));
+                        break;
+                    }
+                };
+                if consecutive_empty_source_passes >= 2 && reuse.accounts_selected < remaining {
+                    terminal_reason = Some(
+                        "Apollo returned no previously unseen companies on two successive adaptive searches"
+                            .to_string(),
+                    );
+                    break;
+                }
+            }
+
+            if reuse.lead_ids.is_empty() || reuse.person_ids.is_empty() {
+                if terminal_reason.is_none() && source_passes >= max_source_passes {
+                    terminal_reason = Some(format!(
+                        "the configured safety ceiling of {max_source_passes} adaptive sourcing passes was reached"
+                    ));
+                }
+                break;
+            }
+
+            ui::activity(
+                "Working replacement set",
+                format!(
+                    "{} account(s) · {} mapped people · {} already verified · {} slot(s) still open",
+                    reuse.accounts_selected,
+                    reuse.people_selected,
+                    reuse.verified_selected,
+                    remaining,
+                ),
+            );
+            people_selected_total += reuse.people_selected;
+
+            // Preserve already-reviewed current-policy work on an ordinary run.
+            // A requested rewrite deliberately sends it through planning again.
+            let mut plan_leads = reuse.lead_ids.to_vec();
+            if !replace_drafts {
+                plan_leads.retain(|lead_id| {
+                    let already_done = self
+                        .db
+                        .lead_has_current_reviewed_sequence(lead_id, effective_touches)
+                        .unwrap_or(false);
+                    if already_done {
+                        fulfilled.insert(lead_id.clone());
+                    }
+                    !already_done
+                });
+            }
+            if plan_leads.is_empty() {
+                continue;
+            }
+            let plan_lead_set = plan_leads
+                .iter()
+                .cloned()
+                .collect::<std::collections::HashSet<_>>();
+            let plan_person_ids = reuse
+                .person_ids
+                .iter()
+                .filter(|person_id| {
+                    self.db
+                        .get_person(person_id)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|person| plan_lead_set.contains(&person.lead_id))
+                })
+                .cloned()
+                .collect::<std::collections::HashSet<_>>();
+
+            refreshed_total += self.do_refresh_context(thesis, &plan_leads).await;
+
+            let need_enrich = self
+                .db
+                .list_people(Some(&self.brand), Some("new"))
+                .map(|people| {
+                    people
+                        .into_iter()
+                        .filter(|person| plan_person_ids.contains(&person.id))
+                        .count()
+                })
+                .unwrap_or(0);
+            if need_enrich > 0 {
+                match self
+                    .do_enrich(need_enrich, false, Some(&plan_person_ids))
+                    .await
+                {
+                    Ok(summary) => verified_total += summary.verified,
+                    Err(error) => {
+                        let verified_now = self
+                            .db
+                            .list_people(Some(&self.brand), Some("verified"))
+                            .map(|people| {
+                                people
+                                    .into_iter()
+                                    .filter(|person| plan_person_ids.contains(&person.id))
+                                    .count()
+                            })
+                            .unwrap_or(0);
+                        if verified_now == 0 {
+                            terminal_reason = Some(format!(
+                                "contact enrichment could not produce a verified address: {error}"
+                            ));
+                            break;
+                        }
+                        ui::activity(
+                            "Enrichment partial",
+                            format!("{error} — drafting the {verified_now} verified contact(s)"),
+                        );
+                    }
+                }
+            } else {
+                let verified_now = self
+                    .db
+                    .list_people(Some(&self.brand), Some("verified"))
+                    .map(|people| {
+                        people
+                            .into_iter()
+                            .filter(|person| plan_person_ids.contains(&person.id))
+                            .count()
+                    })
+                    .unwrap_or(0);
+                verified_total += verified_now;
+                ui::activity(
+                    "Enrichment skipped",
+                    format!("{verified_now} selected contact(s) already verified · 0 Apollo reveal credits"),
+                );
+            }
+
+            let first_plan = self
+                .do_plan(
+                    touches,
+                    false,
+                    replace_drafts,
+                    Some(&plan_person_ids),
+                    Some(contacts),
+                )
+                .await;
+            let mut pass = match first_plan {
+                Ok(summary) => summary,
+                Err(error) => {
+                    ui::activity(
+                        "Drafting pass failed",
+                        format!("{error} · replacing this working set and continuing"),
+                    );
+                    excluded.extend(plan_leads);
+                    continue;
+                }
+            };
+
+            people_planned_total += pass.people_planned;
+            people_rejected_total += pass.people_rejected;
+            people_held_total += pass.people_held;
+            people_stopped_total += pass.people_stopped;
+            touches_drafted_total += pass.touches_drafted;
+            touches_scheduled_total += pass.touches_scheduled;
+            fulfilled.extend(pass.planned_lead_ids.iter().cloned());
+            if let Some(reason) = pass.stopped_reason.take() {
+                terminal_reason = Some(reason);
+                break;
+            }
+
+            // Give rejected copy one fresh, feedback-informed whole-sequence pass
+            // before abandoning the account. Successful accounts are excluded
+            // from this retry so accepted copy is never churned unnecessarily.
+            let retry_leads = plan_leads
+                .iter()
+                .filter(|lead_id| !fulfilled.contains(*lead_id))
+                .cloned()
+                .collect::<std::collections::HashSet<_>>();
+            if pass.people_rejected > 0 && !retry_leads.is_empty() {
+                let retry_people = plan_person_ids
+                    .iter()
+                    .filter(|person_id| {
+                        self.db
+                            .get_person(person_id)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|person| retry_leads.contains(&person.lead_id))
+                    })
+                    .cloned()
+                    .collect::<std::collections::HashSet<_>>();
+                ui::activity(
+                    "Retrying rejected sequences",
+                    format!(
+                        "{} account(s) · saved reviewer feedback becomes the rewrite brief",
+                        retry_leads.len()
+                    ),
+                );
+                match self
+                    .do_plan(touches, false, true, Some(&retry_people), Some(contacts))
+                    .await
+                {
+                    Ok(mut retry) => {
+                        people_planned_total += retry.people_planned;
+                        people_rejected_total += retry.people_rejected;
+                        people_held_total += retry.people_held;
+                        people_stopped_total += retry.people_stopped;
+                        touches_drafted_total += retry.touches_drafted;
+                        touches_scheduled_total += retry.touches_scheduled;
+                        fulfilled.extend(retry.planned_lead_ids.iter().cloned());
+                        if let Some(reason) = retry.stopped_reason.take() {
+                            terminal_reason = Some(reason);
+                            break;
+                        }
+                    }
+                    Err(error) => ui::activity(
+                        "Rewrite pass failed",
+                        format!("{error} · replacing the affected account(s)"),
+                    ),
+                }
+            }
+
+            // Anything that still has no reviewed sequence is not allowed to
+            // occupy a requested output slot. Exclude it for this motion and let
+            // the next round select or source a replacement.
+            for lead_id in plan_leads {
+                if !fulfilled.contains(&lead_id) {
+                    excluded.insert(lead_id);
+                }
+            }
+        }
+
+        if fulfilled.len() < accounts && terminal_reason.is_none() {
+            terminal_reason = Some(format!(
+                "the configured safety ceiling of {max_motion_rounds} replacement rounds was reached"
+            ));
+        }
 
         open_browser(&self.crm_url());
         ui::activity("Opened CRM dashboard", self.crm_url());
+        let apollo_note = if source_passes == 0 {
+            "Apollo skipped; on-file inventory filled the motion".to_string()
+        } else {
+            format!(
+                "Apollo ran {source_passes} adaptive pass(es): {} organizations seen, {} new candidates assessed, {} qualified accounts, {} people added",
+                source_total.orgs_found,
+                source_total.candidates_new,
+                source_total.leads_qualified,
+                source_total.people_added,
+            )
+        };
 
-        if pln.people_planned == 0 {
-            if let Some(reason) = &pln.stopped_reason {
-                return format!(
-                    "Drafting stopped after the working set was prepared: {reason}. {} contact(s) were not completed and {} copy draft(s) were rejected before the stop. Nothing was sent. Existing feedback is in the CRM at {}.",
-                    pln.people_stopped,
-                    pln.people_rejected,
-                    self.crm_url(),
-                );
-            }
-            if pln.people_rejected > 0 {
-                return format!(
-                    "Drafting reached {} verified contact(s), but every sequence was rejected by copy review. The recipient-specific reasons are saved in the CRM at {}. Nothing was sent.",
-                    pln.people_rejected,
-                    self.crm_url(),
-                );
-            }
+        if fulfilled.len() >= accounts {
             return format!(
-                "The working set contains {accounts_sel} account(s) / {people_sel} selected people \
-                 (Apollo orgs={orgs}, new leads={leads}, refreshed={refreshed}, newly verified={verified}), \
-                 but no new sequence was needed. The selected contacts either lack a verified email or already have an active/sent sequence. CRM: {url}.",
-                accounts_sel = reuse.accounts_selected,
-                people_sel = reuse.people_selected,
-                orgs = src.orgs_found,
-                leads = src.leads_qualified,
-                refreshed = refreshed,
-                verified = enr.verified,
+                "Full motion filled {filled}/{accounts} account slots with current reviewed {effective_touches}-touch sequences. {planned} sequence(s) were newly written; {drafted} touches remain drafts and {scheduled} were scheduled. {apollo_note}. Refreshed {refreshed_total} account(s) and processed {people_selected_total} mapped-contact selection(s), including {verified_total} verified result(s); the motion maps {contacts} contacts per account as coverage while activating one primary recipient at a time. Nothing was sent. CRM: {url}.",
+                filled = fulfilled.len(),
+                planned = people_planned_total,
+                drafted = touches_drafted_total,
+                scheduled = touches_scheduled_total,
                 url = self.crm_url(),
             );
         }
 
-        if let Some(reason) = &pln.stopped_reason {
-            return format!(
-                "Drafting stopped early: {reason}. Saved {} sequence(s) that had already passed; {} contact(s) were not completed and {} draft(s) were rejected. Nothing was sent. CRM: {}.",
-                pln.people_planned,
-                pln.people_stopped,
-                pln.people_rejected,
-                self.crm_url(),
-            );
-        }
-
-        let apollo_note = if src.orgs_found == 0 && src.leads_qualified == 0 {
-            "Apollo skipped (reused on-file inventory)".to_string()
-        } else {
-            format!(
-                "Apollo: {} org(s) seen · {} new lead(s) · {} people added",
-                src.orgs_found, src.leads_qualified, src.people_added
-            )
-        };
-
         format!(
-            "Full motion done: {planned} sequence(s) for {accounts_sel} account(s) \
-             ({people_sel} contacts, {verified_sel} verified). {apollo_note}. \
-             Refreshed framing on {refreshed} account(s). Nothing sent — say \"approve\" to schedule. CRM: {url}.",
-            planned = pln.people_planned,
-            accounts_sel = reuse.accounts_selected,
-            people_sel = reuse.people_selected,
-            verified_sel = reuse.verified_selected.max(enr.verified),
-            apollo_note = apollo_note,
-            refreshed = refreshed,
+            "Full motion persisted through {rounds} replacement round(s) and filled {filled}/{accounts} account slots before hitting a real execution boundary: {reason}. {apollo_note}. It rejected {rejected} copy attempt(s), held {held} weak recipient/account attempt(s), and left {stopped} unfinished after the boundary; none of those counted as completed output. Nothing was sent. CRM: {url}.",
+            rounds = motion_rounds,
+            filled = fulfilled.len(),
+            reason = terminal_reason.unwrap_or_else(|| "unknown execution boundary".to_string()),
+            rejected = people_rejected_total,
+            held = people_held_total,
+            stopped = people_stopped_total,
             url = self.crm_url(),
         )
     }
@@ -2253,7 +2443,7 @@ For a pure conversational answer (no action to run), leave `steps` empty and put
 Actions (each is a step's `action`):\n\
 - run_campaign: hypothetical research-only campaign; no Apollo.\n\
 - source_leads: ONLY finds and qualifies Apollo accounts+people, then stops — it writes NO emails. Use only when the request is purely to find companies/people and they want NEW Apollo search. set thesis/accounts/contacts (defaults 10/3).\n\
-- run_full_motion: end-to-end motion for a brand (never sends). REUSE-FIRST: if the CRM already has enough accounts/people for that brand, it SKIPS Apollo, refreshes why those companies fit, and writes missing, rejected, or stale sequences — cheaper and preferred when the operator says find N companies + write the sequence for a brand that already has inventory. Current-policy reviewed drafts are preserved unless the operator explicitly asks to rewrite/redraft/refine/replace them. set thesis/accounts/contacts/touches (defaults 5/5/4). Bulk activation still chooses one primary contact per account. set force_new=true ONLY when they explicitly ask for new/fresh/more companies not already on file.\n\
+- run_full_motion: end-to-end motion for a brand (never sends). The requested account count is a FULFILLMENT CONTRACT: persist through adaptive sourcing passes, contact shortfalls, weak hypotheses, and rejected copy; save misses as targeting corrections, retry rejected copy with its feedback, and replace any account that still lacks a current reviewed sequence. Stop short only at a real provider/model-budget/search-exhaustion safety boundary and report filled/requested exactly. REUSE-FIRST: if the CRM already has enough accounts/people for that brand, it SKIPS Apollo, refreshes why those companies fit, and writes missing, rejected, or stale sequences. Current-policy reviewed drafts are preserved unless the operator explicitly asks to rewrite/redraft/refine/replace them. set thesis/accounts/contacts/touches (defaults 5/5/4). Bulk activation still chooses one primary contact per account. set force_new=true ONLY when they explicitly ask for new/fresh/more companies not already on file.\n\
 - enrich_people: reveal/verify sourced emails; phone only when explicit.\n\
 - plan_outreach: draft sequences for contacts ALREADY found (no account/people search). A scoped request may reveal only those selected contacts whose email is still missing, because an email sequence must not silently shrink; skip that reveal when the operator says no Apollo/no enrichment/verified only. IMPORTANT SCOPE: 'first N people' with NO company/account count means N people TOTAL in CRM order: set limit=N and OMIT accounts/contacts. 'first N people in the first company' means accounts=1, contacts=N. 'N people for each of M companies' means accounts=M, contacts=N. contacts is always PER selected company, never a bare total. Preserve current-policy reviewed drafts on ordinary retries; safely replace unsent drafts only when the operator explicitly says rewrite/redraft/refine/replace. auto only when explicit.\n\
 - approve_outreach: only after explicit approval — this is what actually schedules drafts to send.\n\

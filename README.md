@@ -349,6 +349,22 @@ Apollo runs only for an account shortfall, or when you explicitly ask for **new/
 (`force_new`). That keeps re-runs cheap and keeps sequences aligned with the current business
 profile and playbook.
 
+A full motion treats the requested account count as a fulfillment contract, not the size of one
+search batch. If a sourcing pass produces no qualified accounts, the qualification misses are
+saved and the ICP is derived again before another Apollo pass. Accounts with insufficient contact
+coverage, no verified workflow owner, weak evidence, or copy that cannot pass review are removed
+from the working set and replaced. Rejected copy gets one additional whole-sequence rewrite using
+the saved reviewer feedback before replacement. An account slot counts only when a complete,
+reviewed current-policy sequence exists for the requested touch shape.
+
+The motion stops short only at an explicit execution boundary: two adaptive searches with no
+previously unseen companies, a provider/authentication/credit or model-budget stop, or the
+configurable safety ceilings. The defaults allow eight adaptive sourcing passes and four
+replacement rounds per requested account (plus four); operators can change them with
+`SPRUCE_FULL_MOTION_SOURCE_PASSES` and `SPRUCE_FULL_MOTION_ROUNDS`. The terminal summary reports
+the filled/asked count and the exact boundary instead of presenting a failed batch as completed
+work.
+
 The working-set IDs are enforced during enrichment: a 5-account × 5-person mapping request reveals
 those five selected contacts at each account, rather than the first 25 unenriched rows in database
 order. Outreach then activates one primary person per account instead of launching five parallel

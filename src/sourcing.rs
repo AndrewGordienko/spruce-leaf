@@ -43,6 +43,9 @@ const CONTACT_BACKFILL_FACTOR: usize = 2;
 #[derive(Debug, Default)]
 pub struct SourceSummary {
     pub orgs_found: usize,
+    /// Previously unseen Apollo organizations that actually reached qualification.
+    /// Distinguishes a useful miss from an exhausted/repeating search page.
+    pub candidates_new: usize,
     pub leads_qualified: usize,
     pub people_added: usize,
 }
@@ -397,6 +400,7 @@ pub async fn source(
     );
     let mut summary = SourceSummary {
         orgs_found,
+        candidates_new: fresh.len(),
         ..Default::default()
     };
 
@@ -1842,19 +1846,24 @@ async fn hydrate_org(apollo: &Apollo, org: ApolloOrg) -> ApolloOrg {
 
 // --- Reuse-first inventory -------------------------------------------------
 
-/// Pick the strongest on-file accounts/people for a brand so a full motion can
-/// skip Apollo when the CRM already has enough inventory. Preference order:
-/// more verified contacts, richer doctrine, more recent update.
-pub fn select_reuse(
+/// Select reusable inventory while omitting accounts that already failed this
+/// full-motion attempt. This is how the orchestrator advances to a replacement
+/// instead of repeatedly presenting the same held or rejected recipient.
+pub fn select_reuse_excluding(
     db: &SharedDb,
     pb: &Playbook,
     brand: &str,
     n_accounts: usize,
     n_contacts: usize,
+    excluded_lead_ids: &std::collections::HashSet<String>,
 ) -> Result<ReuseSelection> {
     let n_accounts = n_accounts.max(1);
     let n_contacts = n_contacts.max(1);
-    let leads = db.list_leads(Some(brand))?;
+    let leads = db
+        .list_leads(Some(brand))?
+        .into_iter()
+        .filter(|lead| !excluded_lead_ids.contains(&lead.id))
+        .collect::<Vec<_>>();
     let people = db.list_people(Some(brand), None)?;
 
     let mut by_lead: std::collections::HashMap<String, Vec<Person>> =
@@ -2383,7 +2392,8 @@ mod tests {
 
     use super::{
         clamp_employee_ranges, credible_canonical_signal, enforce_play_qualification,
-        reusable_workflow_contact, reuse_lead_score, reuse_person_score, OrgQual,
+        reusable_workflow_contact, reuse_lead_score, reuse_person_score, select_reuse_excluding,
+        OrgQual,
     };
 
     #[test]
@@ -2409,8 +2419,9 @@ mod tests {
             "Staff assemble the decision record manually across three systems."
         ));
     }
-    use crate::db::{Lead, Person};
+    use crate::db::{Db, Lead, Person};
     use crate::gtm::{default_plays, SignalCandidate};
+    use crate::playbook::Playbooks;
 
     #[test]
     fn clamp_drops_buckets_above_the_ceiling() {
@@ -2493,6 +2504,41 @@ mod tests {
         assert!(reusable_workflow_contact(&operator));
         assert!(!reusable_workflow_contact(&cfo));
         assert!(!reusable_workflow_contact(&mislabeled_controller));
+    }
+
+    #[test]
+    fn reuse_selection_does_not_reselect_a_failed_account() {
+        let db = std::sync::Arc::new(Db::open(":memory:").expect("open memory db"));
+        let lead_id = db
+            .upsert_lead(&Lead {
+                brand: "outagehub".into(),
+                apollo_org_id: "org-failed-motion".into(),
+                name: "Failed Motion Account".into(),
+                ..Default::default()
+            })
+            .expect("insert lead");
+        db.upsert_person(&Person {
+            lead_id: lead_id.clone(),
+            brand: "outagehub".into(),
+            apollo_person_id: "person-failed-motion".into(),
+            name: "Operations Owner".into(),
+            title: "Director of Operations".into(),
+            vantage: "process_owner".into(),
+            ..Default::default()
+        })
+        .expect("insert person");
+        let playbooks = Playbooks::load("playbooks").expect("load playbooks");
+        let playbook = playbooks.get("outagehub").expect("outagehub playbook");
+
+        let visible = select_reuse_excluding(&db, playbook, "outagehub", 1, 1, &HashSet::new())
+            .expect("select inventory");
+        assert_eq!(visible.accounts_on_file, 1);
+
+        let excluded = HashSet::from([lead_id]);
+        let replacement = select_reuse_excluding(&db, playbook, "outagehub", 1, 1, &excluded)
+            .expect("select replacement inventory");
+        assert_eq!(replacement.accounts_on_file, 0);
+        assert!(replacement.lead_ids.is_empty());
     }
 
     #[test]

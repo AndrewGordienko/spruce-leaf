@@ -1849,6 +1849,81 @@ impl Db {
             .optional()?)
     }
 
+    /// Whether an account already has at least one complete, reviewed sequence
+    /// under the current copy policy. Full-motion orchestration counts this as
+    /// fulfilled inventory instead of sourcing a duplicate account merely
+    /// because ordinary planning correctly skipped an existing draft.
+    pub fn lead_has_current_reviewed_sequence(
+        &self,
+        lead_id: &str,
+        expected_touches: usize,
+    ) -> Result<bool> {
+        let expected_touches = match expected_touches {
+            1 => 1,
+            7 => 7,
+            _ => 4,
+        };
+        let conn = self.conn.lock().unwrap();
+        let exists: i64 = conn.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM sequences s
+               WHERE s.lead_id=?1 AND s.status='active' AND s.copy_policy_version=?2
+                 AND (SELECT COUNT(*) FROM touches t WHERE t.sequence_id=s.id)=?3
+                 AND (SELECT MIN(t.stage) FROM touches t WHERE t.sequence_id=s.id)=1
+                 AND (SELECT MAX(t.stage) FROM touches t WHERE t.sequence_id=s.id)=
+                     (SELECT COUNT(*) FROM touches t WHERE t.sequence_id=s.id)
+                 AND (SELECT COUNT(DISTINCT t.stage) FROM touches t WHERE t.sequence_id=s.id)=
+                     (SELECT COUNT(*) FROM touches t WHERE t.sequence_id=s.id)
+                 AND NOT EXISTS (
+                   SELECT 1 FROM touches t WHERE t.sequence_id=s.id
+                     AND (COALESCE(t.review_passes,0)<>1 OR trim(t.body)=''
+                          OR trim(t.body)='Writing draft…')
+                 )
+             )",
+            params![lead_id, CURRENT_COPY_POLICY_VERSION, expected_touches],
+            |row| row.get(0),
+        )?;
+        Ok(exists == 1)
+    }
+
+    /// Exact findings from the most recent rejected sequence for this person.
+    /// A full-motion rewrite feeds these back to the writer instead of paying
+    /// for a statistically independent retry that can repeat the same defects.
+    pub fn latest_rejected_sequence_feedback(&self, person_id: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT t.review_issues,t.error FROM touches t
+             WHERE t.sequence_id=(
+               SELECT s.id FROM sequences s
+               WHERE s.person_id=?1 AND s.status='rejected'
+               ORDER BY s.created_at DESC, s.rowid DESC LIMIT 1
+             )
+             ORDER BY t.stage ASC",
+        )?;
+        let rows = stmt.query_map(params![person_id], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            ))
+        })?;
+        let mut feedback = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for row in rows {
+            let (issues, error) = row?;
+            let mut findings = jd(&issues);
+            if findings.is_empty() && !error.trim().is_empty() {
+                findings.push(error);
+            }
+            for finding in findings {
+                let finding = finding.trim().to_string();
+                if !finding.is_empty() && seen.insert(finding.clone()) {
+                    feedback.push(finding);
+                }
+            }
+        }
+        Ok(feedback)
+    }
+
     // --- Sales conversations ----------------------------------------------
 
     /// Resolve an inbound message to a durable conversation. RFC thread
@@ -6731,5 +6806,80 @@ mod tests {
             .expect("rejected visible");
         assert_eq!(rejected[0].status, "blocked");
         assert!(rejected[0].error.contains("council rejected"));
+        assert_eq!(
+            db.latest_rejected_sequence_feedback(&rejected_person)
+                .expect("load rewrite feedback"),
+            vec!["council rejected the copy".to_string()]
+        );
+    }
+
+    #[test]
+    fn reviewed_sequence_fulfills_only_its_requested_touch_shape() {
+        let db = Db::open(":memory:").expect("open memory db");
+        let lead_id = db
+            .upsert_lead(&Lead {
+                brand: "outagehub".into(),
+                apollo_org_id: "org-reviewed-shape".into(),
+                name: "Reviewed Shape Account".into(),
+                ..Default::default()
+            })
+            .expect("insert lead");
+        let person_id = db
+            .upsert_person(&Person {
+                lead_id: lead_id.clone(),
+                brand: "outagehub".into(),
+                apollo_person_id: "person-reviewed-shape".into(),
+                name: "Operations Owner".into(),
+                ..Default::default()
+            })
+            .expect("insert person");
+        let sequence_id = db
+            .create_sequence(&Sequence {
+                person_id: person_id.clone(),
+                lead_id: lead_id.clone(),
+                brand: "outagehub".into(),
+                status: "active".into(),
+                copy_policy_version: CURRENT_COPY_POLICY_VERSION,
+                ..Default::default()
+            })
+            .expect("insert sequence");
+
+        db.insert_touch(&Touch {
+            sequence_id: sequence_id.clone(),
+            person_id: person_id.clone(),
+            lead_id: lead_id.clone(),
+            brand: "outagehub".into(),
+            stage: 1,
+            body: "A reviewed first touch.".into(),
+            review_passes: Some(true),
+            ..Default::default()
+        })
+        .expect("insert first touch");
+        assert!(db
+            .lead_has_current_reviewed_sequence(&lead_id, 1)
+            .expect("check one touch"));
+        assert!(!db
+            .lead_has_current_reviewed_sequence(&lead_id, 4)
+            .expect("check incomplete four-touch sequence"));
+
+        for stage in 2..=4 {
+            db.insert_touch(&Touch {
+                sequence_id: sequence_id.clone(),
+                person_id: person_id.clone(),
+                lead_id: lead_id.clone(),
+                brand: "outagehub".into(),
+                stage,
+                body: format!("Reviewed touch {stage}."),
+                review_passes: Some(true),
+                ..Default::default()
+            })
+            .expect("insert reviewed touch");
+        }
+        assert!(db
+            .lead_has_current_reviewed_sequence(&lead_id, 4)
+            .expect("check complete four-touch sequence"));
+        assert!(!db
+            .lead_has_current_reviewed_sequence(&lead_id, 7)
+            .expect("check incomplete seven-touch sequence"));
     }
 }
