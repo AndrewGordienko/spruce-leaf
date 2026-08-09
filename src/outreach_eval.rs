@@ -10,6 +10,8 @@ use serde_json::json;
 
 use crate::engine::Engine;
 
+const HUMAN_STYLE_RUBRIC: &str = include_str!("../evals/style-guide-rubric.md");
+
 #[derive(Debug, Deserialize)]
 struct EvalCase {
     id: String,
@@ -142,11 +144,17 @@ async fn judge(engine: &Engine, case: &EvalCase, swap: bool) -> Result<PairwiseV
     engine
         .structured_bulk::<PairwiseVerdict>(
             "outreach.eval_pairwise",
-            "You are a blind, skeptical cold-outreach evaluator. Choose the message a sensible recipient is more likely to answer. Judge evidence safety, recipient relevance, specificity, natural spoken language, cognitive load, and whether replying is easy. Do not reward length, polish, or framework compliance. The verified account facts and verified seller facts are separate exhaustive evidence boundaries; a supplied hypothesis is not a fact. Allow faithful paraphrases and conservative subset claims (for example, custom systems described as small internal tools). Flag only materially new declarative account details, outcomes, or seller capabilities that cross either boundary. Return tie only when neither is materially better.",
+            &eval_system_prompt(),
             &user,
             schema(),
         )
         .await
+}
+
+fn eval_system_prompt() -> String {
+    format!(
+        "You are a blind, skeptical cold-outreach evaluator. Choose the message a sensible recipient is more likely to answer under the human style rubric below. Judge evidence safety, recipient relevance, specificity, natural spoken language, cognitive load, and whether replying is easy. Minimum length is not the goal: reward the minimum information needed to make a reply worthwhile, and do not prefer a terse note when it forces the recipient to decode jargon or lacks a reason to care. A short discovery call plus an email alternative is a valid first ask for a credible workflow owner when the note earns it. A scripted yes/no/category/referral menu is not low friction; it makes the recipient complete the sender's form. Penalize invented task nouns and internal labels even when they make a note shorter or more concrete. Do not reward polish or visible framework compliance.\n\nThe verified account facts and verified seller facts are separate exhaustive evidence boundaries; a supplied hypothesis is not a fact. Allow faithful paraphrases, explicitly uncertain questions, reasonable role-vantage inferences, and conservative subset claims. Flag only materially new declarative account details, outcomes, or seller capabilities that cross either boundary. Return tie only when neither is materially better. Never infer the preferred answer from candidate order.\n\nHUMAN STYLE RUBRIC:\n{HUMAN_STYLE_RUBRIC}"
+    )
 }
 
 fn normalize_label(value: &str) -> &str {
@@ -184,7 +192,7 @@ fn schema() -> serde_json::Value {
 mod tests {
     use std::path::Path;
 
-    use super::{load, normalize_label, swap_label};
+    use super::{eval_system_prompt, load, normalize_label, swap_label};
 
     #[test]
     fn normalizes_and_swaps_pairwise_labels() {
@@ -197,5 +205,14 @@ mod tests {
     fn bundled_corpus_is_valid_jsonl() {
         let cases = load(Path::new("evals/outreach-gold.jsonl")).expect("load eval corpus");
         assert!(cases.len() >= 2);
+    }
+
+    #[test]
+    fn blind_judge_uses_human_style_without_gold_labels() {
+        let prompt = eval_system_prompt();
+        assert!(prompt.contains("scripted yes/no/category/referral menu"));
+        assert!(prompt.contains("short discovery call plus an email alternative"));
+        assert!(!prompt.contains("expected"));
+        assert!(!prompt.contains("editor_note"));
     }
 }

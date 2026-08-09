@@ -2,7 +2,10 @@
 
 Production promotion is evidence-based, not a model-name decision.
 
-The bundled two-case corpus is a seed built from the CRM drafts Andrew rejected. It exercises the harness, but it is not promotion-grade until Andrew approves or edits the preferred alternatives. Expand it with real before/after decisions and keep a holdout that prompt authors cannot see.
+The bundled corpus combines anonymized rejected-draft contrasts with Andrew's human-written
+OutageHub, GnK, and Wapahki/Morrow reference messages. Those references are validation anchors,
+not templates or prospect facts. Keep expanding it with real before/after decisions and maintain a
+holdout that prompt authors cannot see.
 
 1. Add anonymized human before/after pairs to `evals/outreach-gold.jsonl`. Keep
    `verified_facts` (prospect) separate from `verified_seller_facts` (Andrew's

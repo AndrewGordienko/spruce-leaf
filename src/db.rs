@@ -3536,6 +3536,21 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    pub fn account_play_assessment(
+        &self,
+        lead_id: &str,
+        play_id: &str,
+    ) -> Result<Option<AccountPlayAssessment>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT * FROM account_play_assessments WHERE lead_id=?1 AND play_id=?2",
+                params![lead_id, play_id],
+                |row| Ok(row_to_account_play_assessment(row)),
+            )
+            .optional()?)
+    }
+
     pub fn current_gtm_play(&self, brand: &str) -> Result<Option<GtmPlay>> {
         let conn = self.conn.lock().unwrap();
         Ok(conn
@@ -6645,8 +6660,8 @@ mod tests {
             .current_gtm_play("outagehub")
             .expect("load current play")
             .expect("seeded outagehub play");
-        assert_eq!(play.version, 4);
-        assert_eq!(play.minimum_signal_matches, 2);
+        assert_eq!(play.version, 5);
+        assert_eq!(play.minimum_signal_matches, 3);
         assert!(play
             .required_signal_keys
             .contains(&"account.outage_sensitive_decision".to_string()));

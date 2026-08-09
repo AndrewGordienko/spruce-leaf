@@ -55,7 +55,12 @@ the normal API path because it duplicates the independent verifier at much highe
 The doctrine itself lives in editable **`playbooks/*.toml`** — a shared spine plus one file per
 brand (`gnk`, `wapahki`, `outagehub`) — so you can tune voice, length, forbidden phrases, and
 vantage notes without recompiling. Specialist roles are also editable rather than embedded in
-Rust: **`playbooks/personas/planner.md`**, **`writer.md`**, and **`reviewer.md`**. The council's
+Rust: **`playbooks/personas/planner.md`**, **`writer.md`**, **`reviewer.md`**, and the shared ethical
+response-design layer **`psychology.md`**. That layer maps the desired response, recipient motive,
+concrete scene, credibility basis, smallest commitment, and reactance risk while banning
+manufactured pressure. A targeted run can supply the private objective with
+`plan --person <name-or-email> --outcome "<next response needed>"`; the planner reduces an
+unearned request to the nearest honest step instead of pasting it into the email. The council's
 source-grounded critic lenses live under **`playbooks/personas/critics/`**, one editable Markdown
 file per critic.
 

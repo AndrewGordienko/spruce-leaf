@@ -9,6 +9,13 @@ subject, and the first two lines. The recipient must have a plausible reason of
 their own to keep reading and answer. Andrew wanting research is not that
 reason. A clean email that is easy to ignore fails.
 
+Judge the copy against the private response brief. The desired response must be
+appropriate to the recipient's vantage, the role-relevant motive must be
+plausible without mind-reading, the operating scene must be concrete, and the
+ask must be the smallest step that still advances the work. Reject invented
+psychology and any manufactured reciprocity, authority, social proof, scarcity,
+urgency, shared identity, or commitment pressure.
+
 Reject a first email that is merely a diagnostic question followed by a vague
 claim that the seller builds software, tools, robots, data, or integrations.
 The recipient needs a specific trigger, a credible role-relevant implication,
@@ -53,10 +60,11 @@ fallback complete.
 
 Score the final wording on:
 
-- whether email one follows the brand-specific word band, usually in 3–7 spoken
+- whether email one follows the brand-specific word band, usually in 4–10 spoken
   sentences, and whether every follow-up is materially shorter but substantive;
-- whether the subject is a plain lowercase phrase of 2–6 words rather than
-  a headline, question, number, or product label;
+- whether the subject is a plain, specific operating phrase of 3–9 words rather
+  than a generic headline, question, number, or product label; sentence or title
+  case is acceptable;
 - situation recognition and evidence accuracy;
 - whether a touch with an ask gives this recipient a real reason to answer;
 - natural spoken voice and clarity;
@@ -98,10 +106,32 @@ Also fail copy that reads like a content calendar: generic rules, aphorisms,
 educational blurbs, or industry observations dropped into a thread without a
 person-specific conversational purpose.
 
+Do not reward terse copy merely for passing a word-count gate. A fuller founder
+note can be more sendable when it clearly explains why this person, the actual
+operating moment, the plausible consequence, the seller's limited mechanism,
+and an easy call-or-email response path. Reject compressed internal language
+such as "decision trail," "operational surface," "classification path," or
+"outside-in signal" unless the recipient's own public language makes it natural.
+
 Also fail generic account facts used as personalization, a founder biography in
 the opening, repetitive "does X repeat or does Y vary" questions, canned
 research phrases, connection notes that merely mention a prior email, or product explanations before the recipient has a reason to
 care. Do not award 85 merely because the copy is short and accurate.
+
+Fail forced-response menus and research taxonomies. Phrases such as
+"within-run, between-run, or both," "fixed or manual," "yes, no, or the right
+person," and "reply with X" are not low-friction human asks; they make the
+recipient complete Andrew's form. The recipient must be free to answer in
+ordinary language. Also fail invented task nouns used to manufacture
+specificity. A food-production footprint does not prove trays, cases, pouches,
+conveyors, changeovers, or any named station. When those details are not in the
+verified facts, the email must ask at the supported level and let the operator
+name the task.
+
+Read for experiment narration. "The question concerns," "the premise was
+narrow," "the key distinction is," and repeated instructions about how little
+the recipient may type are internal notes, not correspondence. A score above
+84 is impossible while any of those patterns materially shapes the message.
 
 A correction, referral, expression of interest, permission to receive a real
 give-back, or a short conversation comparing one precise hypothesis with the

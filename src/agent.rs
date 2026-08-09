@@ -70,6 +70,13 @@ struct Step {
     thesis: String,
     #[serde(default)]
     query: String,
+    /// Exact next response/action wanted from the named recipient. This is a
+    /// private planning input, never buyer-facing copy.
+    #[serde(default)]
+    outcome: String,
+    /// Exact existing person id, email, or name for a targeted planning step.
+    #[serde(default)]
+    person: String,
     #[serde(default)]
     accounts: Option<u64>,
     #[serde(default)]
@@ -106,6 +113,31 @@ struct PlanScope {
     selected_ids: std::collections::HashSet<String>,
     pending_enrichment_ids: std::collections::HashSet<String>,
     accounts: Vec<PlanScopeAccount>,
+}
+
+struct PlanOptions<'a> {
+    touches: usize,
+    auto: bool,
+    replace: bool,
+    only_person_ids: Option<&'a std::collections::HashSet<String>>,
+    per_account_cap: Option<usize>,
+    person_filter: Option<&'a str>,
+    desired_outcome: Option<&'a str>,
+}
+
+struct FullMotionOptions<'a> {
+    thesis: &'a str,
+    accounts: usize,
+    contacts: usize,
+    touches: usize,
+    force_new: bool,
+    replace_drafts: bool,
+    desired_outcome: Option<&'a str>,
+}
+
+fn nonempty(value: &str) -> Option<&str> {
+    let value = value.trim();
+    (!value.is_empty()).then_some(value)
 }
 
 fn explicit_total_cap(input: &str) -> bool {
@@ -746,14 +778,15 @@ impl Agent {
                 let accounts = step.accounts.unwrap_or(5).max(1) as usize;
                 let contacts = step.contacts.unwrap_or(5).max(1) as usize;
                 let touches = step.touches.unwrap_or(7).max(1) as usize;
-                self.run_full_motion(
-                    &thesis,
+                self.run_full_motion(FullMotionOptions {
+                    thesis: &thesis,
                     accounts,
                     contacts,
                     touches,
-                    step.force_new,
-                    requests_copy_replacement(input),
-                )
+                    force_new: step.force_new,
+                    replace_drafts: requests_copy_replacement(input),
+                    desired_outcome: nonempty(&step.outcome),
+                })
                 .await
             }
             "enrich_people" => {
@@ -780,6 +813,8 @@ impl Agent {
                     total_limit,
                     !forbids_contact_enrichment(input),
                     requests_copy_replacement(input),
+                    nonempty(&step.person),
+                    nonempty(&step.outcome),
                 )
                 .await
             }
@@ -1026,14 +1061,16 @@ impl Agent {
     /// the requested account × contact cardinality does not silently collapse.
     /// No account or people search occurs here; real send volume remains bounded
     /// by send-time account limits.
-    async fn do_plan(
-        &self,
-        touches: usize,
-        auto: bool,
-        replace: bool,
-        only_person_ids: Option<&std::collections::HashSet<String>>,
-        per_account_cap: Option<usize>,
-    ) -> Result<outreach::PlanSummary, String> {
+    async fn do_plan(&self, options: PlanOptions<'_>) -> Result<outreach::PlanSummary, String> {
+        let PlanOptions {
+            touches,
+            auto,
+            replace,
+            only_person_ids,
+            per_account_cap,
+            person_filter,
+            desired_outcome,
+        } = options;
         let requested_touches = touches.max(1);
         let touches = outreach::supported_touch_count(requested_touches);
         if touches != requested_touches {
@@ -1167,10 +1204,11 @@ impl Agent {
             self.concurrency.max(1),
             auto,
             self.critique,
-            None,
+            person_filter,
             replace,
             per_account_cap,
             planning_scope,
+            desired_outcome,
             Some(progress),
         )
         .await;
@@ -1202,6 +1240,8 @@ impl Agent {
         total_limit: Option<usize>,
         fill_contact_coverage: bool,
         replace_existing: bool,
+        person_filter: Option<&str>,
+        desired_outcome: Option<&str>,
     ) -> String {
         let scoped =
             account_limit.is_some() || contacts_per_account.is_some() || total_limit.is_some();
@@ -1456,13 +1496,15 @@ impl Agent {
             // sequences remain protected by the persistence layer. Ordinary
             // retries preserve accepted current-policy drafts and fill only
             // missing/rejected recipients.
-            .do_plan(
+            .do_plan(PlanOptions {
                 touches,
                 auto,
-                replace_existing,
-                only_person_ids.as_ref(),
-                None,
-            )
+                replace: replace_existing,
+                only_person_ids: only_person_ids.as_ref(),
+                per_account_cap: None,
+                person_filter,
+                desired_outcome,
+            })
             .await
         {
             Ok(s) => {
@@ -1509,15 +1551,16 @@ impl Agent {
     /// framing), enrich only contacts still missing verified email, and
     /// (re)write the sequences for the selected set. Apollo is only called for
     /// the shortfall — or when `force_new` is true.
-    async fn run_full_motion(
-        &self,
-        thesis: &str,
-        accounts: usize,
-        contacts: usize,
-        touches: usize,
-        force_new: bool,
-        replace_drafts: bool,
-    ) -> String {
+    async fn run_full_motion(&self, options: FullMotionOptions<'_>) -> String {
+        let FullMotionOptions {
+            thesis,
+            accounts,
+            contacts,
+            touches,
+            force_new,
+            replace_drafts,
+            desired_outcome,
+        } = options;
         let accounts = accounts.max(1);
         let contacts = contacts.max(1);
         let effective_touches = outreach::supported_touch_count(touches);
@@ -1784,13 +1827,15 @@ impl Agent {
             }
 
             let first_plan = self
-                .do_plan(
+                .do_plan(PlanOptions {
                     touches,
-                    false,
-                    replace_drafts,
-                    Some(&plan_person_ids),
-                    Some(contacts),
-                )
+                    auto: false,
+                    replace: replace_drafts,
+                    only_person_ids: Some(&plan_person_ids),
+                    per_account_cap: Some(contacts),
+                    person_filter: None,
+                    desired_outcome,
+                })
                 .await;
             let mut pass = match first_plan {
                 Ok(summary) => summary,
@@ -1844,7 +1889,15 @@ impl Agent {
                     ),
                 );
                 match self
-                    .do_plan(touches, false, true, Some(&retry_people), Some(contacts))
+                    .do_plan(PlanOptions {
+                        touches,
+                        auto: false,
+                        replace: true,
+                        only_person_ids: Some(&retry_people),
+                        per_account_cap: Some(contacts),
+                        person_filter: None,
+                        desired_outcome,
+                    })
                     .await
                 {
                     Ok(mut retry) => {
@@ -2460,7 +2513,7 @@ Actions (each is a step's `action`):\n\
 - source_leads: ONLY finds and qualifies Apollo accounts+people, then stops — it writes NO emails. Use only when the request is purely to find companies/people and contains no request to write, draft, sequence, or perform outreach. set thesis/accounts/contacts (defaults 10/3).\n\
 - run_full_motion: end-to-end motion for a brand (never sends). The requested account count is a FULFILLMENT CONTRACT: persist through adaptive sourcing passes, contact shortfalls, weak hypotheses, and rejected copy; save misses as targeting corrections, retry rejected copy with its feedback, and replace any account that still lacks a current reviewed sequence. Stop short only at a real provider/model-budget/search-exhaustion safety boundary and report filled/requested exactly. REUSE-FIRST: if the CRM already has enough accounts/people for that brand, it SKIPS Apollo, refreshes why those companies fit, and writes missing, rejected, or stale sequences. Current-policy reviewed drafts are preserved unless the operator explicitly asks to rewrite/redraft/refine/replace them. set thesis/accounts/contacts/touches (defaults 5/5/7). Bulk activation still chooses one primary contact per account. set force_new=true ONLY when they explicitly ask for new/fresh/more companies not already on file.\n\
 - enrich_people: reveal/verify sourced emails; phone only when explicit.\n\
-- plan_outreach: draft sequences for contacts ALREADY found (no account/people search). A scoped request may reveal only those selected contacts whose email is still missing, because an email sequence must not silently shrink; skip that reveal when the operator says no Apollo/no enrichment/verified only. IMPORTANT SCOPE: 'first N people' with NO company/account count means N people TOTAL in CRM order: set limit=N and OMIT accounts/contacts. 'first N people in the first company' means accounts=1, contacts=N. 'N people for each of M companies' means accounts=M, contacts=N. contacts is always PER selected company, never a bare total. Preserve current-policy reviewed drafts on ordinary retries; safely replace unsent drafts only when the operator explicitly says rewrite/redraft/refine/replace. auto only when explicit.\n\
+- plan_outreach: draft sequences for contacts ALREADY found (no account/people search). When the operator says 'I need X from person Y,' put Y's exact name/email/id in person and X in outcome. Do not reinterpret X as buyer-facing wording; the response planner will reduce it when it is not yet earned. A scoped request may reveal only those selected contacts whose email is still missing, because an email sequence must not silently shrink; skip that reveal when the operator says no Apollo/no enrichment/verified only. IMPORTANT SCOPE: 'first N people' with NO company/account count means N people TOTAL in CRM order: set limit=N and OMIT accounts/contacts. 'first N people in the first company' means accounts=1, contacts=N. 'N people for each of M companies' means accounts=M, contacts=N. contacts is always PER selected company, never a bare total. Preserve current-policy reviewed drafts on ordinary retries; safely replace unsent drafts only when the operator explicitly says rewrite/redraft/refine/replace. auto only when explicit.\n\
 - approve_outreach: only after explicit approval — this is what actually schedules drafts to send.\n\
 - discover_opportunities, list_opportunities (actionable when requested), resolve_opportunity_contacts (enrich only with explicit credit authorization), plan_funding_outreach (auto only when explicit), approve_funding_outreach (reviewed opportunity_id + explicit approval), prepare_application: the funding/procurement motion; set opportunity_id where needed.\n\
 - show_funnel, show_calendar, list_accounts, list_opportunities, show_learnings, open_crm, open_gtm: direct read/open actions (leave a step's brand empty to span all brands). Use open_gtm when the operator asks to inspect signals, root-cause qualification, active plays, experiments, proofs, or attributed outcomes.\n\
@@ -2493,6 +2546,8 @@ fn decision_schema(brands: &[&str]) -> Value {
             "brand": { "type": "string", "enum": brands, "description": "The brand this step concerns. Leave empty only for portfolio-wide reads (they span all brands)." },
             "thesis": { "type": "string", "description": "The workflow/market to target for sourcing/campaign steps." },
             "query": { "type": "string", "description": "For search_knowledge: the topic to look up in the ingested books." },
+            "outcome": { "type": "string", "description": "For plan_outreach or run_full_motion: the exact next response or action the operator wants from the named person. Preserve the user's words; leave empty when none is stated." },
+            "person": { "type": "string", "description": "For a targeted plan_outreach request: exact existing person id, email, or name stated by the operator." },
             "accounts": { "type": "integer", "description": "For plan_outreach, number of existing companies in current CRM order to scope. Set 1 for 'the first company'." },
             "contacts": { "type": "integer", "description": "For plan_outreach, number of visible-order people PER selected company. Use only when the operator names a company scope, such as '3 people in the first company' or '3 people for each company'. Omit for a bare 'first 3 people'." },
             "touches": { "type": "integer" },
@@ -2665,6 +2720,9 @@ fn coalesce_full_motion_steps(steps: &mut Vec<Step>, fallback_brand: &str) {
         if full.thesis.trim().is_empty() {
             full.thesis = plan.thesis.clone();
         }
+        if full.outcome.trim().is_empty() {
+            full.outcome = plan.outcome.clone();
+        }
         full.accounts = source.accounts.or(plan.accounts);
         // The source step carries the mapping coverage requested by the user;
         // the planning step may say one because activation is one primary.
@@ -2728,6 +2786,8 @@ mod tests {
         // Each step carries its own action and brand.
         assert_eq!(step["properties"]["action"]["type"], "string");
         assert_eq!(step["properties"]["brand"]["enum"][0], "gnk");
+        assert_eq!(step["properties"]["person"]["type"], "string");
+        assert_eq!(step["properties"]["outcome"]["type"], "string");
         // `reply` is only for the no-steps conversational path — not a step action.
         let step_actions = step["properties"]["action"]["enum"]
             .as_array()
@@ -2749,6 +2809,7 @@ mod tests {
             Step {
                 action: "plan_outreach".into(),
                 brand: "outagehub".into(),
+                outcome: "get the NOC manager to describe the current triage step".into(),
                 accounts: Some(3),
                 contacts: Some(1),
                 touches: Some(4),
@@ -2764,6 +2825,10 @@ mod tests {
         assert_eq!(steps[0].accounts, Some(3));
         assert_eq!(steps[0].contacts, Some(2));
         assert_eq!(steps[0].touches, Some(4));
+        assert_eq!(
+            steps[0].outcome,
+            "get the NOC manager to describe the current triage step"
+        );
         assert!(steps[0].force_new);
     }
 

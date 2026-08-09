@@ -36,6 +36,9 @@ pub struct OutreachPersonas {
     pub planner: String,
     pub writer: String,
     pub reviewer: String,
+    /// Shared ethical response-design doctrine applied privately by every
+    /// outreach role.
+    pub psychology: String,
     pub critics: Vec<SalesCriticPersona>,
 }
 
@@ -194,6 +197,7 @@ impl OutreachPersonas {
             planner: read_text(&dir.join("planner.md"))?,
             writer: read_text(&dir.join("writer.md"))?,
             reviewer: read_text(&dir.join("reviewer.md"))?,
+            psychology: read_text(&dir.join("psychology.md"))?,
             critics,
         })
     }
@@ -255,7 +259,7 @@ impl Playbook {
     /// Compact company qualification prompt, focused on evidence boundaries.
     pub fn qualification_system_prompt(&self) -> String {
         format!(
-            "You qualify real companies for {name}. Motion: {motion}. Separate supported facts, reasonable inferences, and a falsifiable workflow hypothesis. A company qualifies only when at least {signals} independent signals support one specific recurring workflow and the company is realistically winnable. A first-party job description supports only the investment, system, workflow, or responsibility it explicitly names; it cannot prove pain, urgency, budget, buying intent, or that the recipient owns it. Never invent systems, customers, volumes, savings, urgency, or dollar impact. Name the mechanism, a measurable non-dollar consequence, the strongest objection, and what would falsify the thesis. Return only the requested structured data.",
+            "Qualify real companies for {name} around this motion: {motion}. Separate facts, inferences, and one falsifiable workflow hypothesis. Require at least {signals} independent signals and a realistically winnable account. A job description proves only what it explicitly names, never pain, urgency, budget, buying intent, or ownership. Never invent systems, customers, volume, savings, urgency, or dollar impact. Use a physical object, station, machine, alarm, dispatch, or private handoff only when a source names it; otherwise stay at the supported task category and let discovery identify the work. Name the mechanism, a measurable non-dollar consequence, the strongest objection, and the kill condition. Return only the requested structured data.",
             name = self.name,
             motion = self.motion,
             signals = self.min_signals,
@@ -296,16 +300,18 @@ impl Playbook {
         let subjects = self.subject_examples.join(" | ");
         let forbidden = self.forbidden(shared).join(", ");
         let role_contract = if role == "WRITER" {
-            "Write like one founder contacting one operator. Use only supplied evidence, test one operating decision, keep inference explicitly uncertain, and make one role-appropriate ask. Concrete nouns and natural speech beat frameworks. A correction or route is useful, but the note still needs a recipient-relevant reason to answer."
+            "Write like one founder contacting one operator. Use only supplied evidence, test one operating decision, keep inference explicitly uncertain, and make one role-appropriate ask. Concrete nouns and natural speech beat frameworks, but never name an object, station, machine, alarm, or private handoff that appears only in an internal hypothesis. Never script the recipient's reply with quoted words, categories, or a yes/no/referral menu. A correction or route is useful, but the note still needs a recipient-relevant reason to answer. Preserve a requested short discovery conversation plus email alternative when the recipient is a credible workflow owner and the hypothesis category is source-grounded."
         } else if role == "PLANNER" {
-            "Choose the commercial angle before copy is written. Compare three distinct first-touch approaches against the verified trigger, recipient vantage, strongest objection, and easiest useful reply. Select one coherent thread; do not blend candidates or plan filler stages. Hold when the evidence cannot support a natural note."
+            "Choose the commercial angle before copy is written. Compare three distinct first-touch approaches against the verified trigger, recipient vantage, strongest objection, and easiest useful reply. Select one coherent thread; do not blend candidates or plan filler stages. A short discovery conversation is a valid first ask for a credible workflow owner; preserve the operator's requested outcome when earned and offer an email answer as the easier path. Hold when the evidence cannot support a natural note."
         } else {
-            "Act as a skeptical recipient and independent copy chief. Passing means Andrew could send the exact words unchanged: evidence-safe, specific, natural aloud, easy to answer, and appropriate to the recipient's vantage. Reject polished research blurbs, repeated retreats, invented value, and vague capability language."
+            "Act as a skeptical recipient and independent copy chief. Passing means Andrew could send the exact words unchanged: evidence-safe, specific, natural aloud, easy to answer, and appropriate to the recipient's vantage. Reject polished research blurbs, repeated retreats, invented value, vague capability language, forced response menus, experiment narration, and any physical task noun that appears only in the hypothesis rather than verified facts. Do not approve unnatural copy merely because it is grammatical and mechanically valid."
         };
         let persona_excerpt = compact_persona_excerpt(persona, 120);
+        let psychology_excerpt = compact_persona_excerpt(&shared.personas.psychology, 130);
         format!(
             "=== {role} CONTRACT ===\n{role_contract}\n\n\
              === EDITABLE PERSONA EXCERPT ===\n{persona_excerpt}\n\n\
+             === PRIVATE RESPONSE-DESIGN DOCTRINE ===\n{psychology_excerpt}\n\n\
              === {name} BUYER-FACING CONSTRAINTS ===\n\
              Seller context (state at most once and only when useful): {intro}\n\
              Email 1 length: {min}-{max} words including signature.\n\
@@ -317,6 +323,7 @@ impl Playbook {
             role = role,
             role_contract = role_contract,
             persona_excerpt = persona_excerpt,
+            psychology_excerpt = psychology_excerpt,
             name = self.name,
             intro = self.one_liner,
             min = self.min_words,
@@ -559,10 +566,15 @@ mod tests {
         assert!(gnk.icp_system_prompt().split_whitespace().count() < 100);
         assert!(gnk.qualification_system_prompt().split_whitespace().count() < 150);
         assert!(copy.contains("Write like one founder contacting one operator"));
+        assert!(copy.contains("Never script the recipient's reply"));
         assert!(copy.contains("The recipient does not owe Andrew market research"));
+        assert!(copy.contains("PRIVATE RESPONSE-DESIGN DOCTRINE"));
+        assert!(copy.contains("Before planning copy, name the one response"));
         assert!(planner.contains("Choose the commercial angle before copy is written"));
+        assert!(planner.contains("short discovery conversation is a valid first ask"));
         assert!(planner.contains("Your output is a private plan"));
         assert!(reviewer.contains("Act as a skeptical recipient"));
+        assert!(reviewer.contains("forced response menus"));
         assert!(reviewer.contains("Correctness is not sendability"));
         assert!(copy.contains("=== GnK BUYER-FACING CONSTRAINTS"));
         assert!(copy.split_whitespace().count() < 1_000);
@@ -571,18 +583,23 @@ mod tests {
         assert!(!reviewer.contains("=== SHARED OUTREACH DOCTRINE"));
         assert!(!planner.contains("=== SHARED OUTREACH DOCTRINE"));
         assert!(planner.split_whitespace().count() < 1_000);
-        assert_eq!((gnk.min_words, gnk.max_words), (70, 130));
+        assert_eq!((gnk.min_words, gnk.max_words), (110, 170));
         let outagehub = playbooks.get("outagehub").expect("outagehub");
-        assert_eq!((outagehub.min_words, outagehub.max_words), (90, 140));
+        assert_eq!((outagehub.min_words, outagehub.max_words), (90, 160));
         assert!(outagehub
             .copy_system_prompt(&playbooks.shared)
             .contains("matches reported events to locations"));
         let wapahki = playbooks.get("wapahki").expect("wapahki");
-        assert_eq!((wapahki.min_words, wapahki.max_words), (100, 160));
+        assert_eq!((wapahki.min_words, wapahki.max_words), (110, 170));
         assert!(wapahki
             .review_system_prompt(&playbooks.shared)
             .contains("skeptical recipient"));
         assert_eq!(playbooks.shared.personas.critics.len(), 10);
+        assert!(playbooks
+            .shared
+            .personas
+            .psychology
+            .contains("Ethical response-design doctrine"));
         assert_eq!(playbooks.shared.personas.critics[0].id, "01_alex_hormozi");
     }
 }

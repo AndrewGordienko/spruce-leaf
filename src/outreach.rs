@@ -405,10 +405,30 @@ struct PersonSequenceCopy {
 struct SequencePlan {
     #[serde(default)]
     overall_strategy: String,
+    /// Private response design: what Andrew needs from this particular person
+    /// and why that small action could make sense from their side of the inbox.
+    #[serde(default)]
+    response_strategy: ResponseStrategy,
     #[serde(default)]
     touches: Vec<TouchPlan>,
     #[serde(default)]
     applied_principles: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct ResponseStrategy {
+    #[serde(default)]
+    desired_response: String,
+    #[serde(default)]
+    role_relevant_motive: String,
+    #[serde(default)]
+    concrete_scene: String,
+    #[serde(default)]
+    credibility_basis: String,
+    #[serde(default)]
+    smallest_commitment: String,
+    #[serde(default)]
+    reactance_guard: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -662,6 +682,7 @@ pub async fn plan_pending(
     replace_drafts: bool,
     per_account_cap: Option<usize>,
     only_person_ids: Option<&HashSet<String>>,
+    desired_outcome: Option<&str>,
     progress_reporter: Option<PlanProgressReporter>,
 ) -> Result<PlanSummary> {
     let requested_touches = n_touches.max(1);
@@ -802,6 +823,7 @@ pub async fn plan_pending(
     let business_context = business_copy_context(business);
     let performance_context = empirical_copy_context(db, &pb.key)?;
     let stopped_reason = Arc::new(Mutex::new(None::<String>));
+    let desired_outcome = desired_outcome.map(str::to_string);
     // Capacity checks and touch promotion form one small critical section. The
     // expensive writing and review calls still run concurrently, while every
     // accepted recipient is committed as soon as its batch completes.
@@ -816,6 +838,7 @@ pub async fn plan_pending(
         let progress = progress.clone();
         let stopped_reason = Arc::clone(&stopped_reason);
         let finalize_lock = Arc::clone(&finalize_lock);
+        let desired_outcome = desired_outcome.clone();
         async move {
             let Some(lead) = lead else {
                 let recipients = people
@@ -882,6 +905,7 @@ pub async fn plan_pending(
                 &knowledge,
                 &gtm_contexts,
                 &checkpoints,
+                desired_outcome.as_deref(),
                 critique,
                 &progress,
             )
@@ -1271,15 +1295,28 @@ fn plan_system_prompt(pb: &Playbook, shared: &Shared) -> String {
 }
 
 /// Plan one recipient's full sequence before a word of copy is written.
+struct SequencePlanningInput<'a> {
+    account: &'a CopyAccount,
+    person: &'a crate::db::Person,
+    touches: usize,
+    knowledge: &'a RoleKnowledge,
+    gtm_context: &'a str,
+    desired_outcome: Option<&'a str>,
+}
+
 async fn plan_sequence(
     client: &Engine,
     plan_system: &str,
-    account: &CopyAccount,
-    person: &crate::db::Person,
-    n: usize,
-    knowledge: &RoleKnowledge,
-    gtm_context: &str,
+    input: SequencePlanningInput<'_>,
 ) -> Result<SequencePlan> {
+    let SequencePlanningInput {
+        account,
+        person,
+        touches: n,
+        knowledge,
+        gtm_context,
+        desired_outcome,
+    } = input;
     let account = planner_account_brief(account);
     let discovery_only = gtm_context.contains("GTM ACTION STATE: discovery_ready");
     let recipient = json!({
@@ -1289,9 +1326,10 @@ async fn plan_sequence(
         "vantage": person.vantage,
         "likely_access_internal_only": if discovery_only { "" } else { person.can_observe.as_str() },
         "ask_scope": recipient_ask_scope(person),
+        "operator_requested_outcome_internal_only": desired_outcome.unwrap_or("No narrower outcome supplied; choose the smallest useful cold response for this vantage and evidence state."),
     });
     let user = format!(
-        "Plan a {n}-touch no-reply sequence for this recipient. Hypotheses define the decision and mechanism but are not facts. Before selecting the thread, compare three distinct T1 approaches: problem-sniffing from the strongest source, a concise commercial point of view, and an existence-or-routing note. Prefer the one with the clearest recipient reason to answer and lowest evidence risk; do not blend them. State the selected approach and why in overall_strategy.\n\nACCOUNT BRIEF:\n{account}\n\nRECIPIENT:\n{recipient}\n\nPRIVATE GTM ACTION CONTEXT:\n{gtm_context}\n\nRELEVANT PLANNING KNOWLEDGE:\n{knowledge}\n\nT1 connects a verified trigger to one operating decision and one role-matched ask. T2 advances the mechanism. T3 is a human LinkedIn request. T4, when present, adds a sourced fact, useful distinction, objection answer, route, or close. Never invent collateral or a later stage merely to fill the plan. For each touch return stage, channel, objective, angle, and at most one ask. Never make LinkedIn say only that an email was sent. If action state is research_required, do not plan. Cite only principle IDs that changed the plan.",
+        "Plan a {n}-touch no-reply sequence for this recipient. Hypotheses define the decision and mechanism but are not facts. First complete the private response_strategy: the exact response Andrew needs, why it could matter to this role, one concrete operating scene, the credibility basis, the smallest voluntary commitment, and what would trigger reactance. Honor an operator-requested outcome only when it is earned by the evidence and this person's vantage; otherwise reduce it to the nearest honest step. Before selecting the thread, compare three distinct T1 approaches: problem-sniffing from the strongest source, a concise commercial point of view, and an existence-or-routing note. Prefer the one with the clearest recipient reason to answer and lowest evidence risk; do not blend them. State the selected approach and why in overall_strategy.\n\nACCOUNT BRIEF:\n{account}\n\nRECIPIENT:\n{recipient}\n\nPRIVATE GTM ACTION CONTEXT:\n{gtm_context}\n\nRELEVANT PLANNING KNOWLEDGE:\n{knowledge}\n\nT1 connects a verified trigger to one operating decision and one role-matched ask. T2 advances the mechanism. T3 is a human LinkedIn request. T4, when present, adds a sourced fact, useful distinction, objection answer, route, or close. Never invent collateral or a later stage merely to fill the plan. For each touch return stage, channel, objective, angle, and at most one ask. Never make LinkedIn say only that an email was sent. If action state is research_required, do not plan. Cite only principle IDs that changed the plan.",
         account = serde_json::to_string_pretty(&account).unwrap_or_default(),
         recipient = serde_json::to_string_pretty(&recipient).unwrap_or_default(),
         knowledge = knowledge.block,
@@ -1319,6 +1357,7 @@ async fn write_account_sequences(
     knowledge: &OutreachKnowledge,
     gtm_contexts: &HashMap<String, GtmActionContext>,
     checkpoints: &HashMap<String, String>,
+    desired_outcome: Option<&str>,
     critique: bool,
     progress: &PlanProgress,
 ) -> Result<AccountCopyResult> {
@@ -1341,14 +1380,17 @@ async fn write_account_sequences(
                     plan_sequence(
                         client,
                         &plan_system,
-                        account_ref,
-                        person,
-                        n,
-                        &knowledge.planner,
-                        &gtm_contexts
-                            .get(&person.id)
-                            .map(GtmActionContext::prompt_block)
-                            .unwrap_or_else(|| "GTM ACTION STATE: unavailable".into()),
+                        SequencePlanningInput {
+                            account: account_ref,
+                            person,
+                            touches: n,
+                            knowledge: &knowledge.planner,
+                            gtm_context: &gtm_contexts
+                                .get(&person.id)
+                                .map(GtmActionContext::prompt_block)
+                                .unwrap_or_else(|| "GTM ACTION STATE: unavailable".into()),
+                            desired_outcome,
+                        },
                     )
                     .await,
                 )
@@ -1390,6 +1432,7 @@ async fn write_account_sequences(
             },
             "verified_person_insights": Vec::<String>::new(),
             "ask_scope": recipient_ask_scope(person),
+            "operator_requested_outcome_internal_only": desired_outcome.unwrap_or("No narrower outcome supplied; choose the smallest useful cold response for this vantage and evidence state."),
             "sequence_plan": plans.get(&person.id),
             "previous_rejection_feedback_internal_only": db
                 .latest_rejected_sequence_feedback(&person.id)
@@ -1404,7 +1447,7 @@ async fn write_account_sequences(
     let planning_contract = if lean {
         "For each recipient, choose one source-backed trigger and one operating decision this title can plausibly answer. Keep the mechanism explicitly unverified. Privately draft three genuinely different T1 candidates: a problem-sniffing note, a concise point of view, and an existence-or-routing note. Pick one; never blend or return the alternatives. T2 must sharpen the mechanism rather than restate T1. T3 is a natural connection request. If T4 is present, add only a sourced fact, a useful concrete distinction, or an honest answer to the strongest objection; never invent an artifact to fill the slot. The sequence stays on one human thread and must not become an interview or a chain of retreats. Do not expose the private plan or discarded candidates."
     } else {
-        "Follow each recipient's supplied private sequence_plan."
+        "Follow each recipient's supplied private sequence_plan. Treat response_strategy as the governing outcome and recipient-friction brief, not language to paste into the email."
     };
     let writer_knowledge = knowledge.writer.block.clone();
     let brand_trigger_contract = brand_trigger_contract(&pb.key, n);
@@ -1417,9 +1460,9 @@ Think through the buyer-safe brief and copy decision context. Return exactly one
 
 If previous_rejection_feedback_internal_only is nonempty, this is a whole-sequence rewrite after a failed review. Treat every saved finding as a hard defect to remove, reconsider the structure that produced it, and return genuinely revised copy. Do not quote or mention the feedback to the recipient.
 
-T1 must use the brand-specific word band. Write it as one natural note, not as a checklist. Use one verified fact to explain why this person received it, ask about one recognizable operating moment, state one concrete seller difference in plain language, and give one easy way to answer. Treat the mechanism as uncertainty, but do not narrate the research process or stack caveats. A direct workflow owner may be asked for a short conversation to compare the precise hypothesis with actual work; a router may only be asked to route.
+T1 must use the brand-specific word band. Write it as one natural note, not as a checklist. Use one verified fact to explain why this person received it, ask about one recognizable operating moment, state one concrete seller difference in plain language, and give one easy way to answer. Treat the mechanism as uncertainty, but do not narrate the research process or stack caveats. Never dictate answer labels or turn the note into a multiple-choice research form; an easy answer is an ordinary sentence in the recipient's own language. Never manufacture specificity with a task, object, machine, customer, or process that is absent from verified facts. A short discovery conversation is a valid cold ask for a direct workflow owner when the hypothesis is precise. When operator_requested_outcome_internal_only asks for that conversation or a short email explanation and the evidence supports the workflow category, T1 must offer those two natural paths; do not silently replace them with a coded answer, routing request, or permission to send collateral. A router may only be asked to route.
 
-For four touches use email/0, email/3, linkedin_request/7, email/14. For seven touches use email/0, email/3, linkedin_request/5, email/9, linkedin_or_email/13, email/17, linkedin_or_email/21. Every email-capable touch must look like an email: a short first-name greeting on its own line, coherent message, and exact signature on its own line. T1 uses one plain 2-6 word lowercase subject. Later email-capable touches preserve it with one re: prefix. A linkedin_request has no subject, greeting, signature, pitch, meeting ask, or prior-email reference; it must stay under 300 characters.
+For four touches use email/0, email/3, linkedin_request/7, email/14. For seven touches use email/0, email/3, linkedin_request/5, email/9, linkedin_or_email/13, email/17, linkedin_or_email/21. Every email-capable touch must look like an email: `Hi [First name],` on its own line, a coherent message, and the exact signature on its own line. T1 uses one plain, specific 3-9 word operational subject; sentence case or title case is fine. Later email-capable touches preserve it with one re: prefix. A linkedin_request has no subject, greeting, signature, pitch, meeting ask, or prior-email reference; it must stay under 300 characters.
 
 Purpose and goal are private CRM notes, never substitutes for buyer-facing prose. Before returning, read the whole sequence as the recipient. Remove generic lessons, fragments, surveys, framework language, and repeated retreat lines. In four touches, at most one touch may mainly say Andrew may be wrong, invite a correction/referral, or close; in seven touches the maximum is three. Rewrite any excess around mechanism, useful contribution, and the hard buyer objection. Never reveal play labels, experiment arms, confidence scores, or internal hypotheses."#,
         n = n,
@@ -1650,9 +1693,9 @@ Purpose and goal are private CRM notes, never substitutes for buyer-facing prose
 
 fn brand_trigger_contract(brand: &str, touches: usize) -> &'static str {
     if brand == "outagehub" && touches >= 7 {
-        "OUTAGEHUB SEVEN-TOUCH CONTRACT: A stable sourced fact about the prospect's operated site/network footprint can be the trigger; a recent utility outage is not required and must never be invented. T1 is one founder note: one footprint fact, one question about a recognizable outage-time decision, one sentence naming OutageHub and the specific outside context it could add beyond alarms or site calls, then one easy ask. Aim for 90-120 words. T2 sharpens the diagnostic with one new distinction. T3 is only a human, recipient-specific reason to connect: no product explainer, collateral, meeting ask, or prior-email reference. T4 offers one useful historical comparison or other concrete contribution. T5 answers the strongest objection, usually what this adds beyond alarms, telemetry, or site calls. T6 routes once. T7 closes without another pitch. State the public-versus-private data limitation at most once across the sequence. Do not repeat the same utility-data mechanism in more than two touches or offer the same artifact twice."
+        "OUTAGEHUB SEVEN-TOUCH CONTRACT: A stable sourced fact about the prospect's operated site/network footprint can be the trigger; a recent utility outage is not required and must never be invented. T1 is a complete founder note, normally 100-150 words: directly explain why this person was chosen, describe one recognizable outage-time decision and a restrained practical consequence of uncertainty, name OutageHub and the specific outside utility context it could add beyond alarms or site calls, then offer a short conversation or email reply. Do not compress those ideas into internal-memo phrases or expand them into a dossier. T2 sharpens the diagnostic with one new distinction. T3 is only a human, recipient-specific reason to connect: no product explainer, collateral, meeting ask, or prior-email reference. T4 offers one useful historical comparison or other concrete contribution. T5 answers the strongest objection, usually what this adds beyond alarms, telemetry, or site calls. T6 routes once. T7 closes without another pitch. State the public-versus-private data limitation at most once across the sequence. Do not repeat the same utility-data mechanism in more than two touches or offer the same artifact twice."
     } else if brand == "outagehub" {
-        "OUTAGEHUB FOUR-TOUCH CONTRACT: A stable sourced fact about the prospect's operated site/network footprint can be the trigger; a recent utility outage is not required and must never be invented. T1 should read like one founder note: one footprint fact, one question about a recognizable outage-time decision, one sentence naming OutageHub and the specific outside context it could add beyond alarms or site calls, then one easy ask. Aim for 90-120 words. T2 must add one new diagnostic distinction and may offer one small historical comparison. T3 is only a human, recipient-specific reason to connect: no product explainer, historical comparison, collateral, meeting ask, or prior-email reference. T4 routes or closes the same question without explaining public outage data again. State the public-versus-private data limitation at most once across the sequence. Do not repeat the same utility-data mechanism in more than two touches."
+        "OUTAGEHUB FOUR-TOUCH CONTRACT: A stable sourced fact about the prospect's operated site/network footprint can be the trigger; a recent utility outage is not required and must never be invented. T1 should read like a complete 100-150 word founder note: why this person, one recognizable outage-time decision, a restrained practical consequence, one plain OutageHub explanation, and a short conversation or email reply. Do not compress those ideas into internal-memo phrases or expand them into a dossier. T2 must add one new diagnostic distinction and may offer one small historical comparison. T3 is only a human, recipient-specific reason to connect: no product explainer, historical comparison, collateral, meeting ask, or prior-email reference. T4 routes or closes the same question without explaining public outage data again. State the public-versus-private data limitation at most once across the sequence. Do not repeat the same utility-data mechanism in more than two touches."
     } else {
         ""
     }
@@ -1683,7 +1726,13 @@ async fn review_person_copy(
     let lean = client.prefers_lean_outreach();
     let allowed_principles = knowledge.writer.allowed_ids.clone();
     let private_copy_decision = format!(
-        "PRIVATE COPY DECISION (judge the messages against this; never paste these labels):\n- writer's operating moment and decision: {}\n- writer's mechanism to test, never an account fact: {}\n- canonical account mechanism hypothesis, never an account fact: {}\n- concrete system concept only if the premise is confirmed: {}\n- writer's strongest buyer objection: {}\n- canonical hard buyer question: {}\n- role-relevant reason this topic could matter: {}\n- supported seller give-back, empty when none: {}",
+        "PRIVATE COPY DECISION (judge the messages against this; never paste these labels):\n- desired response: {}\n- role-relevant motive: {}\n- concrete scene: {}\n- credibility basis: {}\n- smallest voluntary commitment: {}\n- reactance guard: {}\n- writer's operating moment and decision: {}\n- writer's mechanism to test, never an account fact: {}\n- canonical account mechanism hypothesis, never an account fact: {}\n- concrete system concept only if the premise is confirmed: {}\n- writer's strongest buyer objection: {}\n- canonical hard buyer question: {}\n- role-relevant reason this topic could matter: {}\n- supported seller give-back, empty when none: {}",
+        plan.map(|plan| plan.response_strategy.desired_response.trim()).unwrap_or_default(),
+        plan.map(|plan| plan.response_strategy.role_relevant_motive.trim()).unwrap_or_default(),
+        plan.map(|plan| plan.response_strategy.concrete_scene.trim()).unwrap_or_default(),
+        plan.map(|plan| plan.response_strategy.credibility_basis.trim()).unwrap_or_default(),
+        plan.map(|plan| plan.response_strategy.smallest_commitment.trim()).unwrap_or_default(),
+        plan.map(|plan| plan.response_strategy.reactance_guard.trim()).unwrap_or_default(),
         raw.operating_decision.trim(),
         raw.mechanism_to_test.trim(),
         account.mechanism.trim(),
@@ -1757,7 +1806,8 @@ async fn review_person_copy(
     }
     person_progress("running final sendability gate");
     scrub_ai_punctuation(&mut sequence);
-    let issues = sequence_quality_issues(pb, shared, &sequence, &reviews, n, critique);
+    let issues =
+        account_sequence_quality_issues(pb, shared, account, &sequence, &reviews, n, critique);
     if !issues.is_empty() {
         return Err(anyhow!("sendability gate: {}", issues.join("; ")));
     }
@@ -1783,11 +1833,10 @@ fn sales_council_enabled(_lean_api: bool) -> bool {
 
 /// Production QA normally uses at most two model calls per recipient: one
 /// repair plus one independent verification, or one verification plus one
-/// semantic repair. A third call is reserved for recovery when an editor omits
-/// a required rewrite, introduces a deterministic defect, or the independent
-/// verifier finds a semantic issue after an initial mechanical repair. Rust
-/// reruns its deterministic rules after every edit, so the recovery allowance
-/// cannot weaken the sendability envelope.
+/// semantic repair. A third call handles normal recovery; a fourth is available
+/// only when a semantic rewrite itself introduces an exact mechanical defect.
+/// Rust reruns its deterministic rules after every edit, so the recovery
+/// allowance cannot weaken the sendability envelope.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn review_and_edit_sequence_lean(
     client: &Engine,
@@ -1803,8 +1852,15 @@ pub(crate) async fn review_and_edit_sequence_lean(
 ) -> Result<Vec<TouchReview>> {
     scrub_ai_punctuation(sequence);
     enforce_email_signatures(sequence, &pb.signature);
-    let mut deterministic =
-        sequence_quality_issues(pb, shared, sequence, &[], expected_touches, false);
+    let mut deterministic = account_sequence_quality_issues(
+        pb,
+        shared,
+        account,
+        sequence,
+        &[],
+        expected_touches,
+        false,
+    );
     if !critique {
         if deterministic.is_empty() {
             return Ok(Vec::new());
@@ -1817,7 +1873,11 @@ pub(crate) async fn review_and_edit_sequence_lean(
 
     let review_system = pb.review_system_prompt(shared);
 
-    const MAX_QA_CALLS: usize = 3;
+    // Three calls cover the normal repair/verify path. A fourth is reserved
+    // only when a semantic rewrite introduces an exact deterministic defect;
+    // throwing away otherwise useful copy at that point is worse than one
+    // tightly scoped cleanup.
+    const MAX_QA_CALLS: usize = 4;
     let mut qa_calls = 0usize;
 
     // Mechanical findings are exact and cheap to validate. Most clear in one
@@ -1856,8 +1916,15 @@ pub(crate) async fn review_and_edit_sequence_lean(
                     .map(|error| error.to_string());
             scrub_ai_punctuation(sequence);
             enforce_email_signatures(sequence, &pb.signature);
-            deterministic =
-                sequence_quality_issues(pb, shared, sequence, &[], expected_touches, false);
+            deterministic = account_sequence_quality_issues(
+                pb,
+                shared,
+                account,
+                sequence,
+                &[],
+                expected_touches,
+                false,
+            );
             if let Some(error) = apply_error {
                 deterministic.push(error);
             }
@@ -1937,8 +2004,15 @@ pub(crate) async fn review_and_edit_sequence_lean(
         .map(|error| error.to_string());
     scrub_ai_punctuation(sequence);
     enforce_email_signatures(sequence, &pb.signature);
-    let mut after_repair =
-        sequence_quality_issues(pb, shared, sequence, &[], expected_touches, false);
+    let mut after_repair = account_sequence_quality_issues(
+        pb,
+        shared,
+        account,
+        sequence,
+        &[],
+        expected_touches,
+        false,
+    );
     if let Some(error) = apply_error {
         after_repair.push(error);
     }
@@ -1947,7 +2021,7 @@ pub(crate) async fn review_and_edit_sequence_lean(
 
     // A semantic edit can accidentally add a fourth question, miss a word
     // band, or omit the requested body. Repair only those exact stages once;
-    // this is the third and final QA call on the normal verify→repair path.
+    // this is the reserved fourth call on the verify→repair recovery path.
     let mut approval_doc = repair;
     if !after_repair.is_empty() {
         if qa_calls >= MAX_QA_CALLS {
@@ -1978,8 +2052,15 @@ pub(crate) async fn review_and_edit_sequence_lean(
         apply_targeted_repairs(sequence, &cleanup, &after_repair, expected_touches)?;
         scrub_ai_punctuation(sequence);
         enforce_email_signatures(sequence, &pb.signature);
-        let after_cleanup =
-            sequence_quality_issues(pb, shared, sequence, &[], expected_touches, false);
+        let after_cleanup = account_sequence_quality_issues(
+            pb,
+            shared,
+            account,
+            sequence,
+            &[],
+            expected_touches,
+            false,
+        );
         if !after_cleanup.is_empty() {
             return Err(anyhow!(
                 "copy could not clear final mechanical recovery: {}",
@@ -3260,18 +3341,17 @@ fn touch_word_band(pb: &Playbook, touch: &CopyTouch) -> (usize, usize) {
         (8, 45)
     } else if touch.channel.eq_ignore_ascii_case("linkedin_or_email") {
         if touch.stage == 7 {
-            (8, 50)
+            (15, 60)
         } else {
             // Dual-use follow-ups still have to be substantive correspondence
             // when LinkedIn is unavailable and they fall back to email.
-            (25, 70)
+            (35, 100)
         }
     } else if touch.channel.eq_ignore_ascii_case("email") {
         match touch.stage {
             // The prompt targets the brand band exactly. QA keeps a small
             // tolerance so a natural 69-word GnK note is not sent through two
             // model repairs merely to add a filler word to a 70-word target.
-            1 if pb.key == "outagehub" => (80, 130),
             1 => (
                 pb.min_words.saturating_sub(10),
                 pb.max_words.saturating_add(10),
@@ -3279,10 +3359,10 @@ fn touch_word_band(pb: &Playbook, touch: &CopyTouch) -> (usize, usize) {
             // These are still emails, not caption-sized blurbs. T2 sharpens
             // the diagnostic, T4 contributes value, and T6 routes; each stays
             // shorter than T1 while retaining enough room to do its actual job.
-            2 => (35, 75),
-            4 => (40, 85),
-            6 => (18, 60),
-            7 => (8, 50),
+            2 => (35, 145),
+            4 => (45, 120),
+            6 => (25, 80),
+            7 => (15, 60),
             _ => (8, 40),
         }
     } else if touch.channel.eq_ignore_ascii_case("linkedin") {
@@ -3447,6 +3527,122 @@ fn is_retreat_or_route_touch(touch: &CopyTouch) -> bool {
     .any(|marker| body.contains(marker))
 }
 
+/// Making the response smaller is useful; dictating the prospect's answer is
+/// not. These patterns came from otherwise high-scoring model copy that read
+/// like a coded research form rather than a founder email.
+fn has_forced_response_menu(body: &str) -> bool {
+    let body = body.to_ascii_lowercase();
+    [
+        "yes, no, or",
+        "a yes, no",
+        "reply with",
+        "reply \"",
+        "reply ‘",
+        "reply “",
+        "the easiest reply is",
+        "one word is enough",
+        "is enough to classify",
+        "is enough to end",
+        "a name is enough",
+        "within-run",
+        "between-run",
+        "fixed or manual",
+        "fixed, flexible",
+    ]
+    .iter()
+    .any(|marker| body.contains(marker))
+}
+
+fn narrates_internal_copy_logic(body: &str) -> bool {
+    let body = body.to_ascii_lowercase();
+    [
+        "the question concerns",
+        "the premise was narrow",
+        "the key distinction is",
+        "the deciding point is",
+        "repetitive slice",
+        "the practical fork is",
+        "the practical split is",
+    ]
+    .iter()
+    .any(|marker| body.contains(marker))
+}
+
+fn unsupported_account_task_noun_issues(
+    pb: &Playbook,
+    account: &CopyAccount,
+    sequence: &CopySequence,
+) -> Vec<String> {
+    if !pb.key.eq_ignore_ascii_case("wapahki") {
+        return Vec::new();
+    }
+    let facts = account.observed_facts.join(" ").to_ascii_lowercase();
+    let noun_groups: &[(&[&str], &[&str], &str)] = &[
+        (&["tray"], &["tray"], "tray"),
+        (&["pouch"], &["pouch"], "pouch"),
+        (&["pallet"], &["pallet"], "pallet"),
+        (&["conveyor"], &["conveyor"], "conveyor"),
+        (&["bottle"], &["bottle"], "bottle"),
+        (&["carton"], &["carton"], "carton"),
+        (
+            &[
+                "case-loading",
+                "case loading",
+                "case-packing",
+                "case packing",
+                "into cases",
+            ],
+            &[
+                "case loading",
+                "case-loading",
+                "case packing",
+                "case-packing",
+                "into cases",
+            ],
+            "case-loading task",
+        ),
+        (
+            &["pack pattern", "packing pattern"],
+            &["pack pattern", "packing pattern"],
+            "packing pattern",
+        ),
+    ];
+    let mut issues = Vec::new();
+    for touch in &sequence.touches {
+        let body = touch.body.to_ascii_lowercase();
+        for (copy_terms, fact_terms, label) in noun_groups {
+            let appears_in_copy = copy_terms.iter().any(|term| body.contains(term));
+            let supported = fact_terms.iter().any(|term| facts.contains(term));
+            if appears_in_copy && !supported {
+                issues.push(format!(
+                    "stage {} names an unverified {label}; keep the email at the supported packing/handling category and let the recipient identify the actual task",
+                    touch.stage
+                ));
+            }
+        }
+    }
+    issues.sort();
+    issues.dedup();
+    issues
+}
+
+fn account_sequence_quality_issues(
+    pb: &Playbook,
+    shared: &Shared,
+    account: &CopyAccount,
+    sequence: &CopySequence,
+    reviews: &[TouchReview],
+    expected_touches: usize,
+    critique: bool,
+) -> Vec<String> {
+    let mut issues =
+        sequence_quality_issues(pb, shared, sequence, reviews, expected_touches, critique);
+    issues.extend(unsupported_account_task_noun_issues(pb, account, sequence));
+    issues.sort();
+    issues.dedup();
+    issues
+}
+
 fn sequence_quality_issues(
     pb: &Playbook,
     shared: &Shared,
@@ -3508,9 +3704,9 @@ fn sequence_quality_issues(
         if is_email_capable_channel(&channel) {
             let subject_words = touch.subject.split_whitespace().count();
             if touch.stage == 1 {
-                if !(2..=6).contains(&subject_words) {
+                if !(3..=9).contains(&subject_words) {
                     issues.push(format!(
-                        "stage 1 subject has {subject_words} words (needs 2–6)"
+                        "stage 1 subject has {subject_words} words (needs 3–9)"
                     ));
                 }
             } else {
@@ -3521,9 +3717,6 @@ fn sequence_quality_issues(
                         touch.stage
                     ));
                 }
-            }
-            if touch.subject.chars().any(char::is_uppercase) {
-                issues.push(format!("stage {} subject must be lowercase", touch.stage));
             }
             if touch.subject.contains('?') || touch.subject.chars().any(|c| c.is_ascii_digit()) {
                 issues.push(format!(
@@ -3539,31 +3732,30 @@ fn sequence_quality_issues(
                     .find(|line| !line.is_empty())
                     .unwrap_or("");
                 let greeting_words = greeting.split_whitespace().count();
-                if !greeting.ends_with(',')
-                    || greeting_words == 0
-                    || greeting_words > 3
+                if !greeting.starts_with("Hi ")
+                    || !greeting.ends_with(',')
+                    || !(2..=4).contains(&greeting_words)
                     || greeting.contains('?')
                 {
                     issues.push(format!(
-                        "stage {} must start with a short greeting on its own line",
+                        "stage {} must start with 'Hi [First name],' on its own line",
                         touch.stage
                     ));
                 }
             }
             let sentences = copy_sentence_count(&touch.body, &pb.signature);
-            let sentence_limit_ok = match touch.stage {
-                1 => (3..=7).contains(&sentences),
-                7 => (1..=3).contains(&sentences),
-                2 | 4 | 5 => (1..=4).contains(&sentences),
-                _ => (1..=3).contains(&sentences),
+            // Sentence counts are only a coarse corruption guard. Earlier
+            // narrow stage-specific maxima rejected perfectly natural short
+            // emails after the semantic editor had fixed them, and pushed the
+            // writer toward fragments. Word bands and the independent reviewer
+            // carry style; this gate catches only empty or sprawling output.
+            let sentence_limit_ok = if touch.stage == 1 {
+                (3..=12).contains(&sentences)
+            } else {
+                (1..=8).contains(&sentences)
             };
             if !sentence_limit_ok {
-                let expected = match touch.stage {
-                    1 => "3–7",
-                    7 => "1–3",
-                    2 | 4 | 5 => "1–4",
-                    _ => "1–3",
-                };
+                let expected = if touch.stage == 1 { "3–12" } else { "1–8" };
                 issues.push(format!(
                     "stage {} has {sentences} copy sentences (needs {expected})",
                     touch.stage
@@ -3577,19 +3769,17 @@ fn sequence_quality_issues(
                     !paragraph.is_empty() && paragraph != pb.signature
                 })
                 .count();
-            // A well-formed email is greeting + up to three body paragraphs + a
-            // sign-off line, each separated by a blank line — so the greeting AND
-            // the sign-off both count here on top of the body. The old ceiling of 4
-            // silently rejected any email-1 with three body paragraphs (the longest
-            // touch), a normal sendable shape; six blocks is where it truly runs on.
-            if paragraphs > 5 {
+            // T1 may use distinct short paragraphs for role relevance, operating
+            // moment, seller mechanism, and CTA. Follow-ups remain more compact.
+            let paragraph_limit = if touch.stage == 1 { 7 } else { 6 };
+            if paragraphs > paragraph_limit {
                 issues.push(format!("stage {} has {paragraphs} paragraphs", touch.stage));
             }
         }
         let question_limit = touch_question_limit(touch.stage);
         if touch.body.matches('?').count() > question_limit {
             issues.push(if touch.stage == 1 {
-                "stage 1 asks more than one operating question plus one CTA".to_string()
+                "stage 1 asks more than one central operating question plus one CTA".to_string()
             } else {
                 format!("stage {} asks more than one question", touch.stage)
             });
@@ -3603,6 +3793,18 @@ fn sequence_quality_issues(
         }
         if touch.stage == 7 && touch.body.contains('?') {
             issues.push("stage 7 must close without a question".to_string());
+        }
+        if has_forced_response_menu(&touch.body) {
+            issues.push(format!(
+                "stage {} dictates a response menu or internal taxonomy; ask one natural question and let the recipient answer in their own words",
+                touch.stage
+            ));
+        }
+        if narrates_internal_copy_logic(&touch.body) {
+            issues.push(format!(
+                "stage {} narrates the outreach logic instead of speaking naturally to the recipient",
+                touch.stage
+            ));
         }
         let lint = lint_copy_touch(pb, shared, touch);
         if !lint.forbidden_hits.is_empty() {
@@ -3686,9 +3888,13 @@ fn sequence_quality_issues(
         .iter()
         .map(|touch| touch.body.to_ascii_lowercase().matches(&brand_name).count())
         .sum::<usize>();
-    if brand_mentions > 1 {
+    // Repeating the seller name in most touches is clearly automated, but a
+    // second natural reference in a seven-touch thread is not a sendability
+    // failure. The semantic reviewer still judges whether either mention is
+    // seller-first or unnecessary.
+    if brand_mentions > 2 {
         issues.push(format!(
-            "{} appears {brand_mentions} times (maximum 1 across the sequence)",
+            "{} appears {brand_mentions} times (maximum 2 across the sequence)",
             pb.name
         ));
     }
@@ -3739,16 +3945,6 @@ fn sequence_quality_issues(
                     .into(),
             );
         }
-    }
-
-    if pb.key == "wapahki"
-        && sequence
-            .touches
-            .iter()
-            .find(|touch| touch.stage == 1)
-            .is_some_and(|touch| touch.body.to_ascii_lowercase().contains("wapahki"))
-    {
-        issues.push("stage 1 must not introduce Wapahki before relevance is established".into());
     }
 
     if expected_touches == 7 {
@@ -3971,11 +4167,24 @@ fn plan_schema(n: usize) -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["overall_strategy", "touches", "applied_principles"],
+        "required": ["overall_strategy", "response_strategy", "touches", "applied_principles"],
         "properties": {
             "overall_strategy": {
                 "type": "string",
                 "description": format!("One or two sentences on the arc across all {n} touches.")
+            },
+            "response_strategy": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["desired_response", "role_relevant_motive", "concrete_scene", "credibility_basis", "smallest_commitment", "reactance_guard"],
+                "properties": {
+                    "desired_response": { "type": "string", "description": "The exact next reply or action Andrew needs from this person." },
+                    "role_relevant_motive": { "type": "string", "description": "Why responding could matter to this recipient based only on verified role/account context." },
+                    "concrete_scene": { "type": "string", "description": "One recognizable operating moment the recipient can mentally simulate." },
+                    "credibility_basis": { "type": "string", "description": "The verified, attributed, or self-testable basis that makes the note worth considering." },
+                    "smallest_commitment": { "type": "string", "description": "The lowest-effort voluntary step that still advances the work." },
+                    "reactance_guard": { "type": "string", "description": "The claim, pressure, or ask size most likely to feel presumptuous or manipulative and therefore must be avoided." }
+                }
             },
             "touches": {
                 "type": "array",
@@ -4136,13 +4345,14 @@ fn review_edit_schema(n: usize) -> Value {
 mod tests {
     use super::{
         affected_stages, apply_targeted_repairs, brand_trigger_contract, business_copy_context,
-        copy_sentence_count, format_progress_status, is_email_capable_channel,
-        is_retreat_or_route_touch, mentions_outreach_asset, normalize_dashes,
-        normalize_principle_ids, normalize_thread_subjects, provisional_channel,
-        provisional_day_offset, select_people_for_planning, sequence_quality_issues,
-        supported_touch_count, touch_question_limit, touch_word_band, word_set_similarity,
-        CopySequence, CopyTouch, EditDoc, EditReview, PlanProgressRecipient, PlanProgressUpdate,
-        TouchReview,
+        copy_sentence_count, format_progress_status, has_forced_response_menu,
+        is_email_capable_channel, is_retreat_or_route_touch, mentions_outreach_asset,
+        narrates_internal_copy_logic, normalize_dashes, normalize_principle_ids,
+        normalize_thread_subjects, provisional_channel, provisional_day_offset,
+        select_people_for_planning, sequence_quality_issues, supported_touch_count,
+        touch_question_limit, touch_word_band, unsupported_account_task_noun_issues,
+        word_set_similarity, CopyAccount, CopySequence, CopyTouch, EditDoc, EditReview,
+        PlanProgressRecipient, PlanProgressUpdate, TouchReview,
     };
 
     #[test]
@@ -4230,7 +4440,7 @@ mod tests {
     }
 
     #[test]
-    fn first_email_reserves_a_second_question_for_the_cta_only() {
+    fn first_email_allows_one_central_question_and_cta() {
         assert_eq!(touch_question_limit(1), 2);
         for stage in 2..=7 {
             assert_eq!(touch_question_limit(stage), 1);
@@ -4293,7 +4503,12 @@ mod tests {
     fn gnk_email_bands_leave_room_for_substance_without_a_dossier() {
         let playbooks = Playbooks::load("playbooks").expect("load playbooks");
         let pb = playbooks.get("gnk").expect("gnk playbook");
-        for (stage, expected) in [(1, (60, 140)), (2, (35, 75)), (4, (40, 85)), (6, (18, 60))] {
+        for (stage, expected) in [
+            (1, (100, 180)),
+            (2, (35, 145)),
+            (4, (45, 120)),
+            (6, (25, 80)),
+        ] {
             let touch = CopyTouch {
                 stage,
                 day_offset: stage,
@@ -4314,7 +4529,7 @@ mod tests {
             purpose: String::new(),
             goal: String::new(),
         };
-        assert_eq!(touch_word_band(pb, &objection_touch), (25, 70));
+        assert_eq!(touch_word_band(pb, &objection_touch), (35, 100));
     }
 
     #[test]
@@ -4344,6 +4559,67 @@ mod tests {
             1,
             "Would a short conversation help, or should I ask someone closer to the work?"
         )));
+    }
+
+    #[test]
+    fn response_menus_and_experiment_narration_are_not_human_copy() {
+        assert!(has_forced_response_menu(
+            "Within-run, between-run, or both is enough to classify it."
+        ));
+        assert!(has_forced_response_menu(
+            "A yes, no, or the right person's name is plenty."
+        ));
+        assert!(!has_forced_response_menu(
+            "Even a short email about where the work stays manual would help."
+        ));
+        assert!(narrates_internal_copy_logic(
+            "The premise was narrow: one handling task changes by format."
+        ));
+    }
+
+    #[test]
+    fn wapahki_specificity_cannot_come_only_from_an_internal_hypothesis() {
+        let playbooks = Playbooks::load("playbooks").expect("load playbooks");
+        let pb = playbooks.get("wapahki").expect("wapahki playbook");
+        let account = CopyAccount {
+            name: "Fresh Foods".into(),
+            industry: "food production".into(),
+            hq: "Ontario".into(),
+            observed_facts: vec![
+                "Fresh Foods operates six kitchens across five brands.".into(),
+                "The company makes prepared foods.".into(),
+            ],
+            inferences: Vec::new(),
+            hypothesis: "A tray-loading task may remain manual.".into(),
+            mechanism: String::new(),
+            consequence_metric: String::new(),
+            signals: Vec::new(),
+            system_concept: String::new(),
+            hard_buyer_question: String::new(),
+            kill_condition: String::new(),
+            magnitude_note: String::new(),
+            applied_principles: Vec::new(),
+        };
+        let sequence = CopySequence {
+            touches: vec![CopyTouch {
+                stage: 1,
+                day_offset: 0,
+                channel: "email".into(),
+                subject: "Packing format changes".into(),
+                body: "Hi Maya,\n\nDoes a finished-tray case-loading task remain manual?\n\nAndrew"
+                    .into(),
+                purpose: "test one task".into(),
+                goal: "earn a correction".into(),
+            }],
+            applied_principles: Vec::new(),
+        };
+        let issues = unsupported_account_task_noun_issues(pb, &account, &sequence);
+        assert!(issues.iter().any(|issue| issue.contains("unverified tray")));
+
+        let mut supported = account;
+        supported.observed_facts =
+            vec!["The plant describes a tray-filling and case-loading station.".into()];
+        assert!(unsupported_account_task_noun_issues(pb, &supported, &sequence).is_empty());
     }
 
     #[test]
@@ -4592,11 +4868,11 @@ mod tests {
                 day_offset: day,
                 channel: "email".into(),
                 subject: if stage == 1 {
-                    "case handling".into()
+                    "Case handling review".into()
                 } else {
-                    "re: case handling".into()
+                    "re: Case handling review".into()
                 },
-                body: format!("Maya,\n\n{middle}\n\n{signature}"),
+                body: format!("Hi Maya,\n\n{middle}\n\n{signature}"),
                 purpose: "continue one conversation".into(),
                 goal: "earn a correction".into(),
             };
@@ -4630,8 +4906,8 @@ mod tests {
                         stage: 5,
                         day_offset: 13,
                         channel: "linkedin_or_email".into(),
-                        subject: "re: case handling".into(),
-                        body: format!("Maya,\n\nThe screen is practical and takes a minute to scan. Happy to send it without arranging a call.\n\n{signature}"),
+                        subject: "re: Case handling review".into(),
+                        body: format!("Hi Maya,\n\nThe screen is practical and takes a minute to scan. Happy to send it without arranging a call.\n\n{signature}"),
                         purpose: "offer one useful resource".into(),
                         goal: "make replying worthwhile".into(),
                     },
@@ -4644,8 +4920,8 @@ mod tests {
                         stage: 7,
                         day_offset: 21,
                         channel: "linkedin_or_email".into(),
-                        subject: "re: case handling".into(),
-                        body: format!("Maya,\n\nI will close the thread here. Thanks for considering it.\n\n{signature}"),
+                        subject: "re: Case handling review".into(),
+                        body: format!("Hi Maya,\n\nI will close the thread here. Thanks for considering it.\n\n{signature}"),
                         purpose: "close".into(),
                         goal: "stop respectfully".into(),
                     },
@@ -4656,7 +4932,7 @@ mod tests {
             let issues = sequence_quality_issues(pb, &playbooks.shared, &sequence, &[], 7, false);
             assert!(
                 !issues.iter().any(|issue| {
-                    issue.contains("must start with a short greeting")
+                    issue.contains("must start with 'Hi [First name],'")
                         || issue.contains("must keep the original email subject")
                         || issue.contains("subject has")
                         || issue.contains("maximum 300")
@@ -4786,7 +5062,7 @@ mod tests {
     }
 
     #[test]
-    fn wapahki_gate_limits_questions_and_defers_the_brand_name() {
+    fn wapahki_gate_limits_questions_and_brand_repetition() {
         let playbooks = Playbooks::load("playbooks").expect("load playbooks");
         let pb = playbooks.get("wapahki").expect("wapahki playbook");
         let channels = [
@@ -4829,12 +5105,6 @@ mod tests {
             issues
                 .iter()
                 .any(|issue| issue.contains("questions in 7 touches")),
-            "issues were {issues:?}"
-        );
-        assert!(
-            issues
-                .iter()
-                .any(|issue| issue.contains("stage 1 must not introduce Wapahki")),
             "issues were {issues:?}"
         );
         assert!(

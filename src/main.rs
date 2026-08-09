@@ -41,6 +41,7 @@ mod outreach_eval;
 mod pipeline;
 mod playbook;
 mod prompts;
+mod qualification;
 mod repl;
 mod reply_agent;
 mod report;
@@ -202,6 +203,10 @@ enum Command {
         /// Limit planning to one exact person id, email, or name.
         #[arg(long)]
         person: Option<String>,
+        /// The exact next response or action wanted from this recipient. The
+        /// planner will reduce an over-large request to the nearest earned step.
+        #[arg(long)]
+        outcome: Option<String>,
         /// Replace an existing active sequence only when it has no sent touches.
         #[arg(long)]
         replace_drafts: bool,
@@ -594,6 +599,7 @@ fn main() -> Result<()> {
             limit,
             auto,
             person,
+            outcome,
             replace_drafts,
         } => {
             let client = make_engine(&rt, &cli)?;
@@ -662,6 +668,7 @@ fn main() -> Result<()> {
                     )
                 },
                 only_person_ids.as_ref(),
+                outcome.as_deref(),
                 None,
             ))?;
             println!(

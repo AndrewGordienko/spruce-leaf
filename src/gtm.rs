@@ -408,7 +408,41 @@ pub fn prepare_action(
 ) -> Result<GtmActionContext> {
     db.expire_signal_observations()?;
     let play = db.current_gtm_play(brand)?;
-    let observations = db.list_active_signal_observations(Some(brand), Some(lead_id), None)?;
+    let assessment = match &play {
+        Some(play) => db.account_play_assessment(lead_id, &play.id)?,
+        None => None,
+    };
+    let mut observations = db.list_active_signal_observations(Some(brand), Some(lead_id), None)?;
+    // Preserve old observations for lineage, but do not let them overrule the
+    // latest account assessment or restore a signal that the current refresh
+    // could not support.
+    if let Some(assessment) = &assessment {
+        observations.retain(|observation| {
+            observation.definition_key == "contact.workflow_vantage"
+                || assessment
+                    .matched_signal_keys
+                    .contains(&observation.definition_key)
+        });
+    }
+    // A source-backed operating context is often split across facts (for
+    // example, one observation names six cold-storage facilities while another
+    // names the 24/7 refrigerated service). The credibility boundary should
+    // reason over that account evidence together, not demand one sentence that
+    // unnaturally restates the whole thesis. Contact-vantage text is excluded.
+    let account_evidence = observations
+        .iter()
+        .filter(|observation| observation.definition_key != "contact.workflow_vantage")
+        .map(|observation| observation.evidence.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    observations.retain(|observation| {
+        observation.definition_key == "contact.workflow_vantage"
+            || credible_action_signal(
+                brand,
+                &observation.definition_key,
+                &format!("{} {account_evidence}", observation.evidence),
+            )
+    });
     let mut matched_signal_keys = observations
         .iter()
         .map(|observation| observation.definition_key.clone())
@@ -446,7 +480,13 @@ pub fn prepare_action(
             .iter()
             .filter(|key| matched_signal_keys.contains(key))
             .count();
-        if matched >= play.minimum_signal_matches.max(1) as usize {
+        let assessment_allows_action = assessment
+            .as_ref()
+            .is_none_or(|assessment| assessment.status == "qualified");
+        if assessment_allows_action
+            && matched >= play.minimum_signal_matches.max(1) as usize
+            && mandatory_action_signals_present(brand, &matched_signal_keys)
+        {
             "action_ready"
         } else if brand == "gnk"
             && matched_signal_keys.contains(&"account.fit_evidence".to_string())
@@ -482,6 +522,28 @@ pub fn prepare_action(
         experiment_assignment_id,
         experiment_arm,
     })
+}
+
+fn mandatory_action_signals_present(brand: &str, matched: &[String]) -> bool {
+    if !brand.eq_ignore_ascii_case("outagehub") {
+        return true;
+    }
+    [
+        "account.distributed_locations",
+        "account.outage_sensitive_decision",
+    ]
+    .iter()
+    .all(|required| matched.iter().any(|key| key == required))
+}
+
+/// Last-mile evidence guard. Qualification applies a richer version of this
+/// check, but the action boundary must remain safe when old CRM observations
+/// were created under an earlier playbook.
+fn credible_action_signal(brand: &str, key: &str, evidence: &str) -> bool {
+    if !brand.eq_ignore_ascii_case("outagehub") {
+        return true;
+    }
+    crate::qualification::credible_outagehub_signal(key, evidence)
 }
 
 pub fn signal_catalog_prompt(brand: &str) -> String {
@@ -622,14 +684,14 @@ pub fn default_plays() -> Vec<GtmPlay> {
         GtmPlay {
             brand: "outagehub".into(),
             key: "historical_outage_replay".into(),
-            version: 4,
+            version: 5,
             name: "Historical location-matched outage replay".into(),
             lifecycle: "testing".into(),
             motion: "internal_pipeline_to_forward_deployed_proof".into(),
             target_icp: "Operators with a source-backed distributed operating footprint where a location-specific outage decision is plausible. Public research must establish the real sites or assets; the diagnostic note may test the exact decision rather than pretend the internal workflow is already known. An internal NOC, dispatch, or software surface strengthens fit but need not be public.".into(),
             target_vantages: vec!["process_owner".into(), "operator".into(), "technical_evaluator".into(), "router".into()],
             required_signal_keys: vec!["account.fit_evidence".into(), "account.outage_sensitive_decision".into(), "account.distributed_locations".into()],
-            minimum_signal_matches: 2,
+            minimum_signal_matches: 3,
             hypothesis: "Location-matched public utility context changes a live classification, dispatch, escalation, hold, transfer, or communication decision.".into(),
             action_policy: "Use the verified footprint to ask one concrete question about the current decision path. Treat the decision and mechanism as hypotheses. If the problem is confirmed, offer one small historical event review; do not lead with an API, webhook, dashboard, or pilot.".into(),
             proof_type: "historical_replay".into(),
@@ -701,7 +763,9 @@ mod tests {
         customer_development_missing, customer_development_stage, default_signal_definitions,
         prepare_action, seed_defaults, GtmActionContext, SignalCandidate,
     };
-    use crate::db::{CustomerDevelopmentRecord, Db, Lead, Person, SignalObservation};
+    use crate::db::{
+        AccountPlayAssessment, CustomerDevelopmentRecord, Db, Lead, Person, SignalObservation,
+    };
     use std::sync::Arc;
     use uuid::Uuid;
 
@@ -819,6 +883,214 @@ mod tests {
         assert!(discovery
             .copy_prompt_block()
             .contains("Never claim that work is manual"));
+        drop(db);
+        remove_temp_db(&path);
+    }
+
+    #[test]
+    fn current_research_needed_assessment_cannot_enter_multitouch_copy() {
+        let path = std::env::temp_dir().join(format!(
+            "spruce-assessment-readiness-test-{}.sqlite",
+            Uuid::new_v4()
+        ));
+        let db = Arc::new(Db::open(&path).expect("open temp db"));
+        seed_defaults(&db).expect("seed GTM defaults");
+        let lead_id = db
+            .upsert_lead(&Lead {
+                brand: "outagehub".into(),
+                apollo_org_id: "org-assessment-held".into(),
+                name: "Held Operator".into(),
+                ..Default::default()
+            })
+            .expect("lead");
+        let person_id = db
+            .upsert_person(&Person {
+                lead_id: lead_id.clone(),
+                brand: "outagehub".into(),
+                apollo_person_id: "person-assessment-held".into(),
+                name: "Pat Operator".into(),
+                vantage: "process_owner".into(),
+                email_status: "verified".into(),
+                ..Default::default()
+            })
+            .expect("person");
+        let signals = vec![
+            SignalCandidate {
+                definition_key: "account.fit_evidence".into(),
+                evidence: "The company operates a Canadian network operations centre.".into(),
+                confidence: 0.9,
+                ..Default::default()
+            },
+            SignalCandidate {
+                definition_key: "account.distributed_locations".into(),
+                evidence: "The company operates multiple remote sites across Canada.".into(),
+                confidence: 0.9,
+                ..Default::default()
+            },
+            SignalCandidate {
+                definition_key: "account.outage_sensitive_decision".into(),
+                evidence: "Operators check utility outages before dispatching to a site.".into(),
+                confidence: 0.9,
+                ..Default::default()
+            },
+        ];
+        db.record_signal_candidates("outagehub", &lead_id, &signals, "test")
+            .expect("signals");
+        let play = db
+            .current_gtm_play("outagehub")
+            .expect("play query")
+            .expect("play");
+        db.upsert_account_play_assessment(&AccountPlayAssessment {
+            lead_id: lead_id.clone(),
+            brand: "outagehub".into(),
+            play_id: play.id,
+            play_version: play.version,
+            status: "research_needed".into(),
+            fit_score: 60,
+            matched_signal_keys: signals
+                .iter()
+                .map(|signal| signal.definition_key.clone())
+                .collect(),
+            ..Default::default()
+        })
+        .expect("assessment");
+
+        let person = db.get_person(&person_id).unwrap().unwrap();
+        let context = prepare_action(&db, "outagehub", &lead_id, &person).expect("context");
+        assert!(!context.action_ready());
+        assert!(!context.sequence_ready_for(7));
+        drop(db);
+        remove_temp_db(&path);
+    }
+
+    #[test]
+    fn generic_cold_storage_facts_do_not_prove_an_outage_decision() {
+        let path = std::env::temp_dir().join(format!(
+            "spruce-outage-signal-test-{}.sqlite",
+            Uuid::new_v4()
+        ));
+        let db = Arc::new(Db::open(&path).expect("open temp db"));
+        seed_defaults(&db).expect("seed GTM defaults");
+        let lead_id = db
+            .upsert_lead(&Lead {
+                brand: "outagehub".into(),
+                apollo_org_id: "org-generic-cold-storage".into(),
+                name: "Generic Cold Storage".into(),
+                ..Default::default()
+            })
+            .expect("lead");
+        let person_id = db
+            .upsert_person(&Person {
+                lead_id: lead_id.clone(),
+                brand: "outagehub".into(),
+                apollo_person_id: "person-generic-cold-storage".into(),
+                name: "Casey Manager".into(),
+                vantage: "process_owner".into(),
+                email_status: "verified".into(),
+                ..Default::default()
+            })
+            .expect("person");
+        db.record_signal_candidates(
+            "outagehub",
+            &lead_id,
+            &[
+                SignalCandidate {
+                    definition_key: "account.fit_evidence".into(),
+                    evidence: "The company provides refrigerated logistics.".into(),
+                    confidence: 0.9,
+                    ..Default::default()
+                },
+                SignalCandidate {
+                    definition_key: "account.distributed_locations".into(),
+                    evidence: "The company operates facilities across Canada.".into(),
+                    confidence: 0.9,
+                    ..Default::default()
+                },
+                SignalCandidate {
+                    definition_key: "account.outage_sensitive_decision".into(),
+                    evidence: "The company provides 24/7 refrigerated logistics and hold control."
+                        .into(),
+                    confidence: 0.9,
+                    ..Default::default()
+                },
+            ],
+            "legacy-test",
+        )
+        .expect("signals");
+
+        let person = db.get_person(&person_id).unwrap().unwrap();
+        let context = prepare_action(&db, "outagehub", &lead_id, &person).expect("context");
+        assert!(!context
+            .matched_signal_keys
+            .contains(&"account.outage_sensitive_decision".to_string()));
+        assert!(!context.action_ready());
+        drop(db);
+        remove_temp_db(&path);
+    }
+
+    #[test]
+    fn complementary_account_facts_can_support_a_cautious_outage_hypothesis() {
+        let path = std::env::temp_dir().join(format!(
+            "spruce-outage-combined-signal-test-{}.sqlite",
+            Uuid::new_v4()
+        ));
+        let db = Arc::new(Db::open(&path).expect("open temp db"));
+        seed_defaults(&db).expect("seed GTM defaults");
+        let lead_id = db
+            .upsert_lead(&Lead {
+                brand: "outagehub".into(),
+                apollo_org_id: "org-operated-cold-storage".into(),
+                name: "Operated Cold Storage".into(),
+                ..Default::default()
+            })
+            .expect("lead");
+        let person_id = db
+            .upsert_person(&Person {
+                lead_id: lead_id.clone(),
+                brand: "outagehub".into(),
+                apollo_person_id: "person-maintenance-owner".into(),
+                name: "Morgan Engineer".into(),
+                vantage: "process_owner".into(),
+                email_status: "verified".into(),
+                ..Default::default()
+            })
+            .expect("person");
+        db.record_signal_candidates(
+            "outagehub",
+            &lead_id,
+            &[
+                SignalCandidate {
+                    definition_key: "account.fit_evidence".into(),
+                    evidence:
+                        "The operator runs automated cold-storage warehouses in three provinces."
+                            .into(),
+                    confidence: 0.9,
+                    ..Default::default()
+                },
+                SignalCandidate {
+                    definition_key: "account.distributed_locations".into(),
+                    evidence: "Facilities are located across Ontario, Alberta, and Quebec.".into(),
+                    confidence: 0.9,
+                    ..Default::default()
+                },
+                SignalCandidate {
+                    definition_key: "account.outage_sensitive_decision".into(),
+                    evidence: "The company provides refrigerated operations around the clock."
+                        .into(),
+                    confidence: 0.9,
+                    ..Default::default()
+                },
+            ],
+            "combined-test",
+        )
+        .expect("signals");
+
+        let person = db.get_person(&person_id).unwrap().unwrap();
+        let context = prepare_action(&db, "outagehub", &lead_id, &person).expect("context");
+        assert!(context
+            .matched_signal_keys
+            .contains(&"account.outage_sensitive_decision".to_string()));
+        assert!(context.action_ready());
         drop(db);
         remove_temp_db(&path);
     }

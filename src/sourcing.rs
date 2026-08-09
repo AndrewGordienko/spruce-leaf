@@ -1020,86 +1020,7 @@ fn credible_canonical_signal(brand: &str, key: &str, evidence: &str) -> bool {
     let text = evidence.to_ascii_lowercase();
     let has = |terms: &[&str]| terms.iter().any(|term| text.contains(term));
     if brand.eq_ignore_ascii_case("outagehub") {
-        return match key.trim() {
-            "account.distributed_locations" => {
-                has(&[
-                    "site",
-                    "facility",
-                    "facilities",
-                    "warehouse",
-                    "residence",
-                    "charger",
-                    "station",
-                    "network",
-                    "asset",
-                    "portfolio",
-                    "store",
-                    "branch",
-                    "terminal",
-                    "plant",
-                    "campus",
-                    "tower",
-                    "location",
-                ]) && has(&[
-                    "multiple",
-                    "several",
-                    "across",
-                    "province",
-                    "region",
-                    "territor",
-                    "nationwide",
-                    "canada",
-                    "remote",
-                    "distributed",
-                    "locations",
-                    "facilities",
-                    "sites",
-                ]) && !(has(&["office", "headquarters", "hq"])
-                    && !has(&[
-                        "site",
-                        "facility",
-                        "facilities",
-                        "warehouse",
-                        "residence",
-                        "charger",
-                        "station",
-                        "network",
-                        "asset",
-                        "store",
-                        "terminal",
-                        "plant",
-                        "tower",
-                    ]))
-            }
-            "account.outage_sensitive_decision" => {
-                has(&[
-                    "outage",
-                    "utility",
-                    "grid",
-                    "loss of power",
-                    "loss-of-power",
-                    "power loss",
-                    "power failure",
-                    "power interruption",
-                    "blackout",
-                    "restoration",
-                ]) && has(&[
-                    "dispatch",
-                    "escalat",
-                    "hold",
-                    "transfer",
-                    "communicat",
-                    "prioriti",
-                    "classif",
-                    "check",
-                    "respond",
-                    "response",
-                    "route",
-                    "investigat",
-                ])
-            }
-            _ => true,
-        };
+        return crate::qualification::credible_outagehub_signal(key, evidence);
     }
     if !brand.eq_ignore_ascii_case("gnk") {
         return true;
@@ -1466,6 +1387,7 @@ async fn qualify_org(
     knowledge: &str,
     research: &str,
 ) -> Result<OrgQual> {
+    let brand_guard = brand_qualification_guard(&pb.key);
     let facts = json!({
         "name": org.name,
         "domain": org.domain(),
@@ -1494,7 +1416,12 @@ async fn qualify_org(
          doctrine fields. THESIS: {thesis}\n\nAPOLLO FACTS (the ONLY things you may state as fact):\n{facts}\n\n{research_block}{knowledge}\n\n\
          Rules: observed_facts must each be supported by the Apollo facts OR the website research \
          above — never invent a customer, metric, or dollar figure. Put every reasonable-but-unproven \
-         guess in inferences. consequence_metric is a measurable consequence, NOT dollars. If at \
+         guess in inferences. Keep physical and operational specificity evidence-bound: a hypothesis \
+         may name a tray, pouch, case, pallet, conveyor, machine, alarm, dispatch, or internal handoff \
+         only when a public source names that object or task. Otherwise use the supported category \
+         (for example, physical packing or handling work) and make discovery identify the actual job. \
+         An inference is not permission to manufacture a concrete station for outreach. \
+         consequence_metric is a measurable consequence, NOT dollars. If at \
          least {min} independent signals don't support the hypothesis, set qualified=false with a \
          one-line reject_reason. Preserve the readable `signals` list, and also map every supported \
          observation you can to `structured_signals` using the canonical catalog. Every canonical \
@@ -1513,13 +1440,21 @@ async fn qualify_org(
          that cause. Score play fit 0-100: 30 signal/decision evidence, 25 root-cause + workaround \
          clarity, 20 reachable stakeholder vantage, 15 bounded-proof fit, 10 credible timing/why-now. \
          A generic industry, technology, hiring, or scale match cannot score 65. Put real blockers in \
-         disqualifiers and unknown evidence in evidence_gaps.\n\n{signal_catalog}",
+         disqualifiers and unknown evidence in evidence_gaps.\n\n{brand_guard}\n\n{signal_catalog}",
         facts = serde_json::to_string_pretty(&facts).unwrap_or_default(),
         min = pb.min_signals,
     );
     client
         .structured_bulk::<OrgQual>("source.qualify", system, &user, qual_schema())
         .await
+}
+
+fn brand_qualification_guard(brand: &str) -> &'static str {
+    if brand.eq_ignore_ascii_case("outagehub") {
+        "OUTAGEHUB ACCOUNT GUARD: A company is not qualified merely because it has offices, uses electricity, sells fuel or electrical equipment, installs generators or solar, runs generic field service, or names routing software. Customer delivery addresses are not the company's operated sites. Qualify either (a) direct first-party evidence of an outage-time classification, dispatch, escalation, continuity, transfer, hold, or communication decision, OR (b) a first-party operating footprint where grid loss obviously affects a time-sensitive service: an operated EV charging network, diagnostic laboratory network, cold-storage facilities, senior-care portfolio, telecom/NOC-managed sites, or a generator/temporary-power response fleet. Path (b) supports asking one cautious workflow hypothesis; it does not prove the private alarm, triage, or dispatch process. Record the public operating responsibility as evidence and leave the internal decision explicitly unverified. Reject contractors, installers, equipment sellers, and ordinary multi-office businesses unless they operate the relevant distributed service. A recent outage at a prospect site is never required."
+    } else {
+        ""
+    }
 }
 
 async fn assign_vantage(
@@ -2210,6 +2145,7 @@ pub async fn refresh_lead_context(
         "You refresh commercial framing for companies already qualified for {name}. Motion: {motion}. \
          Keep the company; rewrite why it fits now. Separate supported facts, inferences, and a \
          falsifiable workflow hypothesis. Never invent customers, metrics, systems, or dollar impact. \
+         Do not invent physical objects, stations, alarms, or private handoffs to make the hypothesis sound concrete. \
          Return only the requested structured data.",
         name = pb.name,
         motion = pb.motion,
@@ -2394,6 +2330,7 @@ async fn refresh_one_lead(
     website_research: &str,
     knowledge: &str,
 ) -> Result<LeadRefresh> {
+    let brand_guard = brand_qualification_guard(&pb.key);
     let facts = json!({
         "name": lead.name,
         "domain": lead.domain,
@@ -2432,7 +2369,11 @@ async fn refresh_one_lead(
          `why` remain analyst hypotheses. Put the supporting official URL in source_url for every \
          structured signal derived from the new website evidence. \
          Never invent customers, systems, volumes, or dollar figures. consequence_metric is measurable \
-         and non-dollar. why_this_company: one plain sentence a founder could say out loud. Preserve \
+         and non-dollar. A hypothesis or mechanism may name a physical object, station, machine, alarm, \
+         dispatch, or private handoff only when the observed facts or official-site research names it. \
+         Otherwise stay at the supported task category and make discovery identify the actual work. \
+         Do not promote an old inference into concrete copy merely because it sounds plausible. \
+         why_this_company: one plain sentence a founder could say out loud. Preserve \
          readable `signals` and map supported evidence to `structured_signals` using only the catalog. \
          Every structured signal's evidence must quote or closely paraphrase a prior_observed_fact; \
          prior_inferences, prior_hypothesis, prior_signals, technology lists, and generic company breadth \
@@ -2442,10 +2383,9 @@ async fn refresh_one_lead(
          Separate symptom from root cause, describe the current workaround without asserting guesses \
          as fact, state why the bounded proof fits, and score the account against the same 100-point \
          play-fit rubric used during sourcing. Unknowns go in evidence_gaps; hard blockers go in \
-         disqualifiers.\n\n{signal_catalog}",
+         disqualifiers.\n\n{brand_guard}\n\n{signal_catalog}",
         facts = serde_json::to_string_pretty(&facts).unwrap_or_default(),
     );
-    let _ = pb; // brand motion already in system prompt
     client
         .structured_bulk::<LeadRefresh>("source.refresh", system, &user, refresh_schema())
         .await

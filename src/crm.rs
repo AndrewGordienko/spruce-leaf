@@ -788,6 +788,7 @@ async fn strategy_api(State(state): State<WebState>) -> impl IntoResponse {
             "planner": state.playbooks.shared.personas.planner,
             "writer": state.playbooks.shared.personas.writer,
             "reviewer": state.playbooks.shared.personas.reviewer,
+            "psychology": state.playbooks.shared.personas.psychology,
             "sales_council": state.playbooks.shared.personas.critics.iter().map(|critic| serde_json::json!({
                 "id": critic.id,
                 "name": critic.name,
@@ -1903,6 +1904,11 @@ fn render_strategy_hub(
             "Reviewer",
             "playbooks/personas/reviewer.md",
             &playbooks.shared.personas.reviewer,
+        ),
+        (
+            "Response design",
+            "playbooks/personas/psychology.md",
+            &playbooks.shared.personas.psychology,
         ),
     ] {
         b.push_str(&format!(

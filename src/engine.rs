@@ -2195,10 +2195,12 @@ fn openai_output_cap(stage: &str) -> u64 {
         | "source.vantage"
         | "source.website_research"
         | "source.refresh"
-        | "outreach.plan"
-        | "outreach.review_edit"
-        | "outreach.verify_final"
         | "outreach.eval_pairwise" => 4_096,
+        // Frontier reasoning tokens share the output allowance with strict
+        // JSON. Planning and review regularly need more than 4k at xhigh even
+        // though the visible document is small; truncating them throws away a
+        // completed generation instead of improving copy quality.
+        "outreach.plan" | "outreach.review_edit" | "outreach.verify_final" => 8_192,
         // xhigh reasoning tokens count against this allowance. Seven complete
         // touches plus strict JSON need headroom after the model has reasoned;
         // 6,144 repeatedly terminated valid Sol runs before the closing JSON.

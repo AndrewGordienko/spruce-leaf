@@ -40,7 +40,9 @@ For each account, separate what you can support from what you are guessing:\n\
   - observed_facts: 2-4 publicly supportable facts (only these may later be stated as fact).\n\
   - inferences: 1-3 reasonable but unproven guesses the facts make plausible.\n\
   - hypothesis: the ONE commercial question — the specific recurring workflow/decision that may \
-be expensive, framed as something to test.\n\
+be expensive, framed as something to test. Name a physical object, station, machine, alarm, or \
+private handoff only when an observed fact names it; otherwise use the supported task category and \
+make discovery identify the actual work.\n\
   - mechanism: WHY the burden, time, or risk occurs (e.g. the record is in one system, the \
 evidence needed to act on it is spread across others).\n\
   - consequence_metric: a metric that could be MEASURED if the hypothesis holds (hours, decisions \
@@ -187,9 +189,8 @@ linkedin_request/5, email/9, linkedin_or_email/13, email/17, linkedin_or_email/2
 The connection request is 8–24 words with no pitch or meeting ask. Conditional touches are short \
 LinkedIn DMs when connected and email fallbacks otherwise. Finish by day 21. Touch 1 email is \
 {min}–{max} words including the greeting and signature; later emails are shorter but substantive; touch 7 has no question. \
-Mention {brand} only in touch 1. Use at most one \
-question, one CTA, one verified account fact, and one short sentence about {brand} per touch. \
-Subjects are 2–6 plain lowercase words with no numbers or question marks. Do not use fake familiarity, explain your strategy, dump the \
+Mention {brand} only in touch 1. Use at most one central operating question, one CTA, one verified account fact, and one short explanation of {brand} per touch. \
+Touch one may use a related diagnostic question plus a short CTA. Subjects are 3–9 plain, specific operational words with no numbers or question marks; sentence or title case is fine. Do not use fake familiarity, explain your strategy, dump the \
 research, or assert limitations of the recipient's tools.\n\n\
 Follow the length band, the voice, the forbidden list, and the pre-send test from the doctrine. \
 Center the operating decision, not {brand}. In four touches, T2 sharpens the mechanism, T3 is a \

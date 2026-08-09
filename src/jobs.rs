@@ -155,6 +155,8 @@ pub fn schedule_next(
 #[serde(default)]
 pub struct JobPayload {
     pub thesis: String,
+    /// Optional private response objective for outreach planning.
+    pub outcome: String,
     pub accounts: usize,
     pub contacts: usize,
     pub limit: usize,
@@ -348,6 +350,7 @@ async fn execute(
                         .clamp(1, 2),
                 ),
                 None,
+                (!payload.outcome.trim().is_empty()).then_some(payload.outcome.trim()),
                 None,
             )
             .await?;
