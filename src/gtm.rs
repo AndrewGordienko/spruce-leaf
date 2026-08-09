@@ -382,7 +382,7 @@ impl GtmActionContext {
             .join("\n");
         let action = match self.state.as_str() {
             "action_ready" => "The account has enough sourced evidence for one narrow commercial note. Use only a supplied observation as the company-specific signal. Lead with a role-relevant implication and a credible point of view. A cold outcome may be a short working conversation, interest, correction, or referral; it is not yet a pilot or proof. Never invent collateral or claim an asset exists unless verified seller context explicitly supplies it.",
-            "discovery_ready" => "The company fit and this recipient's operating vantage are sourced, but the internal workflow problem is not public evidence. At most, write one manual hypothesis-safe routing note. State only supplied company facts. Never claim that work is manual, expensive, recurring, fragmented, or cross-system. Never propose a proof, pilot, integration, or product evaluation.",
+            "discovery_ready" => "The company fit and this recipient's operating vantage are sourced, but the internal workflow problem is not public evidence. At most, write one manual hypothesis-safe discovery note. State only supplied company facts and frame the private workflow as a question. When the title is a credible operator, process owner, or operational executive and the public workflow category is specific, a short discovery conversation plus an email-reply alternative is permitted; discovery is not the same as a demo or product evaluation. A router should only be asked to route. Never claim that work is manual, expensive, recurring, fragmented, or cross-system. Never propose a proof, pilot, integration, or product evaluation.",
             _ => "The account does not yet have enough sourced evidence for a multi-touch sequence. Hold it for research or use one manual routing note; do not manufacture discovery questions or explain a proof, integration, pilot, or product.",
         };
         format!(
@@ -883,6 +883,9 @@ mod tests {
         assert!(discovery
             .copy_prompt_block()
             .contains("Never claim that work is manual"));
+        assert!(discovery
+            .copy_prompt_block()
+            .contains("short discovery conversation plus an email-reply alternative is permitted"));
         drop(db);
         remove_temp_db(&path);
     }

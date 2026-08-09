@@ -1329,7 +1329,7 @@ async fn plan_sequence(
         "operator_requested_outcome_internal_only": desired_outcome.unwrap_or("No narrower outcome supplied; choose the smallest useful cold response for this vantage and evidence state."),
     });
     let user = format!(
-        "Plan a {n}-touch no-reply sequence for this recipient. Hypotheses define the decision and mechanism but are not facts. First complete the private response_strategy: the exact response Andrew needs, why it could matter to this role, one concrete operating scene, the credibility basis, the smallest voluntary commitment, and what would trigger reactance. Honor an operator-requested outcome only when it is earned by the evidence and this person's vantage; otherwise reduce it to the nearest honest step. Before selecting the thread, compare three distinct T1 approaches: problem-sniffing from the strongest source, a concise commercial point of view, and an existence-or-routing note. Prefer the one with the clearest recipient reason to answer and lowest evidence risk; do not blend them. State the selected approach and why in overall_strategy.\n\nACCOUNT BRIEF:\n{account}\n\nRECIPIENT:\n{recipient}\n\nPRIVATE GTM ACTION CONTEXT:\n{gtm_context}\n\nRELEVANT PLANNING KNOWLEDGE:\n{knowledge}\n\nT1 connects a verified trigger to one operating decision and one role-matched ask. T2 advances the mechanism. T3 is a human LinkedIn request. T4, when present, adds a sourced fact, useful distinction, objection answer, route, or close. Never invent collateral or a later stage merely to fill the plan. For each touch return stage, channel, objective, angle, and at most one ask. Never make LinkedIn say only that an email was sent. If action state is research_required, do not plan. Cite only principle IDs that changed the plan.",
+        "Plan a {n}-touch no-reply sequence for this recipient. Hypotheses define the decision and mechanism but are not facts. First complete the private response_strategy: the exact response Andrew needs, why it could matter to this role, one concrete operating scene, the credibility basis, the smallest voluntary commitment, and what would trigger reactance. Honor an operator-requested outcome when it is earned by the evidence and this person's vantage; otherwise reduce it to the nearest honest step. Discovery-ready means the private problem remains a question, not that Andrew may ask only for routing: when the public workflow category is specific and the recipient is a credible operator, process owner, or operational executive, a short discovery conversation plus an email-reply alternative is an earned cold outcome. Reserve routing-only treatment for routers or misaligned titles. Before selecting the thread, compare three distinct T1 approaches: problem-sniffing from the strongest source, a concise commercial point of view, and an existence-or-routing note. Prefer the one with the clearest recipient reason to answer and lowest evidence risk; do not blend them. State the selected approach and why in overall_strategy.\n\nACCOUNT BRIEF:\n{account}\n\nRECIPIENT:\n{recipient}\n\nPRIVATE GTM ACTION CONTEXT:\n{gtm_context}\n\nRELEVANT PLANNING KNOWLEDGE:\n{knowledge}\n\nT1 connects a verified trigger to one operating decision and one role-matched ask. T2 advances the mechanism. T3 is a human LinkedIn request. T4, when present, adds a sourced fact, useful distinction, objection answer, route, or close. Never invent collateral or a later stage merely to fill the plan. For each touch return stage, channel, objective, angle, and at most one ask. Never make LinkedIn say only that an email was sent. If action state is research_required, do not plan. Cite only principle IDs that changed the plan.",
         account = serde_json::to_string_pretty(&account).unwrap_or_default(),
         recipient = serde_json::to_string_pretty(&recipient).unwrap_or_default(),
         knowledge = knowledge.block,
@@ -3704,9 +3704,14 @@ fn sequence_quality_issues(
         if is_email_capable_channel(&channel) {
             let subject_words = touch.subject.split_whitespace().count();
             if touch.stage == 1 {
-                if !(3..=9).contains(&subject_words) {
+                // Prompt toward 3–9 words, but tolerate a specific two-word
+                // subject. Throwing away an otherwise reviewed sequence after
+                // a final editor changes "Packing format changes" to
+                // "Format changes" is mechanical overreach, not quality
+                // control.
+                if !(2..=9).contains(&subject_words) {
                     issues.push(format!(
-                        "stage 1 subject has {subject_words} words (needs 3–9)"
+                        "stage 1 subject has {subject_words} words (needs 2–9)"
                     ));
                 }
             } else {
@@ -4868,9 +4873,9 @@ mod tests {
                 day_offset: day,
                 channel: "email".into(),
                 subject: if stage == 1 {
-                    "Case handling review".into()
+                    "Case handling".into()
                 } else {
-                    "re: Case handling review".into()
+                    "re: Case handling".into()
                 },
                 body: format!("Hi Maya,\n\n{middle}\n\n{signature}"),
                 purpose: "continue one conversation".into(),
@@ -4906,7 +4911,7 @@ mod tests {
                         stage: 5,
                         day_offset: 13,
                         channel: "linkedin_or_email".into(),
-                        subject: "re: Case handling review".into(),
+                        subject: "re: Case handling".into(),
                         body: format!("Hi Maya,\n\nThe screen is practical and takes a minute to scan. Happy to send it without arranging a call.\n\n{signature}"),
                         purpose: "offer one useful resource".into(),
                         goal: "make replying worthwhile".into(),
@@ -4920,7 +4925,7 @@ mod tests {
                         stage: 7,
                         day_offset: 21,
                         channel: "linkedin_or_email".into(),
-                        subject: "re: Case handling review".into(),
+                        subject: "re: Case handling".into(),
                         body: format!("Hi Maya,\n\nI will close the thread here. Thanks for considering it.\n\n{signature}"),
                         purpose: "close".into(),
                         goal: "stop respectfully".into(),
