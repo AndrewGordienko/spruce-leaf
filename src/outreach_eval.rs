@@ -12,35 +12,35 @@ use crate::engine::Engine;
 
 const HUMAN_STYLE_RUBRIC: &str = include_str!("../evals/style-guide-rubric.md");
 
-#[derive(Debug, Deserialize)]
-struct EvalCase {
-    id: String,
-    brand: String,
-    account: String,
-    recipient: String,
-    title: String,
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct EvalCase {
+    pub(crate) id: String,
+    pub(crate) brand: String,
+    pub(crate) account: String,
+    pub(crate) recipient: String,
+    pub(crate) title: String,
     #[serde(default)]
-    verified_facts: Vec<String>,
+    pub(crate) verified_facts: Vec<String>,
     #[serde(default)]
-    verified_seller_facts: Vec<String>,
+    pub(crate) verified_seller_facts: Vec<String>,
     #[serde(default)]
-    hypothesis_not_fact: String,
-    candidate_a: String,
-    candidate_b: String,
+    pub(crate) hypothesis_not_fact: String,
+    pub(crate) candidate_a: String,
+    pub(crate) candidate_b: String,
     /// Human gold label: a, b, or tie.
-    expected: String,
+    pub(crate) expected: String,
     #[serde(default)]
-    editor_note: String,
+    pub(crate) editor_note: String,
 }
 
 #[derive(Debug, Deserialize)]
-struct PairwiseVerdict {
-    preferred: String,
-    rationale: String,
+pub(crate) struct PairwiseVerdict {
+    pub(crate) preferred: String,
+    pub(crate) rationale: String,
     #[serde(default)]
-    unsupported_claims_a: Vec<String>,
+    pub(crate) unsupported_claims_a: Vec<String>,
     #[serde(default)]
-    unsupported_claims_b: Vec<String>,
+    pub(crate) unsupported_claims_b: Vec<String>,
 }
 
 pub async fn run(engine: &Engine, path: &Path, double_blind: bool) -> Result<()> {
@@ -108,7 +108,7 @@ pub async fn run(engine: &Engine, path: &Path, double_blind: bool) -> Result<()>
     Ok(())
 }
 
-fn load(path: &Path) -> Result<Vec<EvalCase>> {
+pub(crate) fn load(path: &Path) -> Result<Vec<EvalCase>> {
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     BufReader::new(file)
         .lines()
@@ -151,13 +151,26 @@ async fn judge(engine: &Engine, case: &EvalCase, swap: bool) -> Result<PairwiseV
         .await
 }
 
+pub(crate) async fn judge_candidates(
+    engine: &Engine,
+    case: &EvalCase,
+    candidate_a: &str,
+    candidate_b: &str,
+    swap: bool,
+) -> Result<PairwiseVerdict> {
+    let mut comparison = case.clone();
+    comparison.candidate_a = candidate_a.to_string();
+    comparison.candidate_b = candidate_b.to_string();
+    judge(engine, &comparison, swap).await
+}
+
 fn eval_system_prompt() -> String {
     format!(
         "You are a blind, skeptical cold-outreach evaluator. Choose the message a sensible recipient is more likely to answer under the human style rubric below. Judge evidence safety, recipient relevance, specificity, natural spoken language, cognitive load, and whether replying is easy. Minimum length is not the goal: reward the minimum information needed to make a reply worthwhile, and do not prefer a terse note when it forces the recipient to decode jargon or lacks a reason to care. A short discovery call plus an email alternative is a valid first ask for a credible workflow owner when the note earns it. A scripted yes/no/category/referral menu is not low friction; it makes the recipient complete the sender's form. Penalize invented task nouns and internal labels even when they make a note shorter or more concrete. Do not reward polish or visible framework compliance.\n\nThe verified account facts and verified seller facts are separate exhaustive evidence boundaries; a supplied hypothesis is not a fact. Allow faithful paraphrases, explicitly uncertain questions, reasonable role-vantage inferences, and conservative subset claims. Flag only materially new declarative account details, outcomes, or seller capabilities that cross either boundary. Return tie only when neither is materially better. Never infer the preferred answer from candidate order.\n\nHUMAN STYLE RUBRIC:\n{HUMAN_STYLE_RUBRIC}"
     )
 }
 
-fn normalize_label(value: &str) -> &str {
+pub(crate) fn normalize_label(value: &str) -> &str {
     match value.trim().to_ascii_lowercase().as_str() {
         "a" | "candidate_a" => "a",
         "b" | "candidate_b" => "b",
@@ -166,7 +179,7 @@ fn normalize_label(value: &str) -> &str {
     }
 }
 
-fn swap_label(value: &str) -> &str {
+pub(crate) fn swap_label(value: &str) -> &str {
     match normalize_label(value) {
         "a" => "b",
         "b" => "a",

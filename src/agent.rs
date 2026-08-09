@@ -123,6 +123,10 @@ struct PlanOptions<'a> {
     per_account_cap: Option<usize>,
     person_filter: Option<&'a str>,
     desired_outcome: Option<&'a str>,
+    /// Standalone planning owns its transcript. Full motion already explains
+    /// account selection, so nested readiness checks stay quiet unless copy is
+    /// actually drafted or a real error needs to be surfaced.
+    show_holds: bool,
 }
 
 struct FullMotionOptions<'a> {
@@ -696,7 +700,7 @@ impl Agent {
             "run_full_motion" => (
                 "Running full motion".into(),
                 format!(
-                    "{brand} · {} accounts · {} people each · {} touches",
+                    "{brand} · {} accounts · {} mapped contacts each · 1 primary sequence per account · {} touches",
                     step.accounts.unwrap_or(5),
                     step.contacts.unwrap_or(5),
                     step.touches.unwrap_or(7)
@@ -1012,19 +1016,22 @@ impl Agent {
         limit: usize,
         phone: bool,
         only_person_ids: Option<&std::collections::HashSet<String>>,
+        transient: bool,
     ) -> Result<enrich::EnrichSummary, String> {
         let apollo = Apollo::from_env().map_err(|e| format!("Can't enrich: {e:#}"))?;
-        let view = ui::SourceView::start_enrichment(
-            format!(
-                "{} · up to {limit} contacts · email reveal + verification{}",
-                self.playbooks
-                    .get(&self.brand)
-                    .map(|playbook| playbook.name.as_str())
-                    .unwrap_or(self.brand.as_str()),
-                if phone { " + phone" } else { "" }
-            ),
-            self.client.stats(),
+        let header = format!(
+            "{} · up to {limit} contacts · email reveal + verification{}",
+            self.playbooks
+                .get(&self.brand)
+                .map(|playbook| playbook.name.as_str())
+                .unwrap_or(self.brand.as_str()),
+            if phone { " + phone" } else { "" }
         );
+        let view = if transient {
+            ui::SourceView::start_enrichment_transient(header, self.client.stats())
+        } else {
+            ui::SourceView::start_enrichment(header, self.client.stats())
+        };
         let progress = view.enrich_reporter();
         let result = enrich::enrich_pending(
             &self.db,
@@ -1044,7 +1051,7 @@ impl Agent {
     }
 
     async fn enrich_people(&self, limit: usize, phone: bool) -> String {
-        match self.do_enrich(limit, phone, None).await {
+        match self.do_enrich(limit, phone, None, false).await {
             Ok(s) => format!(
                 "Enriched {} people: {} emails found, {} verified. Next, ask me to plan outreach.",
                 s.attempted, s.emails_found, s.verified
@@ -1070,6 +1077,7 @@ impl Agent {
             per_account_cap,
             person_filter,
             desired_outcome,
+            show_holds,
         } = options;
         let requested_touches = touches.max(1);
         let touches = outreach::supported_touch_count(requested_touches);
@@ -1152,7 +1160,7 @@ impl Agent {
                     }
                 }
             }
-            if !held_accounts.is_empty() {
+            if !held_accounts.is_empty() && show_holds {
                 ui::activity(
                     "Held weak account hypotheses",
                     format!(
@@ -1280,6 +1288,7 @@ impl Agent {
                         scope.pending_enrichment_ids.len(),
                         false,
                         Some(&scope.pending_enrichment_ids),
+                        false,
                     )
                     .await
                 {
@@ -1355,7 +1364,7 @@ impl Agent {
                 .collect::<Vec<_>>();
             lead_ids.sort();
             lead_ids.dedup();
-            self.do_refresh_context("", &lead_ids).await;
+            self.do_refresh_context("", &lead_ids, true).await;
         }
 
         // A bare "first N people" means the first N sequenceable people, not
@@ -1443,7 +1452,7 @@ impl Agent {
                                 candidate_leads.len()
                             ),
                         );
-                        self.do_refresh_context("", &candidate_leads).await;
+                        self.do_refresh_context("", &candidate_leads, true).await;
                         for person in &all_people {
                             if ready_count(person_ids) >= target {
                                 break;
@@ -1504,6 +1513,7 @@ impl Agent {
                 per_account_cap: None,
                 person_filter,
                 desired_outcome,
+                show_holds: true,
             })
             .await
         {
@@ -1626,9 +1636,9 @@ impl Agent {
             };
             if motion_rounds == 1 {
                 ui::activity(
-                    "Inspected on-file inventory",
+                    "Selecting accounts",
                     format!(
-                        "{} eligible account(s) · {} account slot(s) short · {} mapped people ({} verified)",
+                        "target {accounts} · {} reusable account(s) · {} initial shortfall · {} mapped people ({} verified)",
                         reuse.accounts_on_file,
                         reuse.accounts_shortfall,
                         reuse.people_on_file,
@@ -1646,20 +1656,18 @@ impl Agent {
             {
                 let want = remaining.saturating_sub(reuse.accounts_selected).max(1);
                 source_passes += 1;
-                ui::activity(
-                    if source_passes == 1 {
+                if source_passes == 1 {
+                    ui::activity(
                         if force_new {
-                            "Sourcing new accounts"
+                            "Finding new accounts"
                         } else {
-                            "Filling account shortfall"
-                        }
-                    } else {
-                        "Adaptive sourcing pass"
-                    },
-                    format!(
-                        "pass {source_passes}/{max_source_passes} · need {want} more account slot(s) · prior misses refine the next ICP"
-                    ),
-                );
+                            "Finding replacements"
+                        },
+                        format!(
+                            "need {want} more · up to {max_source_passes} adaptive searches · prior misses refine later searches"
+                        ),
+                    );
+                }
                 // Interleave upstream search with downstream fulfillment. A
                 // ten-to-twenty-company deep-research wave can consume the
                 // entire turn before writing begins; a bounded wave learns or
@@ -1720,16 +1728,6 @@ impl Agent {
                 break;
             }
 
-            ui::activity(
-                "Working replacement set",
-                format!(
-                    "{} account(s) · {} mapped people · {} already verified · {} slot(s) still open",
-                    reuse.accounts_selected,
-                    reuse.people_selected,
-                    reuse.verified_selected,
-                    remaining,
-                ),
-            );
             people_selected_total += reuse.people_selected;
 
             // Preserve already-reviewed current-policy work on an ordinary run.
@@ -1767,7 +1765,7 @@ impl Agent {
                 .cloned()
                 .collect::<std::collections::HashSet<_>>();
 
-            refreshed_total += self.do_refresh_context(thesis, &plan_leads).await;
+            refreshed_total += self.do_refresh_context(thesis, &plan_leads, false).await;
 
             let need_enrich = self
                 .db
@@ -1781,7 +1779,7 @@ impl Agent {
                 .unwrap_or(0);
             if need_enrich > 0 {
                 match self
-                    .do_enrich(need_enrich, false, Some(&plan_person_ids))
+                    .do_enrich(need_enrich, false, Some(&plan_person_ids), true)
                     .await
                 {
                     Ok(summary) => verified_total += summary.verified,
@@ -1820,10 +1818,6 @@ impl Agent {
                     })
                     .unwrap_or(0);
                 verified_total += verified_now;
-                ui::activity(
-                    "Enrichment skipped",
-                    format!("{verified_now} selected contact(s) already verified · 0 Apollo reveal credits"),
-                );
             }
 
             let first_plan = self
@@ -1835,6 +1829,7 @@ impl Agent {
                     per_account_cap: Some(contacts),
                     person_filter: None,
                     desired_outcome,
+                    show_holds: false,
                 })
                 .await;
             let mut pass = match first_plan {
@@ -1897,6 +1892,7 @@ impl Agent {
                         per_account_cap: Some(contacts),
                         person_filter: None,
                         desired_outcome,
+                        show_holds: false,
                     })
                     .await
                 {
@@ -1952,7 +1948,7 @@ impl Agent {
 
         if fulfilled.len() >= accounts {
             return format!(
-                "Full motion filled {filled}/{accounts} account slots with current reviewed {effective_touches}-touch sequences. {planned} sequence(s) were newly written; {drafted} touches remain drafts and {scheduled} were scheduled. {apollo_note}. Refreshed {refreshed_total} account(s) and processed {people_selected_total} mapped-contact selection(s), including {verified_total} verified result(s); the motion maps {contacts} contacts per account as coverage while activating one primary recipient at a time. Nothing was sent. CRM: {url}.",
+                "Full motion filled {filled}/{accounts} account slots with current reviewed {effective_touches}-touch sequences. {planned} primary sequence(s) were newly written; {drafted} touches remain drafts and {scheduled} were scheduled. {apollo_note}. Refreshed {refreshed_total} account(s) and processed {people_selected_total} mapped-contact selection(s), including {verified_total} verified result(s). The motion maps {contacts} contacts per account for coverage but shows and activates one primary sequence per account; secondary contacts remain visible in GTM Lab. Nothing was sent. CRM: {url}.",
                 filled = fulfilled.len(),
                 planned = people_planned_total,
                 drafted = touches_drafted_total,
@@ -1962,7 +1958,7 @@ impl Agent {
         }
 
         format!(
-            "Full motion persisted through {rounds} replacement round(s) and filled {filled}/{accounts} account slots before hitting a real execution boundary: {reason}. {apollo_note}. It rejected {rejected} copy attempt(s), held {held} weak recipient/account attempt(s), and left {stopped} unfinished after the boundary; none of those counted as completed output. Nothing was sent. CRM: {url}.",
+            "Full motion persisted through {rounds} replacement round(s) and filled {filled}/{accounts} account slots before hitting a real execution boundary: {reason}. That means {filled} primary sequence(s) reached Pipeline, not {accounts}; mapped secondary contacts remain in GTM Lab. {apollo_note}. It rejected {rejected} copy attempt(s), held {held} weak recipient/account attempt(s), and left {stopped} unfinished after the boundary; none of those counted as completed output. Nothing was sent. CRM: {url}.",
             rounds = motion_rounds,
             filled = fulfilled.len(),
             reason = terminal_reason.unwrap_or_else(|| "unknown execution boundary".to_string()),
@@ -1974,7 +1970,12 @@ impl Agent {
     }
 
     /// Refresh doctrine framing for leads already on file (no Apollo).
-    async fn do_refresh_context(&self, thesis: &str, lead_ids: &[String]) -> usize {
+    async fn do_refresh_context(
+        &self,
+        thesis: &str,
+        lead_ids: &[String],
+        show_result: bool,
+    ) -> usize {
         if lead_ids.is_empty() {
             return 0;
         }
@@ -1987,6 +1988,8 @@ impl Agent {
             Err(_) => return 0,
         };
         let lib = self.library.read().await.clone();
+        // The spinner is transient on a TTY; `show_result` controls only the
+        // durable transcript block printed after it finishes.
         let work = ui::Spinner::start("Refreshing account framing");
         let result = sourcing::refresh_lead_context(
             &self.db,
@@ -2002,23 +2005,29 @@ impl Agent {
         drop(work);
         match result {
             Ok(0) => {
-                ui::activity(
-                    "Account framing reused",
-                    "recent source-backed framing retained · 0 refresh model calls",
-                );
+                if show_result {
+                    ui::activity(
+                        "Account framing reused",
+                        "recent source-backed framing retained · 0 refresh model calls",
+                    );
+                }
                 0
             }
             Ok(n) => {
-                ui::activity(
-                    "Refreshed account framing",
-                    format!(
-                        "{n} account(s) · official site re-read + evidence reassessed · no Apollo"
-                    ),
-                );
+                if show_result {
+                    ui::activity(
+                        "Refreshed account framing",
+                        format!(
+                            "{n} account(s) · official site re-read + evidence reassessed · no Apollo"
+                        ),
+                    );
+                }
                 n
             }
             Err(e) => {
-                ui::activity("Framing refresh skipped", format!("{e:#}"));
+                if show_result {
+                    ui::activity("Framing refresh skipped", format!("{e:#}"));
+                }
                 0
             }
         }

@@ -35,6 +35,11 @@ their own account and recipient.
   ask for the smallest useful voluntary step, and remove pressure likely to
   trigger reactance. Never manufacture authority, reciprocity, social proof,
   scarcity, urgency, or shared identity.
+- Grade the inbox before the argument. A subject must name the recognizable
+  operating event, decision, object, or consequence—not merely the topic.
+  Labels such as "utility status," "power alarms," "claim evidence," and
+  "decision trail" are accurate but too generic to deserve an open. The first
+  two lines must then sound natural aloud, not like an internal research memo.
 
 ## OutageHub
 

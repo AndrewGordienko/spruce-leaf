@@ -30,7 +30,10 @@ use uuid::Uuid;
 
 /// Increment when the buyer-facing copy contract changes materially. The CRM
 /// only presents sequences approved under the current policy.
-pub const CURRENT_COPY_POLICY_VERSION: i64 = 9;
+// v10 makes inbox-worthiness part of sendability: generic topical subjects,
+// internal-memo phrasing, and legacy one-line response scripts must be rewritten
+// before a sequence returns to Pipeline.
+pub const CURRENT_COPY_POLICY_VERSION: i64 = 10;
 
 /// A real company sourced from Apollo and (optionally) qualified against a brand
 /// thesis. Everything the model *guesses* stays in the inference/hypothesis

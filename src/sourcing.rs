@@ -309,6 +309,14 @@ pub async fn source(
         thesis,
     )
     .await?;
+    // Apollo treats a long keyword-tag list as a broad net. For OutageHub that
+    // repeatedly surfaced contractors, generic field service, and energy
+    // suppliers instead of operators of one outage-sensitive service. Keep the
+    // model's highest-priority tags and let later adaptive passes choose a new
+    // vertical from the accumulated qualification learnings.
+    if pb.key.eq_ignore_ascii_case("outagehub") && icp.keywords.len() > 6 {
+        icp.keywords.truncate(6);
+    }
     icp.employee_ranges = clamp_employee_ranges(icp.employee_ranges, pb.max_employees);
     report_source(
         progress.as_ref(),
@@ -1353,6 +1361,11 @@ async fn derive_icp(
         firmographic.push(' ');
         firmographic.push_str(pb.icp_note.trim());
     }
+    let search_discipline = if pb.key.eq_ignore_ascii_case("outagehub") {
+        " OUTAGEHUB SEARCH DISCIPLINE: choose exactly one source-backed operating vertical for this pass (for example an operated charging network, diagnostic laboratory network, cold-storage operator, senior-care portfolio, telecom/NOC network, or generator/temporary-power response fleet). Return only 3-6 narrow organization keyword tags for that one vertical. Do not mix broad terms such as energy, field service, utilities, contractors, renewable, electrical, or operations. If prior learnings show that this vertical has already produced mostly misses, move to a different canonical vertical rather than broadening the keywords."
+    } else {
+        ""
+    };
     let context_block = if business_context.trim().is_empty() {
         String::new()
     } else {
@@ -1366,7 +1379,7 @@ async fn derive_icp(
          keyword match. Include the job titles/seniorities of the people who would OWN or OBSERVE the \
          workflow (by vantage, not just seniority). Keep keywords concrete and industry-specific. \
          Employee ranges must use Apollo's bucket format like \"51,200\".{firmographic} If the thesis \
-         implies a region, set locations.\n\n{doctrine}",
+         implies a region, set locations.{search_discipline}\n\n{doctrine}",
         motion = pb.motion,
         doctrine = core_strategy_block("icp"),
     );
@@ -2757,7 +2770,7 @@ mod tests {
             ),
             (
                 "account.distributed_locations",
-                "Operates remote locations across utility territories.",
+                "Operates remote telecom towers and network sites across utility territories.",
             ),
         ]
         .into_iter()

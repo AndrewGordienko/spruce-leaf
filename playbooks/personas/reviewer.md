@@ -9,6 +9,13 @@ subject, and the first two lines. The recipient must have a plausible reason of
 their own to keep reading and answer. Andrew wanting research is not that
 reason. A clean email that is easy to ignore fails.
 
+Grade the subject before allowing the body to rescue it. "Utility status,"
+"power alarms," "claim evidence," "decision trail," and "automation question"
+are topical labels, not reasons to open. A passing subject plainly names a
+recognizable operating event, decision, object, or consequence and creates a
+small accurate knowledge gap. It remains understated and forwardable; clickbait
+and manufactured curiosity fail too.
+
 Judge the copy against the private response brief. The desired response must be
 appropriate to the recipient's vantage, the role-relevant motive must be
 plausible without mind-reading, the operating scene must be concrete, and the
@@ -63,8 +70,8 @@ Score the final wording on:
 - whether email one follows the brand-specific word band, usually in 4–10 spoken
   sentences, and whether every follow-up is materially shorter but substantive;
 - whether the subject is a plain, specific operating phrase of 3–9 words rather
-  than a generic headline, question, number, or product label; sentence or title
-  case is acceptable;
+  than a generic headline, broad topic label, question, number, or product
+  label; sentence or title case is acceptable;
 - situation recognition and evidence accuracy;
 - whether a touch with an ask gives this recipient a real reason to answer;
 - natural spoken voice and clarity;
@@ -132,6 +139,10 @@ Read for experiment narration. "The question concerns," "the premise was
 narrow," "the key distinction is," and repeated instructions about how little
 the recipient may type are internal notes, not correspondence. A score above
 84 is impossible while any of those patterns materially shapes the message.
+Apply the same rule to "the distinction I have in mind," "the practical
+difference is," and claims that a role or fact "makes this decision
+consequential." Read the line aloud; if it sounds like a memo about the email,
+the current wording fails.
 
 A correction, referral, expression of interest, permission to receive a real
 give-back, or a short conversation comparing one precise hypothesis with the

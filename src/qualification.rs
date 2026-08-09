@@ -19,7 +19,7 @@ fn has(text: &str, terms: &[&str]) -> bool {
 }
 
 fn distributed_operating_footprint(text: &str) -> bool {
-    let operating_site = has(
+    let concrete_site = has(
         text,
         &[
             "site",
@@ -29,18 +29,30 @@ fn distributed_operating_footprint(text: &str) -> bool {
             "residence",
             "charger",
             "station",
-            "network",
             "asset",
-            "portfolio",
             "store",
             "branch",
             "terminal",
             "plant",
             "campus",
             "tower",
-            "location",
         ],
     );
+    let operated_network = has(text, &["network"])
+        && has(
+            text,
+            &[
+                "charging",
+                "charger",
+                "telecom",
+                "communications",
+                "cell site",
+                "tower",
+                "remote site",
+                "asset network",
+            ],
+        );
+    let operating_site = concrete_site || operated_network;
     let distributed = has(
         text,
         &[
@@ -78,7 +90,31 @@ fn distributed_operating_footprint(text: &str) -> bool {
                 "tower",
             ],
         );
-    operating_site && distributed && !office_only
+    // A supplier's customer addresses are not its own distributed operating
+    // footprint. This distinction matters for OutageHub: matching 175,000
+    // delivery destinations is not evidence that the supplier monitors or
+    // makes outage-time decisions for those locations.
+    let customer_delivery_only = has(
+        text,
+        &[
+            "customer delivery location",
+            "customer locations",
+            "delivery destinations",
+            "delivery addresses",
+        ],
+    ) && !has(
+        text,
+        &[
+            "operates the sites",
+            "operates sites",
+            "operates facilities",
+            "owns the sites",
+            "owns facilities",
+            "manages the sites",
+            "monitors the sites",
+        ],
+    );
+    operating_site && distributed && !office_only && !customer_delivery_only
 }
 
 fn outage_decision_or_exposure(text: &str) -> bool {
@@ -188,19 +224,22 @@ fn outage_decision_or_exposure(text: &str) -> bool {
             "tower network",
         ],
     );
-    let managed_power_response = has(text, &["generator", "temporary power", "backup power"])
-        && has(
-            text,
-            &[
-                "rental fleet",
-                "fuel delivery",
-                "remote monitoring",
-                "dispatch",
-                "field technicians",
-                "customer sites",
-                "emergency response",
-            ],
-        );
+    let power_service = has(text, &["generator", "temporary power", "backup power"]);
+    let response_operation = has(
+        text,
+        &[
+            "rental fleet",
+            "dispatches technicians",
+            "dispatching technicians",
+            "dispatches crews",
+            "field technicians",
+            "emergency response fleet",
+            "temporary-power response",
+        ],
+    ) || (has(text, &["remote monitoring", "monitors"])
+        && has(text, &["generator", "customer sites"]))
+        || (has(text, &["emergency response"]) && has(text, &["generator", "temporary power"]));
+    let managed_power_response = power_service && response_operation;
 
     (owns_or_runs
         && (charging_network
@@ -238,11 +277,25 @@ mod tests {
             "The installer sells generators and solar equipment.",
             "The company has offices across Canada and every office uses electricity.",
             "The company provides refrigerated logistics and hold control.",
+            "The propane supplier provides fuel delivery to customer backup-power locations across Canada.",
+            "The supplier serves 175,000 customer delivery locations across Canada.",
         ] {
             assert!(!credible_outagehub_signal(
                 "account.outage_sensitive_decision",
                 evidence
             ));
         }
+    }
+
+    #[test]
+    fn customer_addresses_are_not_the_operators_distributed_sites() {
+        assert!(!credible_outagehub_signal(
+            "account.distributed_locations",
+            "The supplier serves 175,000 customer delivery locations across Canada."
+        ));
+        assert!(credible_outagehub_signal(
+            "account.distributed_locations",
+            "The operator runs automated cold-storage facilities across Ontario, Alberta, and Quebec."
+        ));
     }
 }

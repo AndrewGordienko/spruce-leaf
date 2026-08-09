@@ -1460,7 +1460,9 @@ Think through the buyer-safe brief and copy decision context. Return exactly one
 
 If previous_rejection_feedback_internal_only is nonempty, this is a whole-sequence rewrite after a failed review. Treat every saved finding as a hard defect to remove, reconsider the structure that produced it, and return genuinely revised copy. Do not quote or mention the feedback to the recipient.
 
-T1 must use the brand-specific word band. Write it as one natural note, not as a checklist. Use one verified fact to explain why this person received it, ask about one recognizable operating moment, state one concrete seller difference in plain language, and give one easy way to answer. Treat the mechanism as uncertainty, but do not narrate the research process or stack caveats. Never dictate answer labels or turn the note into a multiple-choice research form; an easy answer is an ordinary sentence in the recipient's own language. Never manufacture specificity with a task, object, machine, customer, or process that is absent from verified facts. A short discovery conversation is a valid cold ask for a direct workflow owner when the hypothesis is precise. When operator_requested_outcome_internal_only asks for that conversation or a short email explanation and the evidence supports the workflow category, T1 must offer those two natural paths; do not silently replace them with a coded answer, routing request, or permission to send collateral. A router may only be asked to route.
+T1 must use the brand-specific word band. Write it as one natural note, not as a checklist. Use one verified fact to explain why this person received it, ask about one recognizable operating moment, state one concrete seller difference in plain language, and give one easy way to answer. Treat the mechanism as uncertainty, but do not narrate the research process or stack caveats. A complete founder note usually moves naturally from why this person, to the operating moment and bounded guess, to what Andrew is exploring, to one call-or-email response path; use that logic without copying a fixed template. Never dictate answer labels or turn the note into a multiple-choice research form; an easy answer is an ordinary sentence in the recipient's own language. Never manufacture specificity with a task, object, machine, customer, or process that is absent from verified facts. A short discovery conversation is a valid cold ask for a direct workflow owner when the hypothesis is precise. When operator_requested_outcome_internal_only asks for that conversation or a short email explanation and the evidence supports the workflow category, T1 must offer those two natural paths; do not silently replace them with a coded answer, routing request, or permission to send collateral. A router may only be asked to route.
+
+Before returning T1, privately write five possible subjects and discard any that merely label the category, such as `utility status`, `power alarms`, `claim evidence`, `decision trail`, or `automation question`. Choose a 3-9 word subject that names the recognizable event, decision, object, or consequence in the email and gives this recipient an accurate reason to open. It should remain plain and forwardable, never clickbait. Then read the first two body lines aloud. Rewrite compressed phrases such as `make this decision consequential`, `the distinction I have in mind`, and `the practical difference is` into ordinary spoken English.
 
 For four touches use email/0, email/3, linkedin_request/7, email/14. For seven touches use email/0, email/3, linkedin_request/5, email/9, linkedin_or_email/13, email/17, linkedin_or_email/21. Every email-capable touch must look like an email: `Hi [First name],` on its own line, a coherent message, and the exact signature on its own line. T1 uses one plain, specific 3-9 word operational subject; sentence case or title case is fine. Later email-capable touches preserve it with one re: prefix. A linkedin_request has no subject, greeting, signature, pitch, meeting ask, or prior-email reference; it must stay under 300 characters.
 
@@ -1693,9 +1695,9 @@ Purpose and goal are private CRM notes, never substitutes for buyer-facing prose
 
 fn brand_trigger_contract(brand: &str, touches: usize) -> &'static str {
     if brand == "outagehub" && touches >= 7 {
-        "OUTAGEHUB SEVEN-TOUCH CONTRACT: A stable sourced fact about the prospect's operated site/network footprint can be the trigger; a recent utility outage is not required and must never be invented. T1 is a complete founder note, normally 100-150 words: directly explain why this person was chosen, describe one recognizable outage-time decision and a restrained practical consequence of uncertainty, name OutageHub and the specific outside utility context it could add beyond alarms or site calls, then offer a short conversation or email reply. Do not compress those ideas into internal-memo phrases or expand them into a dossier. T2 sharpens the diagnostic with one new distinction. T3 is only a human, recipient-specific reason to connect: no product explainer, collateral, meeting ask, or prior-email reference. T4 offers one useful historical comparison or other concrete contribution. T5 answers the strongest objection, usually what this adds beyond alarms, telemetry, or site calls. T6 routes once. T7 closes without another pitch. State the public-versus-private data limitation at most once across the sequence. Do not repeat the same utility-data mechanism in more than two touches or offer the same artifact twice."
+        "OUTAGEHUB SEVEN-TOUCH CONTRACT: A stable sourced fact about the prospect's operated site/network footprint can be the trigger; a recent utility outage is not required and must never be invented. T1 is a complete founder note, normally 100-150 words: directly explain why this person was chosen, describe one recognizable outage-time decision and a restrained practical consequence of uncertainty, name OutageHub and the specific outside utility context it could add beyond alarms or site calls, then offer a short conversation or email reply. Do not compress those ideas into internal-memo phrases or expand them into a dossier. T2 sharpens the diagnostic with one new distinction. T3 is only a human, recipient-specific reason to connect: no product explainer, collateral, meeting ask, or prior-email reference. T4 contributes a useful comparison or supported work product; a historical example is optional and may name a prospect location, incident, or outage window only when that detail appears in verified facts or the recipient first supplies it. T5 answers the strongest objection, usually what this adds beyond alarms, telemetry, or site calls. T6 routes once. T7 closes without another pitch. State the public-versus-private data limitation at most once across the sequence. Do not repeat the same utility-data mechanism in more than two touches or offer the same artifact twice."
     } else if brand == "outagehub" {
-        "OUTAGEHUB FOUR-TOUCH CONTRACT: A stable sourced fact about the prospect's operated site/network footprint can be the trigger; a recent utility outage is not required and must never be invented. T1 should read like a complete 100-150 word founder note: why this person, one recognizable outage-time decision, a restrained practical consequence, one plain OutageHub explanation, and a short conversation or email reply. Do not compress those ideas into internal-memo phrases or expand them into a dossier. T2 must add one new diagnostic distinction and may offer one small historical comparison. T3 is only a human, recipient-specific reason to connect: no product explainer, historical comparison, collateral, meeting ask, or prior-email reference. T4 routes or closes the same question without explaining public outage data again. State the public-versus-private data limitation at most once across the sequence. Do not repeat the same utility-data mechanism in more than two touches."
+        "OUTAGEHUB FOUR-TOUCH CONTRACT: A stable sourced fact about the prospect's operated site/network footprint can be the trigger; a recent utility outage is not required and must never be invented. T1 should read like a complete 100-150 word founder note: why this person, one recognizable outage-time decision, a restrained practical consequence, one plain OutageHub explanation, and a short conversation or email reply. Do not compress those ideas into internal-memo phrases or expand them into a dossier. T2 must add one new diagnostic distinction and may offer one supported work product. A historical comparison may name a prospect location, incident, or outage window only when that detail appears in verified facts or the recipient first supplies it. T3 is only a human, recipient-specific reason to connect: no product explainer, historical comparison, collateral, meeting ask, or prior-email reference. T4 routes or closes the same question without explaining public outage data again. State the public-versus-private data limitation at most once across the sequence. Do not repeat the same utility-data mechanism in more than two touches."
     } else {
         ""
     }
@@ -2873,7 +2875,7 @@ async fn request_sales_council(
         .collect::<Vec<_>>()
         .join("\n\n");
     let system = format!(
-        "You moderate a pre-send sales council. Apply every configured analytical lens independently; do not average them into one generic opinion and do not imitate or speak as the named real people. Each critic grades the CURRENT wording of every email. Correct, grammatical, and non-offensive is not enough: the first touch needs a plausible self-interested reason to stop and answer a stranger. Calibrate later touches to their job: a reply-thread follow-up may contribute a concrete useful contrast without another CTA; a routing or close touch may be brief. Do not demand a separate offer in every touch. Default to rejection when the sequence feels like automated account research, a multi-part interview, generic theory, or seller curiosity disguised as relevance. Passing means score >= 85, passes=true, and no unresolved issues. Unanimous approval is intentionally difficult. A critic may disagree with another. Be demanding but evidence-bound. Return only the requested structured data.\n\n{critic_prompts}"
+        "You moderate a pre-send sales council. Apply every configured analytical lens independently; do not average them into one generic opinion and do not imitate or speak as the named real people. Each critic grades the CURRENT wording of every email. Correct, grammatical, and non-offensive is not enough: the first touch needs a plausible self-interested reason to open, keep reading, and answer a stranger. Grade the subject before reading the body. A topical label such as `utility status`, `power alarms`, `claim evidence`, or `decision trail` fails even when accurate; it creates no specific knowledge gap. The subject must plainly name the operating event, decision, object, or consequence that makes this exact note distinct. Calibrate later touches to their job: a reply-thread follow-up may contribute a concrete useful contrast without another CTA; a routing or close touch may be brief. Do not demand a separate offer in every touch. Default to rejection when the sequence feels like automated account research, a multi-part interview, generic theory, or seller curiosity disguised as relevance. Passing means score >= 85, passes=true, and no unresolved issues. Unanimous approval is intentionally difficult. A critic may disagree with another. Be demanding but evidence-bound. Return only the requested structured data.\n\n{critic_prompts}"
     );
     let emails = sequence
         .touches
@@ -3028,7 +3030,7 @@ async fn request_copy_review_with_tier(
     );
     let brand_contract = brand_trigger_contract(&pb.key, expected_touches);
     let user = format!(
-        "{task}\n\n{stage_contract}\n{brand_contract}\nCHANNEL: linkedin_request has no subject; linkedin_or_email must work as either a DM or a complete email fallback.\nSENDABILITY: reject T1 if it is merely a diagnostic question plus a vague capability sentence. Require one verified trigger, one operating decision, one concrete seller difference, and a role-relevant reason to answer. Curiosity is not recipient value. Never require or invent collateral. T2 must advance the mechanism. Any later touch must add a sourced fact, useful distinction, honest objection answer, route, or close rather than paraphrase.\nEVIDENCE: the verified facts below are exhaustive. The hypothesis is not fact. Never invent an internal event, system, practice, consequence, or ownership claim.\n\nSIGNATURE: {signature}\nVERIFIED FACTS: {facts}\nHYPOTHESIS, NOT FACT: {hypothesis}\nRECIPIENT: {name} ({title}, {vantage})\nLIKELY ACCESS, INTERNAL ONLY: {can_observe}\nASK SCOPE: {ask_scope}\nDETERMINISTIC FINDINGS: {deterministic}\n\nCURRENT SEQUENCE:\n{sequence}\n\nRELEVANT REVIEW KNOWLEDGE:\n{knowledge}",
+        "{task}\n\n{stage_contract}\n{brand_contract}\nCHANNEL: linkedin_request has no subject; linkedin_or_email must work as either a DM or a complete email fallback.\nINBOX TEST: grade T1's subject and first two lines before the rest. A subject that merely labels the category (`utility status`, `power alarms`, `claim evidence`, `decision trail`, `automation question`) fails even if relevant. Require a plain 3-9 word phrase naming the operating event, decision, object, or consequence that makes this exact email worth opening. No clickbait. Reject internal-memo prose such as `make this decision consequential`, `the distinction I have in mind`, and `the practical difference is`; Andrew must be able to say every line naturally aloud.\nSENDABILITY: reject T1 if it is merely a diagnostic question plus a vague capability sentence. Require one verified trigger, one operating decision, one concrete seller difference, and a role-relevant reason to answer. Curiosity is not recipient value. Never require or invent collateral. T2 must advance the mechanism. Any later touch must add a sourced fact, useful distinction, honest objection answer, route, or close rather than paraphrase.\nEVIDENCE: the verified facts below are exhaustive. The hypothesis is not fact. Never invent an internal event, system, practice, consequence, or ownership claim.\n\nSIGNATURE: {signature}\nVERIFIED FACTS: {facts}\nHYPOTHESIS, NOT FACT: {hypothesis}\nRECIPIENT: {name} ({title}, {vantage})\nLIKELY ACCESS, INTERNAL ONLY: {can_observe}\nASK SCOPE: {ask_scope}\nDETERMINISTIC FINDINGS: {deterministic}\n\nCURRENT SEQUENCE:\n{sequence}\n\nRELEVANT REVIEW KNOWLEDGE:\n{knowledge}",
         task = task,
         brand_contract = brand_contract,
         signature = pb.signature,
@@ -3540,6 +3542,8 @@ fn has_forced_response_menu(body: &str) -> bool {
         "reply ‘",
         "reply “",
         "the easiest reply is",
+        "one-line note",
+        "one-line reply",
         "one word is enough",
         "is enough to classify",
         "is enough to end",
@@ -3559,13 +3563,83 @@ fn narrates_internal_copy_logic(body: &str) -> bool {
         "the question concerns",
         "the premise was narrow",
         "the key distinction is",
+        "the distinction i have in mind",
         "the deciding point is",
+        "the practical difference is",
         "repetitive slice",
         "the practical fork is",
         "the practical split is",
+        "decision consequential",
+        "i respect that work",
     ]
     .iter()
     .any(|marker| body.contains(marker))
+}
+
+/// A subject can be mechanically short and still be invisible in an inbox.
+/// Reject category labels such as "utility status", "claim evidence", or
+/// "decision trail" and make the editor name the operating event, decision,
+/// object, or consequence that makes this thread distinct.
+pub(crate) fn generic_subject_label(subject: &str) -> bool {
+    let generic = [
+        "a",
+        "about",
+        "alarm",
+        "alarms",
+        "an",
+        "at",
+        "classification",
+        "claim",
+        "claims",
+        "context",
+        "decision",
+        "decisions",
+        "evidence",
+        "for",
+        "from",
+        "in",
+        "issue",
+        "issues",
+        "location",
+        "locations",
+        "of",
+        "on",
+        "operational",
+        "operations",
+        "outage",
+        "outages",
+        "power",
+        "question",
+        "review",
+        "reviews",
+        "site",
+        "sites",
+        "status",
+        "support",
+        "the",
+        "to",
+        "trail",
+        "trails",
+        "utility",
+        "with",
+        "workflow",
+        "workflows",
+    ];
+    let meaningful = subject
+        .trim()
+        .strip_prefix("re: ")
+        .unwrap_or(subject.trim())
+        .split_whitespace()
+        .map(|word| {
+            word.trim_matches(|character: char| !character.is_alphanumeric())
+                .to_ascii_lowercase()
+        })
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    !meaningful.is_empty()
+        && meaningful
+            .iter()
+            .all(|word| generic.contains(&word.as_str()))
 }
 
 fn unsupported_account_task_noun_issues(
@@ -3704,15 +3778,16 @@ fn sequence_quality_issues(
         if is_email_capable_channel(&channel) {
             let subject_words = touch.subject.split_whitespace().count();
             if touch.stage == 1 {
-                // Prompt toward 3–9 words, but tolerate a specific two-word
-                // subject. Throwing away an otherwise reviewed sequence after
-                // a final editor changes "Packing format changes" to
-                // "Format changes" is mechanical overreach, not quality
-                // control.
-                if !(2..=9).contains(&subject_words) {
+                if !(3..=9).contains(&subject_words) {
                     issues.push(format!(
-                        "stage 1 subject has {subject_words} words (needs 2–9)"
+                        "stage 1 subject has {subject_words} words (needs 3–9)"
                     ));
+                }
+                if generic_subject_label(&touch.subject) {
+                    issues.push(
+                        "stage 1 subject is only a generic topic label; name the concrete operating event, decision, object, or consequence that makes the email worth opening"
+                            .into(),
+                    );
                 }
             } else {
                 let expected = format!("re: {thread_root}");
@@ -4350,14 +4425,14 @@ fn review_edit_schema(n: usize) -> Value {
 mod tests {
     use super::{
         affected_stages, apply_targeted_repairs, brand_trigger_contract, business_copy_context,
-        copy_sentence_count, format_progress_status, has_forced_response_menu,
-        is_email_capable_channel, is_retreat_or_route_touch, mentions_outreach_asset,
-        narrates_internal_copy_logic, normalize_dashes, normalize_principle_ids,
-        normalize_thread_subjects, provisional_channel, provisional_day_offset,
-        select_people_for_planning, sequence_quality_issues, supported_touch_count,
-        touch_question_limit, touch_word_band, unsupported_account_task_noun_issues,
-        word_set_similarity, CopyAccount, CopySequence, CopyTouch, EditDoc, EditReview,
-        PlanProgressRecipient, PlanProgressUpdate, TouchReview,
+        copy_sentence_count, format_progress_status, generic_subject_label,
+        has_forced_response_menu, is_email_capable_channel, is_retreat_or_route_touch,
+        mentions_outreach_asset, narrates_internal_copy_logic, normalize_dashes,
+        normalize_principle_ids, normalize_thread_subjects, provisional_channel,
+        provisional_day_offset, select_people_for_planning, sequence_quality_issues,
+        supported_touch_count, touch_question_limit, touch_word_band,
+        unsupported_account_task_noun_issues, word_set_similarity, CopyAccount, CopySequence,
+        CopyTouch, EditDoc, EditReview, PlanProgressRecipient, PlanProgressUpdate, TouchReview,
     };
 
     #[test]
@@ -4574,12 +4649,39 @@ mod tests {
         assert!(has_forced_response_menu(
             "A yes, no, or the right person's name is plenty."
         ));
+        assert!(has_forced_response_menu(
+            "A one-line note on where the work sits would help."
+        ));
         assert!(!has_forced_response_menu(
             "Even a short email about where the work stays manual would help."
         ));
         assert!(narrates_internal_copy_logic(
             "The premise was narrow: one handling task changes by format."
         ));
+        assert!(narrates_internal_copy_logic(
+            "The distinction I have in mind is detection versus response."
+        ));
+    }
+
+    #[test]
+    fn subject_gate_rejects_topical_labels_but_keeps_operating_scenes() {
+        for subject in [
+            "utility status",
+            "power alarms",
+            "claim evidence",
+            "decision trail",
+            "utility context for site alarms",
+        ] {
+            assert!(generic_subject_label(subject), "should reject {subject}");
+        }
+        for subject in [
+            "Separating grid outages from site faults",
+            "Attributing downtime at charging sites",
+            "Reconstructing delay evidence after project slips",
+            "Bottle packing across format changes",
+        ] {
+            assert!(!generic_subject_label(subject), "should keep {subject}");
+        }
     }
 
     #[test]
@@ -4873,9 +4975,9 @@ mod tests {
                 day_offset: day,
                 channel: "email".into(),
                 subject: if stage == 1 {
-                    "Case handling".into()
+                    "Case handling decisions".into()
                 } else {
-                    "re: Case handling".into()
+                    "re: Case handling decisions".into()
                 },
                 body: format!("Hi Maya,\n\n{middle}\n\n{signature}"),
                 purpose: "continue one conversation".into(),
@@ -4911,7 +5013,7 @@ mod tests {
                         stage: 5,
                         day_offset: 13,
                         channel: "linkedin_or_email".into(),
-                        subject: "re: Case handling".into(),
+                        subject: "re: Case handling decisions".into(),
                         body: format!("Hi Maya,\n\nThe screen is practical and takes a minute to scan. Happy to send it without arranging a call.\n\n{signature}"),
                         purpose: "offer one useful resource".into(),
                         goal: "make replying worthwhile".into(),
@@ -4925,7 +5027,7 @@ mod tests {
                         stage: 7,
                         day_offset: 21,
                         channel: "linkedin_or_email".into(),
-                        subject: "re: Case handling".into(),
+                        subject: "re: Case handling decisions".into(),
                         body: format!("Hi Maya,\n\nI will close the thread here. Thanks for considering it.\n\n{signature}"),
                         purpose: "close".into(),
                         goal: "stop respectfully".into(),

@@ -190,7 +190,7 @@ The connection request is 8–24 words with no pitch or meeting ask. Conditional
 LinkedIn DMs when connected and email fallbacks otherwise. Finish by day 21. Touch 1 email is \
 {min}–{max} words including the greeting and signature; later emails are shorter but substantive; touch 7 has no question. \
 Mention {brand} only in touch 1. Use at most one central operating question, one CTA, one verified account fact, and one short explanation of {brand} per touch. \
-Touch one may use a related diagnostic question plus a short CTA. Subjects are 3–9 plain, specific operational words with no numbers or question marks; sentence or title case is fine. Do not use fake familiarity, explain your strategy, dump the \
+Touch one may use a related diagnostic question plus a short CTA. Privately consider five subject lines, then choose 3–9 plain operational words that name the recognizable event, decision, object, or consequence. Reject generic category labels such as `utility status`, `power alarms`, `claim evidence`, `decision trail`, or `automation question`; accurate but invisible is not good enough. Use no numbers or question marks; sentence or title case is fine. Do not use fake familiarity, explain your strategy, dump the \
 research, or assert limitations of the recipient's tools.\n\n\
 Follow the length band, the voice, the forbidden list, and the pre-send test from the doctrine. \
 Center the operating decision, not {brand}. In four touches, T2 sharpens the mechanism, T3 is a \

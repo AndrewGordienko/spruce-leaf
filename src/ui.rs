@@ -446,6 +446,20 @@ impl SourceView {
         )
     }
 
+    /// Full motion reports contact coverage as part of its own final result.
+    /// Keep Apollo reveal progress visible only while it is running so a
+    /// replacement loop does not leave one durable enrichment block per pass.
+    pub fn start_enrichment_transient(header: String, stats: Arc<Stats>) -> Self {
+        Self::start_with_titles(
+            header,
+            stats,
+            "Enriching contacts",
+            "Enriched contacts",
+            "Enrichment stopped",
+            true,
+        )
+    }
+
     fn start_with_titles(
         header: String,
         stats: Arc<Stats>,

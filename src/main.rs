@@ -37,6 +37,7 @@ mod mailbox;
 mod metrics;
 mod opportunity;
 mod outreach;
+mod outreach_ablation;
 mod outreach_eval;
 mod pipeline;
 mod playbook;
@@ -219,6 +220,21 @@ enum Command {
         /// Judge each pair in both orders and require an order-consistent verdict.
         #[arg(long)]
         double_blind: bool,
+    },
+
+    /// Remove or expand one copy-prompt layer at a time and blind-compare the result.
+    EvalOutreachAblation {
+        #[arg(long, default_value = "evals/outreach-gold.jsonl")]
+        corpus: String,
+        /// One representative case per brand, up to this limit.
+        #[arg(long, default_value_t = 3, value_parser = positive_usize)]
+        cases: usize,
+        /// Independent generations per case and arm.
+        #[arg(long, default_value_t = 1, value_parser = positive_usize)]
+        repeats: usize,
+        /// Print every generated body as well as subjects and blind verdicts.
+        #[arg(long)]
+        show_drafts: bool,
     },
 
     /// Approve drafted email touches so the cadence engine may send them.
@@ -702,6 +718,26 @@ fn main() -> Result<()> {
                 &client,
                 Path::new(&corpus),
                 double_blind,
+            ))?;
+            Ok(())
+        }
+
+        Command::EvalOutreachAblation {
+            corpus,
+            cases,
+            repeats,
+            show_drafts,
+        } => {
+            let client = make_engine(&rt, &cli)?;
+            let playbooks = load_playbooks(&cli)?;
+            rt.block_on(outreach_ablation::run(
+                &client,
+                &playbooks,
+                Path::new(&corpus),
+                cases,
+                repeats,
+                cli.concurrency,
+                show_drafts,
             ))?;
             Ok(())
         }

@@ -61,6 +61,11 @@ pub struct Playbook {
     pub signature: String,
     /// One-sentence, concrete brand introduction.
     pub one_liner: String,
+    /// Stable seller-side facts the writer may state when relevant. Keeping
+    /// these separate from account evidence lets the reviewer apply the same
+    /// capability boundary as the writer.
+    #[serde(default)]
+    pub verified_seller_facts: Vec<String>,
     /// The kind of workflow / task / decision this brand tests for.
     pub motion: String,
 
@@ -298,6 +303,7 @@ impl Playbook {
             .collect::<Vec<_>>()
             .join("\n");
         let subjects = self.subject_examples.join(" | ");
+        let seller_facts = self.verified_seller_facts.join(" | ");
         let forbidden = self.forbidden(shared).join(", ");
         let role_contract = if role == "WRITER" {
             "Write like one founder contacting one operator. Use only supplied evidence, test one operating decision, keep inference explicitly uncertain, and make one role-appropriate ask. Concrete nouns and natural speech beat frameworks, but never name an object, station, machine, alarm, or private handoff that appears only in an internal hypothesis. Never script the recipient's reply with quoted words, categories, or a yes/no/referral menu. A correction or route is useful, but the note still needs a recipient-relevant reason to answer. Preserve a requested short discovery conversation plus email alternative when the recipient is a credible workflow owner and the hypothesis category is source-grounded."
@@ -306,7 +312,13 @@ impl Playbook {
         } else {
             "Act as a skeptical recipient and independent copy chief. Passing means Andrew could send the exact words unchanged: evidence-safe, specific, natural aloud, easy to answer, and appropriate to the recipient's vantage. Reject polished research blurbs, repeated retreats, invented value, vague capability language, forced response menus, experiment narration, and any physical task noun that appears only in the hypothesis rather than verified facts. Do not approve unnatural copy merely because it is grammatical and mechanically valid."
         };
-        let persona_excerpt = compact_persona_excerpt(persona, 120);
+        // The prompt ablation suite showed that the 120-word writer excerpt was
+        // an awkward half-measure: it exposed the role without enough of the
+        // concrete voice and evidence-boundary guidance to improve drafts. A
+        // 360-word writer excerpt improved 2/3 cross-brand cases while adding
+        // ~250 words; expanding psychology was mixed, so other roles stay lean.
+        let persona_words = if role == "WRITER" { 360 } else { 120 };
+        let persona_excerpt = compact_persona_excerpt(persona, persona_words);
         let psychology_excerpt = compact_persona_excerpt(&shared.personas.psychology, 130);
         format!(
             "=== {role} CONTRACT ===\n{role_contract}\n\n\
@@ -314,6 +326,7 @@ impl Playbook {
              === PRIVATE RESPONSE-DESIGN DOCTRINE ===\n{psychology_excerpt}\n\n\
              === {name} BUYER-FACING CONSTRAINTS ===\n\
              Seller context (state at most once and only when useful): {intro}\n\
+             Other verified seller facts (use only when relevant): {seller_facts}\n\
              Email 1 length: {min}-{max} words including signature.\n\
              Required signature: {signature}\n\
              Brand requirements:\n{requirements}\n\
@@ -326,6 +339,7 @@ impl Playbook {
             psychology_excerpt = psychology_excerpt,
             name = self.name,
             intro = self.one_liner,
+            seller_facts = seller_facts,
             min = self.min_words,
             max = self.max_words,
             signature = self.signature,
@@ -577,7 +591,7 @@ mod tests {
         assert!(reviewer.contains("forced response menus"));
         assert!(reviewer.contains("Correctness is not sendability"));
         assert!(copy.contains("=== GnK BUYER-FACING CONSTRAINTS"));
-        assert!(copy.split_whitespace().count() < 1_000);
+        assert!(copy.split_whitespace().count() < 1_500);
         assert!(reviewer.split_whitespace().count() < 1_000);
         assert!(!copy.contains("=== SHARED OUTREACH DOCTRINE"));
         assert!(!reviewer.contains("=== SHARED OUTREACH DOCTRINE"));

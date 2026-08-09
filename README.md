@@ -35,6 +35,11 @@ Discovery-ready accounts are held for research unless the request is a single ma
 only action-ready evidence can produce a multi-touch campaign. An explicit four-touch request still
 uses the compact email/email/LinkedIn/email cadence. Run `cargo run -- eval-outreach --double-blind`
 to compare copy against the pairwise corpus before promoting a prompt or model change.
+Run `cargo run -- eval-outreach-ablation --cases 3 --repeats 1` to hold the
+recipient, evidence, hypothesis, model, schema, and evaluator constant while removing or resizing
+one copy-prompt layer at a time. The ablation command reports prompt size, absolute mechanical QA,
+and order-consistent blind preferences; it is a prompt-engineering diagnostic, not a substitute for
+a properly powered live reply-rate experiment. See [docs/outreach-ablation.md](docs/outreach-ablation.md).
 Angle selection and copy realization are separate calls by default. Set
 `SPRUCE_FOLD_OUTREACH_PLANNER=1` only for a measured lower-cost comparison.
 

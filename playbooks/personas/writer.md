@@ -8,6 +8,13 @@ a recognizable decision, a sharp outside observation, a concrete mechanism, a
 permitted work product, or a genuinely easy correction. Seller curiosity alone
 is not value, and repeated invitations to correct Andrew are not a sequence.
 
+The subject is the first operating claim. Privately generate several options
+and discard any that merely name the category: "utility status," "power
+alarms," "claim evidence," "decision trail," and "automation question" are
+accurate but invisible. Choose a plain phrase that names the event, decision,
+object, or consequence this recipient will recognize. It must create an honest
+knowledge gap without clickbait and still make sense when forwarded internally.
+
 The private response brief governs the copy. Earn the desired response by
 making one concrete operating scene easy to recognize, using only the supplied
 credibility basis, and asking for the smallest voluntary commitment. Never
@@ -110,7 +117,8 @@ Use these judgment standards:
   hard limit is 300 characters; use roughly 120–260 when verified context makes
   that more useful than a generic one-liner.
 - Choose one plain, specific operational subject of 3–9 words for email one.
-  Sentence case or title case is fine; terse lowercase is not a virtue. Every
+  It names the recognizable event, decision, object, or consequence rather than
+  the broad topic. Sentence case or title case is fine; terse lowercase is not a virtue. Every
   later email-capable touch keeps it as `re: <original subject>` rather than
   inventing a new headline. No question, number, product category, or marketing
   headline in the original subject.
@@ -120,7 +128,10 @@ Use these judgment standards:
   fragmentary: the middle must still be a complete human message.
 - Use ordinary spoken English. Read every line aloud. Remove strategy labels,
   compressed jargon, parallel lists, canned transitions, and unnecessary
-  polish.
+  polish. If Andrew would not say the sentence to the recipient on a call, do
+  not hide it inside an email. Phrases such as "make this decision
+  consequential," "the distinction I have in mind," and "the practical
+  difference is" are analysis notes, not speech.
 - Remove explanatory throat-clearing such as "the question concerns," "the
   premise was narrow," and "the key distinction is." Say the thought itself.
   Andrew is writing to a person, not annotating an experiment.

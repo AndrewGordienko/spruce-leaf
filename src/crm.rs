@@ -301,6 +301,7 @@ struct WebState {
 struct ExecutionDashboard {
     funnel: Funnel,
     accounts: Vec<ExecutionAccount>,
+    mapped_contacts: usize,
     customer_development_accounts: Vec<Lead>,
     opportunities: Vec<ExecutionOpportunity>,
     meetings: Vec<Meeting>,
@@ -430,6 +431,14 @@ fn execution_dashboard(db: &SharedDb, brand: Option<&str>) -> Result<ExecutionDa
             });
         }
     }
+    let ready_lead_ids = accounts
+        .iter()
+        .map(|account| account.lead.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let mapped_contacts = people
+        .iter()
+        .filter(|person| ready_lead_ids.contains(person.lead_id.as_str()))
+        .count();
 
     let mut opportunities = Vec::new();
     for opportunity in db.list_opportunities(brand, None)? {
@@ -450,6 +459,7 @@ fn execution_dashboard(db: &SharedDb, brand: Option<&str>) -> Result<ExecutionDa
     Ok(ExecutionDashboard {
         funnel: metrics::funnel(db, brand)?,
         accounts,
+        mapped_contacts,
         customer_development_accounts,
         opportunities,
         meetings: db.list_meetings(brand)?,
@@ -1358,21 +1368,21 @@ fn render_html(
             "Wapahki, GnK and OutageHub — three books of business, one sheet.".to_string(),
         ),
     };
-    let stat_labels = if use_live {
-        ["ready companies", "reviewed sequences", "scheduled touches"]
+    let stats = if let Some(dashboard) = execution {
+        vec![
+            (account_count.to_string(), "ready companies"),
+            (dashboard.mapped_contacts.to_string(), "mapped contacts"),
+            (contact_count.to_string(), "reviewed sequences"),
+            (scheduled_count.to_string(), "scheduled touches"),
+        ]
     } else {
-        ["companies", "people", "scheduled"]
+        vec![
+            (account_count.to_string(), "companies"),
+            (contact_count.to_string(), "people"),
+            (scheduled_count.to_string(), "scheduled"),
+        ]
     };
-    render_subbar(
-        &mut b,
-        &heading,
-        &tagline,
-        &[
-            (account_count.to_string(), stat_labels[0]),
-            (contact_count.to_string(), stat_labels[1]),
-            (scheduled_count.to_string(), stat_labels[2]),
-        ],
-    );
+    render_subbar(&mut b, &heading, &tagline, &stats);
 
     if let (Some(meta), Some(profile)) = (brand, profile) {
         render_strategy_strip(&mut b, meta, profile);
@@ -1466,7 +1476,7 @@ fn render_outcome_strip(b: &mut String, dashboard: &ExecutionDashboard, brand: O
     b.push_str(&format!(
         "<section class=\"outcome-strip\" aria-label=\"Next best work\"><div class=\"outcome-intro\">\
          <span class=\"strategy-kicker\">Next best work</span><strong>Start conversations → create meetings → advance proof</strong>\
-         <small>Only complete current-policy sequences appear here. Research, held accounts, and rejected copy stay in GTM Lab.</small></div>\
+         <small>{mapped} contacts are mapped across ready accounts; this sheet shows one reviewed primary sequence per account. Research, held accounts, and rejected copy stay in GTM Lab.</small></div>\
          <a class=\"outcome-card\" href=\"#pipeline\"><b>{approvals}</b><span>email drafts</span><small>approve these conversation steps</small></a>\
          <a class=\"outcome-card\" href=\"#pipeline\"><b>{social}</b><span>LinkedIn actions</span><small>complete the manual channel work</small></a>\
          <a class=\"outcome-card\" href=\"#pipeline\"><b>{replies}</b><span>recent replies</span><small>route, answer, or ask for the meeting</small></a>\
@@ -1474,6 +1484,7 @@ fn render_outcome_strip(b: &mut String, dashboard: &ExecutionDashboard, brand: O
          <a class=\"outcome-card\" href=\"{gtm}\"><b>{pursuits}</b><span>active pursuits</span><small>move evidence into a proof or application</small></a>\
          </section>",
         approvals = approvals,
+        mapped = dashboard.mapped_contacts,
         social = social_tasks,
         replies = dashboard.replies.len(),
         meetings = dashboard.meetings.len(),
