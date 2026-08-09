@@ -1586,7 +1586,13 @@ impl Engine {
         let result = self.with_timeout(selection.backend, work).await;
         match &result {
             Ok(outcome) => self.stats.record_success(stage, outcome),
-            Err(_) => self.stats.record_failure(stage),
+            Err(error) => {
+                if let Some(failure) = error.downcast_ref::<BilledCallError>() {
+                    self.stats.record_billed_failure(stage, &failure.usage);
+                } else {
+                    self.stats.record_failure(stage);
+                }
+            }
         }
         self.log_usage(stage, selection, prompt_chars, fallback, &result);
         result
@@ -2042,10 +2048,18 @@ fn parse_openai_response(
         bail!("OpenAI response contained no output text");
     }
     let structured = if structured_call {
-        Some(
-            serde_json::from_str(result_text.trim())
-                .context("parsing OpenAI structured output as JSON")?,
-        )
+        let parsed = parse_first_json_value(&result_text)
+            .context("parsing OpenAI structured output as JSON");
+        match parsed {
+            Ok(value) => Some(value),
+            Err(error) => {
+                return Err(BilledCallError {
+                    message: format!("{error:#}"),
+                    usage: usage(),
+                }
+                .into())
+            }
+        }
     } else {
         None
     };
@@ -2054,6 +2068,24 @@ fn parse_openai_response(
         structured,
         ..usage()
     })
+}
+
+/// Strict-schema providers should return one JSON document, but Responses can
+/// occasionally emit the same completed object in two output-text parts. The
+/// ordinary parser reports that as trailing characters. Accept the first full
+/// object/array while still rejecting prose or a truncated first document.
+fn parse_first_json_value(text: &str) -> Result<Value> {
+    let trimmed = text.trim();
+    match serde_json::from_str::<Value>(trimmed) {
+        Ok(value) => Ok(value),
+        Err(full_error) => {
+            let mut documents = serde_json::Deserializer::from_str(trimmed).into_iter::<Value>();
+            if let Some(Ok(value)) = documents.next() {
+                return Ok(value);
+            }
+            Err(full_error.into())
+        }
+    }
 }
 
 /// Current GPT-5.6 token price calculation for direct Responses processing.
@@ -2573,6 +2605,50 @@ mod tests {
         assert_eq!(outcome.cache_write_input_tokens, 100);
         assert_eq!(outcome.duration_ms, 42);
         assert!((outcome.cost_usd - 0.00391).abs() < 0.0000001);
+    }
+
+    #[test]
+    fn openai_structured_response_recovers_a_valid_object_before_trailing_output() {
+        let payload = json!({
+            "status": "completed",
+            "model": "gpt-5.6-terra",
+            "service_tier": "default",
+            "output": [{
+                "type": "message",
+                "content": [{
+                    "type": "output_text",
+                    "text": "{\"answer\":\"yes\"}\n{\"answer\":\"duplicate\"}"
+                }]
+            }],
+            "usage": {"input_tokens": 100, "output_tokens": 20}
+        });
+
+        let outcome = parse_openai_response(&payload, true, Duration::from_millis(1))
+            .expect("recover first complete structured document");
+
+        assert_eq!(outcome.structured, Some(json!({"answer": "yes"})));
+    }
+
+    #[test]
+    fn malformed_openai_structured_output_retains_billed_usage() {
+        let payload = json!({
+            "status": "completed",
+            "model": "gpt-5.6-terra",
+            "service_tier": "default",
+            "output": [{
+                "type": "message",
+                "content": [{"type": "output_text", "text": "not json"}]
+            }],
+            "usage": {"input_tokens": 321, "output_tokens": 12}
+        });
+
+        let error = parse_openai_response(&payload, true, Duration::from_millis(1))
+            .expect_err("invalid structured output must remain an error");
+        let billed = error
+            .downcast_ref::<super::BilledCallError>()
+            .expect("parse error retains provider usage");
+        assert_eq!(billed.usage.input_tokens, 321);
+        assert_eq!(billed.usage.output_tokens, 12);
     }
 
     #[test]

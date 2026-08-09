@@ -546,20 +546,36 @@ impl Agent {
         let prompt = self.build_prompt(input).await;
 
         let mut turn = ui::TurnView::new();
-        let mut decision: Decision = self
+        let brand_keys = self.brand_keys();
+        let routed = self
             .client
             .structured_fast_streamed(
                 "interactive.router",
                 &self.system(),
                 &prompt,
-                decision_schema(&self.brand_keys()),
+                decision_schema(&brand_keys),
                 &mut |ev| turn.on_event(ev),
             )
-            .await?;
-        coalesce_full_motion_steps(&mut decision.steps, &self.brand);
+            .await;
         // Router output is intentionally private, so conversational replies are
         // rendered once from the accepted structured decision.
         let streamed = turn.finish();
+        let mut decision: Decision = match routed {
+            Ok(decision) => decision,
+            Err(error) => {
+                let Some(decision) =
+                    deterministic_full_motion_fallback(input, &brand_keys, self.brand.as_str())
+                else {
+                    return Err(error);
+                };
+                ui::activity(
+                    "Recovered router formatting",
+                    "recognized the explicit full-motion command locally",
+                );
+                decision
+            }
+        };
+        coalesce_full_motion_steps(&mut decision.steps, &self.brand);
 
         // Pure conversational answer: no actions to run this turn. The model
         // already streamed a visible reply, so don't reprint — but remember it.
@@ -2517,6 +2533,104 @@ fn decision_schema(brands: &[&str]) -> Value {
     })
 }
 
+/// Full-motion commands already contain all of the costly execution choices.
+/// If the model router returns malformed structured output, recover this narrow
+/// and explicit intent locally rather than abandoning the entire outbound run.
+/// Other commands still surface the router error instead of being guessed.
+fn deterministic_full_motion_fallback(
+    input: &str,
+    brands: &[&str],
+    fallback_brand: &str,
+) -> Option<Decision> {
+    let normalized = input.to_ascii_lowercase();
+    if !normalized.contains("full motion") {
+        return None;
+    }
+
+    let tokens = normalized
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    let mentions = tokens
+        .iter()
+        .enumerate()
+        .filter_map(|(index, token)| count_token(token).map(|count| (index, count)))
+        .collect::<Vec<_>>();
+    let person_nouns = [
+        "person",
+        "people",
+        "contact",
+        "contacts",
+        "recipient",
+        "recipients",
+    ];
+    let touch_nouns = ["touch", "touches", "stage", "stages"];
+    let account_nouns = ["account", "accounts", "company", "companies"];
+
+    let touches = count_near_noun(&tokens, &mentions, &touch_nouns, &[]);
+    let contacts = count_near_noun(&tokens, &mentions, &person_nouns, &[]);
+    // "2 people per company" describes contact coverage, not two accounts.
+    let mut account_blockers = person_nouns.to_vec();
+    account_blockers.extend(["each", "per"]);
+    let explicit_accounts = count_near_noun(&tokens, &mentions, &account_nouns, &account_blockers);
+
+    let used = [touches, contacts, explicit_accounts]
+        .into_iter()
+        .flatten()
+        .map(|(index, _)| index)
+        .collect::<std::collections::HashSet<_>>();
+    let accounts = explicit_accounts.or_else(|| {
+        mentions
+            .iter()
+            .copied()
+            .find(|(index, _)| !used.contains(index))
+    });
+    let brand = brands
+        .iter()
+        .copied()
+        .find(|brand| normalized.contains(&brand.to_ascii_lowercase()))
+        .unwrap_or(fallback_brand);
+    let force_new = tokens.iter().any(|token| matches!(*token, "new" | "fresh"));
+
+    Some(Decision {
+        reply: String::new(),
+        steps: vec![Step {
+            action: "run_full_motion".into(),
+            brand: brand.to_string(),
+            thesis: input.to_string(),
+            accounts: accounts.map(|(_, count)| count.max(1) as u64),
+            contacts: contacts.map(|(_, count)| count.max(1) as u64),
+            touches: touches.map(|(_, count)| count.max(1) as u64),
+            force_new,
+            ..Default::default()
+        }],
+    })
+}
+
+/// Find a number followed within three tokens by one of the requested nouns.
+/// Blockers prevent a later noun from stealing a count from an earlier scope,
+/// as in "2 mapped people per company".
+fn count_near_noun(
+    tokens: &[&str],
+    mentions: &[(usize, usize)],
+    nouns: &[&str],
+    blockers: &[&str],
+) -> Option<(usize, usize)> {
+    mentions.iter().copied().find(|(index, _)| {
+        let following = tokens.iter().skip(index + 1).take(3).copied();
+        let mut blocked = false;
+        for token in following {
+            if nouns.contains(&token) {
+                return !blocked;
+            }
+            if blockers.contains(&token) || count_token(token).is_some() {
+                blocked = true;
+            }
+        }
+        false
+    })
+}
+
 /// The model router occasionally represents one end-to-end request as
 /// `source_leads` followed by `plan_outreach`. That bypasses the fulfillment
 /// loop because both standalone actions are intentionally bounded one-shots.
@@ -2602,9 +2716,9 @@ pub fn open_browser(url: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        coalesce_full_motion_steps, decision_schema, forbids_contact_enrichment,
-        requests_copy_replacement, routed_total_limit, select_plan_scope, unqualified_people_total,
-        Step,
+        coalesce_full_motion_steps, decision_schema, deterministic_full_motion_fallback,
+        forbids_contact_enrichment, requests_copy_replacement, routed_total_limit,
+        select_plan_scope, unqualified_people_total, Step,
     };
     use crate::db::{Db, Lead, Person};
 
@@ -2664,6 +2778,35 @@ mod tests {
         assert_eq!(steps[0].contacts, Some(2));
         assert_eq!(steps[0].touches, Some(4));
         assert!(steps[0].force_new);
+    }
+
+    #[test]
+    fn explicit_continue_full_motion_survives_a_broken_model_router() {
+        let decision = deterministic_full_motion_fallback(
+            "continue the unfinished OutageHub full motion: fill 3 reviewed 4-touch sequences, keep 2 mapped people per company, drafts only",
+            &["gnk", "outagehub", "wapahki"],
+            "gnk",
+        )
+        .expect("explicit full motion has a deterministic route");
+
+        assert_eq!(decision.steps.len(), 1);
+        let step = &decision.steps[0];
+        assert_eq!(step.action, "run_full_motion");
+        assert_eq!(step.brand, "outagehub");
+        assert_eq!(step.accounts, Some(3));
+        assert_eq!(step.contacts, Some(2));
+        assert_eq!(step.touches, Some(4));
+        assert!(!step.force_new);
+    }
+
+    #[test]
+    fn deterministic_router_fallback_is_limited_to_explicit_full_motion() {
+        assert!(deterministic_full_motion_fallback(
+            "draft some OutageHub outreach",
+            &["gnk", "outagehub", "wapahki"],
+            "gnk",
+        )
+        .is_none());
     }
 
     #[test]
