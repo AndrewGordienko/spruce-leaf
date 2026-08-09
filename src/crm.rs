@@ -301,6 +301,7 @@ struct WebState {
 struct ExecutionDashboard {
     funnel: Funnel,
     accounts: Vec<ExecutionAccount>,
+    customer_development_accounts: Vec<Lead>,
     opportunities: Vec<ExecutionOpportunity>,
     meetings: Vec<Meeting>,
     mailboxes: Vec<PublicMailbox>,
@@ -413,18 +414,21 @@ fn execution_dashboard(db: &SharedDb, brand: Option<&str>) -> Result<ExecutionDa
         .iter()
         .map(|person| person.id.as_str())
         .collect::<std::collections::HashSet<_>>();
+    let customer_development_accounts = db.list_leads(brand)?;
     let mut accounts = Vec::new();
-    for lead in db.list_leads(brand)? {
+    for lead in customer_development_accounts.iter().cloned() {
         let mut account_people = Vec::new();
         for person in people.iter().filter(|p| p.lead_id == lead.id) {
             if let Some(entry) = ready_execution_person(db, person)? {
                 account_people.push(entry);
             }
         }
-        accounts.push(ExecutionAccount {
-            lead,
-            people: account_people,
-        });
+        if !account_people.is_empty() {
+            accounts.push(ExecutionAccount {
+                lead,
+                people: account_people,
+            });
+        }
     }
 
     let mut opportunities = Vec::new();
@@ -446,6 +450,7 @@ fn execution_dashboard(db: &SharedDb, brand: Option<&str>) -> Result<ExecutionDa
     Ok(ExecutionDashboard {
         funnel: metrics::funnel(db, brand)?,
         accounts,
+        customer_development_accounts,
         opportunities,
         meetings: db.list_meetings(brand)?,
         mailboxes: db
@@ -1352,14 +1357,19 @@ fn render_html(
             "Wapahki, GnK and OutageHub — three books of business, one sheet.".to_string(),
         ),
     };
+    let stat_labels = if use_live {
+        ["ready companies", "reviewed sequences", "scheduled touches"]
+    } else {
+        ["companies", "people", "scheduled"]
+    };
     render_subbar(
         &mut b,
         &heading,
         &tagline,
         &[
-            (account_count.to_string(), "companies"),
-            (contact_count.to_string(), "people"),
-            (scheduled_count.to_string(), "scheduled"),
+            (account_count.to_string(), stat_labels[0]),
+            (contact_count.to_string(), stat_labels[1]),
+            (scheduled_count.to_string(), stat_labels[2]),
         ],
     );
 
@@ -1455,8 +1465,8 @@ fn render_outcome_strip(b: &mut String, dashboard: &ExecutionDashboard, brand: O
     b.push_str(&format!(
         "<section class=\"outcome-strip\" aria-label=\"Next best work\"><div class=\"outcome-intro\">\
          <span class=\"strategy-kicker\">Next best work</span><strong>Start conversations → create meetings → advance proof</strong>\
-         <small>Spruce Leaf capabilities are rolled up into the outcomes that need attention now.</small></div>\
-         <a class=\"outcome-card\" href=\"#pipeline\"><b>{approvals}</b><span>reviewed drafts</span><small>approve to start conversations</small></a>\
+         <small>Only complete current-policy sequences appear here. Research, held accounts, and rejected copy stay in GTM Lab.</small></div>\
+         <a class=\"outcome-card\" href=\"#pipeline\"><b>{approvals}</b><span>email drafts</span><small>approve these conversation steps</small></a>\
          <a class=\"outcome-card\" href=\"#pipeline\"><b>{social}</b><span>LinkedIn actions</span><small>complete the manual channel work</small></a>\
          <a class=\"outcome-card\" href=\"#pipeline\"><b>{replies}</b><span>recent replies</span><small>route, answer, or ask for the meeting</small></a>\
          <a class=\"outcome-card meeting\" href=\"#pipeline\"><b>{meetings}</b><span>meetings</span><small>prepare and capture next commitments</small></a>\
@@ -1489,9 +1499,9 @@ fn render_customer_development(b: &mut String, dashboard: &ExecutionDashboard) {
     );
     for stage in crate::gtm::CUSTOMER_DEVELOPMENT_STAGES {
         let count = dashboard
-            .accounts
+            .customer_development_accounts
             .iter()
-            .filter(|account| stage_for_lead(&account.lead.id) == stage.key)
+            .filter(|lead| stage_for_lead(&lead.id) == stage.key)
             .count();
         b.push_str(&format!(
             "<div class=\"customer-dev-rung\"><strong>{}</strong><span>{}</span></div>",
@@ -1501,17 +1511,17 @@ fn render_customer_development(b: &mut String, dashboard: &ExecutionDashboard) {
     }
     b.push_str("</div><div class=\"customer-dev-accounts\">");
 
-    for account in &dashboard.accounts {
+    for lead in &dashboard.customer_development_accounts {
         let fallback = CustomerDevelopmentRecord {
-            brand: account.lead.brand.clone(),
-            lead_id: account.lead.id.clone(),
+            brand: lead.brand.clone(),
+            lead_id: lead.id.clone(),
             commitment_kind: "none".into(),
             ..Default::default()
         };
         let record = dashboard
             .customer_development
             .iter()
-            .find(|record| record.lead_id == account.lead.id)
+            .find(|record| record.lead_id == lead.id)
             .unwrap_or(&fallback);
         let stage = crate::gtm::customer_development_stage_info(record);
         let missing = crate::gtm::customer_development_missing(record);
@@ -1530,7 +1540,7 @@ fn render_customer_development(b: &mut String, dashboard: &ExecutionDashboard) {
              <div><b>Next commitment</b><p>{}</p></div><div><b>Still missing</b><p>{}</p></div></div>",
             esc(stage.key),
             esc(stage.label),
-            esc(&account.lead.name),
+            esc(&lead.name),
             esc(&updated_label),
             esc(if record.next_action.trim().is_empty() {
                 stage.next_commitment
@@ -1592,7 +1602,7 @@ fn render_customer_development(b: &mut String, dashboard: &ExecutionDashboard) {
             esc(&record.commitment_detail),
         ));
     }
-    if dashboard.accounts.is_empty() {
+    if dashboard.customer_development_accounts.is_empty() {
         b.push_str(
             "<div class=\"customer-dev-empty\"><strong>No Wapahki accounts yet</strong><span>Source a small set of plants around one concrete task hypothesis. Each account will start at Hypothesis; replies and saved evidence move it forward.</span></div>",
         );
@@ -1771,7 +1781,7 @@ fn render_hub(counts: &[(&'static BrandMeta, usize)], businesses: &Businesses) -
         b.push_str(&format!(
             "<div class=\"brand-card {brand}\">\
              <div class=\"brand-card-top\"><span class=\"brand-chip {brand}\">{name}</span>\
-             <span class=\"brand-card-count\">{contacts} people</span></div>\
+             <span class=\"brand-card-count\">{contacts} ready sequences</span></div>\
              <p class=\"brand-card-tagline\">{summary}</p>\
              <p class=\"brand-card-goal\"><b>Trying to:</b> {goal}</p>\
              <div class=\"brand-card-actions\">\
@@ -4820,6 +4830,10 @@ mod tests {
         assert!(html.contains(&format!("data-open-id=\"person-{person_id}\"")));
         assert!(html.contains("0 sent · 1 ready"));
         assert!(html.contains("Next best work"));
+        assert!(html.contains("ready companies"));
+        assert!(html.contains("reviewed sequences"));
+        assert!(html.contains("email drafts"));
+        assert!(!html.contains("reviewed drafts"));
         assert!(html.contains("<b>1</b><span>LinkedIn actions</span>"));
         assert!(html.contains("viewport-fit=cover"));
         assert!(html.contains(".surface-tabs {\n    order: 3; display: flex"));
@@ -4882,8 +4896,7 @@ mod tests {
         }
 
         let dashboard = execution_dashboard(&db, Some("gnk")).expect("dashboard");
-        assert_eq!(dashboard.accounts.len(), 1);
-        assert!(dashboard.accounts[0].people.is_empty());
+        assert!(dashboard.accounts.is_empty());
         assert_eq!(brand_tab_counts(&db)[1].1, 0);
         let html = render_html(
             &Crm::default(),

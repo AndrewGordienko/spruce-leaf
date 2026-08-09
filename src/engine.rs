@@ -699,6 +699,7 @@ impl Engine {
                 .find_map(|key| std::env::var(key).ok())
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
+                .or_else(|| (stage == "outreach.write_account").then(|| "gpt-5.6-sol".to_string()))
                 .or(selection.model);
         }
         selection
@@ -1866,7 +1867,7 @@ fn openai_reasoning_effort(stage: &str, fast: bool) -> String {
                 "SPRUCE_OPENAI_WRITER_REASONING_EFFORT",
                 "SPRUCE_OPENAI_COPY_REASONING_EFFORT",
             ],
-            "high",
+            "xhigh",
         )
     } else if stage == "outreach.review_edit" {
         (
@@ -1882,7 +1883,7 @@ fn openai_reasoning_effort(stage: &str, fast: bool) -> String {
                 "SPRUCE_OPENAI_VERIFIER_REASONING_EFFORT",
                 "SPRUCE_OPENAI_COPY_REASONING_EFFORT",
             ],
-            "medium",
+            "high",
         )
     } else if is_outreach_strategy_stage(stage) {
         (&["SPRUCE_OPENAI_STRATEGY_REASONING_EFFORT"], "medium")
@@ -2563,7 +2564,7 @@ mod tests {
         );
 
         assert_eq!(request["model"], "gpt-5.6-terra");
-        assert_eq!(request["reasoning"]["effort"], "high");
+        assert_eq!(request["reasoning"]["effort"], "xhigh");
         assert_eq!(request["service_tier"], "default");
         assert_eq!(request["max_output_tokens"], 6_144);
         assert_eq!(request["prompt_cache_options"]["mode"], "explicit");
@@ -2952,10 +2953,10 @@ mod tests {
     }
 
     #[test]
-    fn outreach_lanes_preserve_the_selected_model_by_default() {
+    fn outreach_writer_uses_the_frontier_lane_without_changing_other_stages() {
         let engine = Engine::new(Backend::Openai, Some("gpt-5.6-terra".to_string()));
         let quality = engine.selection_for_stage("outreach.write_account", false);
-        assert_eq!(quality.model.as_deref(), Some("gpt-5.6-terra"));
+        assert_eq!(quality.model.as_deref(), Some("gpt-5.6-sol"));
         assert!(!quality.fast);
 
         let ordinary = engine.selection_for_stage("source.website_research", false);

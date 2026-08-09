@@ -10,11 +10,11 @@ OpenAI Responses API by default, or to the optional Claude, Codex, or Grok local
 Apollo sourcing, contact enrichment, verified outreach planning, approval, and funnel reporting.
 
 Set `OPENAI_API_KEY` for the default backend. The normal model is `gpt-5.6-terra`; lightweight
-routing uses `gpt-5.6-luna`. Outreach writing defaults to `high`; copy repair and independent final
-verification default to `medium`. Account qualification, contact-vantage selection, hypothesis
-refresh, and outreach angle planning use the selected model at `medium`. Sol remains an explicit opt-in, not a hidden default:
-the earlier Sol/xhigh lane spent thousands of reasoning tokens per short email without reliably
-improving the buyer-facing copy. Override the lanes with
+routing uses `gpt-5.6-luna`. The isolated outreach writer uses `gpt-5.6-sol` at `xhigh`; copy repair
+uses the selected model at `medium`, and independent final verification uses it at `high`.
+Account qualification, contact-vantage selection, hypothesis refresh, and outreach angle planning
+use the selected model at `medium`. Sol is intentionally limited to the one call where prose taste
+matters; the deterministic sequence gates still decide whether its output is sendable. Override the lanes with
 `SPRUCE_OPENAI_WRITER_MODEL`, `SPRUCE_OPENAI_EDITOR_MODEL`, `SPRUCE_OPENAI_VERIFIER_MODEL`
 and their matching `*_REASONING_EFFORT` keys. `SPRUCE_OPENAI_COPY_MODEL` and
 `SPRUCE_OPENAI_COPY_REASONING_EFFORT` remain fallbacks for all three lanes. Use
@@ -30,10 +30,10 @@ used by the bulk action it routes.
 Automatic account-framing refreshes reuse source-backed research for six hours by default; tune with
 `SPRUCE_ACCOUNT_REFRESH_TTL_SECS` or set it to `0` to force every re-read.
 
-Bulk outreach now activates one primary person per account and drafts at most four eager touches.
+Bulk outreach activates one primary person per account and defaults to seven reviewed touches.
 Discovery-ready accounts are held for research unless the request is a single manual routing note;
-only action-ready evidence can produce a multi-touch campaign. Set `SPRUCE_EAGER_FULL_SEQUENCE=1`
-only for a deliberate legacy seven-touch comparison. Run `cargo run -- eval-outreach --double-blind`
+only action-ready evidence can produce a multi-touch campaign. An explicit four-touch request still
+uses the compact email/email/LinkedIn/email cadence. Run `cargo run -- eval-outreach --double-blind`
 to compare copy against the pairwise corpus before promoting a prompt or model change.
 Angle selection and copy realization are separate calls by default. Set
 `SPRUCE_FOLD_OUTREACH_PLANNER=1` only for a measured lower-cost comparison.
@@ -490,13 +490,14 @@ attendee. The live autopilot daemon may complete that guarded booking automatica
 mode and one-shot `inbox` record it as pending unless `inbox --book` is explicit; use
 `book-meetings` to approve pending inserts.
 
-### Short email and LinkedIn cadence
+### Email and LinkedIn cadence
 
-New plans default to four touches: email on days 0 and 3, a personalized LinkedIn
-connection request on day 7, and email on day 14. Longer follow-up should be
-earned by a live thread, not prewritten as filler. Legacy seven-touch generation
-is available only behind `SPRUCE_EAGER_FULL_SEQUENCE=1`. There are no call
-touches. Connection requests are short and contain no pitch or meeting ask.
+New plans default to seven touches: email on days 0 and 3, a personalized LinkedIn
+connection request on day 5, then email or conditional LinkedIn/email follow-ups
+on days 9, 13, 17, and 21. The arc is diagnostic, useful contribution, objection,
+routing, and close rather than seven paraphrases. An explicit four-touch request
+uses days 0, 3, 7, and 14. There are no call touches. Connection requests are short
+and contain no pitch or meeting ask.
 
 Spruce Leaf does not scrape LinkedIn connection state. The CRM therefore exposes
 an explicit status beside each person. A conditional touch is held as a manual

@@ -629,7 +629,7 @@ impl Agent {
             "plan_outreach" => {
                 let accounts = step.accounts.unwrap_or(0);
                 let contacts = step.contacts.unwrap_or(0);
-                let touches = step.touches.unwrap_or(4);
+                let touches = step.touches.unwrap_or(7);
                 let scope = unqualified_people_total(input)
                     .map(|people| format!("{people} people total in CRM order"))
                     .unwrap_or_else(|| match (accounts, contacts) {
@@ -667,7 +667,7 @@ impl Agent {
                     "{brand} · {} accounts · {} people each · {} touches",
                     step.accounts.unwrap_or(5),
                     step.contacts.unwrap_or(5),
-                    step.touches.unwrap_or(4)
+                    step.touches.unwrap_or(7)
                 ),
             ),
             "enrich_people" => (
@@ -723,7 +723,7 @@ impl Agent {
                 };
                 let accounts = step.accounts.unwrap_or(5).max(1) as usize;
                 let contacts = step.contacts.unwrap_or(5).max(1) as usize;
-                let touches = step.touches.unwrap_or(4).max(1) as usize;
+                let touches = step.touches.unwrap_or(7).max(1) as usize;
                 self.run_campaign(&thesis, accounts, contacts, touches)
                     .await
             }
@@ -745,7 +745,7 @@ impl Agent {
                 };
                 let accounts = step.accounts.unwrap_or(5).max(1) as usize;
                 let contacts = step.contacts.unwrap_or(5).max(1) as usize;
-                let touches = step.touches.unwrap_or(4).max(1) as usize;
+                let touches = step.touches.unwrap_or(7).max(1) as usize;
                 self.run_full_motion(
                     &thesis,
                     accounts,
@@ -773,7 +773,7 @@ impl Agent {
                         )
                     };
                 self.plan_outreach(
-                    step.touches.unwrap_or(4).max(1) as usize,
+                    step.touches.unwrap_or(7).max(1) as usize,
                     step.auto,
                     account_limit,
                     contacts_per_account,
@@ -905,6 +905,7 @@ impl Agent {
         accounts: usize,
         contacts: usize,
         candidate_limit: Option<usize>,
+        transient: bool,
     ) -> Result<sourcing::SourceSummary, String> {
         let pb = self
             .playbooks
@@ -916,13 +917,15 @@ impl Agent {
             .map_err(|e| format!("Can't source: {e:#}"))?;
         let apollo = Apollo::from_env().map_err(|e| format!("Can't source: {e:#}"))?;
         let lib = self.library.read().await.clone();
-        let view = ui::SourceView::start(
-            format!(
-                "{} · {accounts} account target · {contacts} people each · active GTM play",
-                pb.name
-            ),
-            self.client.stats(),
+        let header = format!(
+            "{} · {accounts} account target · {contacts} people each · active GTM play",
+            pb.name
         );
+        let view = if transient {
+            ui::SourceView::start_transient(header, self.client.stats())
+        } else {
+            ui::SourceView::start(header, self.client.stats())
+        };
         let progress = view.reporter();
         let result = sourcing::source(
             &self.db,
@@ -949,7 +952,10 @@ impl Agent {
     }
 
     async fn source_leads(&self, thesis: &str, accounts: usize, contacts: usize) -> String {
-        match self.do_source(thesis, accounts, contacts, None).await {
+        match self
+            .do_source(thesis, accounts, contacts, None, false)
+            .await
+        {
             Ok(s) => {
                 // Surface the freshly-filed leads/people in the live CRM.
                 if s.leads_qualified > 0 || s.people_added > 0 {
@@ -1029,16 +1035,7 @@ impl Agent {
         per_account_cap: Option<usize>,
     ) -> Result<outreach::PlanSummary, String> {
         let requested_touches = touches.max(1);
-        let legacy_full_sequence = std::env::var("SPRUCE_EAGER_FULL_SEQUENCE")
-            .ok()
-            .is_some_and(|value| matches!(value.trim(), "1" | "true" | "on"));
-        let touches = if requested_touches == 1 {
-            1
-        } else if legacy_full_sequence && requested_touches >= 7 {
-            7
-        } else {
-            4
-        };
+        let touches = outreach::supported_touch_count(requested_touches);
         if touches != requested_touches {
             ui::activity(
                 "Normalized eager sequence",
@@ -1523,17 +1520,7 @@ impl Agent {
     ) -> String {
         let accounts = accounts.max(1);
         let contacts = contacts.max(1);
-        let effective_touches = if touches.max(1) == 1 {
-            1
-        } else if touches >= 7
-            && std::env::var("SPRUCE_EAGER_FULL_SEQUENCE")
-                .ok()
-                .is_some_and(|value| matches!(value.trim(), "1" | "true" | "on"))
-        {
-            7
-        } else {
-            4
-        };
+        let effective_touches = outreach::supported_touch_count(touches);
         let max_source_passes = std::env::var("SPRUCE_FULL_MOTION_SOURCE_PASSES")
             .ok()
             .and_then(|value| value.trim().parse::<usize>().ok())
@@ -1636,7 +1623,7 @@ impl Agent {
                 // yields a working account without starving the copy stages.
                 let candidate_limit = want.clamp(4, 6);
                 match self
-                    .do_source(thesis, want, contacts, Some(candidate_limit))
+                    .do_source(thesis, want, contacts, Some(candidate_limit), true)
                     .await
                 {
                     Ok(pass) => {
@@ -2471,7 +2458,7 @@ For a pure conversational answer (no action to run), leave `steps` empty and put
 Actions (each is a step's `action`):\n\
 - run_campaign: hypothetical research-only campaign; no Apollo.\n\
 - source_leads: ONLY finds and qualifies Apollo accounts+people, then stops — it writes NO emails. Use only when the request is purely to find companies/people and contains no request to write, draft, sequence, or perform outreach. set thesis/accounts/contacts (defaults 10/3).\n\
-- run_full_motion: end-to-end motion for a brand (never sends). The requested account count is a FULFILLMENT CONTRACT: persist through adaptive sourcing passes, contact shortfalls, weak hypotheses, and rejected copy; save misses as targeting corrections, retry rejected copy with its feedback, and replace any account that still lacks a current reviewed sequence. Stop short only at a real provider/model-budget/search-exhaustion safety boundary and report filled/requested exactly. REUSE-FIRST: if the CRM already has enough accounts/people for that brand, it SKIPS Apollo, refreshes why those companies fit, and writes missing, rejected, or stale sequences. Current-policy reviewed drafts are preserved unless the operator explicitly asks to rewrite/redraft/refine/replace them. set thesis/accounts/contacts/touches (defaults 5/5/4). Bulk activation still chooses one primary contact per account. set force_new=true ONLY when they explicitly ask for new/fresh/more companies not already on file.\n\
+- run_full_motion: end-to-end motion for a brand (never sends). The requested account count is a FULFILLMENT CONTRACT: persist through adaptive sourcing passes, contact shortfalls, weak hypotheses, and rejected copy; save misses as targeting corrections, retry rejected copy with its feedback, and replace any account that still lacks a current reviewed sequence. Stop short only at a real provider/model-budget/search-exhaustion safety boundary and report filled/requested exactly. REUSE-FIRST: if the CRM already has enough accounts/people for that brand, it SKIPS Apollo, refreshes why those companies fit, and writes missing, rejected, or stale sequences. Current-policy reviewed drafts are preserved unless the operator explicitly asks to rewrite/redraft/refine/replace them. set thesis/accounts/contacts/touches (defaults 5/5/7). Bulk activation still chooses one primary contact per account. set force_new=true ONLY when they explicitly ask for new/fresh/more companies not already on file.\n\
 - enrich_people: reveal/verify sourced emails; phone only when explicit.\n\
 - plan_outreach: draft sequences for contacts ALREADY found (no account/people search). A scoped request may reveal only those selected contacts whose email is still missing, because an email sequence must not silently shrink; skip that reveal when the operator says no Apollo/no enrichment/verified only. IMPORTANT SCOPE: 'first N people' with NO company/account count means N people TOTAL in CRM order: set limit=N and OMIT accounts/contacts. 'first N people in the first company' means accounts=1, contacts=N. 'N people for each of M companies' means accounts=M, contacts=N. contacts is always PER selected company, never a bare total. Preserve current-policy reviewed drafts on ordinary retries; safely replace unsent drafts only when the operator explicitly says rewrite/redraft/refine/replace. auto only when explicit.\n\
 - approve_outreach: only after explicit approval — this is what actually schedules drafts to send.\n\

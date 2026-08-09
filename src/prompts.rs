@@ -182,7 +182,7 @@ For each touch set: day_offset from the start; channel; subject (empty string fo
 body copy; purpose (which move this is — observation / diagnostic / consequence / artifact / \
 hard-question / routing / close); and goal.\n\n\
 If writing four touches, use these exact channel/day pairs: email/0, email/3, \
-linkedin_request/7, email/14. If writing seven touches for a deliberate legacy comparison, use: email/0, email/3, \
+linkedin_request/7, email/14. If writing seven touches, use: email/0, email/3, \
 linkedin_request/5, email/9, linkedin_or_email/13, email/17, linkedin_or_email/21. \
 The connection request is 8–24 words with no pitch or meeting ask. Conditional touches are short \
 LinkedIn DMs when connected and email fallbacks otherwise. Finish by day 21. Touch 1 email is \
@@ -194,7 +194,7 @@ research, or assert limitations of the recipient's tools.\n\n\
 Follow the length band, the voice, the forbidden list, and the pre-send test from the doctrine. \
 Center the operating decision, not {brand}. In four touches, T2 sharpens the mechanism, T3 is a \
 natural connection request, and T4 contributes a useful distinction or answers the hard buyer \
-question before closing. In the legacy sequence, T4 contributes value, T5 answers the hard buyer \
+question before closing. In the seven-touch sequence, T4 contributes value, T5 answers the hard buyer \
 question, T6 routes once, and T7 closes. Keep the whole sequence on ONE problem thread. No more \
 than three touches may primarily retreat, request correction/referral, or close.",
         name = contact.name,

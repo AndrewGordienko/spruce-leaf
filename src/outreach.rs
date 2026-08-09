@@ -665,16 +665,7 @@ pub async fn plan_pending(
     progress_reporter: Option<PlanProgressReporter>,
 ) -> Result<PlanSummary> {
     let requested_touches = n_touches.max(1);
-    let eager_full_sequence = std::env::var("SPRUCE_EAGER_FULL_SEQUENCE")
-        .ok()
-        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "on"));
-    let n_touches = if requested_touches == 1 {
-        1
-    } else if eager_full_sequence && requested_touches >= 7 {
-        7
-    } else {
-        4
-    };
+    let n_touches = supported_touch_count(requested_touches);
     if n_touches != requested_touches {
         log_outreach(format!(
             "normalized eager sequence from {requested_touches} to {n_touches} supported touches"
@@ -1122,6 +1113,14 @@ pub async fn plan_pending(
     Ok(summary)
 }
 
+pub fn supported_touch_count(requested: usize) -> usize {
+    match requested.max(1) {
+        1 => 1,
+        7.. => 7,
+        _ => 4,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn finalize_reviewed_draft(
     db: &SharedDb,
@@ -1408,7 +1407,7 @@ async fn write_account_sequences(
         "Follow each recipient's supplied private sequence_plan."
     };
     let writer_knowledge = knowledge.writer.block.clone();
-    let brand_trigger_contract = brand_trigger_contract(&pb.key);
+    let brand_trigger_contract = brand_trigger_contract(&pb.key, n);
     let writer_instructions = format!(
         r#"Write one {n}-touch no-reply sequence for each recipient. {planning_contract}
 
@@ -1418,11 +1417,11 @@ Think through the buyer-safe brief and copy decision context. Return exactly one
 
 If previous_rejection_feedback_internal_only is nonempty, this is a whole-sequence rewrite after a failed review. Treat every saved finding as a hard defect to remove, reconsider the structure that produced it, and return genuinely revised copy. Do not quote or mention the feedback to the recipient.
 
-T1 must use the brand-specific word band. It cannot be a compressed diagnostic question followed by a vague capability sentence. Connect one verified trigger to a specific operating decision, frame the plausible mechanism as uncertainty, make the consequence or useful distinction concrete, explain one narrow seller capability only when helpful, and end with one role-matched ask. A direct workflow owner may be asked for a short conversation to compare the precise hypothesis with actual work; a router may only be asked to route.
+T1 must use the brand-specific word band. Write it as one natural note, not as a checklist. Use one verified fact to explain why this person received it, ask about one recognizable operating moment, state one concrete seller difference in plain language, and give one easy way to answer. Treat the mechanism as uncertainty, but do not narrate the research process or stack caveats. A direct workflow owner may be asked for a short conversation to compare the precise hypothesis with actual work; a router may only be asked to route.
 
 For four touches use email/0, email/3, linkedin_request/7, email/14. For seven touches use email/0, email/3, linkedin_request/5, email/9, linkedin_or_email/13, email/17, linkedin_or_email/21. Every email-capable touch must look like an email: a short first-name greeting on its own line, coherent message, and exact signature on its own line. T1 uses one plain 2-6 word lowercase subject. Later email-capable touches preserve it with one re: prefix. A linkedin_request has no subject, greeting, signature, pitch, meeting ask, or prior-email reference; it must stay under 300 characters.
 
-Purpose and goal are private CRM notes, never substitutes for buyer-facing prose. Before returning, read the whole sequence as the recipient. Remove generic lessons, fragments, surveys, framework language, and repeated retreat lines. In four touches, at most one touch may mainly say Andrew may be wrong, invite a correction/referral, or close; in the legacy seven-touch shape the maximum is three. Rewrite any excess around mechanism, useful contribution, and the hard buyer objection. Never reveal play labels, experiment arms, confidence scores, or internal hypotheses."#,
+Purpose and goal are private CRM notes, never substitutes for buyer-facing prose. Before returning, read the whole sequence as the recipient. Remove generic lessons, fragments, surveys, framework language, and repeated retreat lines. In four touches, at most one touch may mainly say Andrew may be wrong, invite a correction/referral, or close; in seven touches the maximum is three. Rewrite any excess around mechanism, useful contribution, and the hard buyer objection. Never reveal play labels, experiment arms, confidence scores, or internal hypotheses."#,
         n = n,
         planning_contract = planning_contract,
         brand_trigger_contract = brand_trigger_contract,
@@ -1649,9 +1648,11 @@ Purpose and goal are private CRM notes, never substitutes for buyer-facing prose
     })
 }
 
-fn brand_trigger_contract(brand: &str) -> &'static str {
-    if brand == "outagehub" {
-        "OUTAGEHUB EVIDENCE BOUNDARY: A stable sourced fact about the prospect's site/network footprint, continuity responsibility, field service, or central operations can be the trigger. A recent utility outage at one of its facilities is not required. Never hold an otherwise supported note merely because no live incident was supplied, and never invent one."
+fn brand_trigger_contract(brand: &str, touches: usize) -> &'static str {
+    if brand == "outagehub" && touches >= 7 {
+        "OUTAGEHUB SEVEN-TOUCH CONTRACT: A stable sourced fact about the prospect's operated site/network footprint can be the trigger; a recent utility outage is not required and must never be invented. T1 is one founder note: one footprint fact, one question about a recognizable outage-time decision, one sentence naming OutageHub and the specific outside context it could add beyond alarms or site calls, then one easy ask. Aim for 90-120 words. T2 sharpens the diagnostic with one new distinction. T3 is only a human, recipient-specific reason to connect: no product explainer, collateral, meeting ask, or prior-email reference. T4 offers one useful historical comparison or other concrete contribution. T5 answers the strongest objection, usually what this adds beyond alarms, telemetry, or site calls. T6 routes once. T7 closes without another pitch. State the public-versus-private data limitation at most once across the sequence. Do not repeat the same utility-data mechanism in more than two touches or offer the same artifact twice."
+    } else if brand == "outagehub" {
+        "OUTAGEHUB FOUR-TOUCH CONTRACT: A stable sourced fact about the prospect's operated site/network footprint can be the trigger; a recent utility outage is not required and must never be invented. T1 should read like one founder note: one footprint fact, one question about a recognizable outage-time decision, one sentence naming OutageHub and the specific outside context it could add beyond alarms or site calls, then one easy ask. Aim for 90-120 words. T2 must add one new diagnostic distinction and may offer one small historical comparison. T3 is only a human, recipient-specific reason to connect: no product explainer, historical comparison, collateral, meeting ask, or prior-email reference. T4 routes or closes the same question without explaining public outage data again. State the public-versus-private data limitation at most once across the sequence. Do not repeat the same utility-data mechanism in more than two touches."
     } else {
         ""
     }
@@ -2944,9 +2945,11 @@ async fn request_copy_review_with_tier(
     let stage_contract = format!(
         "SCHEMA CONTRACT: first grade the entire sequence for coherence, relevance, repetition, and whether a sensible recipient has a reason to answer. Then return exactly one review object for every stage 1 through {expected_touches}, even when only a subset needs repair. A sequence passes only at 85+ with no unresolved sequence issues. For an unnamed stage that does not need editing, preserve it with empty revised fields."
     );
+    let brand_contract = brand_trigger_contract(&pb.key, expected_touches);
     let user = format!(
-        "{task}\n\n{stage_contract}\nCHANNEL: linkedin_request has no subject; linkedin_or_email must work as either a DM or a complete email fallback.\nSENDABILITY: reject T1 if it is merely a diagnostic question plus a vague capability sentence. Require one verified trigger, one operating decision, uncertainty about the mechanism, and a role-relevant reason to answer. Curiosity is not recipient value. Never require or invent collateral. T2 must advance the mechanism. Any later touch must add a sourced fact, useful distinction, honest objection answer, route, or close rather than paraphrase.\nEVIDENCE: the verified facts below are exhaustive. The hypothesis is not fact. Never invent an internal event, system, practice, consequence, or ownership claim.\n\nSIGNATURE: {signature}\nVERIFIED FACTS: {facts}\nHYPOTHESIS, NOT FACT: {hypothesis}\nRECIPIENT: {name} ({title}, {vantage})\nLIKELY ACCESS, INTERNAL ONLY: {can_observe}\nASK SCOPE: {ask_scope}\nDETERMINISTIC FINDINGS: {deterministic}\n\nCURRENT SEQUENCE:\n{sequence}\n\nRELEVANT REVIEW KNOWLEDGE:\n{knowledge}",
+        "{task}\n\n{stage_contract}\n{brand_contract}\nCHANNEL: linkedin_request has no subject; linkedin_or_email must work as either a DM or a complete email fallback.\nSENDABILITY: reject T1 if it is merely a diagnostic question plus a vague capability sentence. Require one verified trigger, one operating decision, one concrete seller difference, and a role-relevant reason to answer. Curiosity is not recipient value. Never require or invent collateral. T2 must advance the mechanism. Any later touch must add a sourced fact, useful distinction, honest objection answer, route, or close rather than paraphrase.\nEVIDENCE: the verified facts below are exhaustive. The hypothesis is not fact. Never invent an internal event, system, practice, consequence, or ownership claim.\n\nSIGNATURE: {signature}\nVERIFIED FACTS: {facts}\nHYPOTHESIS, NOT FACT: {hypothesis}\nRECIPIENT: {name} ({title}, {vantage})\nLIKELY ACCESS, INTERNAL ONLY: {can_observe}\nASK SCOPE: {ask_scope}\nDETERMINISTIC FINDINGS: {deterministic}\n\nCURRENT SEQUENCE:\n{sequence}\n\nRELEVANT REVIEW KNOWLEDGE:\n{knowledge}",
         task = task,
+        brand_contract = brand_contract,
         signature = pb.signature,
         facts = verified_facts,
         hypothesis = account.hypothesis,
@@ -3268,6 +3271,7 @@ fn touch_word_band(pb: &Playbook, touch: &CopyTouch) -> (usize, usize) {
             // The prompt targets the brand band exactly. QA keeps a small
             // tolerance so a natural 69-word GnK note is not sent through two
             // model repairs merely to add a filler word to a 70-word target.
+            1 if pb.key == "outagehub" => (80, 130),
             1 => (
                 pb.min_words.saturating_sub(10),
                 pb.max_words.saturating_add(10),
@@ -3339,6 +3343,8 @@ fn mentions_outreach_asset(body: &str) -> bool {
         "checklist",
         "sketch",
         "historical example",
+        "historical comparison",
+        "historical review",
         "fit screen",
         "template",
         "worksheet",
@@ -3350,6 +3356,46 @@ fn mentions_outreach_asset(body: &str) -> bool {
     ]
     .iter()
     .any(|term| body.contains(term))
+}
+
+fn explains_outagehub_signal(body: &str) -> bool {
+    let body = body.to_ascii_lowercase();
+    [
+        "public utility",
+        "utility report",
+        "utility update",
+        "utility event",
+        "outage report",
+        "outage update",
+        "location-matched",
+        "matches canadian utility",
+        "match canadian utility",
+    ]
+    .iter()
+    .any(|term| body.contains(term))
+}
+
+fn states_outagehub_data_boundary(body: &str) -> bool {
+    let body = body.to_ascii_lowercase();
+    let limitation = [
+        "cannot",
+        "can't",
+        "does not",
+        "doesn't",
+        "would not",
+        "wouldn't",
+        "not confirm",
+        "not establish",
+        "not replace",
+        "only outside",
+        "only a reported",
+    ]
+    .iter()
+    .any(|term| body.contains(term));
+    let data = ["utility", "outage", "public report", "outagehub"]
+        .iter()
+        .any(|term| body.contains(term));
+    limitation && data
 }
 
 /// Correction and routing are legitimate outcomes, but the failed campaigns
@@ -3624,12 +3670,13 @@ fn sequence_quality_issues(
         .map(|touch| touch.stage)
         .collect::<Vec<_>>();
     // Even a real resource is one move in a conversation, not the premise of
-    // the whole sequence. Naming collateral in three or more messages is the
-    // generic lead-magnet loop that made otherwise tailored sequences robotic.
-    for stage in asset_stages.iter().skip(2) {
+    // the whole sequence. Repeating it in another message is the generic
+    // lead-magnet loop that made otherwise tailored sequences robotic.
+    let asset_limit = 1;
+    for stage in asset_stages.iter().skip(asset_limit) {
         issues.push(format!(
-            "stage {stage} repeats collateral across {} touches (maximum 2; continue the human conversation instead)",
-            asset_stages.len()
+            "stage {stage} repeats collateral across {} touches (maximum {asset_limit}; continue the human conversation instead)",
+            asset_stages.len(),
         ));
     }
 
@@ -3644,6 +3691,54 @@ fn sequence_quality_issues(
             "{} appears {brand_mentions} times (maximum 1 across the sequence)",
             pb.name
         ));
+    }
+
+    if pb.key == "outagehub" && expected_touches >= 4 {
+        let first = sequence.touches.iter().find(|touch| touch.stage == 1);
+        if first.is_some_and(|touch| !touch.body.to_ascii_lowercase().contains(&brand_name)) {
+            issues.push(
+                "stage 1 must name OutageHub once and state its concrete contribution in the first note"
+                    .into(),
+            );
+        }
+
+        let explainer_stages = sequence
+            .touches
+            .iter()
+            .filter(|touch| explains_outagehub_signal(&touch.body))
+            .map(|touch| touch.stage)
+            .collect::<Vec<_>>();
+        for stage in explainer_stages.iter().skip(2) {
+            issues.push(format!(
+                "stage {stage} repeats the OutageHub utility-data explanation across {} touches (maximum 2)",
+                explainer_stages.len()
+            ));
+        }
+
+        let boundary_stages = sequence
+            .touches
+            .iter()
+            .filter(|touch| states_outagehub_data_boundary(&touch.body))
+            .map(|touch| touch.stage)
+            .collect::<Vec<_>>();
+        for stage in boundary_stages.iter().skip(1) {
+            issues.push(format!(
+                "stage {stage} repeats the public-versus-private data caveat across {} touches (maximum 1)",
+                boundary_stages.len()
+            ));
+        }
+
+        if sequence
+            .touches
+            .iter()
+            .find(|touch| touch.channel.eq_ignore_ascii_case("linkedin_request"))
+            .is_some_and(|touch| mentions_outreach_asset(&touch.body))
+        {
+            issues.push(
+                "stage 3 LinkedIn request must give a human reason to connect without offering collateral or a historical comparison"
+                    .into(),
+            );
+        }
     }
 
     if pb.key == "wapahki"
@@ -4023,20 +4118,30 @@ mod tests {
         is_retreat_or_route_touch, mentions_outreach_asset, normalize_dashes,
         normalize_principle_ids, normalize_thread_subjects, provisional_channel,
         provisional_day_offset, select_people_for_planning, sequence_quality_issues,
-        touch_question_limit, touch_word_band, word_set_similarity, CopySequence, CopyTouch,
-        EditDoc, EditReview, PlanProgressRecipient, PlanProgressUpdate, TouchReview,
+        supported_touch_count, touch_question_limit, touch_word_band, word_set_similarity,
+        CopySequence, CopyTouch, EditDoc, EditReview, PlanProgressRecipient, PlanProgressUpdate,
+        TouchReview,
     };
+
+    #[test]
+    fn seven_touch_requests_are_no_longer_collapsed_to_four() {
+        assert_eq!(supported_touch_count(7), 7);
+        assert_eq!(supported_touch_count(9), 7);
+        assert_eq!(supported_touch_count(4), 4);
+        assert_eq!(supported_touch_count(1), 1);
+    }
     use crate::business::Businesses;
     use crate::db::Person;
     use crate::playbook::Playbooks;
 
     #[test]
     fn outagehub_does_not_require_a_live_outage_as_the_copy_trigger() {
-        let contract = brand_trigger_contract("outagehub");
+        let contract = brand_trigger_contract("outagehub", 7);
         assert!(contract.contains("recent utility outage"));
         assert!(contract.contains("is not required"));
         assert!(contract.contains("stable sourced fact"));
-        assert!(brand_trigger_contract("gnk").is_empty());
+        assert!(contract.contains("T7 closes"));
+        assert!(brand_trigger_contract("gnk", 7).is_empty());
     }
 
     #[test]
@@ -4776,6 +4881,69 @@ mod tests {
         );
         assert!(
             issues.iter().any(|issue| issue.contains("I sent a note")),
+            "issues were {issues:?}"
+        );
+    }
+
+    #[test]
+    fn outagehub_gate_rejects_the_repeated_cory_sequence_shape() {
+        let playbooks = Playbooks::load("playbooks").expect("load playbooks");
+        let pb = playbooks.get("outagehub").expect("outagehub playbook");
+        let signature = pb.signature.clone();
+        let email = |stage, day, middle: &str| CopyTouch {
+            stage,
+            day_offset: day,
+            channel: "email".into(),
+            subject: if stage == 1 {
+                "power alert context".into()
+            } else {
+                "re: power alert context".into()
+            },
+            body: format!("Cory,\n\n{middle}\n\n{signature}"),
+            purpose: "continue the thread".into(),
+            goal: "earn a reply".into(),
+        };
+        let sequence = CopySequence {
+            touches: vec![
+                email(1, 0, "Across Conestoga's cold-storage warehouses, a possible power alert can create a choice between a facility problem and a wider utility event. Public utility reports would not confirm conditions inside a facility, but tied to a location and time they may show a wider reported event. How is that separated before maintenance is escalated?"),
+                email(2, 3, "Public utility updates cannot establish whether refrigeration or generator controls are operating. OutageHub can provide outside context through a reported utility event and independent timeline. I can prepare a historical comparison for Conestoga locations."),
+                CopyTouch {
+                    stage: 3,
+                    day_offset: 7,
+                    channel: "linkedin_request".into(),
+                    subject: String::new(),
+                    body: "Cory, a public utility report cannot establish conditions inside a Conestoga facility. Connecting in case a historical comparison for those locations would be useful.".into(),
+                    purpose: "connect".into(),
+                    goal: "connect".into(),
+                },
+                email(4, 14, "A public utility update is useful only when it aligns with a location and time; it cannot establish refrigeration conditions inside a facility. If this comparison is handled elsewhere, would you point me to the right person?"),
+            ],
+            applied_principles: Vec::new(),
+        };
+
+        let issues = sequence_quality_issues(pb, &playbooks.shared, &sequence, &[], 4, false);
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.contains("stage 1 must name OutageHub")),
+            "issues were {issues:?}"
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.contains("utility-data explanation")),
+            "issues were {issues:?}"
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.contains("public-versus-private data caveat")),
+            "issues were {issues:?}"
+        );
+        assert!(
+            issues.iter().any(|issue| {
+                issue.contains("LinkedIn request") && issue.contains("historical comparison")
+            }),
             "issues were {issues:?}"
         );
     }

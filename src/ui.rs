@@ -394,6 +394,7 @@ struct SourceState {
     started: Instant,
     done: bool,
     succeeded: bool,
+    transient: bool,
 }
 
 /// A stable, Codex-like activity transcript for account sourcing. Milestones
@@ -416,6 +417,21 @@ impl SourceView {
             "Sourcing companies",
             "Sourced companies",
             "Sourcing stopped",
+            false,
+        )
+    }
+
+    /// Full motion already owns the durable pass-by-pass transcript. Keep the
+    /// detailed sourcing view live while a pass runs, then clear it so eight
+    /// adaptive attempts do not bury the actual fulfillment result.
+    pub fn start_transient(header: String, stats: Arc<Stats>) -> Self {
+        Self::start_with_titles(
+            header,
+            stats,
+            "Sourcing companies",
+            "Sourced companies",
+            "Sourcing stopped",
+            true,
         )
     }
 
@@ -426,6 +442,7 @@ impl SourceView {
             "Enriching contacts",
             "Enriched contacts",
             "Enrichment stopped",
+            false,
         )
     }
 
@@ -435,6 +452,7 @@ impl SourceView {
         active_title: &str,
         success_title: &str,
         failure_title: &str,
+        transient: bool,
     ) -> Self {
         let base = stats.snapshot();
         let state = Arc::new(Mutex::new(SourceState {
@@ -446,6 +464,7 @@ impl SourceView {
             started: Instant::now(),
             done: false,
             succeeded: false,
+            transient,
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let handle = if fancy() {
@@ -456,8 +475,10 @@ impl SourceView {
             Some(thread::spawn(move || {
                 source_ticker(state_t, stop_t, stats_t, base)
             }))
-        } else {
+        } else if !transient {
             activity(active_title, &state.lock().unwrap().header);
+            None
+        } else {
             None
         };
         Self {
@@ -505,7 +526,8 @@ impl SourceView {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
-        if fancy() {
+        let transient = self.state.lock().unwrap().transient;
+        if fancy() && !transient {
             println!();
         }
         self.stats.snapshot().since(self.base)
@@ -532,7 +554,7 @@ fn update_source_state(
             status,
         });
     }
-    if !fancy() {
+    if !fancy() && !view.transient {
         println!("• {title}");
         for line in detail.lines() {
             println!("  └ {line}");
@@ -550,6 +572,17 @@ fn source_ticker(
     let mut frame = 0usize;
     loop {
         let done = stop.load(Ordering::Relaxed);
+        let transient = state.lock().unwrap().transient;
+        if done && transient {
+            let out = std::io::stdout();
+            let mut lock = out.lock();
+            if previous_lines > 0 {
+                let _ = write!(lock, "\x1b[{previous_lines}A");
+            }
+            let _ = write!(lock, "\r\x1b[J");
+            let _ = lock.flush();
+            break;
+        }
         let lines = render_source(&state.lock().unwrap(), &stats, base, frame);
         let out = std::io::stdout();
         let mut lock = out.lock();
@@ -1448,6 +1481,7 @@ mod turn_view_tests {
             started: Instant::now(),
             done: false,
             succeeded: false,
+            transient: false,
         };
         let output =
             render_source(&state, &Stats::default(), StatsSnapshot::default(), 0).join("\n");
@@ -1475,6 +1509,7 @@ mod turn_view_tests {
             started: Instant::now(),
             done: false,
             succeeded: false,
+            transient: false,
         };
         let output =
             render_source(&state, &Stats::default(), StatsSnapshot::default(), 0).join("\n");

@@ -338,10 +338,14 @@ pub async fn source(
         .into_iter()
         .collect();
     let on_file = db.list_leads(Some(&pb.key)).unwrap_or_default();
-    for lead in &on_file {
-        let key = lead_dedup_key(lead);
-        if !key.is_empty() {
-            seen.insert(key);
+    let portfolio = db.list_leads(None).unwrap_or_default();
+    let mut portfolio_owners = std::collections::HashMap::<String, String>::new();
+    for lead in &portfolio {
+        for key in lead_identity_keys(lead) {
+            seen.insert(key.clone());
+            portfolio_owners
+                .entry(key)
+                .or_insert_with(|| lead.brand.clone());
         }
     }
 
@@ -359,6 +363,7 @@ pub async fn source(
     let mut fresh: Vec<ApolloOrg> = Vec::new();
     let mut orgs_found = 0usize;
     let mut skipped_known = 0usize;
+    let mut skipped_portfolio = std::collections::BTreeMap::<String, usize>::new();
     for page in 1..=MAX_SOURCE_PAGES {
         let page_orgs = apollo
             .search_organizations(&OrgFilters {
@@ -375,13 +380,28 @@ pub async fn source(
         }
         orgs_found += page_orgs.len();
         for org in page_orgs {
-            let key = org_learning_key(&org);
+            let keys = org_identity_keys(&org);
+            let learning_key = org_learning_key(&org);
+            if let Some(owner) = keys
+                .iter()
+                .find_map(|key| portfolio_owners.get(key))
+                .filter(|owner| !owner.eq_ignore_ascii_case(&pb.key))
+            {
+                *skipped_portfolio.entry(owner.clone()).or_default() += 1;
+                continue;
+            }
             // Skip anything already judged; `insert` returning false also guards
             // the same company reappearing across pages.
-            if !key.is_empty() && !seen.insert(key) {
+            if (!learning_key.is_empty() && seen.contains(&learning_key))
+                || keys.iter().any(|key| seen.contains(key))
+            {
                 skipped_known += 1;
                 continue;
             }
+            if !learning_key.is_empty() {
+                seen.insert(learning_key);
+            }
+            seen.extend(keys);
             fresh.push(org);
         }
         if fresh.len() >= want_candidates {
@@ -392,11 +412,24 @@ pub async fn source(
         progress.as_ref(),
         "apollo",
         "Found candidate companies",
-        format!(
-            "{orgs_found} returned · {} new to qualify · {skipped_known} already judged · {} qualified on file",
-            fresh.len(),
-            on_file.len(),
-        ),
+        {
+            let claimed = skipped_portfolio.values().sum::<usize>();
+            let owners = skipped_portfolio
+                .iter()
+                .map(|(brand, count)| format!("{count} {brand}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "{orgs_found} returned · {} new to qualify · {skipped_known} already judged · {claimed} claimed by another brand{} · {} qualified on file",
+                fresh.len(),
+                if owners.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({owners})")
+                },
+                on_file.len(),
+            )
+        },
         "complete",
     );
     let mut summary = SourceSummary {
@@ -979,17 +1012,98 @@ fn enforce_play_qualification(
     }
 }
 
-/// Canonical signals are stronger than topical resemblance. In particular,
-/// GnK's old qualifier repeatedly relabeled "has a Claims department" as an
-/// expensive recurring workflow and "has several portals" as human
-/// reconciliation. Those facts can support account fit, but not the operating
-/// condition the play needs before multi-touch outreach.
+/// Canonical signals are stronger than topical resemblance. GnK must not turn
+/// department or portal presence into a reconciliation claim. OutageHub must
+/// not turn a contractor's office list or generic emergency service into a
+/// distributed-asset, utility-decision thesis.
 fn credible_canonical_signal(brand: &str, key: &str, evidence: &str) -> bool {
+    let text = evidence.to_ascii_lowercase();
+    let has = |terms: &[&str]| terms.iter().any(|term| text.contains(term));
+    if brand.eq_ignore_ascii_case("outagehub") {
+        return match key.trim() {
+            "account.distributed_locations" => {
+                has(&[
+                    "site",
+                    "facility",
+                    "facilities",
+                    "warehouse",
+                    "residence",
+                    "charger",
+                    "station",
+                    "network",
+                    "asset",
+                    "portfolio",
+                    "store",
+                    "branch",
+                    "terminal",
+                    "plant",
+                    "campus",
+                    "tower",
+                    "location",
+                ]) && has(&[
+                    "multiple",
+                    "several",
+                    "across",
+                    "province",
+                    "region",
+                    "territor",
+                    "nationwide",
+                    "canada",
+                    "remote",
+                    "distributed",
+                    "locations",
+                    "facilities",
+                    "sites",
+                ]) && !(has(&["office", "headquarters", "hq"])
+                    && !has(&[
+                        "site",
+                        "facility",
+                        "facilities",
+                        "warehouse",
+                        "residence",
+                        "charger",
+                        "station",
+                        "network",
+                        "asset",
+                        "store",
+                        "terminal",
+                        "plant",
+                        "tower",
+                    ]))
+            }
+            "account.outage_sensitive_decision" => {
+                has(&[
+                    "outage",
+                    "utility",
+                    "grid",
+                    "loss of power",
+                    "loss-of-power",
+                    "power loss",
+                    "power failure",
+                    "power interruption",
+                    "blackout",
+                    "restoration",
+                ]) && has(&[
+                    "dispatch",
+                    "escalat",
+                    "hold",
+                    "transfer",
+                    "communicat",
+                    "prioriti",
+                    "classif",
+                    "check",
+                    "respond",
+                    "response",
+                    "route",
+                    "investigat",
+                ])
+            }
+            _ => true,
+        };
+    }
     if !brand.eq_ignore_ascii_case("gnk") {
         return true;
     }
-    let text = evidence.to_ascii_lowercase();
-    let has = |terms: &[&str]| terms.iter().any(|term| text.contains(term));
     match key.trim() {
         "account.expensive_recurring_workflow" => {
             has(&[
@@ -1732,24 +1846,47 @@ fn record_qualification_patterns(
     saved
 }
 
-/// Stable dedup handle for a company across runs: prefer Apollo's org id, fall
-/// back to its domain. Used to recognize a company we've already judged.
+fn canonical_company_domain(raw: &str) -> String {
+    raw.trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_start_matches("www.")
+        .trim_end_matches('/')
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
+/// Durable qualification learnings historically used Apollo id first and
+/// domain second. Keep that key stable while the portfolio ownership layer
+/// uses both identities at once.
 fn org_learning_key(org: &ApolloOrg) -> String {
     if !org.id.trim().is_empty() {
         org.id.clone()
     } else {
-        org.domain()
+        canonical_company_domain(&org.domain())
     }
 }
 
-/// Dedup handle for a stored Lead, mirroring [`org_learning_key`] so a company
-/// already qualified in an earlier run is recognized and never re-qualified.
-fn lead_dedup_key(lead: &Lead) -> String {
-    if !lead.apollo_org_id.trim().is_empty() {
-        lead.apollo_org_id.clone()
-    } else {
-        lead.domain.clone()
+fn company_identity_keys(apollo_id: &str, domain: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    if !apollo_id.trim().is_empty() {
+        keys.push(format!("apollo:{}", apollo_id.trim()));
     }
+    let domain = canonical_company_domain(domain);
+    if !domain.is_empty() {
+        keys.push(format!("domain:{domain}"));
+    }
+    keys
+}
+
+fn org_identity_keys(org: &ApolloOrg) -> Vec<String> {
+    company_identity_keys(&org.id, &org.domain())
+}
+
+fn lead_identity_keys(lead: &Lead) -> Vec<String> {
+    company_identity_keys(&lead.apollo_org_id, &lead.domain)
 }
 
 /// Prepend the brand's accumulated learnings to the operating context so ICP
@@ -1933,13 +2070,13 @@ pub fn select_reuse_excluding(
     });
 
     let accounts_on_file = ranked.len();
-    // An account with one historical contact, or no evidence-ready contact at
-    // all, is inventory but not coverage for a "N people per company" motion.
-    // Treat it as a shortfall so the full motion sources replacements instead
-    // of selecting weak rows and holding them only after the expensive refresh.
+    // A mapped roster is enough to select an account for the refresh step. Its
+    // current play assessment may be absent or stale precisely because it has
+    // not been refreshed yet; requiring readiness here made the orchestrator
+    // skip good existing accounts and spend the turn sourcing weaker ones.
     let reusable_accounts = ranked
         .iter()
-        .filter(|(ready, covered, _, _, _)| *ready > 0 && *covered)
+        .filter(|(_, covered, _, _, _)| *covered)
         .count();
     let mut selection = ReuseSelection {
         accounts_on_file,
@@ -1951,7 +2088,7 @@ pub fn select_reuse_excluding(
 
     for (_ready, _covered, _score, lead, mut roster) in ranked
         .into_iter()
-        .filter(|(ready, covered, _, _, _)| *ready > 0 && *covered)
+        .filter(|(_, covered, _, _, _)| *covered)
         .take(n_accounts)
     {
         roster.sort_by(|left, right| {
@@ -2400,10 +2537,22 @@ mod tests {
     use std::collections::HashSet;
 
     use super::{
-        clamp_employee_ranges, credible_canonical_signal, enforce_play_qualification,
-        reusable_workflow_contact, reuse_lead_score, reuse_person_score, select_reuse_excluding,
-        source_candidate_target, OrgQual,
+        clamp_employee_ranges, company_identity_keys, credible_canonical_signal,
+        enforce_play_qualification, reusable_workflow_contact, reuse_lead_score,
+        reuse_person_score, select_reuse_excluding, source_candidate_target, OrgQual,
     };
+
+    #[test]
+    fn portfolio_identity_uses_both_apollo_id_and_canonical_domain() {
+        let keys = company_identity_keys("org-123", "https://www.Example.com/path");
+        assert_eq!(
+            keys,
+            vec![
+                "apollo:org-123".to_string(),
+                "domain:example.com".to_string()
+            ]
+        );
+    }
 
     #[test]
     fn gnk_signals_require_operating_evidence_not_department_or_portal_presence() {
@@ -2426,6 +2575,30 @@ mod tests {
             "gnk",
             "account.cross_system_reconciliation",
             "Staff assemble the decision record manually across three systems."
+        ));
+    }
+
+    #[test]
+    fn outagehub_signals_reject_office_lists_and_generic_emergency_service() {
+        assert!(!credible_canonical_signal(
+            "outagehub",
+            "account.distributed_locations",
+            "The electrical contractor has offices in Vancouver, Burnaby, Kelowna, and Calgary."
+        ));
+        assert!(!credible_canonical_signal(
+            "outagehub",
+            "account.outage_sensitive_decision",
+            "Technicians provide 24/7 emergency electrical service."
+        ));
+        assert!(credible_canonical_signal(
+            "outagehub",
+            "account.distributed_locations",
+            "The operator runs automated cold-storage facilities across Ontario, Alberta, and Quebec."
+        ));
+        assert!(credible_canonical_signal(
+            "outagehub",
+            "account.outage_sensitive_decision",
+            "After a loss-of-power alarm, operators decide whether to dispatch maintenance or hold the response when a utility outage is reported."
         ));
     }
     use crate::db::{Db, Lead, Person};
@@ -2557,6 +2730,39 @@ mod tests {
             .expect("select replacement inventory");
         assert_eq!(replacement.accounts_on_file, 0);
         assert!(replacement.lead_ids.is_empty());
+    }
+
+    #[test]
+    fn reuse_selection_refreshes_mapped_accounts_before_requiring_play_readiness() {
+        let db = std::sync::Arc::new(Db::open(":memory:").expect("open memory db"));
+        let lead_id = db
+            .upsert_lead(&Lead {
+                brand: "outagehub".into(),
+                apollo_org_id: "org-awaiting-refresh".into(),
+                name: "Mapped Distributed Operator".into(),
+                status: "research_needed".into(),
+                ..Default::default()
+            })
+            .expect("insert lead");
+        db.upsert_person(&Person {
+            lead_id: lead_id.clone(),
+            brand: "outagehub".into(),
+            apollo_person_id: "person-awaiting-refresh".into(),
+            name: "Network Operations Owner".into(),
+            title: "Director of Network Operations".into(),
+            vantage: "process_owner".into(),
+            email_status: "verified".into(),
+            ..Default::default()
+        })
+        .expect("insert person");
+        let playbooks = Playbooks::load("playbooks").expect("load playbooks");
+        let playbook = playbooks.get("outagehub").expect("outagehub playbook");
+
+        let selected = select_reuse_excluding(&db, playbook, "outagehub", 1, 1, &HashSet::new())
+            .expect("select inventory for refresh");
+        assert_eq!(selected.accounts_selected, 1);
+        assert_eq!(selected.accounts_shortfall, 0);
+        assert_eq!(selected.lead_ids, vec![lead_id]);
     }
 
     #[test]

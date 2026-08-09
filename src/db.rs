@@ -30,7 +30,7 @@ use uuid::Uuid;
 
 /// Increment when the buyer-facing copy contract changes materially. The CRM
 /// only presents sequences approved under the current policy.
-pub const CURRENT_COPY_POLICY_VERSION: i64 = 8;
+pub const CURRENT_COPY_POLICY_VERSION: i64 = 9;
 
 /// A real company sourced from Apollo and (optionally) qualified against a brand
 /// thesis. Everything the model *guesses* stays in the inference/hypothesis
@@ -770,6 +770,36 @@ impl Db {
     pub fn upsert_lead(&self, lead: &Lead) -> Result<String> {
         let conn = self.conn.lock().unwrap();
         let now = now();
+        let canonical_domain = lead
+            .domain
+            .trim()
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .trim_start_matches("www.")
+            .trim_end_matches('/')
+            .split('/')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let portfolio_owner: Option<String> = conn
+            .query_row(
+                "SELECT brand FROM leads
+                 WHERE brand<>?1 AND (
+                   (?2<>'' AND apollo_org_id=?2) OR
+                   (?3<>'' AND LOWER(RTRIM(REPLACE(REPLACE(REPLACE(domain,'https://',''),'http://',''),'www.',''), '/'))=?3)
+                 )
+                 ORDER BY created_at ASC LIMIT 1",
+                params![lead.brand, lead.apollo_org_id, canonical_domain],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(owner) = portfolio_owner {
+            anyhow::bail!(
+                "company '{}' is already assigned to {}; one company can belong to only one portfolio brand",
+                lead.name,
+                owner
+            );
+        }
         let existing: Option<String> = conn
             .query_row(
                 "SELECT id FROM leads WHERE brand=?1 AND apollo_org_id=?2",
@@ -5594,6 +5624,41 @@ mod tests {
     }
 
     #[test]
+    fn one_company_cannot_be_claimed_by_two_portfolio_brands() {
+        let db = Db::open(":memory:").expect("open memory db");
+        db.upsert_lead(&Lead {
+            brand: "gnk".into(),
+            apollo_org_id: "portfolio-company".into(),
+            name: "Shared Company".into(),
+            domain: "https://www.shared.example/".into(),
+            ..Default::default()
+        })
+        .expect("claim company for gnk");
+
+        let by_apollo = db
+            .upsert_lead(&Lead {
+                brand: "outagehub".into(),
+                apollo_org_id: "portfolio-company".into(),
+                name: "Shared Company".into(),
+                domain: "shared.example".into(),
+                ..Default::default()
+            })
+            .expect_err("same Apollo organization must be rejected");
+        assert!(by_apollo.to_string().contains("already assigned to gnk"));
+
+        let by_domain = db
+            .upsert_lead(&Lead {
+                brand: "wapahki".into(),
+                apollo_org_id: "different-apollo-id".into(),
+                name: "Shared Company Alias".into(),
+                domain: "www.shared.example".into(),
+                ..Default::default()
+            })
+            .expect_err("same canonical domain must be rejected");
+        assert!(by_domain.to_string().contains("already assigned to gnk"));
+    }
+
+    #[test]
     fn legacy_contact_vantage_is_backfilled_for_readiness() {
         let path = std::env::temp_dir().join(format!(
             "spruce-contact-vantage-backfill-test-{}.sqlite",
@@ -6580,8 +6645,8 @@ mod tests {
             .current_gtm_play("outagehub")
             .expect("load current play")
             .expect("seeded outagehub play");
-        assert_eq!(play.version, 3);
-        assert_eq!(play.minimum_signal_matches, 3);
+        assert_eq!(play.version, 4);
+        assert_eq!(play.minimum_signal_matches, 2);
         assert!(play
             .required_signal_keys
             .contains(&"account.outage_sensitive_decision".to_string()));
