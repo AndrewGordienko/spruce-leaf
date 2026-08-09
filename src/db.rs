@@ -6580,11 +6580,14 @@ mod tests {
             .current_gtm_play("outagehub")
             .expect("load current play")
             .expect("seeded outagehub play");
-        assert_eq!(play.version, 2);
+        assert_eq!(play.version, 3);
         assert_eq!(play.minimum_signal_matches, 3);
         assert!(play
             .required_signal_keys
             .contains(&"account.outage_sensitive_decision".to_string()));
+        assert!(!play
+            .required_signal_keys
+            .contains(&"account.existing_operational_system".to_string()));
 
         let lead_id = db
             .upsert_lead(&Lead {

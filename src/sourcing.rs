@@ -256,6 +256,7 @@ pub async fn source(
     thesis: &str,
     n_accounts: usize,
     n_contacts: usize,
+    candidate_limit: Option<usize>,
     concurrency: usize,
     progress: Option<SourceProgressReporter>,
 ) -> Result<SourceSummary> {
@@ -344,7 +345,7 @@ pub async fn source(
         }
     }
 
-    let want_candidates = (n_accounts * 2).clamp(10, 100);
+    let want_candidates = source_candidate_target(n_accounts, candidate_limit);
     let per_page = want_candidates as u32;
     report_source(
         progress.as_ref(),
@@ -1786,6 +1787,14 @@ fn augment_context_with_learnings(
 /// ceiling, so enterprise giants are never fetched. If the model returned only
 /// oversized buckets, fall back to every standard bucket within the ceiling —
 /// never leaving the size filter empty, which would let giants back in.
+fn source_candidate_target(n_accounts: usize, candidate_limit: Option<usize>) -> usize {
+    let n_accounts = n_accounts.max(1);
+    let ordinary_overfetch = n_accounts.saturating_mul(2).clamp(10, 100);
+    candidate_limit
+        .map(|limit| limit.max(n_accounts).min(ordinary_overfetch).clamp(1, 100))
+        .unwrap_or(ordinary_overfetch)
+}
+
 fn clamp_employee_ranges(ranges: Vec<String>, max_employees: Option<i64>) -> Vec<String> {
     let Some(max) = max_employees else {
         return ranges;
@@ -2393,7 +2402,7 @@ mod tests {
     use super::{
         clamp_employee_ranges, credible_canonical_signal, enforce_play_qualification,
         reusable_workflow_contact, reuse_lead_score, reuse_person_score, select_reuse_excluding,
-        OrgQual,
+        source_candidate_target, OrgQual,
     };
 
     #[test]
@@ -2455,6 +2464,15 @@ mod tests {
     fn clamp_is_a_noop_without_a_ceiling() {
         let ranges = vec!["10001,1000000".to_string()];
         assert_eq!(clamp_employee_ranges(ranges.clone(), None), ranges);
+    }
+
+    #[test]
+    fn full_motion_can_bound_deep_qualification_without_weakening_standalone_source() {
+        assert_eq!(source_candidate_target(3, None), 10);
+        assert_eq!(source_candidate_target(3, Some(6)), 6);
+        assert_eq!(source_candidate_target(1, Some(4)), 4);
+        // A caller cannot ask to evaluate fewer candidates than account slots.
+        assert_eq!(source_candidate_target(5, Some(2)), 5);
     }
 
     #[test]

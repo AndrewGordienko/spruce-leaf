@@ -546,6 +546,7 @@ fn main() -> Result<()> {
                 &thesis,
                 accounts,
                 contacts,
+                None,
                 cli.concurrency,
                 None,
             ))?;

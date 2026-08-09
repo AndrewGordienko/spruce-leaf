@@ -888,6 +888,7 @@ impl Agent {
         thesis: &str,
         accounts: usize,
         contacts: usize,
+        candidate_limit: Option<usize>,
     ) -> Result<sourcing::SourceSummary, String> {
         let pb = self
             .playbooks
@@ -919,6 +920,7 @@ impl Agent {
             thesis,
             accounts,
             contacts,
+            candidate_limit,
             self.concurrency.max(1),
             Some(progress),
         )
@@ -931,7 +933,7 @@ impl Agent {
     }
 
     async fn source_leads(&self, thesis: &str, accounts: usize, contacts: usize) -> String {
-        match self.do_source(thesis, accounts, contacts).await {
+        match self.do_source(thesis, accounts, contacts, None).await {
             Ok(s) => {
                 // Surface the freshly-filed leads/people in the live CRM.
                 if s.leads_qualified > 0 || s.people_added > 0 {
@@ -1592,7 +1594,7 @@ impl Agent {
             // Keep widening and re-deriving the ICP within this same motion.
             // Each failed qualification pass is persisted as a correction and
             // therefore changes the next pass instead of repeating it blindly.
-            while reuse.accounts_selected < remaining
+            while reuse.accounts_selected == 0
                 && source_passes < max_source_passes
                 && terminal_reason.is_none()
             {
@@ -1612,7 +1614,15 @@ impl Agent {
                         "pass {source_passes}/{max_source_passes} · need {want} more account slot(s) · prior misses refine the next ICP"
                     ),
                 );
-                match self.do_source(thesis, want, contacts).await {
+                // Interleave upstream search with downstream fulfillment. A
+                // ten-to-twenty-company deep-research wave can consume the
+                // entire turn before writing begins; a bounded wave learns or
+                // yields a working account without starving the copy stages.
+                let candidate_limit = want.clamp(4, 6);
+                match self
+                    .do_source(thesis, want, contacts, Some(candidate_limit))
+                    .await
+                {
                     Ok(pass) => {
                         source_total.orgs_found += pass.orgs_found;
                         source_total.candidates_new += pass.candidates_new;

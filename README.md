@@ -357,6 +357,12 @@ from the working set and replaced. Rejected copy gets one additional whole-seque
 the saved reviewer feedback before replacement. An account slot counts only when a complete,
 reviewed current-policy sequence exists for the requested touch shape.
 
+Full motion also interleaves the funnel instead of exhausting the inference budget upstream. Each
+adaptive pass deeply researches a small fresh-candidate wave sized to the remaining shortfall, then
+immediately refreshes, enriches, and drafts any usable account before searching again. Standalone
+`source` commands retain their wider over-fetch because they have no downstream writing stage to
+reserve capacity for.
+
 The motion stops short only at an explicit execution boundary: two adaptive searches with no
 previously unseen companies, a provider/authentication/credit or model-budget stop, or the
 configurable safety ceilings. The defaults allow eight adaptive sourcing passes and four
