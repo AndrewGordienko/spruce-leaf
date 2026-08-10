@@ -378,6 +378,15 @@ fn ready_execution_person(db: &SharedDb, person: &Person) -> Result<Option<Execu
     if !complete_reviewed_sequence(&touches) {
         return Ok(None);
     }
+    if person.brand == "outagehub"
+        && !crate::gtm::prepare_action(db, &person.brand, &person.lead_id, person)?
+            .sequence_ready_for(touches.len())
+    {
+        // Pipeline is execution state, not an archive. If a newer GTM play or
+        // account assessment says the account is no longer ready, retain the
+        // sequence in GTM Lab but do not present it as sendable work.
+        return Ok(None);
+    }
     Ok(Some(ExecutionPerson {
         person: person.clone(),
         touches,
@@ -1476,7 +1485,7 @@ fn render_outcome_strip(b: &mut String, dashboard: &ExecutionDashboard, brand: O
     b.push_str(&format!(
         "<section class=\"outcome-strip\" aria-label=\"Next best work\"><div class=\"outcome-intro\">\
          <span class=\"strategy-kicker\">Next best work</span><strong>Start conversations → create meetings → advance proof</strong>\
-         <small>{mapped} contacts are mapped across ready accounts; this sheet shows one reviewed primary sequence per account. Research, held accounts, and rejected copy stay in GTM Lab.</small></div>\
+         <small>{mapped} contacts are mapped across ready accounts; this sheet shows every current reviewed recipient sequence. Research, held accounts, and rejected copy stay in GTM Lab.</small></div>\
          <a class=\"outcome-card\" href=\"#pipeline\"><b>{approvals}</b><span>email drafts</span><small>approve these conversation steps</small></a>\
          <a class=\"outcome-card\" href=\"#pipeline\"><b>{social}</b><span>LinkedIn actions</span><small>complete the manual channel work</small></a>\
          <a class=\"outcome-card\" href=\"#pipeline\"><b>{replies}</b><span>recent replies</span><small>route, answer, or ask for the meeting</small></a>\
@@ -3062,7 +3071,7 @@ fn render_people_sheet(b: &mut String, accounts: &[ExecutionAccount]) {
                 entry.person.status == "suppressed",
             )
         });
-        let people = people.into_iter().take(5).collect::<Vec<_>>();
+        let people = people.into_iter().collect::<Vec<_>>();
 
         for (slot, entry) in people.iter().copied().enumerate() {
             let stripe = if account_index % 2 == 1 { " alt" } else { "" };
@@ -3101,7 +3110,7 @@ fn render_mobile_people_cards(b: &mut String, accounts: &[ExecutionAccount], max
         return;
     }
     for account in accounts {
-        let people = account.people.iter().take(5).collect::<Vec<_>>();
+        let people = account.people.iter().collect::<Vec<_>>();
         let touch_count = people
             .iter()
             .map(|entry| entry.touches.len())

@@ -612,6 +612,9 @@ impl Agent {
             }
         };
         coalesce_full_motion_steps(&mut decision.steps, &self.brand);
+        let (outreach_accounts, outreach_recipients) = requested_outreach_scope(&decision.steps);
+        self.client
+            .scale_turn_budget_for_outreach(outreach_accounts, outreach_recipients);
 
         // Pure conversational answer: no actions to run this turn. The model
         // already streamed a visible reply, so don't reprint — but remember it.
@@ -700,7 +703,7 @@ impl Agent {
             "run_full_motion" => (
                 "Running full motion".into(),
                 format!(
-                    "{brand} · {} accounts · {} mapped contacts each · 1 primary sequence per account · {} touches",
+                    "{brand} · {} accounts × {} recipients × {} touches · drafts only",
                     step.accounts.unwrap_or(5),
                     step.contacts.unwrap_or(5),
                     step.touches.unwrap_or(7)
@@ -1061,9 +1064,9 @@ impl Agent {
     }
 
     /// Write sequences for verified people, returning the summary. `replace`
-    /// re-drafts existing (unsent) sequences to improve them. Bulk motions always
-    /// activate one primary recipient per account; `per_account_cap` remains an
-    /// input-compatibility hint, not permission for parallel account blasting.
+    /// re-drafts existing (unsent) sequences to improve them. Bulk motions honor
+    /// the requested per-account recipient count; primary status affects order,
+    /// not whether explicitly requested recipients are silently discarded.
     /// A scoped request may reveal only its selected, not-yet-verified people so
     /// the requested account × contact cardinality does not silently collapse.
     /// No account or people search occurs here; real send volume remains bounded
@@ -1730,15 +1733,38 @@ impl Agent {
 
             people_selected_total += reuse.people_selected;
 
+            // Reassess selected inventory against the current play before an
+            // old reviewed sequence can satisfy the request. Copy-policy
+            // freshness alone is not enough when the ICP/play version changed.
+            // This also lets legacy accounts remain candidates for cheap reuse
+            // without silently treating their old framing as current truth.
+            refreshed_total += self
+                .do_refresh_context(thesis, &reuse.lead_ids, false)
+                .await;
+
             // Preserve already-reviewed current-policy work on an ordinary run.
-            // A requested rewrite deliberately sends it through planning again.
+            // An account is complete only when the requested number of people
+            // each have the requested current-policy touch shape and the account
+            // still clears the live play gate.
             let mut plan_leads = reuse.lead_ids.to_vec();
             if !replace_drafts {
                 plan_leads.retain(|lead_id| {
-                    let already_done = self
-                        .db
-                        .lead_has_current_reviewed_sequence(lead_id, effective_touches)
-                        .unwrap_or(false);
+                    let ready_people = reuse
+                        .person_ids
+                        .iter()
+                        .filter_map(|person_id| self.db.get_person(person_id).ok().flatten())
+                        .filter(|person| person.lead_id == *lead_id)
+                        .filter(|person| {
+                            crate::gtm::prepare_action(&self.db, &self.brand, lead_id, person)
+                                .is_ok_and(|context| context.sequence_ready_for(effective_touches))
+                        })
+                        .filter(|person| {
+                            self.db
+                                .person_has_current_reviewed_sequence(&person.id, effective_touches)
+                                .unwrap_or(false)
+                        })
+                        .count();
+                    let already_done = ready_people >= contacts;
                     if already_done {
                         fulfilled.insert(lead_id.clone());
                     }
@@ -1764,8 +1790,6 @@ impl Agent {
                 })
                 .cloned()
                 .collect::<std::collections::HashSet<_>>();
-
-            refreshed_total += self.do_refresh_context(thesis, &plan_leads, false).await;
 
             let need_enrich = self
                 .db
@@ -1850,7 +1874,16 @@ impl Agent {
             people_stopped_total += pass.people_stopped;
             touches_drafted_total += pass.touches_drafted;
             touches_scheduled_total += pass.touches_scheduled;
-            fulfilled.extend(pass.planned_lead_ids.iter().cloned());
+            for lead_id in &plan_leads {
+                if self
+                    .db
+                    .lead_current_reviewed_sequence_count(lead_id, effective_touches)
+                    .unwrap_or(0)
+                    >= contacts
+                {
+                    fulfilled.insert(lead_id.clone());
+                }
+            }
             if let Some(reason) = pass.stopped_reason.take() {
                 terminal_reason = Some(reason);
                 break;
@@ -1868,11 +1901,17 @@ impl Agent {
                 let retry_people = plan_person_ids
                     .iter()
                     .filter(|person_id| {
-                        self.db
+                        let on_retry_account = self
+                            .db
                             .get_person(person_id)
                             .ok()
                             .flatten()
-                            .is_some_and(|person| retry_leads.contains(&person.lead_id))
+                            .is_some_and(|person| retry_leads.contains(&person.lead_id));
+                        on_retry_account
+                            && !self
+                                .db
+                                .person_has_current_reviewed_sequence(person_id, effective_touches)
+                                .unwrap_or(false)
                     })
                     .cloned()
                     .collect::<std::collections::HashSet<_>>();
@@ -1903,7 +1942,16 @@ impl Agent {
                         people_stopped_total += retry.people_stopped;
                         touches_drafted_total += retry.touches_drafted;
                         touches_scheduled_total += retry.touches_scheduled;
-                        fulfilled.extend(retry.planned_lead_ids.iter().cloned());
+                        for lead_id in &plan_leads {
+                            if self
+                                .db
+                                .lead_current_reviewed_sequence_count(lead_id, effective_touches)
+                                .unwrap_or(0)
+                                >= contacts
+                            {
+                                fulfilled.insert(lead_id.clone());
+                            }
+                        }
                         if let Some(reason) = retry.stopped_reason.take() {
                             terminal_reason = Some(reason);
                             break;
@@ -1948,7 +1996,7 @@ impl Agent {
 
         if fulfilled.len() >= accounts {
             return format!(
-                "Full motion filled {filled}/{accounts} account slots with current reviewed {effective_touches}-touch sequences. {planned} primary sequence(s) were newly written; {drafted} touches remain drafts and {scheduled} were scheduled. {apollo_note}. Refreshed {refreshed_total} account(s) and processed {people_selected_total} mapped-contact selection(s), including {verified_total} verified result(s). The motion maps {contacts} contacts per account for coverage but shows and activates one primary sequence per account; secondary contacts remain visible in GTM Lab. Nothing was sent. CRM: {url}.",
+                "Full motion filled {filled}/{accounts} account slots with {contacts} current reviewed {effective_touches}-touch sequence(s) per account. {planned} recipient sequence(s) were newly written; {drafted} touches remain drafts and {scheduled} were scheduled. {apollo_note}. Refreshed {refreshed_total} account(s) and processed {people_selected_total} recipient selection(s), including {verified_total} verified result(s). Nothing was sent. CRM: {url}.",
                 filled = fulfilled.len(),
                 planned = people_planned_total,
                 drafted = touches_drafted_total,
@@ -1958,7 +2006,7 @@ impl Agent {
         }
 
         format!(
-            "Full motion persisted through {rounds} replacement round(s) and filled {filled}/{accounts} account slots before hitting a real execution boundary: {reason}. That means {filled} primary sequence(s) reached Pipeline, not {accounts}; mapped secondary contacts remain in GTM Lab. {apollo_note}. It rejected {rejected} copy attempt(s), held {held} weak recipient/account attempt(s), and left {stopped} unfinished after the boundary; none of those counted as completed output. Nothing was sent. CRM: {url}.",
+            "Full motion persisted through {rounds} replacement round(s) and filled {filled}/{accounts} account slots at the requested {contacts}-recipient coverage before hitting a real execution boundary: {reason}. A partially drafted account does not count as filled. {apollo_note}. It rejected {rejected} copy attempt(s), held {held} weak recipient/account attempt(s), and left {stopped} unfinished after the boundary; none of those counted as completed output. Nothing was sent. CRM: {url}.",
             rounds = motion_rounds,
             filled = fulfilled.len(),
             reason = terminal_reason.unwrap_or_else(|| "unknown execution boundary".to_string()),
@@ -2513,14 +2561,14 @@ impl Agent {
 MULTIPLE brands or things in one request → emit one step per (brand, action), in the user's order. Examples:\n\
 - 'full motion for gnk and outagehub and wapahki' → three run_full_motion steps, brand gnk / outagehub / wapahki.\n\
 - 'source 10 for gnk, then draft wapahki' → a source_leads step (brand gnk) and a plan_outreach step (brand wapahki).\n\
-- Finding/sourcing companies or people AND writing/drafting their outreach for the SAME brand is ONE run_full_motion step, never separate source_leads + plan_outreach steps. The phrase 'one primary person' describes activation, while contacts still preserves the requested mapped people per company.\n\
+- Finding/sourcing companies or people AND writing/drafting their outreach for the SAME brand is ONE run_full_motion step, never separate source_leads + plan_outreach steps. The contacts field is both mapping and drafting cardinality per company: if the operator asks for five people per company, draft up to five qualified, verified recipients per company.\n\
 - Different actions for different brands in one message are fine; each step carries its own brand and its own fields.\n\
 For a pure conversational answer (no action to run), leave `steps` empty and put the answer in `reply`.\n\n\
 {brand_mode}\n\n\
 Actions (each is a step's `action`):\n\
 - run_campaign: hypothetical research-only campaign; no Apollo.\n\
 - source_leads: ONLY finds and qualifies Apollo accounts+people, then stops — it writes NO emails. Use only when the request is purely to find companies/people and contains no request to write, draft, sequence, or perform outreach. set thesis/accounts/contacts (defaults 10/3).\n\
-- run_full_motion: end-to-end motion for a brand (never sends). The requested account count is a FULFILLMENT CONTRACT: persist through adaptive sourcing passes, contact shortfalls, weak hypotheses, and rejected copy; save misses as targeting corrections, retry rejected copy with its feedback, and replace any account that still lacks a current reviewed sequence. Stop short only at a real provider/model-budget/search-exhaustion safety boundary and report filled/requested exactly. REUSE-FIRST: if the CRM already has enough accounts/people for that brand, it SKIPS Apollo, refreshes why those companies fit, and writes missing, rejected, or stale sequences. Current-policy reviewed drafts are preserved unless the operator explicitly asks to rewrite/redraft/refine/replace them. set thesis/accounts/contacts/touches (defaults 5/5/7). Bulk activation still chooses one primary contact per account. set force_new=true ONLY when they explicitly ask for new/fresh/more companies not already on file.\n\
+- run_full_motion: end-to-end motion for a brand (never sends). The requested account count AND contacts-per-account count are a FULFILLMENT CONTRACT: persist through adaptive sourcing passes, contact shortfalls, weak hypotheses, and rejected copy; save misses as targeting corrections, retry rejected copy with its feedback, and replace an account that still lacks the requested number of current reviewed recipient sequences. Stop short only at a real provider/model-budget/search-exhaustion safety boundary and report filled/requested exactly. REUSE-FIRST: if the CRM already has enough accounts/people for that brand, it SKIPS Apollo, refreshes why those companies fit, and writes missing, rejected, or stale sequences. Current-policy reviewed drafts are preserved unless the operator explicitly asks to rewrite/redraft/refine/replace them. set thesis/accounts/contacts/touches (defaults 5/5/7). set force_new=true ONLY when they explicitly ask for new/fresh/more companies not already on file.\n\
 - enrich_people: reveal/verify sourced emails; phone only when explicit.\n\
 - plan_outreach: draft sequences for contacts ALREADY found (no account/people search). When the operator says 'I need X from person Y,' put Y's exact name/email/id in person and X in outcome. Do not reinterpret X as buyer-facing wording; the response planner will reduce it when it is not yet earned. A scoped request may reveal only those selected contacts whose email is still missing, because an email sequence must not silently shrink; skip that reveal when the operator says no Apollo/no enrichment/verified only. IMPORTANT SCOPE: 'first N people' with NO company/account count means N people TOTAL in CRM order: set limit=N and OMIT accounts/contacts. 'first N people in the first company' means accounts=1, contacts=N. 'N people for each of M companies' means accounts=M, contacts=N. contacts is always PER selected company, never a bare total. Preserve current-policy reviewed drafts on ordinary retries; safely replace unsent drafts only when the operator explicitly says rewrite/redraft/refine/replace. auto only when explicit.\n\
 - approve_outreach: only after explicit approval — this is what actually schedules drafts to send.\n\
@@ -2733,8 +2781,8 @@ fn coalesce_full_motion_steps(steps: &mut Vec<Step>, fallback_brand: &str) {
             full.outcome = plan.outcome.clone();
         }
         full.accounts = source.accounts.or(plan.accounts);
-        // The source step carries the mapping coverage requested by the user;
-        // the planning step may say one because activation is one primary.
+        // Contacts are requested recipient sequences per company, not merely a
+        // hidden mapping pool behind a silently reduced recipient count.
         full.contacts = source.contacts.or(plan.contacts);
         full.touches = plan.touches.or(source.touches);
         full.auto = plan.auto;
@@ -2745,6 +2793,35 @@ fn coalesce_full_motion_steps(steps: &mut Vec<Step>, fallback_brand: &str) {
     }
 
     *steps = normalized;
+}
+
+fn requested_outreach_scope(steps: &[Step]) -> (usize, usize) {
+    let mut accounts = 0usize;
+    let mut recipients = 0usize;
+    for step in steps {
+        match step.action.as_str() {
+            "run_full_motion" => {
+                let step_accounts = step.accounts.unwrap_or(5).max(1) as usize;
+                let contacts = step.contacts.unwrap_or(5).max(1) as usize;
+                accounts = accounts.saturating_add(step_accounts);
+                recipients = recipients.saturating_add(step_accounts.saturating_mul(contacts));
+            }
+            "plan_outreach" => {
+                let step_accounts = step.accounts.unwrap_or(1).max(1) as usize;
+                let step_recipients = if !step.person.trim().is_empty() {
+                    1
+                } else if let Some(limit) = step.limit {
+                    limit.max(1) as usize
+                } else {
+                    step_accounts.saturating_mul(step.contacts.unwrap_or(1).max(1) as usize)
+                };
+                accounts = accounts.saturating_add(step_accounts);
+                recipients = recipients.saturating_add(step_recipients);
+            }
+            _ => {}
+        }
+    }
+    (accounts, recipients)
 }
 
 fn effective_step_brand<'a>(step: &'a Step, fallback_brand: &'a str) -> &'a str {
@@ -2771,10 +2848,22 @@ pub fn open_browser(url: &str) {
 mod tests {
     use super::{
         coalesce_full_motion_steps, decision_schema, deterministic_full_motion_fallback,
-        forbids_contact_enrichment, requests_copy_replacement, routed_total_limit,
-        select_plan_scope, unqualified_people_total, Step,
+        forbids_contact_enrichment, requested_outreach_scope, requests_copy_replacement,
+        routed_total_limit, select_plan_scope, unqualified_people_total, Step,
     };
     use crate::db::{Db, Lead, Person};
+
+    #[test]
+    fn requested_contact_cardinality_sizes_the_execution_envelope() {
+        let steps = vec![Step {
+            action: "run_full_motion".into(),
+            accounts: Some(5),
+            contacts: Some(5),
+            touches: Some(7),
+            ..Default::default()
+        }];
+        assert_eq!(requested_outreach_scope(&steps), (5, 25));
+    }
 
     #[test]
     fn decision_schema_does_not_request_router_scratch_work() {

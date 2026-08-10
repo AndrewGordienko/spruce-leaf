@@ -30,6 +30,25 @@ The requested response must match the person's vantage:
 - A router should receive one easy routing request, not a compressed business
   case.
 
+## Model the role, never the private personality
+
+Use title and mapped vantage only to estimate work context: what the person can
+credibly know, the level of detail they use, what replying might cost socially
+or cognitively, and what commitment their authority supports. Do not infer
+ambition, fear, temperament, political beliefs, private pressure, or personal
+"buttons" from a profile. Public biography may supply a verified work signal;
+it does not license a psychographic dossier.
+
+Operators deserve a concrete operating moment and a question about actual work.
+Frontline leaders can compare recurring exceptions and team intervention.
+Process owners can discuss workflow, measures, and whether the mechanism is
+material. Operational executives can judge spread, consequence, and ownership.
+Economic leaders can discuss attribution and thresholds, not floor mechanics.
+Technical evaluators need precise data and system boundaries after the business
+problem is credible. Routers need one bounded routing request. The private role
+contract should materially change the scene, evidence, question, and ask—not
+merely alter the greeting.
+
 ## Make attention deserved
 
 Use one recognizable scene the recipient can mentally simulate: a charger goes

@@ -47,6 +47,7 @@ mod repl;
 mod reply_agent;
 mod report;
 mod research;
+mod response_design;
 mod send;
 mod sourcing;
 mod storage;
@@ -184,7 +185,7 @@ enum Command {
         phone: bool,
     },
 
-    /// Write reviewed outreach drafts for verified primary contacts.
+    /// Write reviewed outreach drafts for verified contacts.
     Plan {
         /// Requested touch count; defaults to the full seven-touch sequence.
         #[arg(long, default_value_t = 7, value_parser = positive_usize)]
@@ -192,7 +193,7 @@ enum Command {
         /// Limit planning to the first N existing companies in CRM order.
         #[arg(long, value_parser = positive_usize)]
         accounts: Option<usize>,
-        /// Candidate-contact cap per company; bulk planning still activates one primary person.
+        /// Recipient-sequence cap per company; the requested count is honored.
         #[arg(long, value_parser = positive_usize)]
         contacts: Option<usize>,
         /// Optional total contact cap across the selected companies.
@@ -235,6 +236,9 @@ enum Command {
         /// Print every generated body as well as subjects and blind verdicts.
         #[arg(long)]
         show_drafts: bool,
+        /// Run only one named variant against full (for example no-role-contract).
+        #[arg(long)]
+        only: Option<String>,
     },
 
     /// Approve drafted email touches so the cadence engine may send them.
@@ -727,6 +731,7 @@ fn main() -> Result<()> {
             cases,
             repeats,
             show_drafts,
+            only,
         } => {
             let client = make_engine(&rt, &cli)?;
             let playbooks = load_playbooks(&cli)?;
@@ -734,10 +739,13 @@ fn main() -> Result<()> {
                 &client,
                 &playbooks,
                 Path::new(&corpus),
-                cases,
-                repeats,
-                cli.concurrency,
-                show_drafts,
+                outreach_ablation::Options {
+                    case_limit: cases,
+                    repeats,
+                    concurrency: cli.concurrency,
+                    show_drafts,
+                    only: only.as_deref(),
+                },
             ))?;
             Ok(())
         }

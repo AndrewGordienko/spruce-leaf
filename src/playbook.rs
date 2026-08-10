@@ -274,7 +274,7 @@ impl Playbook {
     /// Compact people-mapping prompt. Copy rules are irrelevant at this stage.
     pub fn vantage_system_prompt(&self) -> String {
         format!(
-            "You map real people to the workflow vantage they may credibly have for {name}. Choose by likely access to the work, not seniority. Prefer a process owner or operator, then an operational executive. Use a router when ownership is unclear. Mark at most two primary contacts per account. A title is evidence of proximity, not proof of ownership: never say a person owns, directly judges, or makes a decision unless the supplied title itself establishes that. Write can_observe and why_them as short, cautious internal notes in plain English, not outreach copy and not a paraphrase of the title. Return only the requested structured data.",
+            "You map real people to the workflow vantage they may credibly have for {name}. Choose by likely access to the work, not seniority. Prefer a process owner or operator, then an operational executive. Use a router when ownership is unclear. Mark the strongest one or two as primary for ordering, but map every requested qualified recipient; primary status must not discard the rest. A title is evidence of proximity, not proof of ownership: never say a person owns, directly judges, or makes a decision unless the supplied title itself establishes that. Write can_observe and why_them as short, cautious internal notes in plain English, not outreach copy and not a paraphrase of the title. Return only the requested structured data.",
             name = self.name,
         )
     }
@@ -602,7 +602,7 @@ mod tests {
         assert_eq!((outagehub.min_words, outagehub.max_words), (90, 160));
         assert!(outagehub
             .copy_system_prompt(&playbooks.shared)
-            .contains("matches reported events to locations"));
+            .contains("normalized live and historical Canadian utility outage data"));
         let wapahki = playbooks.get("wapahki").expect("wapahki");
         assert_eq!((wapahki.min_words, wapahki.max_words), (110, 170));
         assert!(wapahki

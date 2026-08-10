@@ -87,6 +87,8 @@ pub struct AccountLimits {
     pub max_new_contacts_per_account_per_day: usize,
     /// How many people at one account may be actively worked (contacted or
     /// replied) at once. Bounds parallel fronts across days, not just per day.
+    /// Zero leaves the requested recipient count uncapped; the daily opener
+    /// limit can still stagger first touches without discarding sequences.
     #[serde(default = "default_max_active_contacts_per_account")]
     pub max_active_contacts_per_account: usize,
     /// Stop a person's sequence once this many touches have been sent with no
@@ -247,7 +249,7 @@ fn default_max_new_contacts_per_account_per_day() -> usize {
 }
 
 fn default_max_active_contacts_per_account() -> usize {
-    2
+    0
 }
 
 fn default_max_unanswered_touches() -> usize {
@@ -596,7 +598,7 @@ mod tests {
             .unwrap()
             .account_limits
             .max_active_contacts_per_account
-            == 1));
+            == 0));
         assert!(!businesses.get("gnk").unwrap().has_motion("funding"));
         assert!(businesses.get("outagehub").unwrap().has_motion("funding"));
         assert!(!businesses

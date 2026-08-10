@@ -2,7 +2,7 @@
 
 A **"Codex for sales."** Launch it, type what you're hunting for, and it runs the whole
 play: find accounts with an expensive workflow, map the people positioned to see that workflow,
-and activate one primary contact with a hypothesis-led outreach sequence — grounded in a library of real sales books —
+and activate the requested verified contacts with hypothesis-led outreach sequences — grounded in a library of real sales books —
 then files everything in a local CRM.
 
 It's a Rust CLI with a provider-neutral reasoning engine. Each line you type goes directly to the
@@ -10,7 +10,7 @@ OpenAI Responses API by default, or to the optional Claude, Codex, or Grok local
 Apollo sourcing, contact enrichment, verified outreach planning, approval, and funnel reporting.
 
 Set `OPENAI_API_KEY` for the default backend. The normal model is `gpt-5.6-terra`; lightweight
-routing uses `gpt-5.6-luna`. The isolated outreach writer uses `gpt-5.6-sol` at `xhigh`; copy repair
+routing uses `gpt-5.6-luna`. The isolated outreach writer uses `gpt-5.6-sol` at `high`; copy repair
 uses the selected model at `medium`, and independent final verification uses it at `high`.
 Account qualification, contact-vantage selection, hypothesis refresh, and outreach angle planning
 use the selected model at `medium`. Sol is intentionally limited to the one call where prose taste
@@ -22,15 +22,18 @@ and their matching `*_REASONING_EFFORT` keys. `SPRUCE_OPENAI_COPY_MODEL` and
 with `--model gpt-5.6-sol` still applies it to other substantive work. Authenticated `claude`, `codex`, and `grok` CLIs remain available through
 `--backend`. Apollo and mailbox credentials are still required for real sourcing and delivery.
 Frontier outreach calls are globally limited to two concurrent requests; tune this cautiously with
-`SPRUCE_OPENAI_FRONTIER_CONCURRENCY`. A turn also stops at 100 model attempts, 120,000 output tokens,
-or $2.00 of measured model cost by default. Override those safety rails with
+`SPRUCE_OPENAI_FRONTIER_CONCURRENCY`. An ordinary turn stops at 100 model attempts, 120,000 output
+tokens, or $2.00 of measured model cost by default. Explicit multi-recipient outreach raises those
+default ceilings in proportion to the requested scope; ceilings remain safeguards, not spend targets. Override them with
 `SPRUCE_TURN_MAX_MODEL_ATTEMPTS`, `SPRUCE_TURN_MAX_OUTPUT_TOKENS`, and
 `SPRUCE_TURN_MAX_COST_USD`. Router fallback is one-call-only: it never silently changes the provider
 used by the bulk action it routes.
 Automatic account-framing refreshes reuse source-backed research for six hours by default; tune with
 `SPRUCE_ACCOUNT_REFRESH_TTL_SECS` or set it to `0` to force every re-read.
 
-Bulk outreach activates one primary person per account and defaults to seven reviewed touches.
+Bulk outreach honors the requested recipient count per account and defaults to seven reviewed touches per recipient.
+Each recipient is written and reviewed in an isolated model call, so a large account request cannot
+overflow one structured response or discard good copy for other contacts.
 Discovery-ready accounts are held for research unless the request is a single manual routing note;
 only action-ready evidence can produce a multi-touch campaign. An explicit four-touch request still
 uses the compact email/email/LinkedIn/email cadence. Run `cargo run -- eval-outreach --double-blind`
@@ -383,8 +386,7 @@ work.
 
 The working-set IDs are enforced during enrichment: a 5-account × 5-person mapping request reveals
 those five selected contacts at each account, rather than the first 25 unenriched rows in database
-order. Outreach then activates one primary person per account instead of launching five parallel
-threads.
+order. Outreach then drafts for the requested number of qualified recipients per account; primary status affects ordering, not eligibility.
 The same cardinality contract applies to scoped re-drafting. A request for 5 accounts × 2 people
 cannot be silently reduced by a router-supplied total limit; Spruce Leaf resolves the ten visible
 people first, reports the exact scope, and reveals email only for selected identities that are still

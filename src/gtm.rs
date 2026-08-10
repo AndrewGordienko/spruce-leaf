@@ -239,7 +239,7 @@ pub fn sourcing_play_block(play: Option<&GtmPlay>) -> String {
         "ACTIVE VERSIONED GTM PLAY (selection policy, not marketing copy)\n\
          Name: {} v{}\nTarget ICP: {}\nHypothesis: {}\nRequired signal catalog keys: {} (minimum {} matches)\n\
          Action policy: {}\nProof we can actually deliver: {}\nSuccess metric: {}\nKill condition: {}\n\
-         Use this play to choose, qualify, and RANK accounts. Reject superficial industry/technology matches. A high-fit account needs source-backed evidence of the operational decision, a defensible root cause for the current ambiguity or manual workaround, a reachable person who can observe it, and a credible path to this bounded proof.",
+         Use this play to choose, qualify, and RANK accounts. Reject superficial industry/technology matches and enforce the declared minimum rather than silently making every catalog key mandatory. When the action policy explicitly says the exact decision may be tested, a source-backed operating footprint can earn a cautious discovery note while the decision and root cause remain questions. Otherwise require source-backed evidence of the decision and current mechanism. Always require a credible path to the bounded proof.",
         play.name,
         play.version,
         play.target_icp,
@@ -480,9 +480,21 @@ pub fn prepare_action(
             .iter()
             .filter(|key| matched_signal_keys.contains(key))
             .count();
-        let assessment_allows_action = assessment
-            .as_ref()
-            .is_none_or(|assessment| assessment.status == "qualified");
+        // OutageHub's earlier play versions let legacy signals make an account
+        // look action-ready without ever reassessing it against the current
+        // ICP. That kept stale renewable developers and contractors in
+        // Pipeline after the play changed. Require a current versioned account
+        // assessment for this motion; inventory without one is still reusable,
+        // but it must be refreshed before copy can pass the gate.
+        let assessment_allows_action = if brand == "outagehub" {
+            assessment
+                .as_ref()
+                .is_some_and(|assessment| assessment.status == "qualified")
+        } else {
+            assessment
+                .as_ref()
+                .is_none_or(|assessment| assessment.status == "qualified")
+        };
         if assessment_allows_action
             && matched >= play.minimum_signal_matches.max(1) as usize
             && mandatory_action_signals_present(brand, &matched_signal_keys)
@@ -528,12 +540,9 @@ fn mandatory_action_signals_present(brand: &str, matched: &[String]) -> bool {
     if !brand.eq_ignore_ascii_case("outagehub") {
         return true;
     }
-    [
-        "account.distributed_locations",
-        "account.outage_sensitive_decision",
-    ]
-    .iter()
-    .all(|required| matched.iter().any(|key| key == required))
+    ["account.fit_evidence", "account.distributed_locations"]
+        .iter()
+        .all(|required| matched.iter().any(|key| key == required))
 }
 
 /// Last-mile evidence guard. Qualification applies a richer version of this
@@ -684,14 +693,14 @@ pub fn default_plays() -> Vec<GtmPlay> {
         GtmPlay {
             brand: "outagehub".into(),
             key: "historical_outage_replay".into(),
-            version: 5,
+            version: 7,
             name: "Historical location-matched outage replay".into(),
             lifecycle: "testing".into(),
             motion: "internal_pipeline_to_forward_deployed_proof".into(),
-            target_icp: "Operators with a source-backed distributed operating footprint where a location-specific outage decision is plausible. Public research must establish the real sites or assets; the diagnostic note may test the exact decision rather than pretend the internal workflow is already known. An internal NOC, dispatch, or software surface strengthens fit but need not be public.".into(),
+            target_icp: "Operators with a source-backed distributed operating footprint where a location-specific outage decision is plausible. Public research must establish the real sites or assets; the diagnostic note may test the exact decision rather than pretend the internal workflow is already known. An internal NOC, dispatch, or software surface strengthens fit but need not be public. Exclude electric utilities, energy developers, generation-asset owners, contractors, installers, and equipment sellers unless they themselves operate a distributed customer or site service where public local-utility outage reports change an operating decision; utility benchmarking is a separate play.".into(),
             target_vantages: vec!["process_owner".into(), "operator".into(), "technical_evaluator".into(), "router".into()],
             required_signal_keys: vec!["account.fit_evidence".into(), "account.outage_sensitive_decision".into(), "account.distributed_locations".into()],
-            minimum_signal_matches: 3,
+            minimum_signal_matches: 2,
             hypothesis: "Location-matched public utility context changes a live classification, dispatch, escalation, hold, transfer, or communication decision.".into(),
             action_policy: "Use the verified footprint to ask one concrete question about the current decision path. Treat the decision and mechanism as hypotheses. If the problem is confirmed, offer one small historical event review; do not lead with an API, webhook, dashboard, or pilot.".into(),
             proof_type: "historical_replay".into(),
@@ -764,7 +773,8 @@ mod tests {
         prepare_action, seed_defaults, GtmActionContext, SignalCandidate,
     };
     use crate::db::{
-        AccountPlayAssessment, CustomerDevelopmentRecord, Db, Lead, Person, SignalObservation,
+        AccountPlayAssessment, CustomerDevelopmentRecord, Db, Lead, Person, SharedDb,
+        SignalObservation,
     };
     use std::sync::Arc;
     use uuid::Uuid;
@@ -777,6 +787,27 @@ mod tests {
         ] {
             let _ = std::fs::remove_file(candidate);
         }
+    }
+
+    fn qualify_current_play(db: &SharedDb, brand: &str, lead_id: &str, keys: &[&str]) {
+        let play = db
+            .current_gtm_play(brand)
+            .expect("play query")
+            .expect("current play");
+        db.upsert_account_play_assessment(&AccountPlayAssessment {
+            lead_id: lead_id.to_string(),
+            brand: brand.to_string(),
+            play_id: play.id,
+            play_version: play.version,
+            status: "qualified".into(),
+            fit_score: 85,
+            matched_signal_keys: keys.iter().map(|key| (*key).to_string()).collect(),
+            root_cause: "A bounded operating decision may benefit from external context.".into(),
+            proof_fit: "The hypothesis can be tested with a small historical comparison.".into(),
+            source: "test".into(),
+            ..Default::default()
+        })
+        .expect("qualified assessment");
     }
 
     #[test]
@@ -967,7 +998,7 @@ mod tests {
     }
 
     #[test]
-    fn generic_cold_storage_facts_do_not_prove_an_outage_decision() {
+    fn generic_cold_storage_footprint_can_earn_a_cautious_discovery_note() {
         let path = std::env::temp_dir().join(format!(
             "spruce-outage-signal-test-{}.sqlite",
             Uuid::new_v4()
@@ -1022,11 +1053,23 @@ mod tests {
         .expect("signals");
 
         let person = db.get_person(&person_id).unwrap().unwrap();
+        let stale = prepare_action(&db, "outagehub", &lead_id, &person).expect("stale context");
+        assert!(!stale.action_ready());
+
+        qualify_current_play(
+            &db,
+            "outagehub",
+            &lead_id,
+            &["account.fit_evidence", "account.distributed_locations"],
+        );
         let context = prepare_action(&db, "outagehub", &lead_id, &person).expect("context");
         assert!(!context
             .matched_signal_keys
             .contains(&"account.outage_sensitive_decision".to_string()));
-        assert!(!context.action_ready());
+        assert!(context.action_ready());
+        assert!(context
+            .copy_prompt_block()
+            .contains("Treat everything else as a question"));
         drop(db);
         remove_temp_db(&path);
     }
@@ -1088,6 +1131,16 @@ mod tests {
         )
         .expect("signals");
 
+        qualify_current_play(
+            &db,
+            "outagehub",
+            &lead_id,
+            &[
+                "account.fit_evidence",
+                "account.distributed_locations",
+                "account.outage_sensitive_decision",
+            ],
+        );
         let person = db.get_person(&person_id).unwrap().unwrap();
         let context = prepare_action(&db, "outagehub", &lead_id, &person).expect("context");
         assert!(context

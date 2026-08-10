@@ -34,6 +34,7 @@ use crate::engine::Engine;
 use crate::gtm::GtmActionContext;
 use crate::knowledge::Library;
 use crate::playbook::{self, Playbook, SalesCriticPersona, Shared};
+use crate::response_design;
 
 #[derive(Debug, Default)]
 pub struct PlanSummary {
@@ -700,9 +701,8 @@ pub async fn plan_pending(
     let system = pb.copy_system_prompt(shared);
 
     // Verified people to sequence. An explicit --person request targets that exact
-    // row. Bulk motions activate one primary workflow owner per account; other
-    // verified contacts remain fallbacks after a route, bounce, or completed
-    // thread. Parallel cold sequences are not account personalization.
+    // row. A bulk request honors the operator's per-account cardinality instead
+    // of silently collapsing five requested recipients into one "primary."
     let mut verified = db.list_people(Some(&pb.key), Some("verified"))?;
     // The full motion scopes drafting to the people IT just sourced, so a run
     // doesn't re-draft the brand's entire accumulated backlog every time.
@@ -715,8 +715,7 @@ pub async fn plan_pending(
             .filter(|person| person_matches(person, person_filter))
             .collect::<Vec<_>>()
     } else {
-        let _requested_cap = per_account_cap;
-        select_people_for_planning(verified, 1)
+        select_people_for_planning(verified, per_account_cap.unwrap_or(1).max(1))
     };
     let mut todo = Vec::new();
     let mut matched_people = 0;
@@ -769,19 +768,12 @@ pub async fn plan_pending(
         });
     }
 
-    // Group by account so its evidence, business context, and knowledge are sent
-    // once, then split each account into small chunks: one writer call produces
-    // every recipient's full sequence, so batching several recipients still
-    // creates enough copy to blow the model's per-call timeout
-    // and get the whole account rejected. Capping recipients per call keeps each
-    // call bounded and lets the account's other recipients still succeed.
-    let max_recipients_per_call = if client.backend() == crate::engine::Backend::Openai {
-        3
-    } else {
-        // A CLI process cannot share one HTTP connection or a server-side
-        // queue; keep each invocation independently bounded.
-        1
-    };
+    // A full seven-touch sequence is already a large structured result. Keep
+    // every writer call to one recipient: three recipients in one response
+    // produced 21 touches and exhausted the provider's 12,288-token output
+    // boundary before returning valid JSON. Account context is intentionally
+    // repeated so one person's failure cannot discard everyone else's copy.
+    let max_recipients_per_call = 1;
     let leads = db.list_leads(Some(&pb.key))?;
     let roster = todo
         .iter()
@@ -1106,10 +1098,9 @@ pub async fn plan_pending(
     summary.planned_lead_ids = planned_by_lead.keys().cloned().collect();
     summary.planned_lead_ids.sort();
 
-    // A bulk replacement also retires unsent legacy sequences for lower-priority
-    // contacts at each successfully replanned account. Otherwise the CRM would
-    // keep displaying the old five-person blast even though the new policy works
-    // only the strongest workflow owner. Sent history is never removed.
+    // A bulk replacement also retires unsent legacy sequences for contacts that
+    // were outside the operator's selected scope at each replanned account.
+    // Sent history is never removed.
     if replace_drafts && person_filter.is_none() {
         for person in db.list_people(Some(&pb.key), None)? {
             let Some(kept_people) = planned_by_lead.get(&person.lead_id) else {
@@ -1325,7 +1316,7 @@ async fn plan_sequence(
         "title": person.title,
         "vantage": person.vantage,
         "likely_access_internal_only": if discovery_only { "" } else { person.can_observe.as_str() },
-        "ask_scope": recipient_ask_scope(person),
+        "role_response_contract_internal_only": response_design::for_person(person).prompt_value(),
         "operator_requested_outcome_internal_only": desired_outcome.unwrap_or("No narrower outcome supplied; choose the smallest useful cold response for this vantage and evidence state."),
     });
     let user = format!(
@@ -1431,7 +1422,7 @@ async fn write_account_sequences(
                 "A LinkedIn URL is on file, but its profile content has not been retrieved. The title is the only verified person-level insight; do not imply posts, tenure, priorities, or biography."
             },
             "verified_person_insights": Vec::<String>::new(),
-            "ask_scope": recipient_ask_scope(person),
+            "role_response_contract_internal_only": response_design::for_person(person).prompt_value(),
             "operator_requested_outcome_internal_only": desired_outcome.unwrap_or("No narrower outcome supplied; choose the smallest useful cold response for this vantage and evidence state."),
             "sequence_plan": plans.get(&person.id),
             "previous_rejection_feedback_internal_only": db
@@ -1445,7 +1436,7 @@ async fn write_account_sequences(
     };
     let writer_account = writer_account_brief(&account);
     let planning_contract = if lean {
-        "For each recipient, choose one source-backed trigger and one operating decision this title can plausibly answer. Keep the mechanism explicitly unverified. Privately draft three genuinely different T1 candidates: a problem-sniffing note, a concise point of view, and an existence-or-routing note. Pick one; never blend or return the alternatives. T2 must sharpen the mechanism rather than restate T1. T3 is a natural connection request. If T4 is present, add only a sourced fact, a useful concrete distinction, or an honest answer to the strongest objection; never invent an artifact to fill the slot. The sequence stays on one human thread and must not become an interview or a chain of retreats. Do not expose the private plan or discarded candidates."
+        "For each recipient, choose one source-backed trigger and one operating decision this title can plausibly answer. Keep the mechanism explicitly unverified. Privately draft three genuinely different T1 candidates: a problem-sniffing note, a concise point of view, and an existence-or-routing note. Pick one; never blend or return the alternatives. T2 must sharpen the mechanism rather than restate T1. T3 is a natural connection request that gives a concrete reason to connect; never fill it with praise for the recipient's remit, background, perspective, or work. If T4 is present, add only a sourced fact, a useful concrete distinction, or an honest answer to the strongest objection; never invent an artifact to fill the slot. The sequence stays on one human thread and must not become an interview or a chain of retreats. Do not expose the private plan or discarded candidates."
     } else {
         "Follow each recipient's supplied private sequence_plan. Treat response_strategy as the governing outcome and recipient-friction brief, not language to paste into the email."
     };
@@ -1464,7 +1455,7 @@ T1 must use the brand-specific word band. Write it as one natural note, not as a
 
 Before returning T1, privately write five possible subjects and discard any that merely label the category, such as `utility status`, `power alarms`, `claim evidence`, `decision trail`, or `automation question`. Choose a 3-9 word subject that names the recognizable event, decision, object, or consequence in the email and gives this recipient an accurate reason to open. It should remain plain and forwardable, never clickbait. Then read the first two body lines aloud. Rewrite compressed phrases such as `make this decision consequential`, `the distinction I have in mind`, and `the practical difference is` into ordinary spoken English.
 
-For four touches use email/0, email/3, linkedin_request/7, email/14. For seven touches use email/0, email/3, linkedin_request/5, email/9, linkedin_or_email/13, email/17, linkedin_or_email/21. Every email-capable touch must look like an email: `Hi [First name],` on its own line, a coherent message, and the exact signature on its own line. T1 uses one plain, specific 3-9 word operational subject; sentence case or title case is fine. Later email-capable touches preserve it with one re: prefix. A linkedin_request has no subject, greeting, signature, pitch, meeting ask, or prior-email reference; it must stay under 300 characters.
+For four touches use email/0, email/3, linkedin_request/7, email/14. For seven touches use email/0, email/3, linkedin_request/5, email/9, linkedin_or_email/13, email/17, linkedin_or_email/21. Every email-capable touch must look like an email: `Hi [First name],` on its own line, a coherent message, and the exact signature on its own line. T1 uses one plain, specific 3-9 word operational subject; sentence case or title case is fine. Later email-capable touches preserve it with one re: prefix. A linkedin_request has no subject, greeting, signature, pitch, meeting ask, or prior-email reference; it must stay under 300 characters. It must name the operating question or shared topic that makes connecting useful. Empty compliments such as `substantial remit`, `valuable perspective`, `impressive background`, or `I respect your work` fail.
 
 Purpose and goal are private CRM notes, never substitutes for buyer-facing prose. Before returning, read the whole sequence as the recipient. Remove generic lessons, fragments, surveys, framework language, and repeated retreat lines. In four touches, at most one touch may mainly say Andrew may be wrong, invite a correction/referral, or close; in seven touches the maximum is three. Rewrite any excess around mechanism, useful contribution, and the hard buyer objection. Never reveal play labels, experiment arms, confidence scores, or internal hypotheses."#,
         n = n,
@@ -2288,28 +2279,6 @@ fn writer_account_brief(account: &CopyAccount) -> Value {
     })
 }
 
-fn recipient_ask_scope(person: &crate::db::Person) -> &'static str {
-    ask_scope_for_vantage(&person.vantage)
-}
-
-fn ask_scope_for_vantage(vantage: &str) -> &'static str {
-    match vantage.to_ascii_lowercase().as_str() {
-        "process_owner" | "operator" => {
-            "Ask one concrete question about actual work, or ask for a short conversation to compare the precise hypothesis with reality."
-        }
-        "operational_executive" => {
-            "Ask whether this is material across the operation, or who sees it day to day."
-        }
-        "technical_evaluator" => {
-            "Do not ask for a technical evaluation yet; ask who handles the operating decision."
-        }
-        "economic_buyer" => {
-            "Ask whether the issue matters at their level, or who can describe the current process."
-        }
-        _ => "Ask only who the right person is; do not make them assess the problem or product.",
-    }
-}
-
 fn copy_contact(person: &crate::db::Person) -> CopyContact {
     CopyContact {
         name: person.name.clone(),
@@ -2883,14 +2852,15 @@ async fn request_sales_council(
         .filter(|touch| is_email_capable_channel(&touch.channel))
         .collect::<Vec<_>>();
     let user = format!(
-        "Review every current email under every critic lens. This is a vote, not an editing task: recommendations diagnose the smallest needed change but never provide canned replacement copy.\n\nREQUIRED SIGNATURE: {signature}\nVERIFIED ACCOUNT FACTS: {facts}\nQUESTION TO TEST (NOT A FACT): {hypothesis}\nRECIPIENT: {name} ({title}, {vantage})\nASK SCOPE: {ask_scope}\n\nCURRENT EMAILS:\n{emails}\n\nRETRIEVED BOOK AND SKILL KNOWLEDGE:\n{knowledge}",
+        "Review every current email under every critic lens. This is a vote, not an editing task: recommendations diagnose the smallest needed change but never provide canned replacement copy.\n\nREQUIRED SIGNATURE: {signature}\nVERIFIED ACCOUNT FACTS: {facts}\nQUESTION TO TEST (NOT A FACT): {hypothesis}\nRECIPIENT: {name} ({title}, {vantage})\nROLE RESPONSE CONTRACT (private; shape the judgment, never state inferred motives as facts):\n{role_contract}\n\nCURRENT EMAILS:\n{emails}\n\nRETRIEVED BOOK AND SKILL KNOWLEDGE:\n{knowledge}",
         signature = pb.signature,
         facts = account.observed_facts.join(" | "),
         hypothesis = account.hypothesis,
         name = contact.name,
         title = contact.title,
         vantage = contact.vantage,
-        ask_scope = ask_scope_for_vantage(&contact.vantage),
+        role_contract = response_design::for_title_and_vantage(&contact.title, &contact.vantage)
+            .prompt_block(),
         emails = serde_json::to_string_pretty(&emails).unwrap_or_default(),
         knowledge = knowledge,
     );
@@ -3030,7 +3000,7 @@ async fn request_copy_review_with_tier(
     );
     let brand_contract = brand_trigger_contract(&pb.key, expected_touches);
     let user = format!(
-        "{task}\n\n{stage_contract}\n{brand_contract}\nCHANNEL: linkedin_request has no subject; linkedin_or_email must work as either a DM or a complete email fallback.\nINBOX TEST: grade T1's subject and first two lines before the rest. A subject that merely labels the category (`utility status`, `power alarms`, `claim evidence`, `decision trail`, `automation question`) fails even if relevant. Require a plain 3-9 word phrase naming the operating event, decision, object, or consequence that makes this exact email worth opening. No clickbait. Reject internal-memo prose such as `make this decision consequential`, `the distinction I have in mind`, and `the practical difference is`; Andrew must be able to say every line naturally aloud.\nSENDABILITY: reject T1 if it is merely a diagnostic question plus a vague capability sentence. Require one verified trigger, one operating decision, one concrete seller difference, and a role-relevant reason to answer. Curiosity is not recipient value. Never require or invent collateral. T2 must advance the mechanism. Any later touch must add a sourced fact, useful distinction, honest objection answer, route, or close rather than paraphrase.\nEVIDENCE: the verified facts below are exhaustive. The hypothesis is not fact. Never invent an internal event, system, practice, consequence, or ownership claim.\n\nSIGNATURE: {signature}\nVERIFIED FACTS: {facts}\nHYPOTHESIS, NOT FACT: {hypothesis}\nRECIPIENT: {name} ({title}, {vantage})\nLIKELY ACCESS, INTERNAL ONLY: {can_observe}\nASK SCOPE: {ask_scope}\nDETERMINISTIC FINDINGS: {deterministic}\n\nCURRENT SEQUENCE:\n{sequence}\n\nRELEVANT REVIEW KNOWLEDGE:\n{knowledge}",
+        "{task}\n\n{stage_contract}\n{brand_contract}\nCHANNEL: linkedin_request has no subject; linkedin_or_email must work as either a DM or a complete email fallback. A LinkedIn request must give a concrete operating reason to connect, not praise the recipient's remit, background, perspective, or work.\nINBOX TEST: grade T1's subject and first two lines before the rest. A subject that merely labels the category (`utility status`, `power alarms`, `claim evidence`, `decision trail`, `automation question`) fails even if relevant. Require a plain 3-9 word phrase naming the operating event, decision, object, or consequence that makes this exact email worth opening. No clickbait. Reject internal-memo prose such as `make this decision consequential`, `the distinction I have in mind`, and `the practical difference is`; Andrew must be able to say every line naturally aloud.\nSENDABILITY: reject T1 if it is merely a diagnostic question plus a vague capability sentence. Require one verified trigger, one operating decision, one concrete seller difference, and a role-relevant reason to answer. Curiosity is not recipient value. Never require or invent collateral. T2 must advance the mechanism. Any later touch must add a sourced fact, useful distinction, honest objection answer, route, or close rather than paraphrase.\nEVIDENCE: the verified facts below are exhaustive. The hypothesis is not fact. Never invent an internal event, system, practice, consequence, or ownership claim.\n\nSIGNATURE: {signature}\nVERIFIED FACTS: {facts}\nHYPOTHESIS, NOT FACT: {hypothesis}\nRECIPIENT: {name} ({title}, {vantage})\nLIKELY ACCESS, INTERNAL ONLY: {can_observe}\nROLE RESPONSE CONTRACT (private; test role fit, reply cost, and face risk without inventing personality):\n{role_contract}\nDETERMINISTIC FINDINGS: {deterministic}\n\nCURRENT SEQUENCE:\n{sequence}\n\nRELEVANT REVIEW KNOWLEDGE:\n{knowledge}",
         task = task,
         brand_contract = brand_contract,
         signature = pb.signature,
@@ -3040,7 +3010,8 @@ async fn request_copy_review_with_tier(
         title = contact.title,
         vantage = contact.vantage,
         can_observe = contact.can_observe,
-        ask_scope = ask_scope_for_vantage(&contact.vantage),
+        role_contract = response_design::for_title_and_vantage(&contact.title, &contact.vantage)
+            .prompt_block(),
         deterministic = if deterministic.is_empty() {
             "none".to_string()
         } else {
@@ -3184,7 +3155,7 @@ fn person_matches(person: &crate::db::Person, filter: Option<&str>) -> bool {
 
 fn select_people_for_planning(
     people: Vec<crate::db::Person>,
-    _per_account: usize,
+    per_account: usize,
 ) -> Vec<crate::db::Person> {
     let mut by_lead: HashMap<String, Vec<crate::db::Person>> = HashMap::new();
     for person in people {
@@ -3205,7 +3176,7 @@ fn select_people_for_planning(
                 .cmp(&planning_priority(left))
                 .then_with(|| left.name.cmp(&right.name))
         });
-        selected.extend(candidates.into_iter().take(1));
+        selected.extend(candidates.into_iter().take(per_account.max(1)));
     }
     selected
 }
@@ -3871,6 +3842,12 @@ fn sequence_quality_issues(
                 touch.body.chars().count()
             ));
         }
+        if channel == "linkedin_request" && is_empty_linkedin_praise(&touch.body) {
+            issues.push(format!(
+                "stage {} is an empty compliment; name the concrete operating question or shared topic that makes connecting useful",
+                touch.stage
+            ));
+        }
         if touch.stage == 7 && touch.body.contains('?') {
             issues.push("stage 7 must close without a question".to_string());
         }
@@ -4103,6 +4080,21 @@ fn sequence_quality_issues(
         }
     }
     issues
+}
+
+fn is_empty_linkedin_praise(body: &str) -> bool {
+    let normalized = body.to_ascii_lowercase();
+    let praise = [
+        "substantial remit",
+        "valuable perspective",
+        "value your perspective",
+        "impressive background",
+        "impressive experience",
+        "respect that work",
+        "respect your work",
+        "your perspective is directly relevant",
+    ];
+    praise.iter().any(|phrase| normalized.contains(phrase))
 }
 
 fn word_set_similarity(left: &str, right: &str, signature: &str) -> (f64, usize) {
@@ -4426,9 +4418,9 @@ mod tests {
     use super::{
         affected_stages, apply_targeted_repairs, brand_trigger_contract, business_copy_context,
         copy_sentence_count, format_progress_status, generic_subject_label,
-        has_forced_response_menu, is_email_capable_channel, is_retreat_or_route_touch,
-        mentions_outreach_asset, narrates_internal_copy_logic, normalize_dashes,
-        normalize_principle_ids, normalize_thread_subjects, provisional_channel,
+        has_forced_response_menu, is_email_capable_channel, is_empty_linkedin_praise,
+        is_retreat_or_route_touch, mentions_outreach_asset, narrates_internal_copy_logic,
+        normalize_dashes, normalize_principle_ids, normalize_thread_subjects, provisional_channel,
         provisional_day_offset, select_people_for_planning, sequence_quality_issues,
         supported_touch_count, touch_question_limit, touch_word_band,
         unsupported_account_task_noun_issues, word_set_similarity, CopyAccount, CopySequence,
@@ -4834,7 +4826,7 @@ mod tests {
     }
 
     #[test]
-    fn bulk_planning_selects_one_primary_workflow_contact_per_account() {
+    fn bulk_planning_honors_the_requested_contacts_per_account() {
         let person =
             |id: &str, lead: &str, name: &str, title: &str, vantage: &str, primary| Person {
                 id: id.into(),
@@ -4859,6 +4851,15 @@ mod tests {
                 ),
                 person("f", "a", "Finance", "Controller", "economic_buyer", false),
                 person(
+                    "t",
+                    "a",
+                    "Technical",
+                    "Systems Engineer",
+                    "technical_evaluator",
+                    false,
+                ),
+                person("x", "a", "Coordinator", "Coordinator", "router", false),
+                person(
                     "b",
                     "b",
                     "Other Owner",
@@ -4867,14 +4868,14 @@ mod tests {
                     true,
                 ),
             ],
-            2,
+            5,
         );
         let account_a = selected
             .iter()
             .filter(|person| person.lead_id == "a")
             .map(|person| person.id.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(account_a, vec!["o"]);
+        assert_eq!(account_a, vec!["o", "e", "f", "t", "x"]);
         assert_eq!(
             selected
                 .iter()
@@ -4962,6 +4963,32 @@ mod tests {
         };
         let issues = sequence_quality_issues(pb, &playbooks.shared, &sequence, &[], 1, false);
         assert!(issues.iter().any(|issue| issue.contains("maximum 300")));
+    }
+
+    #[test]
+    fn linkedin_connection_requests_reject_empty_role_praise() {
+        let playbooks = Playbooks::load("playbooks").expect("load playbooks");
+        let pb = playbooks.get("outagehub").expect("outagehub playbook");
+        let sequence = CopySequence {
+            touches: vec![CopyTouch {
+                stage: 1,
+                day_offset: 0,
+                channel: "linkedin_request".into(),
+                subject: String::new(),
+                body: "Reliability engineering across that mix is a substantial remit; I'd be glad to connect."
+                    .into(),
+                purpose: String::new(),
+                goal: String::new(),
+            }],
+            applied_principles: Vec::new(),
+        };
+        let issues = sequence_quality_issues(pb, &playbooks.shared, &sequence, &[], 1, false);
+        assert!(issues
+            .iter()
+            .any(|issue| issue.contains("empty compliment")));
+        assert!(!is_empty_linkedin_praise(
+            "I'm comparing how multi-site operators separate utility events from equipment alarms. Glad to connect."
+        ));
     }
 
     #[test]

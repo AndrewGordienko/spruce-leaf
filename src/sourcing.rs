@@ -2182,7 +2182,15 @@ pub async fn refresh_lead_context(
     let refresh_cutoff = Utc::now() - ChronoDuration::seconds(refresh_ttl_secs);
     let mut leads = Vec::new();
     for id in lead_ids {
+        // A recent website read is not reusable after the GTM play changes.
+        // Otherwise old signals can make an account look action-ready under a
+        // new policy without ever receiving the new play's qualification pass.
+        let has_current_play_assessment = match active_play.as_ref() {
+            Some(play) => db.account_play_assessment(id, &play.id)?.is_some(),
+            None => true,
+        };
         let recently_refreshed = refresh_ttl_secs > 0
+            && has_current_play_assessment
             && db
                 .list_active_signal_observations(Some(&pb.key), Some(id), None)?
                 .iter()

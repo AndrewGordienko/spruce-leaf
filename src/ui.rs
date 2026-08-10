@@ -481,7 +481,13 @@ impl SourceView {
             transient,
         }));
         let stop = Arc::new(AtomicBool::new(false));
-        let handle = if fancy() {
+        let handle = if fancy() && transient {
+            let state_t = Arc::clone(&state);
+            let stop_t = Arc::clone(&stop);
+            Some(thread::spawn(move || {
+                source_transient_ticker(state_t, stop_t)
+            }))
+        } else if fancy() {
             println!();
             let state_t = Arc::clone(&state);
             let stop_t = Arc::clone(&stop);
@@ -546,6 +552,43 @@ impl SourceView {
         }
         self.stats.snapshot().since(self.base)
     }
+}
+
+/// Full motion owns the durable transcript, so its nested sourcing and
+/// enrichment passes use one physical terminal row. Clearing a multi-line live
+/// tree erased its characters but could not collapse the rows after terminal
+/// scrolling, leaving a large white gap before the next spinner.
+fn source_transient_ticker(state: Arc<Mutex<SourceState>>, stop: Arc<AtomicBool>) {
+    let mut frame = 0usize;
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            print!("\r\x1b[K");
+            let _ = std::io::stdout().flush();
+            break;
+        }
+        let line = render_transient_source(&state.lock().unwrap(), frame);
+        print!("\r\x1b[K{line}");
+        let _ = std::io::stdout().flush();
+        frame += 1;
+        thread::sleep(Duration::from_millis(TICK_MS));
+    }
+}
+
+fn render_transient_source(state: &SourceState, frame: usize) -> String {
+    let phase = state
+        .rows
+        .iter()
+        .rev()
+        .find(|row| row.status == "active")
+        .or_else(|| state.rows.last())
+        .map(|row| row.title.as_str())
+        .unwrap_or(state.active_title.as_str());
+    format!(
+        "{} {} {}",
+        dark_blue(FRAMES[frame % FRAMES.len()]),
+        phase,
+        dim(&format!("({:.0}s)", state.started.elapsed().as_secs_f32()))
+    )
 }
 
 fn update_source_state(
@@ -1194,8 +1237,9 @@ mod turn_view_tests {
     use std::time::Instant;
 
     use super::{
-        json_string_prefix, markdown_line, render_outreach, render_source, session_header_lines,
-        visible_outreach_rows, OutreachRow, OutreachState, SourceRow, SourceState,
+        json_string_prefix, markdown_line, render_outreach, render_source, render_transient_source,
+        session_header_lines, visible_outreach_rows, OutreachRow, OutreachState, SourceRow,
+        SourceState,
     };
     use crate::engine::{Stats, StatsSnapshot};
 
@@ -1262,6 +1306,31 @@ mod turn_view_tests {
         assert!(lines.iter().all(|line| line.chars().count() == width));
         assert!(lines.iter().any(|line| line.contains("codex · default")));
         assert!(lines.iter().any(|line| line.contains("/brand to change")));
+    }
+
+    #[test]
+    fn transient_source_progress_uses_exactly_one_terminal_row() {
+        let state = SourceState {
+            header: "OutageHub · 1 account".into(),
+            active_title: "Sourcing companies".into(),
+            success_title: "Sourced companies".into(),
+            failure_title: "Sourcing stopped".into(),
+            rows: vec![SourceRow {
+                key: "qualify".into(),
+                title: "Qualifying root-cause fit".into(),
+                detail: "5/6 reviewed".into(),
+                status: "active".into(),
+            }],
+            started: Instant::now(),
+            done: false,
+            succeeded: false,
+            transient: true,
+        };
+
+        let line = render_transient_source(&state, 0);
+        assert!(line.contains("Qualifying root-cause fit"));
+        assert!(!line.contains('\n'));
+        assert!(!line.contains("5/6 reviewed"));
     }
 
     #[test]

@@ -30,10 +30,9 @@ use uuid::Uuid;
 
 /// Increment when the buyer-facing copy contract changes materially. The CRM
 /// only presents sequences approved under the current policy.
-// v10 makes inbox-worthiness part of sendability: generic topical subjects,
-// internal-memo phrasing, and legacy one-line response scripts must be rewritten
-// before a sequence returns to Pipeline.
-pub const CURRENT_COPY_POLICY_VERSION: i64 = 10;
+// v11 adds role-level response contracts and honors requested multi-recipient
+// account coverage. Older copy did not receive those planning/review checks.
+pub const CURRENT_COPY_POLICY_VERSION: i64 = 12;
 
 /// A real company sourced from Apollo and (optionally) qualified against a brand
 /// thesis. Everything the model *guesses* stays in the inference/hypothesis
@@ -1882,13 +1881,12 @@ impl Db {
             .optional()?)
     }
 
-    /// Whether an account already has at least one complete, reviewed sequence
-    /// under the current copy policy. Full-motion orchestration counts this as
-    /// fulfilled inventory instead of sourcing a duplicate account merely
-    /// because ordinary planning correctly skipped an existing draft.
-    pub fn lead_has_current_reviewed_sequence(
+    /// Whether this specific recipient already has the complete reviewed shape
+    /// requested by the current motion. Partial-account retries use this to
+    /// preserve good copy for four people while repairing the fifth.
+    pub fn person_has_current_reviewed_sequence(
         &self,
-        lead_id: &str,
+        person_id: &str,
         expected_touches: usize,
     ) -> Result<bool> {
         let expected_touches = match expected_touches {
@@ -1900,7 +1898,7 @@ impl Db {
         let exists: i64 = conn.query_row(
             "SELECT EXISTS(
                SELECT 1 FROM sequences s
-               WHERE s.lead_id=?1 AND s.status='active' AND s.copy_policy_version=?2
+               WHERE s.person_id=?1 AND s.status='active' AND s.copy_policy_version=?2
                  AND (SELECT COUNT(*) FROM touches t WHERE t.sequence_id=s.id)=?3
                  AND (SELECT MIN(t.stage) FROM touches t WHERE t.sequence_id=s.id)=1
                  AND (SELECT MAX(t.stage) FROM touches t WHERE t.sequence_id=s.id)=
@@ -1913,10 +1911,44 @@ impl Db {
                           OR trim(t.body)='Writing draft…')
                  )
              )",
-            params![lead_id, CURRENT_COPY_POLICY_VERSION, expected_touches],
+            params![person_id, CURRENT_COPY_POLICY_VERSION, expected_touches],
             |row| row.get(0),
         )?;
         Ok(exists == 1)
+    }
+
+    /// How many people at an account already have a complete, reviewed sequence
+    /// under the current copy policy and requested touch shape.
+    pub fn lead_current_reviewed_sequence_count(
+        &self,
+        lead_id: &str,
+        expected_touches: usize,
+    ) -> Result<usize> {
+        let expected_touches = match expected_touches {
+            1 => 1,
+            7 => 7,
+            _ => 4,
+        };
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(DISTINCT s.person_id)
+             FROM sequences s
+             WHERE s.lead_id=?1 AND s.status='active' AND s.copy_policy_version=?2
+               AND (SELECT COUNT(*) FROM touches t WHERE t.sequence_id=s.id)=?3
+               AND (SELECT MIN(t.stage) FROM touches t WHERE t.sequence_id=s.id)=1
+               AND (SELECT MAX(t.stage) FROM touches t WHERE t.sequence_id=s.id)=
+                   (SELECT COUNT(*) FROM touches t WHERE t.sequence_id=s.id)
+               AND (SELECT COUNT(DISTINCT t.stage) FROM touches t WHERE t.sequence_id=s.id)=
+                   (SELECT COUNT(*) FROM touches t WHERE t.sequence_id=s.id)
+               AND NOT EXISTS (
+                 SELECT 1 FROM touches t WHERE t.sequence_id=s.id
+                   AND (COALESCE(t.review_passes,0)<>1 OR trim(t.body)=''
+                        OR trim(t.body)='Writing draft…')
+               )",
+            params![lead_id, CURRENT_COPY_POLICY_VERSION, expected_touches],
+            |row| row.get(0),
+        )?;
+        Ok(count.max(0) as usize)
     }
 
     /// Exact findings from the most recent rejected sequence for this person.
@@ -6663,8 +6695,8 @@ mod tests {
             .current_gtm_play("outagehub")
             .expect("load current play")
             .expect("seeded outagehub play");
-        assert_eq!(play.version, 5);
-        assert_eq!(play.minimum_signal_matches, 3);
+        assert_eq!(play.version, 7);
+        assert_eq!(play.minimum_signal_matches, 2);
         assert!(play
             .required_signal_keys
             .contains(&"account.outage_sensitive_decision".to_string()));
@@ -6941,12 +6973,22 @@ mod tests {
             ..Default::default()
         })
         .expect("insert first touch");
+        assert_eq!(
+            db.lead_current_reviewed_sequence_count(&lead_id, 1)
+                .expect("count one reviewed recipient"),
+            1
+        );
         assert!(db
-            .lead_has_current_reviewed_sequence(&lead_id, 1)
-            .expect("check one touch"));
+            .person_has_current_reviewed_sequence(&person_id, 1)
+            .expect("check one reviewed recipient"));
+        assert_eq!(
+            db.lead_current_reviewed_sequence_count(&lead_id, 4)
+                .expect("check incomplete four-touch sequence"),
+            0
+        );
         assert!(!db
-            .lead_has_current_reviewed_sequence(&lead_id, 4)
-            .expect("check incomplete four-touch sequence"));
+            .person_has_current_reviewed_sequence(&person_id, 4)
+            .expect("check incomplete recipient"));
 
         for stage in 2..=4 {
             db.insert_touch(&Touch {
@@ -6961,11 +7003,15 @@ mod tests {
             })
             .expect("insert reviewed touch");
         }
-        assert!(db
-            .lead_has_current_reviewed_sequence(&lead_id, 4)
-            .expect("check complete four-touch sequence"));
-        assert!(!db
-            .lead_has_current_reviewed_sequence(&lead_id, 7)
-            .expect("check incomplete seven-touch sequence"));
+        assert_eq!(
+            db.lead_current_reviewed_sequence_count(&lead_id, 4)
+                .expect("check complete four-touch sequence"),
+            1
+        );
+        assert_eq!(
+            db.lead_current_reviewed_sequence_count(&lead_id, 7)
+                .expect("check incomplete seven-touch sequence"),
+            0
+        );
     }
 }

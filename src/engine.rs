@@ -529,6 +529,32 @@ impl Engine {
         });
     }
 
+    /// Size the default safety envelope to an explicitly requested outreach
+    /// scope. These are ceilings, not spend targets. Explicit environment
+    /// limits remain hard operator overrides.
+    pub fn scale_turn_budget_for_outreach(&self, accounts: usize, recipients: usize) {
+        if recipients == 0 {
+            return;
+        }
+        let (attempts, output_tokens, cost_usd) = outreach_budget_floor(accounts, recipients);
+        let mut budget = self
+            .turn_budget
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner());
+        let Some(budget) = budget.as_mut() else {
+            return;
+        };
+        if std::env::var_os("SPRUCE_TURN_MAX_MODEL_ATTEMPTS").is_none() {
+            budget.max_attempts = budget.max_attempts.max(attempts);
+        }
+        if std::env::var_os("SPRUCE_TURN_MAX_OUTPUT_TOKENS").is_none() {
+            budget.max_output_tokens = budget.max_output_tokens.max(output_tokens);
+        }
+        if std::env::var_os("SPRUCE_TURN_MAX_COST_USD").is_none() {
+            budget.max_cost_usd = budget.max_cost_usd.max(cost_usd);
+        }
+    }
+
     fn check_turn_budget(&self) -> Result<()> {
         let budget = *self
             .turn_budget
@@ -2033,6 +2059,16 @@ fn default_openai_model() -> String {
         .unwrap_or_else(|| "gpt-5.6-terra".to_string())
 }
 
+fn outreach_budget_floor(accounts: usize, recipients: usize) -> (u64, u64, f64) {
+    let accounts = accounts.max(1) as u64;
+    let recipients = recipients.max(1) as u64;
+    (
+        60 + accounts.saturating_mul(8) + recipients.saturating_mul(12),
+        80_000 + accounts.saturating_mul(8_000) + recipients.saturating_mul(20_000),
+        1.0 + accounts as f64 * 0.25 + recipients as f64 * 1.25,
+    )
+}
+
 fn is_outreach_quality_stage(stage: &str) -> bool {
     matches!(
         stage,
@@ -2063,7 +2099,7 @@ fn openai_reasoning_effort(stage: &str, fast: bool) -> String {
                 "SPRUCE_OPENAI_WRITER_REASONING_EFFORT",
                 "SPRUCE_OPENAI_COPY_REASONING_EFFORT",
             ],
-            "xhigh",
+            "high",
         )
     } else if stage == "outreach.review_edit" {
         (
@@ -2201,9 +2237,9 @@ fn openai_output_cap(stage: &str) -> u64 {
         // though the visible document is small; truncating them throws away a
         // completed generation instead of improving copy quality.
         "outreach.plan" | "outreach.review_edit" | "outreach.verify_final" => 8_192,
-        // xhigh reasoning tokens count against this allowance. Seven complete
-        // touches plus strict JSON need headroom after the model has reasoned;
-        // 6,144 repeatedly terminated valid Sol runs before the closing JSON.
+        // Reasoning tokens count against this allowance. Seven complete touches
+        // plus strict JSON need headroom after the model has reasoned; 6,144
+        // repeatedly terminated valid Sol runs before the closing JSON.
         "outreach.write_account" => 12_288,
         _ => 16_384,
     }
@@ -2821,13 +2857,13 @@ mod tests {
         );
 
         assert_eq!(request["model"], "gpt-5.6-terra");
-        assert_eq!(request["reasoning"]["effort"], "xhigh");
+        assert_eq!(request["reasoning"]["effort"], "high");
         assert_eq!(request["service_tier"], "default");
         assert_eq!(request["max_output_tokens"], 12_288);
         assert_eq!(request["prompt_cache_options"]["mode"], "explicit");
         assert!(request.get("prompt_cache_key").is_none());
         assert_eq!(request["store"], false);
-        assert_eq!(request["background"], true);
+        assert!(request.get("background").is_none());
         assert_eq!(request["text"]["format"]["type"], "json_schema");
         assert_eq!(request["text"]["format"]["strict"], true);
         assert_eq!(
@@ -3389,6 +3425,17 @@ mod tests {
 
         let error = engine.check_turn_budget().expect_err("budget should stop");
         assert!(is_run_budget_exhausted(&error));
+    }
+
+    #[test]
+    fn outreach_budget_floor_scales_with_requested_recipient_count() {
+        let one = super::outreach_budget_floor(1, 1);
+        let twenty_five = super::outreach_budget_floor(5, 25);
+        assert!(twenty_five.0 > one.0);
+        assert!(twenty_five.1 > one.1);
+        assert!(twenty_five.2 > one.2);
+        assert!(twenty_five.0 >= 400);
+        assert!(twenty_five.2 >= 30.0);
     }
 
     #[test]

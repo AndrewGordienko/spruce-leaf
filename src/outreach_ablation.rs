@@ -17,10 +17,12 @@ use crate::engine::Engine;
 use crate::outreach::generic_subject_label;
 use crate::outreach_eval::{judge_candidates, load, normalize_label, swap_label, EvalCase};
 use crate::playbook::{Playbook, Playbooks, Shared};
+use crate::response_design;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 enum Arm {
     Full,
+    NoRoleContract,
     NoPsychology,
     NoWriterPersona,
     NoBrandDoctrine,
@@ -29,8 +31,9 @@ enum Arm {
 }
 
 impl Arm {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::Full,
+        Self::NoRoleContract,
         Self::NoPsychology,
         Self::NoWriterPersona,
         Self::NoBrandDoctrine,
@@ -41,6 +44,7 @@ impl Arm {
     fn key(self) -> &'static str {
         match self {
             Self::Full => "full",
+            Self::NoRoleContract => "no_role_contract",
             Self::NoPsychology => "no_psychology",
             Self::NoWriterPersona => "no_writer_persona",
             Self::NoBrandDoctrine => "no_brand_doctrine",
@@ -52,12 +56,20 @@ impl Arm {
     fn interpretation(self) -> &'static str {
         match self {
             Self::Full => "production-sized prompt baseline",
+            Self::NoRoleContract => {
+                "removes only the recipient's title-and-vantage response contract"
+            }
             Self::NoPsychology => "removes only private response-design doctrine",
             Self::NoWriterPersona => "removes only the editable writer persona excerpt",
             Self::NoBrandDoctrine => "removes only brand constraints and examples",
             Self::CompactWriter => "shrinks only the writer excerpt from 360 to 120 words",
             Self::ExpandedPsychology => "expands only the psychology excerpt from 130 to 300 words",
         }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        let key = value.trim().to_ascii_lowercase().replace('-', "_");
+        Self::ALL.into_iter().find(|arm| arm.key() == key)
     }
 }
 
@@ -85,17 +97,22 @@ struct ArmResult {
     prompt_words: usize,
 }
 
+pub(crate) struct Options<'a> {
+    pub case_limit: usize,
+    pub repeats: usize,
+    pub concurrency: usize,
+    pub show_drafts: bool,
+    pub only: Option<&'a str>,
+}
+
 pub async fn run(
     engine: &Engine,
     playbooks: &Playbooks,
     path: &Path,
-    case_limit: usize,
-    repeats: usize,
-    concurrency: usize,
-    show_drafts: bool,
+    options: Options<'_>,
 ) -> Result<()> {
     let all_cases = load(path)?;
-    let cases = representative_cases(all_cases, case_limit);
+    let cases = representative_cases(all_cases, options.case_limit);
     if cases.is_empty() {
         bail!("outreach ablation corpus is empty: {}", path.display());
     }
@@ -103,16 +120,29 @@ pub async fn run(
     println!(
         "Copy-prompt ablation · {} fixed case(s) · {} repeat(s) · model held constant",
         cases.len(),
-        repeats
+        options.repeats
     );
+    let arms = match options.only {
+        Some(value) => {
+            let arm = Arm::parse(value)
+                .filter(|arm| *arm != Arm::Full)
+                .ok_or_else(|| anyhow::anyhow!("unknown ablation arm '{value}'"))?;
+            vec![Arm::Full, arm]
+        }
+        None => Arm::ALL.to_vec(),
+    };
     println!(
-        "Variable: one prompt layer. Constants: recipient, account, facts, hypothesis, requested cold outcome, model, schema, and blind evaluator."
+        "Variable: one prompt layer{}. Constants: recipient, account, facts, hypothesis, requested cold outcome, model, schema, and blind evaluator.",
+        options
+            .only
+            .map_or_else(String::new, |value| format!(" ({value})"))
     );
 
-    let jobs = (0..repeats)
+    let jobs = (0..options.repeats)
         .flat_map(|repeat| {
+            let arms = arms.clone();
             cases.iter().cloned().flat_map(move |case| {
-                Arm::ALL
+                arms.clone()
                     .into_iter()
                     .map(move |arm| (repeat, case.clone(), arm))
             })
@@ -123,11 +153,19 @@ pub async fn run(
         .map(|(repeat, case, arm)| async move {
             let playbook = playbooks.get(&case.brand)?;
             let system = system_prompt(playbook, &playbooks.shared, arm);
-            let prompt_words = system.split_whitespace().count();
+            let role_words = if arm == Arm::NoRoleContract {
+                0
+            } else {
+                response_design::for_title_and_vantage(&case.title, "")
+                    .prompt_block()
+                    .split_whitespace()
+                    .count()
+            };
+            let prompt_words = system.split_whitespace().count() + role_words;
             let draft = generate(engine, &case, playbook, arm, &system).await?;
             Ok::<_, anyhow::Error>(((repeat, case.id.clone(), arm), draft, prompt_words))
         })
-        .buffer_unordered(concurrency.max(1))
+        .buffer_unordered(options.concurrency.max(1))
         .collect::<Vec<_>>()
         .await
         .into_iter()
@@ -149,11 +187,11 @@ pub async fn run(
         drafts.insert(key, draft);
     }
 
-    for arm in Arm::ALL {
+    for &arm in &arms {
         results.entry(arm).or_default().prompt_words = *prompt_words.get(&arm).unwrap_or(&0);
     }
 
-    for repeat in 0..repeats {
+    for repeat in 0..options.repeats {
         for case in &cases {
             let full = drafts
                 .get(&(repeat, case.id.clone(), Arm::Full))
@@ -161,10 +199,10 @@ pub async fn run(
             println!("\n{} · {} ({})", case.id, case.recipient, case.title);
             println!("  full subject: {}", full.subject.trim());
             print_absolute_issues(case, playbooks.get(&case.brand)?, full);
-            if show_drafts {
+            if options.show_drafts {
                 println!("\n{}\n", full.body.trim());
             }
-            for arm in Arm::ALL.into_iter().filter(|arm| *arm != Arm::Full) {
+            for arm in arms.iter().copied().filter(|arm| *arm != Arm::Full) {
                 let variant = drafts
                     .get(&(repeat, case.id.clone(), arm))
                     .expect("variant draft");
@@ -216,7 +254,7 @@ pub async fn run(
                 );
                 print_absolute_issues(case, playbooks.get(&case.brand)?, variant);
                 println!("    {}", forward.rationale.trim());
-                if show_drafts {
+                if options.show_drafts {
                     println!("\n{}\n", variant.body.trim());
                 }
             }
@@ -228,7 +266,7 @@ pub async fn run(
         .map_or(0, |result| result.prompt_words);
     println!("\nAblation summary (directional model-quality evidence, not reply-rate evidence)");
     println!("arm                  words   delta   abs pass   variant wins   ties   full wins   inconsistent");
-    for arm in Arm::ALL.into_iter().filter(|arm| *arm != Arm::Full) {
+    for arm in arms.iter().copied().filter(|arm| *arm != Arm::Full) {
         let result = results.get(&arm).expect("arm result");
         println!(
             "{:<20} {:>5} {:+7} {:>4}/{:<4} {:>14} {:>6} {:>11} {:>14}",
@@ -287,7 +325,7 @@ async fn generate(
     system: &str,
 ) -> Result<GeneratedEmail> {
     let seller_facts = seller_facts(case, playbook);
-    let user = serde_json::to_string_pretty(&json!({
+    let mut payload = json!({
         "brand": case.brand,
         "account": case.account,
         "recipient": case.recipient,
@@ -298,7 +336,14 @@ async fn generate(
         "requested_outcome": "A short discovery conversation, with a short email answer as the easier alternative when the recipient is a credible workflow owner; otherwise an appropriate correction or route.",
         "required_signature": playbook.signature,
         "email_word_band_including_signature": [playbook.min_words, playbook.max_words],
-    }))?;
+    });
+    if arm != Arm::NoRoleContract {
+        payload.as_object_mut().expect("ablation payload").insert(
+            "role_response_contract_internal_only".into(),
+            response_design::for_title_and_vantage(&case.title, "").prompt_value(),
+        );
+    }
+    let user = serde_json::to_string_pretty(&payload)?;
     engine
         .structured_bulk::<GeneratedEmail>(
             &format!("outreach.ablation.generate.{}", arm.key()),
@@ -328,7 +373,7 @@ fn system_prompt(playbook: &Playbook, shared: &Shared, arm: Arm) -> String {
     let core = "Write one cold first email as Andrew to the supplied recipient. Return a subject and body only. The subject must be a plain 3-9 word operating phrase that creates an honest, specific reason to open; privately consider several subjects before choosing. The body must begin `Hi [recipient first name],` on its own line, end with the exact required signature on its own line, and form a complete founder note in ordinary spoken English: why this person, one recognizable operating moment, a bounded guess about the difficulty, the seller's relevant difference, and one role-appropriate response path. Use the verified account and seller facts as separate exhaustive evidence boundaries. The hypothesis is a question, never a fact. Do not invent private workflows, systems, objects, incidents, ownership, impact, seller capabilities, or collateral. Make replying worthwhile and easy without a scripted answer menu, pressure, hype, or internal strategy language. Read the subject and first two lines as an inbox recipient before returning the structured result.";
     let mut production = format!("{core}\n\n{}", playbook.copy_system_prompt(shared));
     match arm {
-        Arm::Full => production,
+        Arm::Full | Arm::NoRoleContract => production,
         Arm::NoPsychology => {
             remove_section(
                 &mut production,
@@ -488,6 +533,7 @@ mod tests {
         let playbook = playbooks.get("outagehub").expect("outagehub");
         let full = system_prompt(playbook, &playbooks.shared, Arm::Full);
         let no_psych = system_prompt(playbook, &playbooks.shared, Arm::NoPsychology);
+        let no_role = system_prompt(playbook, &playbooks.shared, Arm::NoRoleContract);
         let no_persona = system_prompt(playbook, &playbooks.shared, Arm::NoWriterPersona);
         let no_brand = system_prompt(playbook, &playbooks.shared, Arm::NoBrandDoctrine);
         let compact_writer = system_prompt(playbook, &playbooks.shared, Arm::CompactWriter);
@@ -495,6 +541,7 @@ mod tests {
             system_prompt(playbook, &playbooks.shared, Arm::ExpandedPsychology);
 
         assert!(full.contains("PRIVATE RESPONSE-DESIGN DOCTRINE"));
+        assert_eq!(full, no_role);
         assert!(!no_psych.contains("PRIVATE RESPONSE-DESIGN DOCTRINE"));
         assert!(!no_persona.contains("EDITABLE PERSONA EXCERPT"));
         assert!(!no_brand.contains("OutageHub BUYER-FACING CONSTRAINTS"));
