@@ -282,14 +282,14 @@ impl GtmActionContext {
         self.state == "action_ready"
     }
 
-    /// A multi-touch sequence is a commercial action, not a research artifact.
-    /// Only a fully supported action may enter the copywriter. `discovery_ready`
-    /// is retained for research/routing UX, but must never be upgraded into a
-    /// sequence merely because a plausible title was found.
-    /// Discovery-ready context may support one manually reviewed routing note,
-    /// but never an automated no-reply sequence.
-    pub fn sequence_ready_for(&self, touches: usize) -> bool {
-        self.action_ready() || (touches == 1 && self.state == "discovery_ready")
+    /// Discovery-ready means there is enough sourced company fit and verified
+    /// recipient vantage to write hypothesis-safe copy for human review. It
+    /// does not mean the private mechanism is proven. The cadence layer still
+    /// requires `action_ready()` before it may schedule anything, so allowing a
+    /// reviewed discovery sequence here cannot silently turn research into an
+    /// automated send.
+    pub fn sequence_ready_for(&self, _touches: usize) -> bool {
+        self.action_ready() || self.state == "discovery_ready"
     }
 
     /// Private context for the planner/writer. This is decision infrastructure,
@@ -382,7 +382,7 @@ impl GtmActionContext {
             .join("\n");
         let action = match self.state.as_str() {
             "action_ready" => "The account has enough sourced evidence for one narrow commercial note. Use only a supplied observation as the company-specific signal. Lead with a role-relevant implication and a credible point of view. A cold outcome may be a short working conversation, interest, correction, or referral; it is not yet a pilot or proof. Never invent collateral or claim an asset exists unless verified seller context explicitly supplies it.",
-            "discovery_ready" => "The company fit and this recipient's operating vantage are sourced, but the internal workflow problem is not public evidence. At most, write one manual hypothesis-safe discovery note. State only supplied company facts and frame the private workflow as a question. When the title is a credible operator, process owner, or operational executive and the public workflow category is specific, a short discovery conversation plus an email-reply alternative is permitted; discovery is not the same as a demo or product evaluation. A router should only be asked to route. Never claim that work is manual, expensive, recurring, fragmented, or cross-system. Never propose a proof, pilot, integration, or product evaluation.",
+            "discovery_ready" => "The company fit and this recipient's operating vantage are sourced, but the internal workflow problem is not public evidence. Write hypothesis-safe copy for manual review only: state supplied company facts and frame the private workflow as a question. A multi-touch draft may advance that one investigation with sharper distinctions, but must not manufacture proof, urgency, or a new claim in later touches. When the title is a credible operator, process owner, or operational executive and the public workflow category is specific, a short discovery conversation plus an email-reply alternative is permitted; discovery is not the same as a demo or product evaluation. A router should only be asked to route. Never claim that work is manual, expensive, recurring, fragmented, or cross-system. Never propose a proof, pilot, integration, or product evaluation.",
             _ => "The account does not yet have enough sourced evidence for a multi-touch sequence. Hold it for research or use one manual routing note; do not manufacture discovery questions or explain a proof, integration, pilot, or product.",
         };
         format!(
@@ -490,6 +490,17 @@ pub fn prepare_action(
             assessment
                 .as_ref()
                 .is_some_and(|assessment| assessment.status == "qualified")
+        } else if brand == "gnk" {
+            // GnK qualification runs before people are mapped, so an account
+            // can be marked research-needed solely because the reachable-owner
+            // signal is not knowable yet. Once a verified operating contact is
+            // actually mapped, let the live signal count decide readiness. The
+            // mandatory guard below still requires fit, a recurring material
+            // workflow, and that reachable owner; the cross-system mechanism
+            // may remain the hypothesis the email is trying to test.
+            assessment.as_ref().is_none_or(|assessment| {
+                matches!(assessment.status.as_str(), "qualified" | "research_needed")
+            })
         } else {
             assessment
                 .as_ref()
@@ -537,10 +548,18 @@ pub fn prepare_action(
 }
 
 fn mandatory_action_signals_present(brand: &str, matched: &[String]) -> bool {
-    if !brand.eq_ignore_ascii_case("outagehub") {
+    let required: &[&str] = if brand.eq_ignore_ascii_case("outagehub") {
+        &["account.fit_evidence", "account.distributed_locations"]
+    } else if brand.eq_ignore_ascii_case("gnk") {
+        &[
+            "account.fit_evidence",
+            "account.expensive_recurring_workflow",
+            "account.reachable_workflow_owner",
+        ]
+    } else {
         return true;
-    }
-    ["account.fit_evidence", "account.distributed_locations"]
+    };
+    required
         .iter()
         .all(|required| matched.iter().any(|key| key == required))
 }
@@ -862,6 +881,25 @@ mod tests {
             "test",
         )
         .expect("signals");
+        let play = db
+            .current_gtm_play("gnk")
+            .expect("play query")
+            .expect("play");
+        db.upsert_account_play_assessment(&AccountPlayAssessment {
+            lead_id: lead_id.clone(),
+            brand: "gnk".into(),
+            play_id: play.id,
+            play_version: play.version,
+            status: "research_needed".into(),
+            fit_score: 70,
+            matched_signal_keys: vec![
+                "account.fit_evidence".into(),
+                "account.expensive_recurring_workflow".into(),
+            ],
+            source: "test-before-contact-mapping".into(),
+            ..Default::default()
+        })
+        .expect("research-needed assessment");
         let person = db.get_person(&person_id).unwrap().unwrap();
         let context = prepare_action(&db, "gnk", &lead_id, &person).expect("action context");
 
@@ -909,7 +947,7 @@ mod tests {
             .expect("discovery context");
         assert_eq!(discovery.state, "discovery_ready");
         assert!(discovery.sequence_ready_for(1));
-        assert!(!discovery.sequence_ready_for(2));
+        assert!(discovery.sequence_ready_for(7));
         assert!(!discovery.action_ready());
         assert!(discovery
             .copy_prompt_block()

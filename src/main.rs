@@ -1565,6 +1565,7 @@ fn positive_i64(raw: &str) -> std::result::Result<i64, String> {
 #[cfg(test)]
 mod startup_tests {
     use super::{bind_available_crm_listener, is_spruce_crm, CrmEndpoint};
+    use crate::crm::CRM_PROTOCOL_REV;
     use std::io::{Read, Write};
     use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
     use std::thread;
@@ -1590,10 +1591,11 @@ mod startup_tests {
             let (mut stream, _) = listener.accept().expect("accept health probe");
             let mut request = [0_u8; 512];
             let _ = stream.read(&mut request);
+            let response = format!(
+                "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{{\"app\":\"spruce-leaf\",\"protocol\":{CRM_PROTOCOL_REV}}}"
+            );
             stream
-                .write_all(
-                    b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{\"app\":\"spruce-leaf\",\"protocol\":2}",
-                )
+                .write_all(response.as_bytes())
                 .expect("write health response");
         });
 

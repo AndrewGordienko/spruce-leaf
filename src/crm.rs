@@ -614,7 +614,7 @@ const CRM_PORT_SCAN: u16 = 128;
 /// Increment when a dashboard/API change makes reusing an older local server
 /// unsafe. Package version stays intentionally stable during local development,
 /// so it cannot distinguish a stale process on its own.
-const CRM_PROTOCOL_REV: u32 = 3;
+pub(crate) const CRM_PROTOCOL_REV: u32 = 3;
 
 /// Loopback ports to try for the CRM, starting at `first`.
 pub fn port_candidates(first: u16) -> Vec<u16> {

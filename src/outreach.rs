@@ -2994,7 +2994,7 @@ async fn request_copy_review_with_tier(
     let task = if verify_only {
         "This is a final gate over already-repaired copy. Do not edit it. Return empty revised fields. Mark passes=true only when the CURRENT touch is natural, accurate, easy to answer, and ready for Andrew to send unchanged. List only unresolved issues."
     } else if !deterministic.is_empty() {
-        "Repair the named findings as hard constraints. Any feedback string containing 'stage N' names stage N. Change only named stages unless a finding applies to the whole sequence. For EVERY named stage you MUST return a nonempty complete corrected body, even if you disagree with the feedback; never mark a named stage passed with an empty revised body. Return a complete corrected subject only when the feedback concerns the subject; an empty revised_subject preserves an already-good subject. Count the corrected stage's words and question marks before returning: it must fall inside every stated range. Stage 1 may contain one operating question plus one short CTA question; stages 2 through 6 may contain at most one question mark, and stage 7 must contain none. Preserve verified facts, natural phrasing, and unnamed stages. The passes flag and score must grade the FINAL corrected wording you return. List only issues still present after your correction."
+        "Repair the named findings as hard constraints. Any feedback string containing 'stage N' names stage N. Change only named stages unless a finding applies to the whole sequence. For EVERY named stage you MUST return a nonempty complete corrected body, even if you disagree with the feedback; never mark a named stage passed with an empty revised body. If a finding names an unverified task or object, remove that noun from every named stage and use only a supported category such as product, package, packing, or handling; do not preserve specificity merely because it appears in the hypothesis. Return a complete corrected subject only when the feedback concerns the subject; an empty revised_subject preserves an already-good subject. Count the corrected stage's words and question marks before returning: it must fall inside every stated range. Stage 1 may contain one operating question plus one short CTA question; stages 2 through 6 may contain at most one question mark, and stage 7 must contain none. Preserve verified facts, natural phrasing, and unnamed stages. The passes flag and score must grade the FINAL corrected wording you return. List only issues still present after your correction."
     } else {
         "Review and repair the copy. For every touch that is not ready to send, return a complete corrected body and, for email, a complete corrected subject. Stage 1 may contain one operating question plus one short CTA question; stages 2 through 6 may contain at most one question mark, and the final close contains none. The passes flag and score must grade the FINAL corrected wording you return, not the original. List only issues that remain unresolved after your correction. If it cannot be fixed without inventing facts, mark it failed."
     };
@@ -3336,7 +3336,12 @@ fn touch_word_band(pb: &Playbook, touch: &CopyTouch) -> (usize, usize) {
             // the diagnostic, T4 contributes value, and T6 routes; each stays
             // shorter than T1 while retaining enough room to do its actual job.
             2 => (35, 145),
-            4 => (45, 120),
+            // T4 has to contribute a new distinction, not hit an arbitrary
+            // paragraph size. A natural 35–44 word founder follow-up is often
+            // complete; forcing filler here made otherwise reviewable
+            // sequences fail after the semantic editor had already approved
+            // their substance.
+            4 => (35, 120),
             6 => (25, 80),
             7 => (15, 60),
             _ => (8, 40),
@@ -3379,12 +3384,14 @@ fn copy_sentence_count(body: &str, signature: &str) -> usize {
 
 /// The first note often has two different jobs that are both naturally phrased
 /// as questions: test one operating decision, then ask for a short conversation.
-/// Counting punctuation cannot distinguish those jobs, so reserve two marks for
-/// T1 and keep every follow-up to one. Semantic review still rejects a survey or
-/// several operating questions disguised inside the first mark.
+/// Counting punctuation cannot distinguish those jobs, so reserve up to three
+/// marks for T1 and keep every follow-up to one. A short diagnostic with two alternatives
+/// plus a call-or-email CTA can naturally contain three marks (and appears in
+/// the human validation set). Semantic review still rejects a survey or several
+/// unrelated operating questions.
 fn touch_question_limit(stage: u32) -> usize {
     if stage == 1 {
-        2
+        3
     } else {
         1
     }
@@ -4515,8 +4522,8 @@ mod tests {
     }
 
     #[test]
-    fn first_email_allows_one_central_question_and_cta() {
-        assert_eq!(touch_question_limit(1), 2);
+    fn first_email_allows_a_bounded_diagnostic_and_cta() {
+        assert_eq!(touch_question_limit(1), 3);
         for stage in 2..=7 {
             assert_eq!(touch_question_limit(stage), 1);
         }
@@ -4581,7 +4588,7 @@ mod tests {
         for (stage, expected) in [
             (1, (100, 180)),
             (2, (35, 145)),
-            (4, (45, 120)),
+            (4, (35, 120)),
             (6, (25, 80)),
         ] {
             let touch = CopyTouch {
