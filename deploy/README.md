@@ -7,61 +7,52 @@ it touches a real prospect.
 
 ## What actually runs
 
-One long-lived process — `spruce-leaf daemon --live --autopilot` — does three
-things on a loop, off the same SQLite database:
+The default deployment runs two long-lived containers against the same
+persistent SQLite volume:
+
+- `spruce-leaf daemon --live --batch 90` sends approved work and polls replies.
+- `spruce-leaf --port 8788 crm` serves the calendar and pipeline privately.
+
+The daemon does two required loops and one optional loop:
 
 | Loop | What it does | Cadence |
 | --- | --- | --- |
 | **Cadence** | Sends touches whose `due_at` has arrived, respecting timezone windows, per-mailbox caps, and warmup. | every `--interval` (default 60s) |
 | **Inbox** | Polls each mailbox's IMAP for replies, detects bounces/opt-outs, and runs the reply agent (classify → draft → optionally book). | every `--interval` (min 30s) |
-| **Autopilot** | Sources new accounts, enriches emails, and drafts cadences toward funnel targets. | every `--interval` (min 15s) |
+| **Autopilot (optional)** | Sources new accounts, enriches emails, and drafts cadences toward funnel targets when `--autopilot` is explicitly added. | every `--interval` (min 15s) |
 
-State lives in `.spruce/sales.db` (SQLite). Reasoning is done by the **Claude
-Code CLI**, which the daemon shells out to — so the box needs the `claude` binary
-authenticated with your subscription. **No model API key, no per-token billing.**
+State lives in `.spruce/sales.db` (SQLite). The default reasoning backend is the
+OpenAI Responses API, so the host needs `OPENAI_API_KEY`. Approved cold
+sequences do not need to be regenerated before sending; the model is used only
+when the optional sourcing/drafting loop runs or when an inbound reply needs to
+be classified and drafted.
 
-Because it runs `claude` locally and keeps a SQLite file, the host must be a
-**persistent VM with a persistent disk** — not a serverless/ephemeral platform.
-Any small always-on Linux box works (Hetzner, DigitalOcean, Lightsail, a Fly.io
-machine with a volume, etc.). ~1 vCPU / 1–2 GB RAM is plenty.
+Because it keeps a SQLite file, the host must be a **persistent VM with a
+persistent disk** — not a serverless/ephemeral platform.
+Any small always-on Linux VM with a persistent disk works. A basic Ubuntu
+DigitalOcean Droplet or Hetzner Cloud VM is the least surprising setup because
+the checked-in Docker Compose file works unchanged. A Fly Machine also works if
+`.spruce` is mounted on a Fly Volume, but SQLite should remain single-machine.
 
 ---
 
-## Step 1 — Authenticate the Claude subscription (headless)
-
-The server has no browser, so generate a **one-year OAuth token** on a machine
-that does (your laptop):
-
-```bash
-claude setup-token          # opens a browser; approve; copies a token to stdout
-```
-
-Put that token in the server's `.env` as `CLAUDE_CODE_OAUTH_TOKEN` (Step 2).
-
-- Do **not** also set `ANTHROPIC_API_KEY` — it takes precedence and bills per
-  token. Subscription auth is used only when the API key is absent.
-- The token expires in ~1 year. Set a reminder to re-run `setup-token` and swap
-  it in (see *Ongoing ops*).
-- Verify on the box after deploy with `claude /status` — it should say `Login`,
-  not `API key`.
-
-## Step 2 — Fill in `.env`
+## Step 1 — Fill in `.env`
 
 Copy `.env.example` to `.env` and set, at minimum:
 
-- `CLAUDE_CODE_OAUTH_TOKEN=` — from Step 1.
+- `OPENAI_API_KEY=` — used for optional drafting and reply intelligence.
 - One mailbox per active brand: `<BRAND>_FROM_EMAIL`, `<BRAND>_SMTP_HOST/PORT/USER/PASS`,
   `<BRAND>_IMAP_HOST/PORT`. The daemon relays through *your* SMTP provider, so
   deliverability/IP reputation is the relay's, not the VM's.
 - `COMPLIANCE_ADDRESS=` — a physical mailing address. `--live` refuses to send
   without it (CAN-SPAM/CASL).
 - `SPRUCE_SEND_ALLOWLIST=` — **leave commented for production.** You'll set it
-  during testing (Step 4).
+  during testing (Step 3).
 
 `--live` also health-checks each sending domain's SPF/DMARC/MX and refuses to
 send from a mis-authed one, so get DNS right before going live.
 
-## Step 3 — Deploy
+## Step 2 — Deploy
 
 ### Option A — Docker (recommended)
 
@@ -70,19 +61,19 @@ volume. On the box, with the repo checked out and `.env` in place:
 
 ```bash
 docker compose build
-# staged rollout is Step 4 — do NOT skip straight to `up`
+# staged rollout is Step 3 — do NOT skip straight to `up`
 ```
 
 ### Option B — bare metal (systemd)
 
 See the header of [`systemd/spruce-leaf.service`](systemd/spruce-leaf.service)
 for the install commands. Build with `cargo build --release` (needs
-`pkg-config` + `libssl-dev` for the IMAP TLS dependency), install the `claude`
-CLI as the service user, then `systemctl enable --now spruce-leaf`.
+`pkg-config` + `libssl-dev` for the IMAP TLS dependency), then run
+`systemctl enable --now spruce-leaf`.
 
 ---
 
-## Step 4 — Staged rollout (this is the testing plan)
+## Step 3 — Staged rollout (this is the testing plan)
 
 Never point a fresh live daemon at real prospects. Walk these three gates.
 
@@ -135,7 +126,7 @@ is fine).
 4. **Run it live** and watch:
 
    ```bash
-   docker compose up -d
+   docker compose up -d spruce-leaf crm
    docker compose logs -f          # look for "cadence sent 1 touch(es)"
    ```
 
@@ -156,7 +147,7 @@ is fine).
 
 Once the loop works: **comment out `SPRUCE_SEND_ALLOWLIST`**, remove the test
 lead if you like (it's harmless — it just has your address), and start the real
-daemon:
+daemon and private calendar:
 
 ```bash
 docker compose up -d
@@ -167,16 +158,15 @@ docker compose up -d
 ## Watching it ("we can see it send out")
 
 - **Live feed:** `docker compose logs -f` — every pass prints `cadence sent N
-  touch(es)` and inbox/autopilot activity. This is the literal "watch it send."
+  touch(es)` and inbox activity. This is the literal "watch it send."
 - **Funnel + queue:** `docker compose exec spruce-leaf spruce-leaf stats` (leads
   → verified → contacted), `... jobs` (autopilot queue health), `... meetings`.
 - **Audit trail:** every send/bounce/reply/booking is an append-only row in the
   `events` table in `.spruce/sales.db`.
-- **Graphical CRM (optional):** the binary also serves a dashboard
-  (`spruce-leaf crm`, port 8787). To reach it privately, put the box on
-  [Tailscale](https://tailscale.com) or forward over SSH:
-  `ssh -L 8787:127.0.0.1:8787 user@your-vm` then open `http://127.0.0.1:8787`.
-  Don't expose 8787 to the public internet.
+- **Graphical calendar + CRM:** Compose binds the dashboard only to the VM's
+  loopback interface. Forward it over SSH:
+  `ssh -L 8788:127.0.0.1:8788 user@your-vm`, then open
+  `http://127.0.0.1:8788`. Do not expose it to the public internet.
 
 ## What's automatic vs. gated
 
@@ -193,9 +183,8 @@ your behalf is deliberately gated:
 
 ## Ongoing ops
 
-- **Token rotation:** `CLAUDE_CODE_OAUTH_TOKEN` expires ~yearly. Re-run
-  `claude setup-token` on a browser machine, update `.env`, `docker compose up -d`
-  to restart. The CLI warns ~3 days before expiry.
+- **API-key rotation:** update `OPENAI_API_KEY` in `.env`, then run
+  `docker compose up -d` to recreate the services.
 - **Backups:** the whole world is `.spruce/sales.db`. Snapshot the `spruce-data`
   volume (or the file) on a schedule. `.db-wal`/`.db-shm` are transient.
 - **Restarts:** `restart: unless-stopped` (Docker) / `Restart=on-failure`

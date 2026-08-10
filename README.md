@@ -435,6 +435,7 @@ cargo run -- jobs                         # queue + dead-letter health
 cargo run -- synthesize                    # recurring-problem/convergence report
 cargo run -- stats
 cargo run -- --brand wapahki calendar     # policy, 7-day capacity, observed timing
+cargo run -- --brand wapahki calendar --rebalance # rebuild approved queue now
 cargo run -- suppress person@example.com
 
 # global options (any subcommand):
@@ -519,20 +520,42 @@ person requested, and every email follow-up keeps RFC thread headers.
 
 ### Outreach calendar intelligence
 
-Every planned email, LinkedIn task, and legacy call receives a recipient-local calendar
-slot. Used and reserved capacity is counted across all channels at a maximum of
-30 touchpoints per business day for each of `gnk`, `wapahki`, and `outagehub`
-independently. The live
-daemon rechecks both the local window and the business-wide email-send cap just
-before delivery, so late approvals and legacy rows are deferred safely.
+Only reviewed, approved email-capable touches reserve sending capacity. Drafts
+and manual LinkedIn tasks stay outside the email calendar. Each of `gnk`,
+`wapahki`, and `outagehub` has an independent ceiling of 30 emails per quota
+day, so the portfolio ceiling is 90; adding mailboxes never multiplies it. The
+Pipeline **All** tab is the cross-brand calendar.
+
+Approval runs a deterministic portfolio scheduler. Approved human replies have
+send-time priority, active follow-ups are protected next, and remaining capacity
+admits new people breadth-first across accounts. The first selected contact at
+every company is admitted before the second, while every explicitly requested
+contact is retained. One new person per account per day is the default stagger.
+Before a new person enters, all later email-capable touches in that person's
+cadence are reserved relative to the planned opener. This prevents a day-one
+blast from creating a follow-up cliff three days later.
+
+With a seven-touch sequence containing six email-capable stages, 30 emails/day
+supports roughly five new people per business day in steady state. Across the
+21-day cadence that is about 100–110 active people per brand: approximately 35
+companies at three contacts each, or 50 at two. Three contacts per account is
+the default balance for a vague request such as “a few”; an explicit requested
+count always wins.
+
+The live daemon rechecks recipient windows, account throttles, mailbox health,
+and the business-wide actual-send cap immediately before delivery. Its default
+portfolio batch is 90 and it scans past capped/blocked rows so one brand cannot
+hide eligible work for the other two.
 
 Weekend timing is never inferred globally. It must match a named rule in the
 business profile, such as Wapahki's Saturday plant-operations hypothesis or
 OutageHub's continuously operated incident-response cohort. `calendar` reports
 used/reserved capacity and attributes replies to the last preceding send by local
-weekday, rule, industry, and title/vantage cohort. Until the configured minimum
-sample is reached, the agent labels these rules as hypotheses rather than learned
-best times.
+weekday, rule, industry, and title/vantage cohort. Times use deterministic,
+date-varying non-round minutes. Once a comparable cohort clears the configured
+sample threshold, the scheduler ranks the best two allowed hours and three
+allowed weekdays using smoothed reply rates. Learning can narrow a configured
+window but cannot invent a weekend or widen the business's approved policy.
 
 ## Caveat
 

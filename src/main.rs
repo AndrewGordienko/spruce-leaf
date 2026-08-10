@@ -260,7 +260,7 @@ enum Command {
         #[arg(long, default_value_t = 60, value_parser = positive_u64)]
         interval: u64,
         /// Max sends per pass.
-        #[arg(long, default_value_t = 25, value_parser = positive_i64)]
+        #[arg(long, default_value_t = 90, value_parser = positive_i64)]
         batch: i64,
     },
 
@@ -321,7 +321,11 @@ enum Command {
     },
 
     /// Show timing rules, per-business capacity, and observed response timing.
-    Calendar,
+    Calendar {
+        /// Rebuild this brand's approved queue with the portfolio scheduler.
+        #[arg(long)]
+        rebalance: bool,
+    },
 
     /// Configure + health-check per-brand sending mailboxes from env.
     Mailboxes,
@@ -752,7 +756,13 @@ fn main() -> Result<()> {
 
         Command::Approve { person } => {
             let n = db.approve_touches(Some(&cli.brand), person.as_deref())?;
-            println!("\u{2713} approved {n} touch(es) \u{2192} scheduled.");
+            let businesses = load_businesses(&cli)?;
+            let profile = businesses.get(&cli.brand)?;
+            let plan = calendar::rebalance_approved_sales(&db, profile, chrono::Utc::now())?;
+            println!(
+                "\u{2713} approved {n} touch(es) \u{2192} {} email(s) placed across {} active day(s); {} new conversation(s) admitted.",
+                plan.emails, plan.active_days, plan.admitted_people
+            );
             Ok(())
         }
 
@@ -805,6 +815,17 @@ fn main() -> Result<()> {
                         "refusing live sending: mailbox domain checks failed:\n  {}",
                         unhealthy.join("\n  ")
                     );
+                }
+                for brand in businesses.keys() {
+                    let profile = businesses.get(brand)?;
+                    let plan =
+                        calendar::rebalance_approved_sales(&db, profile, chrono::Utc::now())?;
+                    if plan.emails > 0 {
+                        eprintln!(
+                            "\u{2713} [{}] calendar: {} approved email(s), {} new conversation(s), {} active day(s)",
+                            brand, plan.emails, plan.admitted_people, plan.active_days
+                        );
+                    }
                 }
             }
             let cfg = cadence::CadenceConfig {
@@ -1004,9 +1025,19 @@ fn main() -> Result<()> {
             Ok(())
         }
 
-        Command::Calendar => {
+        Command::Calendar { rebalance } => {
             let businesses = load_businesses(&cli)?;
             let profile = businesses.get(&cli.brand)?;
+            if rebalance {
+                let plan = calendar::rebalance_approved_sales(&db, profile, chrono::Utc::now())?;
+                println!(
+                    "\u{2713} rebalanced {} approved email(s), protected {} active follow-up(s), and admitted {} new conversation(s) across {} active day(s).\n",
+                    plan.emails,
+                    plan.protected_followups,
+                    plan.admitted_people,
+                    plan.active_days,
+                );
+            }
             println!(
                 "{}",
                 calendar::render_intelligence(profile, &db, chrono::Utc::now())?

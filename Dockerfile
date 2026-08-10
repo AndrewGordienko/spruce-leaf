@@ -1,8 +1,7 @@
 # syntax=docker/dockerfile:1
 #
-# spruce-leaf cloud image: the outreach daemon plus the Claude Code CLI it shells
-# out to for reasoning. Runs unattended — no browser, no API key. Authenticate
-# the subscription with `claude setup-token` and pass CLAUDE_CODE_OAUTH_TOKEN in.
+# spruce-leaf cloud image: the unattended outreach daemon and CRM. The default
+# OpenAI Responses API backend reads OPENAI_API_KEY from the runtime environment.
 
 ########## builder ##########
 FROM rust:1-bookworm AS builder
@@ -22,16 +21,11 @@ RUN touch src/main.rs && cargo build --release
 
 ########## runtime ##########
 FROM debian:bookworm-slim AS runtime
-# libssl3: native-tls (IMAP) at runtime. curl + ca-certificates: fetch & run the
-# claude CLI and reach SMTP/IMAP/Apollo/Google/Anthropic over TLS.
+# libssl3: native-tls (IMAP) at runtime. ca-certificates: reach
+# SMTP/IMAP/Apollo/Google/OpenAI over TLS.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates libssl3 curl \
+        ca-certificates libssl3 \
     && rm -rf /var/lib/apt/lists/*
-# Claude Code CLI — native binary, no Node runtime required. Symlink onto PATH so
-# the engine's `Command::new("claude")` resolves it.
-RUN curl -fsSL https://claude.ai/install.sh | bash \
-    && ln -sf /root/.local/bin/claude /usr/local/bin/claude \
-    && claude --version
 WORKDIR /app
 # Brand doctrine + operating context the daemon reads at startup. Baked in.
 COPY playbooks ./playbooks
@@ -42,4 +36,4 @@ VOLUME ["/app/.spruce"]
 ENTRYPOINT ["spruce-leaf"]
 # Steady-state intent. Complete the staged rollout in deploy/README.md BEFORE the
 # first `up`: dry-run, then an allowlisted closed-loop test, THEN production.
-CMD ["daemon", "--live", "--autopilot"]
+CMD ["daemon", "--live", "--batch", "90"]

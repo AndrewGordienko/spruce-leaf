@@ -39,7 +39,10 @@ impl Default for CadenceConfig {
     fn default() -> Self {
         CadenceConfig {
             dry_run: true,
-            batch: 25,
+            // Three independently capped brands can each send 30 emails/day.
+            // One pass must therefore be able to drain the full 90-email
+            // portfolio without requiring one brand to wait for another tick.
+            batch: 90,
             send_delay_ms: std::env::var("CADENCE_SEND_DELAY_MS")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -77,9 +80,16 @@ pub async fn tick(
         &mut dry_run_reservations,
     )
     .await?;
-    let due = db.due_touches(None, cfg.batch.saturating_sub(sent as i64))?;
+    let remaining = cfg.batch.saturating_sub(sent as i64);
+    // Scan beyond the send allowance because a large overdue queue for one
+    // capped brand or account must not hide eligible work for the other brands.
+    let scan_limit = remaining.saturating_mul(10).max(300);
+    let due = db.due_touches(None, scan_limit)?;
 
     for touch in due {
+        if sent as i64 >= cfg.batch {
+            break;
+        }
         let Some(person) = db.get_person(&touch.person_id)? else {
             if !cfg.dry_run {
                 db.set_touch_status(&touch.id, "skipped", "", "", "person missing")?;
@@ -187,7 +197,7 @@ pub async fn tick(
         };
         let now = Utc::now();
         if !calendar::can_send_now(profile, &timing, now)? {
-            let slot = calendar::next_slot(profile, &timing, now)?;
+            let slot = calendar::next_slot_with_learning(db, profile, &timing, now)?;
             if !cfg.dry_run {
                 db.reschedule_touch(
                     &touch.id,
@@ -209,7 +219,7 @@ pub async fn tick(
             cfg.dry_run,
             &dry_run_reservations,
         )? {
-            let slot = calendar::next_slot(profile, &timing, quota_end)?;
+            let slot = calendar::next_slot_with_learning(db, profile, &timing, quota_end)?;
             if !cfg.dry_run {
                 db.reschedule_touch(
                     &touch.id,
@@ -240,7 +250,7 @@ pub async fn tick(
                 &quota_date,
                 cfg.dry_run.then_some(&dry_run_account_openers),
             )? {
-                let slot = calendar::next_slot(profile, &timing, quota_end)?;
+                let slot = calendar::next_slot_with_learning(db, profile, &timing, quota_end)?;
                 if !cfg.dry_run {
                     db.reschedule_touch(
                         &touch.id,
@@ -638,7 +648,7 @@ async fn tick_opportunity_outreach(
         };
         let now = Utc::now();
         if !calendar::can_send_now(profile, &timing, now)? {
-            let slot = calendar::next_slot(profile, &timing, now)?;
+            let slot = calendar::next_slot_with_learning(db, profile, &timing, now)?;
             if !cfg.dry_run {
                 db.reschedule_opportunity_touch(
                     &touch.id,
@@ -660,7 +670,7 @@ async fn tick_opportunity_outreach(
             cfg.dry_run,
             dry_run_reservations,
         )? {
-            let slot = calendar::next_slot(profile, &timing, quota_end)?;
+            let slot = calendar::next_slot_with_learning(db, profile, &timing, quota_end)?;
             if !cfg.dry_run {
                 db.reschedule_opportunity_touch(
                     &touch.id,

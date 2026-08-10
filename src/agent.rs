@@ -2084,13 +2084,24 @@ impl Agent {
     fn approve_outreach(&self) -> String {
         match self.db.approve_touches(Some(&self.brand), None) {
             Ok(n) => {
+                let plan = self.businesses.get(&self.brand).and_then(|profile| {
+                    crate::calendar::rebalance_approved_sales(&self.db, profile, chrono::Utc::now())
+                });
+                let schedule = plan
+                    .map(|plan| {
+                        format!(
+                            "{} email(s) across {} active day(s); {} new conversation(s) admitted",
+                            plan.emails, plan.active_days, plan.admitted_people
+                        )
+                    })
+                    .unwrap_or_else(|error| format!("calendar refresh failed: {error:#}"));
                 ui::activity(
                     "Approved outreach",
-                    format!("{n} touch(es) · {}", self.brand),
+                    format!("{n} touch(es) · {} · {schedule}", self.brand),
                 );
                 format!(
-                    "Approved {n} drafted email touch(es) for {} and scheduled them.",
-                    self.brand
+                    "Approved {n} drafted email touch(es) for {}. {schedule}.",
+                    self.brand,
                 )
             }
             Err(e) => format!("Approval failed: {e:#}"),

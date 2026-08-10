@@ -6,7 +6,7 @@
 //! industry/title hypotheses, and a hard per-business daily capacity.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 use anyhow::{anyhow, Result};
@@ -14,7 +14,7 @@ use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Timelike, Utc, Weekday};
 use chrono_tz::Tz;
 
 use crate::business::{BusinessProfile, TimingRule};
-use crate::db::{SharedDb, TimingObservation};
+use crate::db::{Lead, Person, SharedDb, TimingObservation, Touch, TouchScheduleUpdate};
 
 #[derive(Debug, Clone, Default)]
 pub struct TimingContext<'a> {
@@ -37,6 +37,267 @@ pub struct CalendarSlot {
     pub recipient_timezone: String,
     pub rule: String,
     pub rationale: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PortfolioScheduleSummary {
+    pub emails: usize,
+    pub protected_followups: usize,
+    pub admitted_people: usize,
+    pub active_days: usize,
+}
+
+#[derive(Debug, Clone)]
+struct SequencePlan {
+    sequence_id: String,
+    lead: Lead,
+    person: Person,
+    touches: Vec<Touch>,
+    anchor: Option<DateTime<Utc>>,
+    active: bool,
+    created_at: String,
+}
+
+#[derive(Debug, Default)]
+struct CapacityLedger {
+    by_day: HashMap<String, usize>,
+    openers_by_account_day: HashMap<String, usize>,
+}
+
+/// Rebuild the approved sales calendar for one business as a portfolio rather
+/// than preserving generation order. Existing conversations get their
+/// follow-ups first. New sequences are then admitted breadth-first across
+/// accounts, and every email in a person's cadence is reserved relative to the
+/// actual/planned opener before the next person is admitted.
+pub fn rebalance_approved_sales(
+    db: &SharedDb,
+    profile: &BusinessProfile,
+    now: DateTime<Utc>,
+) -> Result<PortfolioScheduleSummary> {
+    let scheduled = db.scheduled_email_touches(&profile.key)?;
+    if scheduled.is_empty() {
+        return Ok(PortfolioScheduleSummary::default());
+    }
+
+    let mut grouped = BTreeMap::<String, Vec<Touch>>::new();
+    for touch in scheduled {
+        grouped
+            .entry(touch.sequence_id.clone())
+            .or_default()
+            .push(touch);
+    }
+
+    let mut active = Vec::<SequencePlan>::new();
+    let mut unopened = BTreeMap::<String, Vec<SequencePlan>>::new();
+    for (sequence_id, mut touches) in grouped {
+        touches.sort_by_key(|touch| touch.stage);
+        let Some(person) = db.get_person(&touches[0].person_id)? else {
+            continue;
+        };
+        let Some(lead) = db.get_lead(&touches[0].lead_id)? else {
+            continue;
+        };
+        let history = db.list_touches_for_sequence(&sequence_id)?;
+        let sent = history
+            .iter()
+            .filter(|touch| touch.status == "sent" && !touch.sent_at.is_empty())
+            .collect::<Vec<_>>();
+        let anchor = sent
+            .iter()
+            .find(|touch| touch.stage == 1)
+            .and_then(|touch| parse_utc(&touch.sent_at))
+            .or_else(|| {
+                sent.iter().find_map(|touch| {
+                    parse_utc(&touch.sent_at)
+                        .map(|sent_at| sent_at - chrono::Duration::days(touch.day_offset.max(0)))
+                })
+            });
+        let plan = SequencePlan {
+            sequence_id,
+            lead: lead.clone(),
+            person,
+            created_at: touches[0].created_at.clone(),
+            touches,
+            anchor,
+            active: !sent.is_empty(),
+        };
+        if plan.active {
+            active.push(plan);
+        } else {
+            unopened.entry(lead.id).or_default().push(plan);
+        }
+    }
+
+    active.sort_by(|left, right| {
+        plan_eligible(left, now)
+            .cmp(&plan_eligible(right, now))
+            .then_with(|| left.created_at.cmp(&right.created_at))
+            .then_with(|| left.sequence_id.cmp(&right.sequence_id))
+    });
+    for plans in unopened.values_mut() {
+        plans.sort_by(|left, right| {
+            right
+                .person
+                .primary
+                .cmp(&left.person.primary)
+                .then_with(|| left.created_at.cmp(&right.created_at))
+                .then_with(|| left.person.id.cmp(&right.person.id))
+        });
+    }
+
+    // Breadth first: contact 1 at every account, then contact 2, etc. Explicitly
+    // requested contacts are never dropped; later contacts simply enter on a
+    // later capacity-safe day.
+    let mut new_plans = Vec::<SequencePlan>::new();
+    let max_depth = unopened.values().map(Vec::len).max().unwrap_or_default();
+    for depth in 0..max_depth {
+        for plans in unopened.values() {
+            if let Some(plan) = plans.get(depth) {
+                new_plans.push(plan.clone());
+            }
+        }
+    }
+
+    let mut ledger = CapacityLedger::default();
+    let mut updates = Vec::<TouchScheduleUpdate>::new();
+    let mut days = HashSet::<String>::new();
+    let mut protected_followups = 0usize;
+    let mut admitted_people = 0usize;
+
+    for plan in active.iter().chain(new_plans.iter()) {
+        let priority = if plan.active {
+            "protected active follow-up"
+        } else {
+            "admitted new conversation with full cadence reserved"
+        };
+        let mut anchor = plan.anchor;
+        let mut plan_updates = Vec::<TouchScheduleUpdate>::new();
+        for touch in &plan.touches {
+            let is_opener = touch.stage == 1 && !plan.active;
+            let eligible = if is_opener {
+                now
+            } else {
+                anchor.unwrap_or(now) + chrono::Duration::days(touch.day_offset.max(0))
+            };
+            let context = TimingContext {
+                industry: &plan.lead.industry,
+                title: &plan.person.title,
+                vantage: &plan.person.vantage,
+                channel: "email",
+                location: if plan.person.location.is_empty() {
+                    &plan.lead.hq
+                } else {
+                    &plan.person.location
+                },
+                timezone: if plan.person.timezone.is_empty() {
+                    &plan.lead.timezone
+                } else {
+                    &plan.person.timezone
+                },
+                stable_key: &touch.id,
+            };
+            let slot = allocate_portfolio_slot(
+                db,
+                profile,
+                &context,
+                eligible.max(now),
+                is_opener.then_some(plan.lead.id.as_str()),
+                &mut ledger,
+            )?;
+            if is_opener {
+                anchor = Some(slot.at);
+                admitted_people += 1;
+            }
+            if plan.active && touch.stage > 1 {
+                protected_followups += 1;
+            }
+            let (_, _, date) = quota_day_bounds(profile, slot.at)?;
+            days.insert(date);
+            plan_updates.push(TouchScheduleUpdate {
+                id: touch.id.clone(),
+                due_at: slot.at.to_rfc3339(),
+                recipient_timezone: slot.recipient_timezone,
+                scheduled_rule: slot.rule,
+                schedule_reason: format!("portfolio scheduler: {priority}; {}", slot.rationale),
+            });
+        }
+        updates.extend(plan_updates);
+    }
+
+    db.apply_touch_schedule(&updates)?;
+    Ok(PortfolioScheduleSummary {
+        emails: updates.len(),
+        protected_followups,
+        admitted_people,
+        active_days: days.len(),
+    })
+}
+
+fn plan_eligible(plan: &SequencePlan, now: DateTime<Utc>) -> DateTime<Utc> {
+    plan.touches
+        .first()
+        .map(|touch| plan.anchor.unwrap_or(now) + chrono::Duration::days(touch.day_offset.max(0)))
+        .unwrap_or(now)
+}
+
+fn parse_utc(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|value| value.with_timezone(&Utc))
+}
+
+fn allocate_portfolio_slot(
+    db: &SharedDb,
+    profile: &BusinessProfile,
+    context: &TimingContext<'_>,
+    not_before: DateTime<Utc>,
+    opener_account: Option<&str>,
+    ledger: &mut CapacityLedger,
+) -> Result<CalendarSlot> {
+    let mut cursor = not_before;
+    for _ in 0..370 {
+        let slot = next_slot_with_learning(db, profile, context, cursor)?;
+        let (start, end, date) = quota_day_bounds(profile, slot.at)?;
+        let used = match ledger.by_day.get(&date) {
+            Some(used) => *used,
+            None => {
+                let fixed = db.sent_touch_count_between(&profile.key, start, end)?
+                    + db.scheduled_opportunity_count_between(&profile.key, start, end)?;
+                ledger.by_day.insert(date.clone(), fixed);
+                fixed
+            }
+        };
+        let opener_ok = match opener_account {
+            Some(account) if profile.account_limits.max_new_contacts_per_account_per_day > 0 => {
+                let key = format!("{account}:{date}");
+                let opened = match ledger.openers_by_account_day.get(&key) {
+                    Some(opened) => *opened,
+                    None => {
+                        let sent = db.account_openers_sent_between(account, start, end)?;
+                        ledger.openers_by_account_day.insert(key.clone(), sent);
+                        sent
+                    }
+                };
+                opened < profile.account_limits.max_new_contacts_per_account_per_day
+            }
+            _ => true,
+        };
+        if used < profile.calendar.daily_touch_cap && opener_ok {
+            *ledger.by_day.entry(date.clone()).or_default() += 1;
+            if let Some(account) = opener_account {
+                *ledger
+                    .openers_by_account_day
+                    .entry(format!("{account}:{date}"))
+                    .or_default() += 1;
+            }
+            return Ok(slot);
+        }
+        cursor = end;
+    }
+    Err(anyhow!(
+        "no portfolio email capacity found for {} in the next year",
+        profile.name
+    ))
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +345,97 @@ pub fn next_slot(
 ) -> Result<CalendarSlot> {
     let tz = recipient_timezone(profile, context);
     let policy = effective_policy(profile, context)?;
+    next_slot_for_policy(profile, context, not_before, tz, policy)
+}
+
+/// Apply response-history learning only after the configured sample threshold
+/// is met for a comparable role/industry cohort. Learning may rank times that a
+/// business rule already allows; it can never invent a weekend or expand the
+/// recipient-local window.
+pub fn next_slot_with_learning(
+    db: &SharedDb,
+    profile: &BusinessProfile,
+    context: &TimingContext<'_>,
+    not_before: DateTime<Utc>,
+) -> Result<CalendarSlot> {
+    let tz = recipient_timezone(profile, context);
+    let mut policy = effective_policy(profile, context)?;
+    let observations = db
+        .timing_observations(&profile.key)?
+        .into_iter()
+        .filter(|observation| comparable_cohort(observation, context))
+        .collect::<Vec<_>>();
+    if observations.len() >= profile.calendar.learning_min_samples {
+        let mut hours = policy
+            .preferred_hours
+            .iter()
+            .map(|hour| (*hour, 0usize, 0usize))
+            .collect::<Vec<_>>();
+        let mut weekdays = policy
+            .weekdays
+            .iter()
+            .map(|day| (*day, 0usize, 0usize))
+            .collect::<Vec<_>>();
+        for observation in &observations {
+            let Some(sent) = parse_utc(&observation.sent_at) else {
+                continue;
+            };
+            let local_tz = observation.timezone.parse::<Tz>().unwrap_or(tz);
+            let local = sent.with_timezone(&local_tz);
+            if let Some(bucket) = hours
+                .iter_mut()
+                .min_by_key(|(hour, _, _)| (i64::from(*hour) - i64::from(local.hour())).abs())
+            {
+                bucket.1 += 1;
+                bucket.2 += usize::from(observation.replied);
+            }
+            if let Some(bucket) = weekdays
+                .iter_mut()
+                .find(|(weekday, _, _)| *weekday == local.weekday())
+            {
+                bucket.1 += 1;
+                bucket.2 += usize::from(observation.replied);
+            }
+        }
+        hours.sort_by(|left, right| response_bucket_order(*left, *right));
+        weekdays.sort_by(|left, right| response_bucket_order(*left, *right));
+        // Retain two hours and three weekdays so learning improves priority
+        // without collapsing all sends into one fragile historical bucket.
+        let learned_hours = hours
+            .iter()
+            .filter(|(_, sends, _)| *sends >= 3)
+            .take(2)
+            .map(|(hour, _, _)| *hour)
+            .collect::<Vec<_>>();
+        let learned_weekdays = weekdays
+            .iter()
+            .filter(|(_, sends, _)| *sends >= 3)
+            .take(3)
+            .map(|(day, _, _)| *day)
+            .collect::<Vec<_>>();
+        if !learned_hours.is_empty() {
+            policy.preferred_hours = learned_hours;
+        }
+        if !learned_weekdays.is_empty() {
+            policy.weekdays = learned_weekdays;
+        }
+        policy.rule = format!("{}+learned_cohort", policy.rule);
+        policy.rationale = format!(
+            "{}; ranked within the allowed window from {} comparable sends (directional, not causal)",
+            policy.rationale,
+            observations.len()
+        );
+    }
+    next_slot_for_policy(profile, context, not_before, tz, policy)
+}
+
+fn next_slot_for_policy(
+    profile: &BusinessProfile,
+    context: &TimingContext<'_>,
+    not_before: DateTime<Utc>,
+    tz: Tz,
+    policy: EffectivePolicy,
+) -> Result<CalendarSlot> {
     let local_start = not_before.with_timezone(&tz);
     let mut date = local_start.date_naive();
 
@@ -125,6 +477,34 @@ pub fn next_slot(
     ))
 }
 
+fn comparable_cohort(observation: &TimingObservation, context: &TimingContext<'_>) -> bool {
+    let role_matches = (!context.vantage.trim().is_empty()
+        && observation
+            .vantage
+            .trim()
+            .eq_ignore_ascii_case(context.vantage.trim()))
+        || title_family(&observation.title) == title_family(context.title);
+    let industry_matches = context.industry.trim().is_empty()
+        || observation.industry.trim().is_empty()
+        || observation
+            .industry
+            .trim()
+            .eq_ignore_ascii_case(context.industry.trim());
+    role_matches && industry_matches
+}
+
+fn response_bucket_order<T: Copy>(
+    left: (T, usize, usize),
+    right: (T, usize, usize),
+) -> std::cmp::Ordering {
+    let left_score = (left.2 as f64 + 1.0) / (left.1 as f64 + 4.0);
+    let right_score = (right.2 as f64 + 1.0) / (right.1 as f64 + 4.0);
+    right_score
+        .partial_cmp(&left_score)
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .then_with(|| right.1.cmp(&left.1))
+}
+
 /// Whether `now` is inside the effective recipient-local window. The daemon
 /// uses this as a final guard for old/imported/late-approved touches.
 pub fn can_send_now(
@@ -162,6 +542,27 @@ pub fn quota_day_bounds(
         start.with_timezone(&Utc),
         end.with_timezone(&Utc),
         date.to_string(),
+    ))
+}
+
+/// UTC bounds for an explicit business-local quota date. Calendar UIs use this
+/// to show the same capacity bucket the daemon enforces.
+pub fn quota_date_bounds(
+    profile: &BusinessProfile,
+    date: NaiveDate,
+) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
+    let tz = profile.calendar.quota_timezone.parse::<Tz>().map_err(|_| {
+        anyhow!(
+            "invalid quota timezone '{}'",
+            profile.calendar.quota_timezone
+        )
+    })?;
+    let next = date
+        .succ_opt()
+        .ok_or_else(|| anyhow!("calendar date overflow"))?;
+    Ok((
+        local_midnight(tz, date)?.with_timezone(&Utc),
+        local_midnight(tz, next)?.with_timezone(&Utc),
     ))
 }
 
@@ -422,7 +823,7 @@ pub fn policy_summary(profile: &BusinessProfile) -> String {
         .map(|rule| rule.key.as_str())
         .collect::<Vec<_>>();
     format!(
-        "{}: max {} touchpoints/day in {}; default {} at {:?}:00 recipient-local; weekend only via [{}]",
+        "{}: max {} approved emails/day in {}; default {} at {:?}:00 recipient-local; weekend only via [{}]",
         profile.name,
         profile.calendar.daily_touch_cap,
         profile.calendar.quota_timezone,
@@ -494,7 +895,7 @@ pub fn render_intelligence(
         }
     }
 
-    out.push_str("\nused/reserved capacity (draft + scheduled + sent, all channels)\n");
+    out.push_str("\nused/reserved email capacity (approved + sent)\n");
     let mut seen_dates = Vec::<String>::new();
     let mut day_offset = 0i64;
     while seen_dates.len() < 7 && day_offset < 10 {
@@ -512,7 +913,7 @@ pub fn render_intelligence(
     }
 
     let upcoming = db.upcoming_calendar(&profile.key, 20)?;
-    out.push_str("\nupcoming touchpoints\n");
+    out.push_str("\nupcoming approved emails\n");
     if upcoming.is_empty() {
         out.push_str("• none planned\n");
     } else {
@@ -835,11 +1236,14 @@ fn stable_index(key: &str, salt: &str, len: usize) -> usize {
 }
 
 fn stable_minute(key: &str, date: &str, hour: u32) -> u32 {
+    // Human-looking, auditable offsets: never :00/:15/:30/:45 or another
+    // five-minute boundary, and the date salt changes the choice day to day.
+    const MINUTES: [u32; 12] = [3, 7, 11, 16, 22, 26, 32, 37, 41, 47, 53, 57];
     let mut hasher = DefaultHasher::new();
     key.hash(&mut hasher);
     date.hash(&mut hasher);
     hour.hash(&mut hasher);
-    (hasher.finish() % 45) as u32
+    MINUTES[hasher.finish() as usize % MINUTES.len()]
 }
 
 fn rotate<T>(values: &mut [T], start: usize) {
@@ -850,13 +1254,16 @@ fn rotate<T>(values: &mut [T], start: usize) {
 
 #[cfg(test)]
 mod tests {
-    use chrono::{Datelike, TimeZone, Timelike, Utc, Weekday};
+    use std::collections::BTreeMap;
+
+    use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc, Weekday};
 
     use crate::business::Businesses;
+    use crate::db::{Db, Lead, Person, Sequence, Touch, CURRENT_COPY_POLICY_VERSION};
 
     use super::{
-        can_send_now, next_slot, quota_day_bounds, schedule_with_capacity, timezone_for_location,
-        TimingContext,
+        can_send_now, next_slot, quota_day_bounds, rebalance_approved_sales,
+        schedule_with_capacity, timezone_for_location, TimingContext,
     };
 
     #[test]
@@ -920,6 +1327,100 @@ mod tests {
 
         assert_eq!(local.weekday(), Weekday::Mon);
         assert!((8..17).contains(&local.hour()));
+        assert_ne!(local.minute() % 5, 0);
+    }
+
+    #[test]
+    fn portfolio_scheduler_spreads_accounts_and_reserves_full_cadences() {
+        let businesses = Businesses::load("businesses").expect("business profiles");
+        let mut profile = businesses.get("gnk").unwrap().clone();
+        profile.calendar.daily_touch_cap = 2;
+        profile.account_limits.max_new_contacts_per_account_per_day = 1;
+        let db = Db::open(":memory:").expect("open memory db");
+        let mut people_by_lead = BTreeMap::<String, Vec<String>>::new();
+
+        for account in 0..2 {
+            let lead_id = db
+                .upsert_lead(&Lead {
+                    brand: "gnk".into(),
+                    apollo_org_id: format!("calendar-org-{account}"),
+                    name: format!("Calendar Account {account}"),
+                    industry: "logistics".into(),
+                    hq: "London, United Kingdom".into(),
+                    ..Default::default()
+                })
+                .unwrap();
+            for contact in 0..2 {
+                let person_id = db
+                    .upsert_person(&Person {
+                        lead_id: lead_id.clone(),
+                        brand: "gnk".into(),
+                        apollo_person_id: format!("calendar-person-{account}-{contact}"),
+                        name: format!("Person {account}-{contact}"),
+                        title: "Operations Director".into(),
+                        location: "London, United Kingdom".into(),
+                        timezone: "Europe/London".into(),
+                        email: format!("person-{account}-{contact}@example.com"),
+                        email_status: "verified".into(),
+                        status: "verified".into(),
+                        primary: contact == 0,
+                        ..Default::default()
+                    })
+                    .unwrap();
+                people_by_lead
+                    .entry(lead_id.clone())
+                    .or_default()
+                    .push(person_id.clone());
+                let sequence_id = db
+                    .create_sequence(&Sequence {
+                        person_id: person_id.clone(),
+                        lead_id: lead_id.clone(),
+                        brand: "gnk".into(),
+                        status: "active".into(),
+                        copy_policy_version: CURRENT_COPY_POLICY_VERSION,
+                        ..Default::default()
+                    })
+                    .unwrap();
+                for (stage, day_offset) in [(1, 0), (2, 3)] {
+                    db.insert_touch(&Touch {
+                        sequence_id: sequence_id.clone(),
+                        person_id: person_id.clone(),
+                        lead_id: lead_id.clone(),
+                        brand: "gnk".into(),
+                        stage,
+                        day_offset,
+                        channel: "email".into(),
+                        status: "scheduled".into(),
+                        due_at: "2026-08-10T08:00:00Z".into(),
+                        ..Default::default()
+                    })
+                    .unwrap();
+                }
+            }
+        }
+
+        let now = Utc.with_ymd_and_hms(2026, 8, 10, 7, 0, 0).unwrap();
+        let summary = rebalance_approved_sales(&db, &profile, now).unwrap();
+        assert_eq!(summary.emails, 8);
+        assert_eq!(summary.admitted_people, 4);
+
+        for people in people_by_lead.values() {
+            let opener_dates = people
+                .iter()
+                .map(|person_id| {
+                    let touches = db.list_touches_for_person(person_id).unwrap();
+                    let due = DateTime::parse_from_rfc3339(&touches[0].due_at).unwrap();
+                    due.with_timezone(&chrono_tz::Europe::London).date_naive()
+                })
+                .collect::<Vec<_>>();
+            assert_ne!(opener_dates[0], opener_dates[1]);
+        }
+
+        for offset in 0..10 {
+            let at = now + chrono::Duration::days(offset);
+            let (start, end, _) = quota_day_bounds(&profile, at).unwrap();
+            assert!(db.planned_touch_count_between("gnk", start, end).unwrap() <= 2);
+        }
     }
 
     #[test]

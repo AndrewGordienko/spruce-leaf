@@ -1250,6 +1250,9 @@ fn finalize_reviewed_draft(
         }
     }
     db.promote_building_sequence(seq_id, replaced_sequence, &seq.applied_principles)?;
+    if touches_scheduled > 0 {
+        calendar::rebalance_approved_sales(db, business, chrono::Utc::now())?;
+    }
     // The sequence is already durable and visible. Event logging is useful
     // telemetry, but a logging hiccup must not report a successfully promoted
     // sequence as rejected.

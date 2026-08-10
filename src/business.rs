@@ -71,8 +71,8 @@ pub struct DiscoveryEvidence {
     pub limits: Vec<String>,
 }
 
-/// Per-account send throttles. The business `daily_touch_cap` bounds the *total*
-/// volume, but says nothing about how that volume is spread. Without these, the
+/// Per-account send throttles. The business `daily_touch_cap` bounds approved
+/// email volume, but says nothing about how that volume is spread. Without these, the
 /// cadence engine will happily open a cold email to five people at the same
 /// plant within the same hour — which reads as a blast, burns the account, and
 /// is exactly the failure mode an autopilot amplifies. These are enforced at
@@ -362,7 +362,7 @@ impl BusinessProfile {
             .collect::<Vec<_>>()
             .join(", ");
         let mut summary = format!(
-            "{}: {} Enabled motions: {}. Outreach calendar: at most {} total touchpoints per {} day; recipient-local timing with named industry/title exceptions.",
+            "{}: {} Enabled motions: {}. Outreach calendar: at most {} approved emails per {} day; recipient-local timing with named industry/title exceptions.",
             self.name,
             self.summary,
             motions,

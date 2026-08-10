@@ -449,7 +449,9 @@ pub struct TimingObservation {
 
 #[derive(Debug, Clone, Default)]
 pub struct CalendarEntry {
+    pub brand: String,
     pub due_at: String,
+    pub stage: i64,
     pub channel: String,
     pub status: String,
     pub recipient: String,
@@ -458,6 +460,18 @@ pub struct CalendarEntry {
     pub recipient_timezone: String,
     pub scheduled_rule: String,
     pub motion: String,
+}
+
+/// One deterministic calendar assignment produced by the portfolio scheduler.
+/// Keeping the write shape in the database layer lets the scheduler calculate
+/// every placement first and then commit the complete plan atomically.
+#[derive(Debug, Clone, Default)]
+pub struct TouchScheduleUpdate {
+    pub id: String,
+    pub due_at: String,
+    pub recipient_timezone: String,
+    pub scheduled_rule: String,
+    pub schedule_reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1187,6 +1201,28 @@ impl Db {
         Ok(())
     }
 
+    pub fn apply_touch_schedule(&self, updates: &[TouchScheduleUpdate]) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE touches SET due_at=?2,recipient_timezone=?3,scheduled_rule=?4,
+                 schedule_reason=?5 WHERE id=?1 AND status='scheduled'",
+            )?;
+            for update in updates {
+                stmt.execute(params![
+                    update.id,
+                    update.due_at,
+                    update.recipient_timezone,
+                    update.scheduled_rule,
+                    update.schedule_reason,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn insert_touch(&self, t: &Touch) -> Result<String> {
         let conn = self.conn.lock().unwrap();
         let id = if t.id.is_empty() {
@@ -1392,12 +1428,32 @@ impl Db {
                      AND lower(prior.channel) IN ('email','linkedin_or_email') \
                      AND prior.status NOT IN ('sent','skipped','cancelled','replied') \
                ) \
-             ORDER BY t.due_at ASC LIMIT ?4",
+             ORDER BY CASE WHEN t.stage>1 THEN 0 ELSE 1 END, t.due_at ASC LIMIT ?4",
         )?;
         let rows = stmt.query_map(
             params![now(), brand, CURRENT_COPY_POLICY_VERSION, limit],
             |r| Ok(row_to_touch(r)),
         )?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Every approved, unsent sales email that the portfolio scheduler may
+    /// place. Manual LinkedIn work remains outside the email capacity plan.
+    pub fn scheduled_email_touches(&self, brand: &str) -> Result<Vec<Touch>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT t.* FROM touches t
+             JOIN sequences s ON s.id=t.sequence_id
+             JOIN people p ON p.id=t.person_id
+             WHERE t.brand=?1 AND t.status='scheduled'
+               AND lower(t.channel) IN ('email','linkedin_or_email')
+               AND s.status='active' AND s.copy_policy_version=?2
+               AND p.status NOT IN ('replied','unsubscribed','bounced','suppressed')
+             ORDER BY s.created_at ASC,t.stage ASC,t.id ASC",
+        )?;
+        let rows = stmt.query_map(params![brand, CURRENT_COPY_POLICY_VERSION], |r| {
+            Ok(row_to_touch(r))
+        })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -1449,10 +1505,9 @@ impl Db {
             .optional()?)
     }
 
-    /// Capacity used or reserved for one business calendar day. Drafts are
-    /// included because approval must not turn an apparently safe plan into a
-    /// 60-touch day, and sent touches remain part of that day's total. Manual
-    /// and automatic channels share the same business cap.
+    /// Email capacity used or reserved for one business calendar day. Only
+    /// approved email-capable work reserves capacity; drafts and manual
+    /// LinkedIn tasks do not enter the sending calendar.
     pub fn planned_touch_count_between(
         &self,
         brand: &str,
@@ -1464,13 +1519,14 @@ impl Db {
         let end = end.to_rfc3339();
         let regular: i64 = conn.query_row(
             "SELECT COUNT(*) FROM touches WHERE brand=?1 AND due_at>=?2 AND due_at<?3
-             AND status IN ('draft','scheduled','sent')",
+             AND lower(channel) IN ('email','linkedin_or_email')
+             AND status IN ('scheduled','sent')",
             params![brand, start, end],
             |r| r.get(0),
         )?;
         let opportunities: i64 = conn.query_row(
             "SELECT COUNT(*) FROM opportunity_touches WHERE brand=?1 AND due_at>=?2 AND due_at<?3
-             AND status IN ('draft','scheduled','sent')",
+             AND status IN ('scheduled','sent')",
             params![brand, start, end],
             |r| r.get(0),
         )?;
@@ -1483,6 +1539,26 @@ impl Db {
             |r| r.get(0),
         )?;
         Ok((regular + opportunities + conversations).max(0) as usize)
+    }
+
+    /// Approved funding emails are fixed reservations while the sales
+    /// portfolio is rebalanced. Sent funding mail is already included in
+    /// `sent_touch_count_between`, so this method intentionally counts only the
+    /// unsent scheduled rows.
+    pub fn scheduled_opportunity_count_between(
+        &self,
+        brand: &str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM opportunity_touches
+             WHERE brand=?1 AND status='scheduled' AND due_at>=?2 AND due_at<?3",
+            params![brand, start.to_rfc3339(), end.to_rfc3339()],
+            |r| r.get(0),
+        )?;
+        Ok(n.max(0) as usize)
     }
 
     /// Actual automated email sends across every mailbox and motion for a
@@ -1737,24 +1813,26 @@ impl Db {
         let mut entries = Vec::new();
         {
             let mut stmt = conn.prepare(
-                "SELECT t.due_at,t.channel,t.status,p.name,l.name,t.purpose,
+                "SELECT t.due_at,t.stage,t.channel,t.status,p.name,l.name,t.purpose,
                         t.recipient_timezone,t.scheduled_rule
                  FROM touches t
                  JOIN people p ON p.id=t.person_id
                  JOIN leads l ON l.id=t.lead_id
-                 WHERE t.brand=?1 AND t.status IN ('draft','scheduled')
+                 WHERE t.brand=?1 AND t.status='scheduled'
                  ORDER BY t.due_at ASC LIMIT ?2",
             )?;
             let rows = stmt.query_map(params![brand, limit as i64], |row| {
                 Ok(CalendarEntry {
+                    brand: brand.to_string(),
                     due_at: row.get(0)?,
-                    channel: row.get(1)?,
-                    status: row.get(2)?,
-                    recipient: row.get(3)?,
-                    account: row.get(4)?,
-                    purpose: row.get(5)?,
-                    recipient_timezone: row.get(6)?,
-                    scheduled_rule: row.get(7)?,
+                    stage: row.get(1)?,
+                    channel: row.get(2)?,
+                    status: row.get(3)?,
+                    recipient: row.get(4)?,
+                    account: row.get(5)?,
+                    purpose: row.get(6)?,
+                    recipient_timezone: row.get(7)?,
+                    scheduled_rule: row.get(8)?,
                     motion: "sales".into(),
                 })
             })?;
@@ -1762,24 +1840,26 @@ impl Db {
         }
         {
             let mut stmt = conn.prepare(
-                "SELECT t.due_at,'email',t.status,c.name,o.title,t.purpose,
+                "SELECT t.due_at,t.stage,'email',t.status,c.name,o.title,t.purpose,
                         t.recipient_timezone,t.scheduled_rule
                  FROM opportunity_touches t
                  JOIN opportunity_contacts c ON c.id=t.contact_id
                  JOIN opportunities o ON o.id=t.opportunity_id
-                 WHERE t.brand=?1 AND t.status IN ('draft','scheduled')
+                 WHERE t.brand=?1 AND t.status='scheduled'
                  ORDER BY t.due_at ASC LIMIT ?2",
             )?;
             let rows = stmt.query_map(params![brand, limit as i64], |row| {
                 Ok(CalendarEntry {
+                    brand: brand.to_string(),
                     due_at: row.get(0)?,
-                    channel: row.get(1)?,
-                    status: row.get(2)?,
-                    recipient: row.get(3)?,
-                    account: row.get(4)?,
-                    purpose: row.get(5)?,
-                    recipient_timezone: row.get(6)?,
-                    scheduled_rule: row.get(7)?,
+                    stage: row.get(1)?,
+                    channel: row.get(2)?,
+                    status: row.get(3)?,
+                    recipient: row.get(4)?,
+                    account: row.get(5)?,
+                    purpose: row.get(6)?,
+                    recipient_timezone: row.get(7)?,
+                    scheduled_rule: row.get(8)?,
                     motion: "funding".into(),
                 })
             })?;
@@ -6559,7 +6639,7 @@ mod tests {
     }
 
     #[test]
-    fn planned_capacity_is_isolated_per_business() {
+    fn approved_email_capacity_is_isolated_per_business() {
         let db = Db::open(":memory:").expect("open memory db");
         let due = Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap();
         let start = Utc.with_ymd_and_hms(2026, 8, 10, 0, 0, 0).unwrap();
@@ -6568,7 +6648,12 @@ mod tests {
             db.insert_touch(&Touch {
                 id: format!("gnk-{index}"),
                 brand: "gnk".into(),
-                status: if index == 0 { "sent" } else { "draft" }.into(),
+                status: match index {
+                    0 => "sent",
+                    1 => "scheduled",
+                    _ => "draft",
+                }
+                .into(),
                 channel: "email".into(),
                 due_at: due.to_rfc3339(),
                 ..Default::default()
@@ -6587,12 +6672,12 @@ mod tests {
 
         assert_eq!(
             db.planned_touch_count_between("gnk", start, end).unwrap(),
-            30
+            2
         );
         assert_eq!(
             db.planned_touch_count_between("wapahki", start, end)
                 .unwrap(),
-            1
+            0
         );
         assert_eq!(
             db.planned_touch_count_between("outagehub", start, end)

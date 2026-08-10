@@ -1,11 +1,11 @@
-# spruce-leaf cloud daemon. `docker compose up -d` runs it detached; it restarts
+# spruce-leaf cloud services. `docker compose up -d` runs them detached; they restart
 # on crash and on host reboot, and its SQLite state persists in a named volume.
 #
 # ⚠ Before the FIRST `up`, walk the staged rollout in deploy/README.md:
 #   1. dry-run:        docker compose run --rm spruce-leaf daemon
 #   2. closed loop:    set SPRUCE_SEND_ALLOWLIST in .env, seed a test lead, up
 #   3. production:     clear SPRUCE_SEND_ALLOWLIST, up
-# The default command below is the PRODUCTION posture (live send + autopilot).
+# The default command below is the PRODUCTION posture (approved live send + inbox).
 
 services:
   spruce-leaf:
@@ -13,7 +13,7 @@ services:
     image: spruce-leaf:latest
     container_name: spruce-leaf
     restart: unless-stopped
-    # All secrets + mailbox config + CLAUDE_CODE_OAUTH_TOKEN come from .env.
+    # All secrets + mailbox config + OPENAI_API_KEY come from .env.
     env_file:
       - .env
     environment:
@@ -22,7 +22,25 @@ services:
       - spruce-data:/app/.spruce
     # Uncomment to watch the daemon's log line-by-line: docker compose logs -f
     # Override for a one-off dry-run: docker compose run --rm spruce-leaf daemon
-    command: ["daemon", "--live", "--autopilot"]
+    # Approved work sends autonomously. Add --autopilot only when continuous
+    # sourcing/model work is intentionally desired.
+    command: ["daemon", "--live", "--batch", "90"]
+
+  crm:
+    image: spruce-leaf:latest
+    container_name: spruce-leaf-crm
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TZ: UTC
+      SPRUCE_CRM_BIND: 0.0.0.0
+    volumes:
+      - spruce-data:/app/.spruce
+    # VM-loopback only: reach it through `ssh -L 8788:127.0.0.1:8788 ...`
+    ports:
+      - "127.0.0.1:8788:8788"
+    command: ["--port", "8788", "crm"]
 
 volumes:
   spruce-data:

@@ -9,8 +9,9 @@
 //! (`/strategy`) that surfaces the business operating profiles and outreach
 //! playbooks guiding Wapahki, GnK, and OutageHub — the business side of the SDR.
 
+use std::collections::BTreeSet;
 use std::io::{Read as _, Write as _};
-use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,7 +25,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use chrono::{DateTime, Local, Utc};
+use chrono::{DateTime, Datelike, Local, NaiveDate, Utc, Weekday};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
@@ -613,7 +614,7 @@ const CRM_PORT_SCAN: u16 = 128;
 /// Increment when a dashboard/API change makes reusing an older local server
 /// unsafe. Package version stays intentionally stable during local development,
 /// so it cannot distinguish a stale process on its own.
-const CRM_PROTOCOL_REV: u32 = 2;
+const CRM_PROTOCOL_REV: u32 = 3;
 
 /// Loopback ports to try for the CRM, starting at `first`.
 pub fn port_candidates(first: u16) -> Vec<u16> {
@@ -622,18 +623,22 @@ pub fn port_candidates(first: u16) -> Vec<u16> {
         .collect()
 }
 
-/// Bind the first free loopback port at or above `first`, else an OS-assigned
-/// one. The returned listener is ready to hand to [`serve_on_listener`]. Binding
-/// (rather than check-then-bind) is race-free across concurrent sessions.
+/// Bind the first free port at or above `first`, else an OS-assigned one. Local
+/// development stays loopback-only. A hosted Docker service may explicitly set
+/// `SPRUCE_CRM_BIND=0.0.0.0`; the compose file still publishes it only on the
+/// VM's loopback interface for an SSH/Tailscale tunnel.
 pub fn bind_free_listener(first: u16) -> Result<TcpListener> {
+    let ip = std::env::var("SPRUCE_CRM_BIND")
+        .ok()
+        .and_then(|value| value.parse::<IpAddr>().ok())
+        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
     for port in port_candidates(first) {
-        let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
+        let address = SocketAddr::new(ip, port);
         if let Ok(listener) = TcpListener::bind(address) {
             return Ok(listener);
         }
     }
-    TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
-        .context("finding a free localhost port for the CRM")
+    TcpListener::bind(SocketAddr::new(ip, 0)).context("finding a free port for the CRM")
 }
 
 /// True when a Spruce Leaf CRM is already answering on this loopback port. A
@@ -699,7 +704,7 @@ async fn health() -> Json<serde_json::Value> {
 /// can click straight through to any of the three CRMs.
 async fn hub(State(state): State<WebState>) -> Html<String> {
     let counts = brand_tab_counts(&state.db);
-    Html(render_hub(&counts, &state.businesses))
+    Html(render_hub(&counts, &state.businesses, &state.db))
 }
 
 /// One brand's CRM: the same dashboard, scoped to a single book of business.
@@ -1225,6 +1230,9 @@ async fn approve_execution(
         let _ = state
             .db
             .approve_touches(Some(&person.brand), Some(&person_id));
+        if let Ok(profile) = state.businesses.get(&person.brand) {
+            let _ = crate::calendar::rebalance_approved_sales(&state.db, profile, Utc::now());
+        }
         brand = Some(person.brand);
     }
     redirect_back(&headers, brand.as_deref())
@@ -1770,53 +1778,218 @@ fn render_subbar(b: &mut String, title: &str, tagline: &str, stats: &[(String, &
 
 /// The portfolio landing page: the brand tabs plus one card per brand, each a
 /// direct link into that brand's CRM.
-fn render_hub(counts: &[(&'static BrandMeta, usize)], businesses: &Businesses) -> String {
-    let mut b = page_head("Sales CRM · Portfolio");
+fn render_hub(
+    counts: &[(&'static BrandMeta, usize)],
+    businesses: &Businesses,
+    db: &SharedDb,
+) -> String {
+    let mut b = page_head("Sales CRM · Outreach calendar");
     render_topbar(&mut b, None, Surface::Pipeline, counts);
-    let total: usize = counts.iter().map(|(_, contacts)| contacts).sum();
+    let mut all_entries = Vec::new();
+    for (meta, _) in counts {
+        if let Ok(mut entries) = db.upcoming_calendar(meta.key, 600) {
+            all_entries.append(&mut entries);
+        }
+    }
+    all_entries.sort_by(|left, right| left.due_at.cmp(&right.due_at));
+    let now = Utc::now();
+    let overdue = all_entries
+        .iter()
+        .filter(|entry| parse_calendar_due(&entry.due_at).is_some_and(|due| due < now))
+        .count();
+    let scheduled_people = all_entries
+        .iter()
+        .map(|entry| format!("{}:{}:{}", entry.brand, entry.account, entry.recipient))
+        .collect::<BTreeSet<_>>()
+        .len();
+    let total_cap: usize = counts
+        .iter()
+        .filter_map(|(meta, _)| businesses.get(meta.key).ok())
+        .map(|profile| profile.calendar.daily_touch_cap)
+        .sum();
     render_subbar(
         &mut b,
-        "Portfolio",
-        "Three books of business, one workspace. Pipeline is the work; Strategy is why the work exists.",
+        "Outreach calendar",
+        "Approved emails across all three businesses. Follow-ups are protected; remaining capacity opens new conversations across accounts.",
         &[
-            (counts.len().to_string(), "brands"),
-            (total.to_string(), "people"),
+            (format!("{total_cap}/day"), "portfolio ceiling"),
+            (scheduled_people.to_string(), "people scheduled"),
+            (overdue.to_string(), "overdue"),
         ],
     );
+    b.push_str("<main class=\"sheet-scroll calendar-scroll\">");
     b.push_str(
-        "<main class=\"sheet-scroll\"><div class=\"portfolio-lead\">\
-         <p>Use <a href=\"/strategy\">Strategy</a> for goals, motions, and outreach doctrine. \
-         Open a brand below for the live people sheet.</p></div>\
-         <div class=\"portfolio\">",
+        "<section class=\"calendar-policy\"><div><b>Portfolio rule</b><span>30 emails per business per quota day. Replies first, then due follow-ups, then new people breadth-first across accounts. A new person enters only after the rest of their cadence has calendar room.</span></div><span class=\"calendar-policy-total\">90 max/day</span></section>",
     );
-    for (meta, contacts) in counts {
-        let summary = businesses
-            .get(meta.key)
-            .map(|p| p.summary.as_str())
-            .unwrap_or(meta.tagline);
-        let goal = businesses
-            .get(meta.key)
-            .ok()
-            .and_then(|p| p.goals.first().map(String::as_str))
-            .unwrap_or(meta.tagline);
+    if overdue > 0 {
         b.push_str(&format!(
-            "<div class=\"brand-card {brand}\">\
-             <div class=\"brand-card-top\"><span class=\"brand-chip {brand}\">{name}</span>\
-             <span class=\"brand-card-count\">{contacts} ready sequences</span></div>\
-             <p class=\"brand-card-tagline\">{summary}</p>\
-             <p class=\"brand-card-goal\"><b>Trying to:</b> {goal}</p>\
-             <div class=\"brand-card-actions\">\
-             <a class=\"brand-card-open\" href=\"/b/{brand}\">Open pipeline →</a>\
-             <a class=\"brand-card-open secondary\" href=\"/strategy/{brand}\">Strategy →</a>\
-             </div></div>",
-            brand = meta.key,
-            name = esc(meta.name),
-            summary = esc(summary),
-            goal = esc(&preview(goal, 180)),
+            "<section class=\"calendar-alert\"><b>{overdue} approved email{} overdue.</b> The daemon will take replies and follow-ups first, then move any overflow into the next valid recipient window.</section>",
+            if overdue == 1 { " is" } else { "s are" }
         ));
     }
-    b.push_str("</div></main></div></body></html>");
+
+    b.push_str("<section class=\"calendar-brand-strip\">");
+    for (meta, contacts) in counts {
+        b.push_str(&format!(
+            "<a class=\"calendar-brand-summary {brand}\" href=\"/b/{brand}\"><span class=\"brand-chip {brand}\">{name}</span><span><b>30/day</b><small>{contacts} ready sequence{suffix}</small></span><i>Open pipeline →</i></a>",
+            brand = meta.key,
+            name = esc(meta.name),
+            suffix = if *contacts == 1 { "" } else { "s" },
+        ));
+    }
+    b.push_str("</section>");
+
+    let dates = portfolio_calendar_dates(businesses, &all_entries, now, 10);
+    b.push_str("<section class=\"calendar-grid\">");
+    for date in dates {
+        render_calendar_day(&mut b, date, counts, businesses, db, &all_entries, now);
+    }
+    b.push_str("</section></main></div></body></html>");
     b
+}
+
+fn portfolio_calendar_dates(
+    businesses: &Businesses,
+    entries: &[crate::db::CalendarEntry],
+    now: DateTime<Utc>,
+    count: usize,
+) -> Vec<NaiveDate> {
+    let tz = businesses
+        .get("gnk")
+        .ok()
+        .and_then(|profile| profile.calendar.quota_timezone.parse::<Tz>().ok())
+        .unwrap_or(chrono_tz::Europe::London);
+    let mut date = now.with_timezone(&tz).date_naive();
+    let entry_dates = entries
+        .iter()
+        .filter_map(|entry| {
+            let profile = businesses.get(&entry.brand).ok()?;
+            let tz = profile.calendar.quota_timezone.parse::<Tz>().ok()?;
+            Some(
+                parse_calendar_due(&entry.due_at)?
+                    .with_timezone(&tz)
+                    .date_naive(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let mut dates = Vec::new();
+    while dates.len() < count {
+        let weekday = date.weekday();
+        if !matches!(weekday, Weekday::Sat | Weekday::Sun) || entry_dates.contains(&date) {
+            dates.push(date);
+        }
+        date = match date.succ_opt() {
+            Some(next) => next,
+            None => break,
+        };
+    }
+    dates
+}
+
+fn render_calendar_day(
+    b: &mut String,
+    date: NaiveDate,
+    counts: &[(&'static BrandMeta, usize)],
+    businesses: &Businesses,
+    db: &SharedDb,
+    entries: &[crate::db::CalendarEntry],
+    now: DateTime<Utc>,
+) {
+    let today = businesses
+        .get("gnk")
+        .ok()
+        .and_then(|profile| profile.calendar.quota_timezone.parse::<Tz>().ok())
+        .map(|tz| now.with_timezone(&tz).date_naive() == date)
+        .unwrap_or(false);
+    let mut total = 0usize;
+    let mut brand_rows = Vec::new();
+    for (meta, _) in counts {
+        let Some(profile) = businesses.get(meta.key).ok() else {
+            continue;
+        };
+        let (used, sent) = crate::calendar::quota_date_bounds(profile, date)
+            .ok()
+            .and_then(|(start, end)| {
+                Some((
+                    db.planned_touch_count_between(meta.key, start, end).ok()?,
+                    db.sent_touch_count_between(meta.key, start, end).ok()?,
+                ))
+            })
+            .unwrap_or_default();
+        total += used;
+        let mut day_entries = entries
+            .iter()
+            .filter(|entry| entry.brand == meta.key)
+            .filter(|entry| {
+                let tz = profile
+                    .calendar
+                    .quota_timezone
+                    .parse::<Tz>()
+                    .unwrap_or(chrono_tz::Europe::London);
+                parse_calendar_due(&entry.due_at)
+                    .is_some_and(|due| due.with_timezone(&tz).date_naive() == date)
+            })
+            .collect::<Vec<_>>();
+        day_entries.sort_by(|left, right| left.due_at.cmp(&right.due_at));
+        brand_rows.push((meta, profile, used, sent, day_entries));
+    }
+    b.push_str(&format!(
+        "<article class=\"calendar-day{}\"><header><div><span>{}</span><b>{}</b></div><strong>{}/90</strong></header>",
+        if today { " today" } else { "" },
+        esc(&date.format("%a").to_string()),
+        esc(&date.format("%-d %b").to_string()),
+        total.min(90),
+    ));
+    for (meta, profile, used, sent, day_entries) in brand_rows {
+        let cap = profile.calendar.daily_touch_cap.max(1);
+        let width = ((used.min(cap) * 100) / cap).max(usize::from(used > 0) * 3);
+        b.push_str(&format!(
+            "<div class=\"calendar-lane {brand}\"><div class=\"calendar-lane-head\"><a href=\"/b/{brand}\">{name}</a><span>{used}/{cap}<small>{sent} sent</small></span></div><div class=\"calendar-meter\"><i style=\"width:{width}%\"></i></div>",
+            brand = meta.key,
+            name = esc(meta.name),
+        ));
+        if day_entries.is_empty() {
+            b.push_str("<p class=\"calendar-open\">capacity available</p>");
+        } else {
+            b.push_str("<div class=\"calendar-events\">");
+            for entry in day_entries.iter().take(3) {
+                b.push_str(&format!(
+                    "<div class=\"calendar-event\"><time>{}</time><span><b>{}</b> · {} · T{}</span></div>",
+                    esc(&calendar_entry_time(entry)),
+                    esc(&entry.account),
+                    esc(&entry.recipient),
+                    entry.stage,
+                ));
+            }
+            if day_entries.len() > 3 {
+                b.push_str(&format!(
+                    "<p class=\"calendar-more\">+{} more approved email{}</p>",
+                    day_entries.len() - 3,
+                    if day_entries.len() == 4 { "" } else { "s" }
+                ));
+            }
+            b.push_str("</div>");
+        }
+        b.push_str("</div>");
+    }
+    b.push_str("</article>");
+}
+
+fn parse_calendar_due(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|due| due.with_timezone(&Utc))
+}
+
+fn calendar_entry_time(entry: &crate::db::CalendarEntry) -> String {
+    let Some(due) = parse_calendar_due(&entry.due_at) else {
+        return "time pending".into();
+    };
+    let tz = entry
+        .recipient_timezone
+        .parse::<Tz>()
+        .unwrap_or(chrono_tz::UTC);
+    due.with_timezone(&tz).format("%-I:%M %p %Z").to_string()
 }
 
 /// Compact business-context strip on each brand pipeline page so the sheet never
@@ -4117,6 +4290,68 @@ a.brand-lockup { text-decoration: none; color: var(--ink); flex: 0 0 auto; }
 .brand-card-actions { display: flex; gap: 14px; margin-top: auto; }
 .portfolio-lead { padding: 18px 24px 0; max-width: 1180px; color: var(--muted); font-size: 13px; }
 .portfolio-lead a { color: var(--blue); font-weight: 600; text-decoration: none; }
+.calendar-scroll { padding: 16px 18px 28px; background: #f7f9fc; }
+.calendar-policy {
+  display: flex; align-items: center; justify-content: space-between; gap: 20px;
+  max-width: 1500px; margin: 0 auto 12px; padding: 12px 14px;
+  border: 1px solid #d2e3fc; border-radius: 10px; background: #edf4ff; color: var(--muted);
+}
+.calendar-policy > div { display: flex; align-items: baseline; gap: 10px; min-width: 0; }
+.calendar-policy b { color: var(--blue-strong); font-size: 12px; white-space: nowrap; }
+.calendar-policy span { font-size: 12px; line-height: 1.4; }
+.calendar-policy .calendar-policy-total { color: var(--blue); font-weight: 750; white-space: nowrap; }
+.calendar-alert {
+  max-width: 1500px; margin: 0 auto 12px; padding: 10px 13px; border: 1px solid #f4c7c3;
+  border-radius: 9px; background: #fce8e6; color: #7c2d26; font-size: 12px;
+}
+.calendar-brand-strip {
+  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px;
+  max-width: 1500px; margin: 0 auto 14px;
+}
+.calendar-brand-summary {
+  display: flex; align-items: center; gap: 12px; min-width: 0; padding: 11px 13px;
+  border: 1px solid var(--line); border-radius: 10px; background: #fff; color: var(--ink); text-decoration: none;
+}
+.calendar-brand-summary:hover { border-color: #bdd2f5; box-shadow: 0 2px 8px rgba(26,115,232,.09); }
+.calendar-brand-summary > span:nth-child(2) { min-width: 0; }
+.calendar-brand-summary > span b { display: block; font-size: 12px; }
+.calendar-brand-summary small { display: block; color: var(--faint); font-size: 10px; margin-top: 1px; }
+.calendar-brand-summary i { margin-left: auto; color: var(--blue); font-size: 10.5px; font-style: normal; white-space: nowrap; }
+.calendar-grid {
+  display: grid; grid-template-columns: repeat(5, minmax(225px, 1fr)); gap: 10px;
+  max-width: 1500px; margin: 0 auto;
+}
+.calendar-day {
+  min-width: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 11px;
+  background: #fff; box-shadow: 0 1px 2px rgba(60,64,67,.04);
+}
+.calendar-day.today { border-color: #9fc0f5; box-shadow: 0 0 0 1px #d2e3fc; }
+.calendar-day > header {
+  display: flex; align-items: center; justify-content: space-between; padding: 10px 11px;
+  border-bottom: 1px solid var(--line); background: #f8faff;
+}
+.calendar-day > header div { display: flex; align-items: baseline; gap: 6px; }
+.calendar-day > header span { color: var(--blue); font-size: 10px; font-weight: 750; text-transform: uppercase; }
+.calendar-day > header b { font-size: 13px; }
+.calendar-day > header strong { color: var(--faint); font-size: 10.5px; font-weight: 650; }
+.calendar-lane { padding: 9px 10px 10px; border-bottom: 1px solid #edf0f4; }
+.calendar-lane:last-child { border-bottom: 0; }
+.calendar-lane-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.calendar-lane-head a { color: var(--ink); font-size: 10.5px; font-weight: 700; text-decoration: none; }
+.calendar-lane-head > span { color: var(--muted); font-size: 10px; font-weight: 650; white-space: nowrap; }
+.calendar-lane-head small { margin-left: 5px; color: var(--faint); font-size: 8.5px; font-weight: 500; }
+.calendar-meter { height: 3px; margin: 5px 0 7px; overflow: hidden; border-radius: 99px; background: #edf0f4; }
+.calendar-meter i { display: block; height: 100%; border-radius: inherit; background: #6d8fbf; }
+.calendar-lane.gnk .calendar-meter i { background: #7c6bb0; }
+.calendar-lane.wapahki .calendar-meter i { background: #6d914a; }
+.calendar-lane.outagehub .calendar-meter i { background: #4285f4; }
+.calendar-open { margin: 0; color: #a1a7af; font-size: 9.5px; }
+.calendar-events { display: grid; gap: 4px; }
+.calendar-event { display: grid; grid-template-columns: auto minmax(0,1fr); gap: 5px; align-items: baseline; }
+.calendar-event time { color: var(--faint); font-size: 8.5px; white-space: nowrap; }
+.calendar-event span { min-width: 0; overflow: hidden; color: var(--muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.calendar-event span b { color: var(--ink); font-weight: 600; }
+.calendar-more { margin: 2px 0 0; color: var(--blue); font-size: 9px; font-weight: 600; }
 .surface-tabs {
   display: flex; align-items: center; gap: 2px; height: 28px; margin-right: 10px;
   padding: 2px; border: 1px solid var(--line); border-radius: 999px; background: #f8f9fb;
@@ -4464,6 +4699,13 @@ a.brand-lockup { text-decoration: none; color: var(--ink); flex: 0 0 auto; }
   .strategy-panel, .gtm-panel { padding: 15px 13px; border-radius: 11px; }
   .portfolio { grid-template-columns: 1fr; gap: 10px; padding: 12px 10px; }
   .portfolio-lead { padding: 12px 12px 0; }
+  .calendar-scroll { padding: 10px; }
+  .calendar-policy { align-items: flex-start; }
+  .calendar-policy > div { display: block; }
+  .calendar-policy b { display: block; margin-bottom: 3px; }
+  .calendar-brand-strip { grid-template-columns: 1fr; }
+  .calendar-grid { display: flex; overflow-x: auto; scroll-snap-type: x mandatory; padding-bottom: 8px; }
+  .calendar-day { flex: 0 0 82vw; scroll-snap-align: start; }
   .strategy-brand-grid, .gtm-card-grid { grid-template-columns: minmax(0, 1fr); }
   .gtm-doctrine, .gtm-split { grid-template-columns: 1fr; }
   .gtm-form { grid-template-columns: 1fr; }
@@ -4491,7 +4733,7 @@ a.brand-lockup { text-decoration: none; color: var(--ink); flex: 0 0 auto; }
 mod tests {
     use super::{
         brand_meta, brand_tab_counts, display_written_at, execution_dashboard, gtm_snapshot,
-        local_write_headers, render_gtm_lab, render_html, render_strategy_brand,
+        local_write_headers, render_gtm_lab, render_html, render_hub, render_strategy_brand,
         render_strategy_hub, Crm, BRANDS,
     };
     use crate::business::Businesses;
@@ -4630,6 +4872,23 @@ mod tests {
         );
         assert!(funding_page.contains("Funding motion"));
         assert!(funding_page.contains("Official sources"));
+    }
+
+    #[test]
+    fn pipeline_all_is_the_cross_brand_capacity_calendar() {
+        let db = Db::open(":memory:").expect("open memory db");
+        let businesses = Businesses::load("businesses").expect("load businesses");
+        let counts = brand_tab_counts(&db);
+        let html = render_hub(&counts, &businesses, &db);
+
+        assert!(html.contains("Outreach calendar"));
+        assert!(html.contains("90 max/day"));
+        assert!(html.contains("Replies first, then due follow-ups"));
+        assert!(html.contains("class=\"calendar-grid\""));
+        assert!(html.contains("Wapahki"));
+        assert!(html.contains("GnK"));
+        assert!(html.contains("OutageHub"));
+        assert!(html.contains("href=\"/b/outagehub\""));
     }
 
     #[test]
