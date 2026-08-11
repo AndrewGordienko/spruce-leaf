@@ -5,12 +5,20 @@ play: find accounts with an expensive workflow, map the people positioned to see
 and activate the requested verified contacts with hypothesis-led outreach sequences — grounded in a library of real sales books —
 then files everything in a local CRM.
 
-It's a Rust CLI with a provider-neutral reasoning engine. Each line you type goes directly to the
-OpenAI Responses API by default, or to the optional Claude, Codex, or Grok local CLI, and can operate:
+It's a Rust CLI with a provider-neutral reasoning engine. Each line you type goes to the
+authenticated Codex CLI by default, or to the optional OpenAI Responses API, Claude, or Grok backend, and can operate:
 Apollo sourcing, contact enrichment, verified outreach planning, approval, and funnel reporting.
 
-Set `OPENAI_API_KEY` for the default backend. The normal model is `gpt-5.6-terra`; lightweight
-routing uses `gpt-5.6-luna`. The isolated outreach writer uses `gpt-5.6-sol` at `high`; copy repair
+The default Codex lane pins `gpt-5.6-terra` for substantive work and `gpt-5.6-luna` for lightweight
+routing, extraction, and website research. Reasoning is low by default, medium for qualification,
+strategy, writing, and final verification, and low for repair. Codex also combines angle selection
+with writing to save one call per recipient; set `SPRUCE_SEPARATE_OUTREACH_PLANNER=1` to restore the
+separate higher-quality planner. Override these defaults with the `SPRUCE_CODEX_*` variables documented in
+`.env.example`. Spruce invokes Codex as an inference-only subprocess and ignores the user's global
+Codex configuration so repository automation remains predictable and economical.
+
+For the optional direct OpenAI backend, set `OPENAI_API_KEY`. Its normal model is `gpt-5.6-terra`;
+lightweight routing uses `gpt-5.6-luna`. The isolated outreach writer uses `gpt-5.6-sol` at `high`; copy repair
 uses the selected model at `medium`, and independent final verification uses it at `high`.
 Account qualification, contact-vantage selection, hypothesis refresh, and outreach angle planning
 use the selected model at `medium`. Sol is intentionally limited to the one call where prose taste
@@ -421,9 +429,10 @@ cargo run -- gtm                          # open the GTM engineering lab
 cargo run -- source "mid-market 3PL invoice reconciliation" --accounts 10 --contacts 3
 cargo run -- enrich --limit 50            # Apollo reveal + DNS verification
 cargo run -- plan --touches 7             # writes drafts; email stays approval-gated
-cargo run -- approve                      # schedules email drafts only
+cargo run -- approve                      # schedules reviewed drafts that still pass current GTM policy
 cargo run -- mailboxes                    # load env config + check SPF/DMARC/MX
 cargo run -- daemon                       # one read-only preview pass, then exit
+cargo run -- --backend claude daemon --autopilot # continuously fill; never sends
 cargo run -- daemon --live                # requires address + healthy sending domains
 cargo run -- daemon --live --autopilot    # also fill discovery funnel toward configured targets
 cargo run -- inbox                        # resolve threads + create approval-gated reply drafts
@@ -442,7 +451,7 @@ cargo run -- suppress person@example.com
 #   --brand <gnk|wapahki|outagehub>   brand playbook            (default gnk)
 #   --playbooks <dir>                 playbook TOML directory   (default playbooks)
 #   --businesses <dir>                business TOML directory   (default businesses)
-#   --backend <openai|claude|codex|grok> inference provider      (default openai)
+#   --backend <openai|claude|codex|grok> inference provider      (default codex)
 #   --model <id>                      backend model override    (default: its default)
 #   --no-critique                     use deterministic QA only; skip the semantic copy edit
 #   --concurrency <N>                 concurrent model calls    (default 2)
@@ -486,10 +495,12 @@ The CLI, interactive agent, and dashboard all operate on this same database.
 
 ### Discovery autopilot and meetings
 
-`daemon --live --autopilot` runs the deterministic supervisor above the existing execution
-pipeline. It fills each brand from the top—source accounts, reveal/verify people, then draft
-reviewed cadences—and persists every lease, retry, result, and dead-letter row in SQLite. Cold
-drafts remain behind `approve`; the autopilot flag does not grant a new sending permission.
+`daemon --autopilot` runs the deterministic supervisor above the existing execution pipeline. It
+fills each brand from the top—source accounts, reveal/verify people, then draft reviewed
+cadences—and persists every lease, retry, result, and dead-letter row in SQLite. Without `--live`,
+it is a fill-only process and never sends email. `daemon --live --autopilot` also runs cadence and
+inbox delivery. Cold drafts remain behind `approve`; the autopilot flag does not grant a new
+sending permission.
 
 Inbound identity prefers RFC `In-Reply-To` and `References` over the sender address. A new person
 introduced on CC therefore stays attached to the original account and thread. Human replies stop

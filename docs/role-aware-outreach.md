@@ -72,3 +72,30 @@ The contract enters all three independent stages:
    face-threatening language.
 
 No contract label or inferred motive may appear in buyer-facing copy.
+
+## Required-response routing
+
+Role adaptation happens only after the system decides what response is needed
+next. Contact selection therefore works backward from one of five response
+types:
+
+| Required response | Eligible first contact | Ask boundary |
+| --- | --- | --- |
+| One real workflow example | Operator or frontline leader | Ask about one moment; do not pitch ownership, budget, or policy |
+| Confirm whether the problem recurs and matters | Process owner | Ask for a short comparison or an email correction |
+| Locate ownership | Operational executive or router | Ask for one role or name, not a discovery meeting |
+| Establish a technical boundary | Technical evaluator after business relevance exists | Ask one feasibility or data question |
+| Make an economic decision | Economic leader after problem evidence exists | Ask about materiality or commitment, not daily mechanics |
+
+The same deterministic priority function is used during sourcing, campaign
+generation, persisted-contact planning, and lead reuse. A model-supplied
+`primary` flag can rank plausible owners but cannot promote a route-only
+recipient over a workflow owner. Explicit learning-placement titles—intern,
+student, trainee, apprentice, and co-op—are always downgraded to `router`.
+Conversely, the system does not globally penalize Sales, Business Development,
+HR, or another function; that function may be the exact process owner when the
+problem lives there.
+
+If no eligible owner is found, the system must not manufacture a pitch for the
+most reachable employee. It may send a bounded routing note or hold the account
+for further contact research.

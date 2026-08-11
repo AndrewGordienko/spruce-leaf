@@ -24,7 +24,7 @@ use chrono::Utc;
 use crate::business::{BusinessProfile, Businesses};
 use crate::calendar::{self, TimingContext};
 use crate::compliance::Compliance;
-use crate::db::SharedDb;
+use crate::db::{GtmOutcome, Lead, Person, SharedDb, Touch};
 use crate::playbook::Playbooks;
 use crate::send::{self, Outgoing};
 
@@ -102,7 +102,30 @@ pub async fn tick(
             }
             continue;
         };
+        let playbook = playbooks.get(&touch.brand)?;
         let profile = businesses.get(&touch.brand)?;
+
+        // A scheduled row is not permanent authorization. Recheck current play
+        // evidence, account ceiling, and recipient stage immediately before any
+        // delivery work so stale/manual approvals cannot bypass GTM policy.
+        if let Some(reason) = crate::gtm::delivery_block_reason(db, playbook, &lead, &person)? {
+            if !cfg.dry_run {
+                db.set_touch_status(&touch.id, "blocked", "", "", &reason)?;
+                db.log_event(
+                    &touch.brand,
+                    &person.id,
+                    &touch.id,
+                    "delivery_blocked",
+                    &reason,
+                )?;
+            } else {
+                eprintln!(
+                    "  · would block [{}] stage {} to {} — {}",
+                    touch.brand, touch.stage, person.email, reason
+                );
+            }
+            continue;
+        }
 
         // Conditional touches become a manual LinkedIn task when the operator
         // has marked the connection accepted. Unknown/requested/not-connected
@@ -157,6 +180,7 @@ pub async fn tick(
         let unanswered_cap = profile.account_limits.max_unanswered_touches;
         if unanswered_cap > 0 && db.sequence_sent_count(&touch.sequence_id)? >= unanswered_cap {
             if !cfg.dry_run {
+                record_nonresponse_outcome(db, &touch, &lead, &person)?;
                 db.stop_sequence(&touch.sequence_id, "completed", "cancelled")?;
                 db.log_event(
                     &touch.brand,
@@ -383,6 +407,54 @@ pub async fn tick(
     }
 
     Ok(sent)
+}
+
+fn record_nonresponse_outcome(
+    db: &SharedDb,
+    due_touch: &Touch,
+    lead: &Lead,
+    person: &Person,
+) -> Result<()> {
+    let Some(sequence) = db.sequence_gtm_attribution(&due_touch.sequence_id)? else {
+        return Ok(());
+    };
+    let origin = db
+        .list_touches_for_sequence(&due_touch.sequence_id)?
+        .into_iter()
+        .filter(|touch| touch.status == "sent")
+        .max_by_key(|touch| touch.stage);
+    db.record_gtm_outcome(&GtmOutcome {
+        brand: due_touch.brand.clone(),
+        kind: "nonresponse".into(),
+        lead_id: due_touch.lead_id.clone(),
+        person_id: due_touch.person_id.clone(),
+        sequence_id: due_touch.sequence_id.clone(),
+        play_id: sequence.play_id,
+        experiment_id: sequence.experiment_id,
+        experiment_assignment_id: sequence.experiment_assignment_id,
+        signal_observation_ids: sequence.signal_observation_ids,
+        touch_id: origin
+            .as_ref()
+            .map(|touch| touch.id.clone())
+            .unwrap_or_default(),
+        touch_stage: origin.as_ref().map(|touch| touch.stage).unwrap_or(0),
+        contact_title: person.title.clone(),
+        contact_vantage: person.vantage.clone(),
+        account_hypothesis: lead.hypothesis.clone(),
+        play_version: sequence.play_version,
+        experiment_arm: sequence.experiment_arm,
+        copy_policy_version: sequence.copy_policy_version,
+        generation_backend: sequence.generation_backend,
+        generation_model: sequence.generation_model,
+        detail: format!(
+            "No reply after {} sent touch(es); cadence stopped at the configured unanswered cap.",
+            db.sequence_sent_count(&due_touch.sequence_id)?
+        ),
+        source: "cadence".into(),
+        fingerprint: format!("nonresponse:{}", due_touch.sequence_id),
+        ..Default::default()
+    })?;
+    Ok(())
 }
 
 async fn tick_conversation_replies(

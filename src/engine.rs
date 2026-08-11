@@ -11,6 +11,7 @@
 //! Every call also accrues token/cost/latency into a shared [`Stats`] so the UI
 //! can print a footer.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -24,6 +25,17 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
+
+/// OS process arguments cannot contain NUL bytes. Website text is untrusted
+/// input and occasionally includes one, so normalize only that impossible argv
+/// character before handing prompts to a local model CLI.
+fn cli_safe_arg(input: &str) -> Cow<'_, str> {
+    if input.contains('\0') {
+        Cow::Owned(input.replace('\0', "\u{FFFD}"))
+    } else {
+        Cow::Borrowed(input)
+    }
+}
 
 #[derive(Debug)]
 struct OpenAiBackgroundPollError(String);
@@ -441,6 +453,7 @@ impl Engine {
             .filter(|s| *s > 0)
             .unwrap_or(240);
         let openai_default = default_openai_model();
+        let codex_default = default_codex_model();
         let frontier_concurrency = std::env::var("SPRUCE_OPENAI_FRONTIER_CONCURRENCY")
             .ok()
             .and_then(|value| value.trim().parse::<usize>().ok())
@@ -454,11 +467,11 @@ impl Engine {
                 } else {
                     openai_default
                 }),
-                codex_model: if backend == Backend::Codex {
-                    model.clone()
+                codex_model: Some(if backend == Backend::Codex {
+                    model.clone().unwrap_or(codex_default)
                 } else {
-                    None
-                },
+                    codex_default
+                }),
                 claude_model: if backend == Backend::Claude {
                     model.clone()
                 } else {
@@ -608,9 +621,10 @@ impl Engine {
         {
             return true;
         }
-        std::env::var("SPRUCE_SEPARATE_OUTREACH_PLANNER")
-            .ok()
-            .is_some_and(|value| value.trim() != "1")
+        if let Ok(value) = std::env::var("SPRUCE_SEPARATE_OUTREACH_PLANNER") {
+            return value.trim() != "1";
+        }
+        self.backend() == Backend::Codex
     }
 
     /// Select a provider while preserving its last model override.
@@ -628,10 +642,10 @@ impl Engine {
 
     /// Select a provider and set (or clear) its model override.
     pub fn select_model(&self, backend: Backend, model: Option<String>) {
-        let model = if backend == Backend::Openai {
-            Some(model.unwrap_or_else(default_openai_model))
-        } else {
-            model
+        let model = match backend {
+            Backend::Openai => Some(model.unwrap_or_else(default_openai_model)),
+            Backend::Codex => Some(model.unwrap_or_else(default_codex_model)),
+            _ => model,
         };
         let mut state = self.models.write().unwrap_or_else(|lock| lock.into_inner());
         let changed = state.backend != backend || *state.model_mut(backend) != model;
@@ -696,6 +710,7 @@ impl Engine {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
             .or_else(|| (selection.backend == Backend::Openai).then(|| "gpt-5.6-luna".to_string()))
+            .or_else(|| (selection.backend == Backend::Codex).then(|| "gpt-5.6-luna".to_string()))
             .or_else(|| (selection.backend == Backend::Claude).then(|| "haiku".to_string()))
             .or_else(|| selection.model.clone());
     }
@@ -779,13 +794,16 @@ impl Engine {
     pub fn outreach_quality_label(&self) -> String {
         let selection = self.selection_for_stage("outreach.write_account", false);
         let model = selection.model.unwrap_or_else(|| "default".to_string());
-        if selection.backend == Backend::Openai {
-            format!(
+        match selection.backend {
+            Backend::Openai => format!(
                 "{model} · {}",
                 openai_reasoning_effort("outreach.write_account", false)
-            )
-        } else {
-            model
+            ),
+            Backend::Codex => format!(
+                "{model} · {}",
+                codex_reasoning_effort("outreach.write_account", false)
+            ),
+            _ => model,
         }
     }
 
@@ -942,7 +960,7 @@ impl Engine {
             .arg("--no-session-persistence")
             .arg("--strict-mcp-config")
             .arg("--system-prompt")
-            .arg(system);
+            .arg(cli_safe_arg(system).as_ref());
         if let Some(m) = model {
             cmd.arg("--model").arg(m);
         }
@@ -954,16 +972,17 @@ impl Engine {
         cmd
     }
 
-    /// Codex runs as an inference-only subprocess. App instructions are passed
-    /// at developer priority; the task itself remains the user message.
-    fn codex_command(&self, system: &str, model: Option<&str>, fast: bool) -> Command {
-        let developer = format!(
-            "You are a pure inference backend embedded in spruce-leaf. Do not inspect files, run \
-             commands, browse, call tools, or modify anything. Return only the requested answer.\n\n\
-             APPLICATION INSTRUCTIONS:\n{system}"
-        );
-        let developer_toml = toml::Value::String(developer).to_string();
-
+    /// Codex runs as an inference-only subprocess. A compact per-call
+    /// instruction file replaces the coding agent's built-in instructions;
+    /// the task itself remains the user message.
+    fn codex_command(
+        &self,
+        instructions_path: &PathBuf,
+        model: Option<&str>,
+        effort: &str,
+    ) -> Command {
+        let instructions_path =
+            toml::Value::String(instructions_path.to_string_lossy().to_string()).to_string();
         let mut cmd = Command::new("codex");
         cmd.arg("exec")
             .arg("--ephemeral")
@@ -1005,7 +1024,7 @@ impl Engine {
             .arg("--cd")
             .arg(std::env::temp_dir())
             .arg("--config")
-            .arg(format!("developer_instructions={developer_toml}"))
+            .arg(format!("model_instructions_file={instructions_path}"))
             .arg("--config")
             .arg("include_permissions_instructions=false")
             .arg("--config")
@@ -1013,10 +1032,11 @@ impl Engine {
             .arg("--config")
             .arg("include_collaboration_mode_instructions=false")
             .arg("--config")
-            .arg("include_environment_context=false");
-        if fast {
-            cmd.arg("--config").arg("model_reasoning_effort=\"low\"");
-        }
+            .arg("include_environment_context=false")
+            // Pin effort on every invocation. Spruce ignores the user's global
+            // Codex config, so its cost posture remains stable across upgrades.
+            .arg("--config")
+            .arg(format!("model_reasoning_effort=\"{effort}\""));
         if let Some(model) = model {
             cmd.arg("--model").arg(model);
         }
@@ -1038,7 +1058,7 @@ impl Engine {
     ) -> Command {
         let mut cmd = Command::new("grok");
         cmd.arg("--system-prompt-override")
-            .arg(system)
+            .arg(cli_safe_arg(system).as_ref())
             .arg("--disallowed-tools")
             .arg("all")
             .arg("--disable-web-search")
@@ -1077,7 +1097,8 @@ impl Engine {
         let mut cmd =
             self.claude_command(system, schema_str.as_deref(), selection.model.as_deref());
         cmd.arg("--output-format").arg("json");
-        cmd.arg(user).stdin(std::process::Stdio::null());
+        cmd.arg(cli_safe_arg(user).as_ref())
+            .stdin(std::process::Stdio::null());
 
         let out = cmd
             .output()
@@ -1148,7 +1169,7 @@ impl Engine {
         cmd.arg("--output-format")
             .arg("json")
             .arg("-p")
-            .arg(user)
+            .arg(cli_safe_arg(user).as_ref())
             .stdin(std::process::Stdio::null());
 
         let out = cmd
@@ -1453,7 +1474,7 @@ impl Engine {
                 Backend::Grok => self.call_grok(selection, system, user, schema).await,
                 Backend::Codex => {
                     fn ignore(_: StreamEvent<'_>) {}
-                    self.stream_codex(selection, system, user, schema, &mut ignore)
+                    self.stream_codex(stage, selection, system, user, schema, &mut ignore)
                         .await
                 }
             }
@@ -1794,7 +1815,7 @@ impl Engine {
                         .await
                 }
                 Backend::Codex => {
-                    self.stream_codex(selection, system, user, schema, on_event)
+                    self.stream_codex(stage, selection, system, user, schema, on_event)
                         .await
                 }
             }
@@ -1839,7 +1860,7 @@ impl Engine {
             .arg("stream-json")
             .arg("--verbose")
             .arg("--include-partial-messages");
-        cmd.arg(user)
+        cmd.arg(cli_safe_arg(user).as_ref())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -1909,7 +1930,7 @@ impl Engine {
             .arg("streaming-messages-json")
             .arg("--include-partial-messages")
             .arg("-p")
-            .arg(user)
+            .arg(cli_safe_arg(user).as_ref())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -1960,6 +1981,7 @@ impl Engine {
 
     async fn stream_codex(
         &self,
+        stage: &str,
         selection: &ModelSelection,
         system: &str,
         user: &str,
@@ -1967,11 +1989,14 @@ impl Engine {
         on_event: &mut (dyn FnMut(StreamEvent<'_>) + Send),
     ) -> Result<CallOutcome> {
         let schema_file = schema.map(TempSchema::new).transpose()?;
-        let mut cmd = self.codex_command(system, selection.model.as_deref(), selection.fast);
+        let instructions_file = TempInstructions::new(system)?;
+        let effort = codex_reasoning_effort(stage, selection.fast);
+        let mut cmd =
+            self.codex_command(&instructions_file.path, selection.model.as_deref(), &effort);
         if let Some(file) = &schema_file {
             cmd.arg("--output-schema").arg(&file.path);
         }
-        cmd.arg(user)
+        cmd.arg(cli_safe_arg(user).as_ref())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -2059,6 +2084,14 @@ fn default_openai_model() -> String {
         .unwrap_or_else(|| "gpt-5.6-terra".to_string())
 }
 
+fn default_codex_model() -> String {
+    std::env::var("SPRUCE_CODEX_MODEL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "gpt-5.6-terra".to_string())
+}
+
 fn outreach_budget_floor(accounts: usize, recipients: usize) -> (u64, u64, f64) {
     let accounts = accounts.max(1) as u64;
     let recipients = recipients.max(1) as u64;
@@ -2129,6 +2162,50 @@ fn openai_reasoning_effort(stage: &str, fast: bool) -> String {
             matches!(
                 value.as_str(),
                 "none" | "low" | "medium" | "high" | "xhigh" | "max"
+            )
+        })
+        .unwrap_or_else(|| default_effort.to_string())
+}
+
+fn codex_reasoning_effort(stage: &str, fast: bool) -> String {
+    let (keys, default_effort): (&[&str], &str) = if fast {
+        (&["SPRUCE_CODEX_FAST_REASONING_EFFORT"], "low")
+    } else if stage == "outreach.write_account" {
+        (
+            &[
+                "SPRUCE_CODEX_WRITER_REASONING_EFFORT",
+                "SPRUCE_CODEX_COPY_REASONING_EFFORT",
+            ],
+            "medium",
+        )
+    } else if stage == "outreach.review_edit" {
+        (
+            &[
+                "SPRUCE_CODEX_EDITOR_REASONING_EFFORT",
+                "SPRUCE_CODEX_COPY_REASONING_EFFORT",
+            ],
+            "low",
+        )
+    } else if matches!(stage, "outreach.verify_final" | "outreach.eval_pairwise") {
+        (
+            &[
+                "SPRUCE_CODEX_VERIFIER_REASONING_EFFORT",
+                "SPRUCE_CODEX_COPY_REASONING_EFFORT",
+            ],
+            "medium",
+        )
+    } else if is_outreach_strategy_stage(stage) {
+        (&["SPRUCE_CODEX_STRATEGY_REASONING_EFFORT"], "medium")
+    } else {
+        (&["SPRUCE_CODEX_REASONING_EFFORT"], "low")
+    };
+    keys.iter()
+        .find_map(|key| std::env::var(key).ok())
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| {
+            matches!(
+                value.as_str(),
+                "minimal" | "low" | "medium" | "high" | "xhigh"
             )
         })
         .unwrap_or_else(|| default_effort.to_string())
@@ -2546,6 +2623,30 @@ struct TempSchema {
     path: PathBuf,
 }
 
+/// Compact replacement instructions for one inference-only Codex subprocess.
+struct TempInstructions {
+    path: PathBuf,
+}
+
+impl TempInstructions {
+    fn new(system: &str) -> Result<Self> {
+        let path = std::env::temp_dir().join(format!(
+            "spruce-leaf-instructions-{}-{}.md",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let content = format!(
+            "You are a pure inference backend embedded in spruce-leaf. Do not inspect files, run \
+             commands, browse, call tools, or modify anything. Return only the requested answer.\n\n\
+             APPLICATION INSTRUCTIONS:\n{}",
+            cli_safe_arg(system)
+        );
+        std::fs::write(&path, content)
+            .with_context(|| format!("writing temporary Codex instructions {}", path.display()))?;
+        Ok(Self { path })
+    }
+}
+
 impl TempSchema {
     fn new(schema: &Value) -> Result<Self> {
         let path = std::env::temp_dir().join(format!(
@@ -2600,6 +2701,12 @@ fn make_codex_schema_strict(schema: &mut Value) {
 }
 
 impl Drop for TempSchema {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+impl Drop for TempInstructions {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
     }
@@ -2769,14 +2876,21 @@ fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::{
-        dispatch, dispatch_codex, is_generation_incomplete, is_retryable_provider_error,
-        is_run_budget_exhausted, is_safe_to_retry_provider_request, make_codex_schema_strict,
-        openai_cost, openai_request, parse_openai_response, usage_exhausted_message, Backend,
-        CallOutcome, Engine, ModelSelection, OpenAiBackgroundPollError, Stats, StreamEvent,
+        cli_safe_arg, codex_reasoning_effort, dispatch, dispatch_codex, is_generation_incomplete,
+        is_retryable_provider_error, is_run_budget_exhausted, is_safe_to_retry_provider_request,
+        make_codex_schema_strict, openai_cost, openai_request, parse_openai_response,
+        usage_exhausted_message, Backend, CallOutcome, Engine, ModelSelection,
+        OpenAiBackgroundPollError, Stats, StreamEvent,
     };
     use serde_json::json;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn local_cli_arguments_normalize_nul_bytes_from_untrusted_page_text() {
+        assert_eq!(cli_safe_arg("ordinary prompt"), "ordinary prompt");
+        assert_eq!(cli_safe_arg("before\0after"), "before\u{FFFD}after");
+    }
 
     #[test]
     fn transient_provider_errors_retry_but_deterministic_and_quota_do_not() {
@@ -3360,6 +3474,35 @@ mod tests {
         assert_eq!(economy.model.as_deref(), Some("gpt-5.6-luna"));
         assert!(economy.fast);
         assert_eq!(engine.model_label(), "gpt-5.6-terra");
+    }
+
+    #[test]
+    fn codex_economy_selection_pins_models_and_stage_effort() {
+        let engine = Engine::new(Backend::Codex, None);
+        assert_eq!(engine.model_label(), "gpt-5.6-terra");
+
+        let economy = engine.selection_for(true);
+        assert_eq!(economy.model.as_deref(), Some("gpt-5.6-luna"));
+        assert!(economy.fast);
+
+        assert_eq!(
+            codex_reasoning_effort("source.website_research", true),
+            "low"
+        );
+        assert_eq!(
+            codex_reasoning_effort("source.website_research", false),
+            "low"
+        );
+        assert_eq!(codex_reasoning_effort("source.qualify", false), "medium");
+        assert_eq!(
+            codex_reasoning_effort("outreach.write_account", false),
+            "medium"
+        );
+        assert_eq!(codex_reasoning_effort("outreach.review_edit", false), "low");
+        assert_eq!(
+            codex_reasoning_effort("outreach.verify_final", false),
+            "medium"
+        );
     }
 
     #[test]

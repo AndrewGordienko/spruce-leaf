@@ -228,8 +228,11 @@ pub async fn research_company(
         corpus = corpus,
     );
 
+    // This brief becomes the factual substrate for qualification and buyer-facing
+    // personalization. Use the substantive lane: a cheap extraction error here
+    // is amplified by every downstream stage.
     match client
-        .structured_fast::<CompanyBrief>("source.website_research", system, &user, brief_schema())
+        .structured_bulk::<CompanyBrief>("source.website_research", system, &user, brief_schema())
         .await
     {
         Ok(mut brief) => {

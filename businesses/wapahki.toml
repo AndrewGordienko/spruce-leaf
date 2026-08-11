@@ -1,0 +1,178 @@
+key = "wapahki"
+name = "Wapahki"
+summary = "An early-stage Toronto robotics venture exploring flexible robotic packing cells for bounded, repetitive food-manufacturing tasks."
+
+known_facts = [
+  "Wapahki is exploring a flexible robotic packing cell.",
+  "Wapahki is based in Toronto.",
+  "Andrew is a University of Toronto student currently working in robotics at Automata.",
+  "It does not yet claim installations or proven savings.",
+  "Andrew has completed two first-party discovery calls about the economics and workflow boundaries of physical automation: one spanning factory design/packing work and one spanning fleet maintenance.",
+  "Andrew has a one-page working automation-fit screen covering the object and motion, run stability, changeover, intervention frequency, sanitation/guarding/damage boundaries, rate, labour, and payback threshold. He may share it freely as a research aid, not as a validated assessment.",
+]
+
+unknowns = [
+  "Incorporation details and company age.",
+  "Current prototype and technology-readiness level.",
+  "Available matching funds and committed pilot partners.",
+  "The first task/site combination with enough recurring volume, bounded variation, and operator burden to justify a cell.",
+  "A credible cell price range, customer payback threshold, pilot price, and deployment lead time.",
+  "Whether the repeatable core of a candidate packing task is large enough that partial automation beats both the manual baseline and a conventional fixed machine.",
+  "Verified loaded labor, run length, SKU/format mix, changeover burden, exception frequency, quality loss, and throughput at candidate plants; interview estimates below are not substitutes.",
+]
+
+goals = [
+  "Find recurring physical tasks repetitive enough for a robot but too variable for conventional automation to handle economically, and capture WHY existing automation breaks down (the market opportunity).",
+  "Prefer partial-automation wedges where a stable high-volume core can be automated while people retain fragile, irregular, safety-critical, or otherwise non-deterministic exceptions.",
+  "Quantify one bounded task's economics (operators, shifts, wage burden, throughput, changeover, payback) until it can be drawn, modeled, priced, and reproduced in the lab.",
+  "Secure graduated commitments — task sketches, shared SKUs/video/data, task evaluations, paid pilots, conditional LOIs — that cluster into evidence of a recurring automation gap ahead of the pre-seed raise.",
+]
+
+constraints = [
+  "Do not sell a finished robot or claim proven ROI.",
+  "Food safety, sanitation, guarding, damage, changeovers, and operator exceptions remain explicit boundaries.",
+  "Do not count sends, opens, compliments, or a meeting as customer validation. Advance the CRM only on prospect evidence or an explicit commitment of time, reputation, or money.",
+  "Do not ask a cold, non-responsive prospect for a design partnership, LOI, or pilot. Earn one commitment rung at a time after a human response.",
+  "A meaningful conditional LOI names the task and site, provisional quantity, commercial/payback assumption, pilot success criteria, decision timeline, sponsor, and conditions to deploy.",
+  "Discovery-call reports are market context, not proof about a target company. Attribute them as one participant's experience and ask whether the pattern matches; never present an estimate, example, or interpretation as an industry fact.",
+  "The automation-fit screen may be offered as a useful give-back. Never imply it proves feasibility or gate access to it behind a meeting.",
+]
+
+[[discovery_evidence]]
+id = "wapahki-call-factory-packing-01"
+recorded_at = "2026-08-08"
+source_kind = "founder discovery call"
+source_url = "https://notes.granola.ai/t/ecf47f48-df80-4f65-b837-a4fe9b66a1d8"
+segment = "high-mix manufacturing and manual protective packaging"
+participant_context = "Technical manager with prior hollow-metal-door factory experience and current experience in short-run plastic/acrylic model-kit assembly."
+evidence_level = "Participant-reported first-hand workflow plus opinions and rough estimates; not independently verified."
+reported_workflows = [
+  "At the hollow-metal-door factory, CNC cutting and bending automated much of the heavy work but still required human operators.",
+  "An Excel-to-SolidWorks automation handled roughly half of design cases; extending it to every exception was judged not worth the budget.",
+  "At the current company, workers rotate among gluing, polishing, cleaning, printing, and packaging as short projects change every one or two days.",
+  "Packaging uses varying combinations of bubble wrap, corrugated board, shrink sheet, thin paper, and boxes; brittle products may require several protective layers and human judgment.",
+  "The participant framed capability as secondary to economics: compare manual, partial, and full automation against volume, labor, and variation.",
+  "The participant raised accountability concerns around non-deterministic algorithms in regulated or safety-critical work.",
+]
+reported_estimates = [
+  "The participant roughly estimated floor labor at $20–30/hour; this was explicitly unconfirmed.",
+  "The participant used a hypothetical fully automated mechanic shop versus a low-capital human shop to illustrate why technical feasibility alone does not establish economic fit.",
+]
+working_interpretations = [
+  "The best Wapahki wedge is likely partial rather than full automation: automate a repeatable normal case and leave exception handling with people.",
+  "Run-level repetition matters more than catalog-level variety. A plant can make many SKUs and still fit if one physical motion stays stable for meaningful stretches.",
+  "Short project runs, constantly changing materials, and fragile handling are negative signals unless one subtask remains common across products.",
+  "Deterministic guarding, limits, and operator escalation should bound any learning-based behavior rather than asking a buyer to trust an unconstrained algorithm.",
+]
+sourcing_implications = [
+  "Prioritize plants with repeated pack-out, case loading, feeding, transfer, or palletizing motions; multiple SKUs are useful only when the normal motion remains common.",
+  "Look for evidence of steady production runs, packaging labor, changeovers, protective packing, or format proliferation, then test exception frequency in discovery.",
+  "De-prioritize pure job shops and project-based assembly where products, materials, and handling logic change every day unless public evidence identifies a recurring subtask.",
+  "Prefer Plant Manager, Production Manager, Production Coordinator, Packaging Manager/Engineer, Process Engineer, or Operations Manager contacts who can describe the last actual run.",
+]
+follow_up_angles = [
+  "I was on a call recently with a technical manager who described a factory automation that stopped at roughly half the cases because covering every exception was not worth the budget. For the task you see, is there a repeatable core worth separating from the exceptions?",
+  "A manufacturer I spoke with described packaging where the materials and protection logic changed every day. Does your pack-out vary that much, or does the same motion repeat within a run?",
+  "One recent factory conversation pushed me toward partial automation rather than replacing the whole job: automate the normal motion and leave fragile or odd cases with an operator. Does that division make sense on your line?",
+]
+next_questions = [
+  "Walk through the last product run: what did operators physically move, what changed between units, and which cases needed judgment?",
+  "How long does one format run before changeover, how many people touch the task per shift, and what rate must the line sustain?",
+  "What automation has already been tried, and why was it rejected, limited, bypassed, or removed?",
+]
+limits = [
+  "This is one participant across two manufacturing contexts, not evidence that Canadian food plants share the same workflow.",
+  "The wage range, automation percentages, and economic examples are reported or illustrative and must not be used as target-account facts.",
+]
+
+[[discovery_evidence]]
+id = "wapahki-call-fleet-maintenance-02"
+recorded_at = "2026-08-08"
+source_kind = "founder discovery call"
+source_url = "https://notes.granola.ai/t/d8a82f7f-bcda-4471-8049-029f546c39b8"
+segment = "fleet maintenance standardization and technician workflow"
+participant_context = "Fleet-maintenance domain conversation covering scheduled service, vehicle variability, technician economics, and checklist optimization."
+evidence_level = "Participant-reported domain workflow, examples, and rough economics; not independently verified."
+reported_workflows = [
+  "The participant separated scheduled from unscheduled maintenance and described scheduled work as substantially more amenable to automation.",
+  "Truck-to-truck differences in engines, filter locations, and part configurations create variation even when vehicles appear similar.",
+  "Wheel and tire work is comparatively standardized but remains manual and physically demanding; the participant described a wheel at roughly 150 pounds.",
+  "The reported scheduled-shop flow moves a truck from staging to bay, through inspection/repair and reassembly, then to a ready area with driver and supervisor notification.",
+  "The participant described a Honeywell voice-guided preventive-maintenance checklist that replaced a long clipboard flow, changed inspection frequency from failure-rate data, and reduced technician walking.",
+  "The participant said stronger fleets deliberately standardize equipment purchases to create repetition and operating efficiency.",
+]
+reported_estimates = [
+  "The participant estimated technicians around $45/hour base and $90,000+ annually, with overtime taking some above six figures.",
+  "The participant characterized trucking margins around 5% and cited a JB Hunt quarterly example; both require independent verification before use.",
+]
+working_interpretations = [
+  "Standardization is itself a buying signal: companies that constrain equipment, formats, or process variants create a larger repeatable core for automation.",
+  "Before attempting physical automation, workflow instrumentation can expose wasted motion, low-value checks, and the highest-frequency standardized task.",
+  "Conservative operators may respond better to a bounded historical or on-site task evaluation than a vision of general-purpose robotics.",
+  "The fleet example sharpens Wapahki's negative screen but does not justify moving the current food-packing motion into truck maintenance.",
+]
+sourcing_implications = [
+  "Add standardization evidence to qualification: repeated equipment, stable packaging families, scheduled runs, fixed work cells, and explicit continuous-improvement programs are stronger than generic automation interest.",
+  "Favor tasks whose geometry and sequence are standardized even when the surrounding operation is variable.",
+  "Treat highly variable repair or one-off work as a poor near-term fit unless a standardized subtask can be isolated.",
+]
+follow_up_angles = [
+  "In a recent maintenance call, I heard that the automatable work was not the whole job but the scheduled, standardized slice. Is there a similar slice in your packaging flow, or do product differences reach every cycle?",
+  "Someone I spoke with described standardization as the prerequisite for automation, even before the robot itself. Does your team deliberately hold packaging formats or equipment families constant long enough for one motion to repeat?",
+]
+next_questions = [
+  "Which task is scheduled and repeatable enough that the team can predict its inputs before the shift starts?",
+  "What has the plant standardized across SKUs, lines, tools, or packaging formats, and where does variation still force manual intervention?",
+  "Which operator movement or check consumes time without requiring judgment, and how was that measured?",
+]
+limits = [
+  "Fleet maintenance is an adjacent analogy, not direct validation of Wapahki's current food-manufacturing packing-cell segment.",
+  "Reported compensation, margin, dimensions, weight, and company examples must be verified before any external claim.",
+]
+
+[account_limits]
+max_new_contacts_per_account_per_day = 10
+max_active_contacts_per_account = 0
+max_unanswered_touches = 5
+
+[calendar]
+daily_touch_cap = 30
+quota_timezone = "America/Toronto"
+fallback_recipient_timezone = "America/Toronto"
+weekdays = ["mon", "tue", "wed", "thu", "fri"]
+window_start = 7
+window_end = 17
+preferred_hours = [7, 10, 14]
+learning_min_samples = 20
+
+[[calendar.rules]]
+key = "plant_floor_weekend_hypothesis"
+industries = ["food", "beverage", "manufactur", "packing", "processing"]
+title_keywords = ["plant", "production", "packaging", "maintenance", "warehouse", "operations", "shift"]
+channels = ["email", "linkedin", "linkedin_request", "linkedin_or_email"]
+weekdays = ["tue", "wed", "thu", "sat"]
+window_start = 7
+window_end = 15
+preferred_hours = [7, 9, 13]
+rationale = "Explicit test hypothesis: plant-facing roles may review messages around Saturday production coverage. Saturday is allowed for this cohort only; Sunday remains excluded until response evidence supports it."
+
+[[calendar.rules]]
+key = "manufacturing_executive_weekdays"
+industries = ["food", "beverage", "manufactur", "packing", "processing"]
+title_keywords = ["president", "owner", "chief", "vice president", "director", "finance"]
+channels = ["email", "linkedin", "linkedin_request", "linkedin_or_email"]
+weekdays = ["tue", "wed", "thu"]
+window_start = 8
+window_end = 17
+preferred_hours = [9, 11, 15]
+rationale = "Initial hypothesis: executive and capital-owning roles should stay in conventional weekday windows even when their plants operate on weekends."
+
+[[motions]]
+key = "customer_discovery"
+kind = "sales"
+objective = "Find manufacturers and operators who can validate one bounded automation task and its exceptions."
+
+[[motions]]
+key = "pilot_partners"
+kind = "partnership"
+objective = "Develop evidence-backed pilot relationships without implying a production-ready product."

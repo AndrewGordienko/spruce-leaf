@@ -3,14 +3,7 @@
 .spruce/
 campaign.json
 campaign.md
-Cargo.lock
-
-# Proprietary business "handbooks" — brand strategies, operating profiles, and
-# curated knowledge inputs. These stay LOCAL and never go to the public repo.
-/playbooks/*
-!/playbooks/personas/
-!/playbooks/personas/*.md
-!/playbooks/personas/critics/
-!/playbooks/personas/critics/*.md
-/businesses/
+# Curated book/source inputs remain local; they can contain licensed or private
+# material. Brand playbooks and business profiles are versioned with the app so
+# a checkout contains the actual policy and operating configuration.
 /knowledge-sources/

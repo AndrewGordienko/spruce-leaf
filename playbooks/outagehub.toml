@@ -1,0 +1,128 @@
+# OutageHub — current validation experiment.
+# The active wedge is operated Canadian EV charging networks. Research must
+# bring a real location-to-utility-event match before outreach is generated.
+
+key = "outagehub"
+name = "OutageHub"
+signature = "Andrew Gordienko"
+
+one_liner = "OutageHub matches live and historical Canadian utility outage reports to operated charging locations through an API."
+
+verified_seller_facts = [
+  "OutageHub exposes time-range outage queries, individual outage details, and provider coverage through an API authenticated with an API key.",
+  "OutageHub records geographic outage polygons and provider-reported fields such as affected-customer count, cause, outage type, planned status, start time, and estimated restoration time when those fields are available.",
+  "OutageHub can compare an operated Canadian charging location with historical public utility outage areas and timestamps.",
+  "A historical match is outside confirmation that a location overlapped a reported utility event; it is not proof of private charger or site status.",
+]
+
+motion = "when an entire operated Canadian EV charging site goes dark, determine whether Service Operations manually checks the local utility before opening an equipment or network ticket, dispatching someone, or updating customers"
+
+icp_note = "For the current experiment, target only companies that operate Canadian EV charging sites. Require a source-backed operated-site footprint, a reachable Service Operations or charging-network workflow owner, and one completed historical match between a public charging location and an actual utility outage area and timestamp. Do not broaden to cold storage, logistics, healthcare, telecom, generators, contractors, utilities, or charging-equipment sellers. Company fit without a completed match is research-needed, not outreach-ready."
+
+min_words = 60
+max_words = 95
+
+min_signals = 4
+
+system_concept_examples = [
+  "an API result showing that an operated charging location overlapped a utility-reported outage at a specific time",
+  "a utility-status check inside the existing site-diagnosis or ticket workflow",
+]
+
+subject_examples = [
+  "When a charging site goes dark",
+  "Checking utility status before dispatch",
+  "Utility overlap at a charging site",
+]
+
+vantage_notes = [
+  "Service Operations / network operations owner: can say whether the team checks a utility map before opening a network or equipment ticket, dispatching someone, or updating customer status.",
+  "Charging operations executive: can answer the same factual question or route it to the daily workflow owner.",
+  "Technical evaluator: relevant only after the manual check and its consequence are confirmed.",
+  "Commercial, customer-success, or general corporate contacts are route-only unless evidence proves they own site diagnosis.",
+]
+
+requirements = [
+  "Generate exactly two emails, on day 0 and day 6. There is no LinkedIn touch, third reminder, referral ladder, or breakup email in this experiment.",
+  "Research must establish an operated Canadian EV charging footprint, a reachable workflow owner, and a completed historical location-to-utility-event match with the actual location and timestamp. A hypothetical example, recent-news mention, or public footprint alone cannot produce copy.",
+  "T1 contains one recognizable moment: an entire charging site goes dark. Ask exactly one easy factual question about whether Service Operations checks the local utility before opening a network or equipment ticket, dispatching someone, or updating customer status—or whether telemetry settles the cause immediately.",
+  "T1 explains OutageHub in one plain clause only when needed. Do not pitch an API, ask for a meeting, or ask the recipient to design the use case.",
+  "T2 contributes the completed historical result: the verified operated location, utility-reported event, and actual timestamp. Offer the evidence or ask one adjacent factual question; do not restate T1.",
+  "Public utility data is outside confirmation, not proof of charger status and not a replacement for telemetry. State that boundary naturally at most once across the two emails.",
+  "Write like an operator discussing site diagnosis. Do not expose phrases such as account file, research, source material, external context, reported interruption, or operational action.",
+]
+
+forbidden = [
+  "operational resilience",
+  "proactive decision-making",
+  "proactive decision making",
+  "enhance operational",
+  "not selling",
+  "enable proactive",
+  "first-trip classify",
+  "classification path",
+  "dispatch-versus-wait",
+  "when a power-related disruption appears",
+  "external context alongside monitoring",
+  "which response step takes the most time",
+  "does that distinction recur",
+  "reported interruption",
+  "next operational action",
+  "location-matched external context",
+  "account file reports",
+  "account file",
+  "manually reconcile",
+  "manually reconciling",
+  "close this out",
+  "closing the loop",
+]
+
+copy_doctrine = """
+This is a narrow two-email learning experiment, not an automated sales
+sequence. Target only operators of Canadian EV charging sites. A candidate is
+not sendable until research has matched one of the prospect's public operated
+locations to a real utility outage area and timestamp. Never invent that match
+or use a hypothetical result.
+
+T1 is 60–95 words and contains one easy question. Start with the exact moment:
+an entire charging site goes dark. Ask whether Service Operations still checks
+the local utility before opening a network or equipment ticket, dispatching
+someone, or updating customer status—or whether telemetry settles the cause
+immediately. Mention OutageHub in one plain clause only if it helps explain why
+Andrew is asking. Do not ask for a meeting or make the recipient validate an
+abstract theory.
+
+T2 arrives six days later and earns its existence with evidence. Name the
+verified location, the utility-reported event, and the actual timestamp from
+the completed historical match. Explain what an API response or webhook would
+have shown at that moment without claiming the chargers lost power. Ask one
+adjacent factual question at most. If there is no real result, there is no T2
+and therefore no sendable sequence.
+
+Use ordinary operational language: site goes dark, check the utility map, open
+a ticket, dispatch a technician, update customers. Avoid abstract mechanism
+labels, research narration, product disclaimers, and the visible machinery of
+an automated sequence. Two unanswered emails end the experiment.
+"""
+
+doctrine = """
+The current hypothesis is deliberately falsifiable: when an entire operated
+charging site goes dark, some Service Operations teams may still check the
+local utility before treating it as a charger, communications, platform, or
+site-equipment incident. OutageHub matters only if that check is manual, late,
+or absent in a way that changes ticketing, dispatch, or customer communication.
+
+Research does the hard work before the recipient is contacted:
+  1. Verify that the company operates Canadian charging sites.
+  2. Resolve public site locations to utility territories.
+  3. Find a genuine historical overlap with a utility outage area.
+  4. Preserve the location, utility, event timestamp, source, and what an
+     OutageHub API response would have contained.
+  5. Find the person closest to site diagnosis or Service Operations.
+
+The recipient is asked one fact they can answer from memory. T1 tests whether
+the manual utility check exists. T2 supplies the historical result. A reply of
+"yes," "telemetry already settles it," or "talk to this person" is useful.
+Silence after T2 ends the sequence. Do not broaden the segment or invent more
+touches to rescue a weak hypothesis.
+"""

@@ -391,6 +391,7 @@ pub async fn handle_inbound(
         person,
         &inbound_id,
         &inbound.message_id,
+        &inbound.in_reply_to,
         &category,
         &decision,
         booked.is_some(),
@@ -409,9 +410,6 @@ fn record_customer_development_reply(
     person: &Person,
     decision: &Decision,
 ) -> Result<()> {
-    if conversation.brand != "wapahki" {
-        return Ok(());
-    }
     let mut record = db
         .customer_development_for_lead(&conversation.brand, &conversation.lead_id)?
         .unwrap_or_else(|| CustomerDevelopmentRecord {
@@ -501,6 +499,7 @@ fn record_gtm_reply_learning(
     person: &Person,
     inbound_id: &str,
     message_id: &str,
+    in_reply_to: &str,
     category: &str,
     decision: &Decision,
     meeting_booked: bool,
@@ -526,27 +525,15 @@ fn record_gtm_reply_learning(
     } else {
         message_id
     };
-    db.record_gtm_outcome(&GtmOutcome {
-        brand: conversation.brand.clone(),
-        kind: outcome_kind.into(),
-        lead_id: conversation.lead_id.clone(),
-        person_id: person.id.clone(),
-        sequence_id: conversation.sequence_id.clone(),
-        conversation_id: conversation.id.clone(),
-        play_id: attribution.play_id.clone(),
-        experiment_id: attribution.experiment_id.clone(),
-        experiment_assignment_id: attribution.experiment_assignment_id.clone(),
-        signal_observation_ids: attribution.signal_observation_ids.clone(),
-        value: if category == "interested" { 1.0 } else { 0.0 },
-        detail: decision.summary.trim().to_string(),
-        source: "reply".into(),
-        fingerprint: format!("reply:{source_key}"),
-        ..Default::default()
-    })?;
-    if meeting_booked {
-        db.record_gtm_outcome(&GtmOutcome {
+    let origin_touch = db.touch_by_message_id(&conversation.brand, in_reply_to)?;
+    let account_hypothesis = db
+        .get_lead(&conversation.lead_id)?
+        .map(|lead| lead.hypothesis)
+        .unwrap_or_default();
+    let make_outcome =
+        |kind: &str, value: f64, detail: String, source: &str, fingerprint: String| GtmOutcome {
             brand: conversation.brand.clone(),
-            kind: "meeting_booked".into(),
+            kind: kind.into(),
             lead_id: conversation.lead_id.clone(),
             person_id: person.id.clone(),
             sequence_id: conversation.sequence_id.clone(),
@@ -555,12 +542,40 @@ fn record_gtm_reply_learning(
             experiment_id: attribution.experiment_id.clone(),
             experiment_assignment_id: attribution.experiment_assignment_id.clone(),
             signal_observation_ids: attribution.signal_observation_ids.clone(),
-            value: 1.0,
-            detail: "Prospect accepted a previously offered slot.".into(),
-            source: "meeting".into(),
-            fingerprint: format!("meeting:{source_key}"),
+            touch_id: origin_touch
+                .as_ref()
+                .map(|touch| touch.id.clone())
+                .unwrap_or_default(),
+            touch_stage: origin_touch.as_ref().map(|touch| touch.stage).unwrap_or(0),
+            contact_title: person.title.clone(),
+            contact_vantage: person.vantage.clone(),
+            account_hypothesis: account_hypothesis.clone(),
+            play_version: attribution.play_version,
+            experiment_arm: attribution.experiment_arm.clone(),
+            copy_policy_version: attribution.copy_policy_version,
+            generation_backend: attribution.generation_backend.clone(),
+            generation_model: attribution.generation_model.clone(),
+            value,
+            detail,
+            source: source.into(),
+            fingerprint,
             ..Default::default()
-        })?;
+        };
+    db.record_gtm_outcome(&make_outcome(
+        outcome_kind,
+        if category == "interested" { 1.0 } else { 0.0 },
+        decision.summary.trim().to_string(),
+        "reply",
+        format!("reply:{source_key}"),
+    ))?;
+    if meeting_booked {
+        db.record_gtm_outcome(&make_outcome(
+            "meeting_booked",
+            1.0,
+            "Prospect accepted a previously offered slot.".into(),
+            "meeting",
+            format!("meeting:{source_key}"),
+        ))?;
     }
 
     let validated_problem = decision.validated_problem.trim();
@@ -627,21 +642,14 @@ fn record_gtm_reply_learning(
                 ..Default::default()
             })?;
             db.record_gtm_outcome(&GtmOutcome {
-                brand: conversation.brand.clone(),
-                kind: "proof_brief_created".into(),
-                lead_id: conversation.lead_id.clone(),
-                person_id: person.id.clone(),
-                sequence_id: conversation.sequence_id.clone(),
-                conversation_id: conversation.id.clone(),
                 play_id: play.id,
-                experiment_id: attribution.experiment_id,
-                experiment_assignment_id: attribution.experiment_assignment_id,
-                signal_observation_ids: attribution.signal_observation_ids,
-                value: 0.0,
-                detail: format!("Internal proof brief {proof_id}; human approval required."),
-                source: "reply".into(),
-                fingerprint: format!("proof-brief:{source_key}"),
-                ..Default::default()
+                ..make_outcome(
+                    "proof_brief_created",
+                    0.0,
+                    format!("Internal proof brief {proof_id}; human approval required."),
+                    "reply",
+                    format!("proof-brief:{source_key}"),
+                )
             })?;
         }
     }

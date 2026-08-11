@@ -123,7 +123,7 @@ Use these judgment standards:
   inventing a new headline. No question, number, product category, or marketing
   headline in the original subject.
 - Every email-capable touch, including a LinkedIn/email fallback, starts with
-  `Hi [First name],` on its own line and ends with the exact signature on its
+  `[First name],` on its own line without Hi, Hello, or Hey and ends with the exact signature on its
   own line. The address line is natural in either channel. Short does not mean
   fragmentary: the middle must still be a complete human message.
 - Use ordinary spoken English. Read every line aloud. Remove strategy labels,

@@ -1020,6 +1020,77 @@ fn enforce_play_qualification(
     }
 }
 
+/// Apply the same evidence and routing policy to a refreshed on-file account as
+/// to a newly sourced one. Refresh used to have only qualified/research-needed
+/// outcomes, which made hard disqualifiers and very weak fit impossible to evict.
+fn enforce_refresh_qualification(
+    refresh: &mut LeadRefresh,
+    play: Option<&crate::db::GtmPlay>,
+    allowed_signal_keys: &HashSet<String>,
+) -> String {
+    let (unknowns, hard_disqualifiers): (Vec<_>, Vec<_>) = refresh
+        .disqualifiers
+        .drain(..)
+        .partition(|item| is_missing_evidence(item));
+    refresh.evidence_gaps.extend(unknowns);
+    refresh.disqualifiers = hard_disqualifiers;
+    refresh.structured_signals.retain(|signal| {
+        allowed_signal_keys.contains(signal.definition_key.trim())
+            && !signal.evidence.trim().is_empty()
+            && signal.confidence >= 0.60
+            && credible_canonical_signal(
+                play.map(|play| play.brand.as_str()).unwrap_or_default(),
+                &signal.definition_key,
+                &signal.evidence,
+            )
+    });
+    let mut matched = refresh
+        .structured_signals
+        .iter()
+        .map(|signal| signal.definition_key.trim().to_string())
+        .collect::<Vec<_>>();
+    matched.sort();
+    matched.dedup();
+    refresh.matched_signal_keys = matched.clone();
+
+    let Some(play) = play else {
+        return if refresh.play_fit_score >= 65 && refresh.disqualifiers.is_empty() {
+            "qualified"
+        } else {
+            "rejected"
+        }
+        .into();
+    };
+    let required_matches = play
+        .required_signal_keys
+        .iter()
+        .filter(|key| matched.contains(key))
+        .count();
+    let minimum = play.minimum_signal_matches.max(1) as usize;
+    let fully_supported = required_matches >= minimum
+        && !refresh.root_cause.trim().is_empty()
+        && !refresh.proof_fit.trim().is_empty()
+        && refresh.play_fit_score >= 65
+        && refresh.disqualifiers.is_empty();
+    let has_source_backed_fit = matched.iter().any(|key| key == "account.fit_evidence")
+        || !refresh.observed_facts.is_empty();
+    let discovery_candidate = has_source_backed_fit
+        && required_matches >= minimum.saturating_sub(1).max(1)
+        && refresh.play_fit_score >= 50
+        && refresh.disqualifiers.is_empty();
+
+    if fully_supported {
+        "qualified".into()
+    } else if discovery_candidate {
+        refresh.evidence_gaps.push(format!(
+            "Only {required_matches}/{minimum} required play signals are publicly supported; outreach must test the missing signal rather than claim it."
+        ));
+        "research_needed".into()
+    } else {
+        "rejected".into()
+    }
+}
+
 /// Canonical signals are stronger than topical resemblance. GnK must not turn
 /// department or portal presence into a reconciliation claim. OutageHub must
 /// not turn a contractor's office list or generic emergency service into a
@@ -1034,6 +1105,92 @@ fn credible_canonical_signal(brand: &str, key: &str, evidence: &str) -> bool {
         return true;
     }
     match key.trim() {
+        "account.specific_recurring_decision" => {
+            has(&[
+                "when ",
+                "after ",
+                "each ",
+                "every ",
+                "recurring",
+                "repeated",
+                "per ",
+            ]) && has(&[
+                "decide",
+                "decision",
+                "determine",
+                "approve",
+                "deny",
+                "dispute",
+                "settle",
+                "escalate",
+                "write off",
+                "release",
+                "recover",
+            ]) && has(&[
+                "rejection",
+                "short-pay",
+                "deduction",
+                "exception",
+                "escalation",
+                "denial",
+                "incident",
+                "claim",
+                "case",
+                "shipment",
+                "load",
+                "audit",
+            ])
+        }
+        "account.believable_operating_consequence" => has(&[
+            "settlement time",
+            "cycle time",
+            "leakage",
+            "write-off",
+            "write off",
+            "recovery",
+            "recoveries",
+            "audit exposure",
+            "regulatory",
+            "customer sla",
+            "service level",
+            "escalation",
+            "senior reviewer",
+            "capacity",
+            "backlog",
+            "delayed decision",
+            "lost revenue",
+            "short-paid",
+            "short paid",
+        ]),
+        "account.external_trigger_or_mechanism_evidence" => {
+            has(&[
+                "rejection",
+                "short-pay",
+                "deduction notice",
+                "denial",
+                "escalation",
+                "dispute",
+                "exception",
+                "incident",
+                "audit request",
+                "receiver",
+            ]) && has(&[
+                "record",
+                "document",
+                "report",
+                "timeline",
+                "temperature",
+                "tender",
+                "bill of lading",
+                "appointment",
+                "policy",
+                "investigation",
+                "prior action",
+                "correspondence",
+                "system",
+                "portal",
+            ])
+        }
         "account.expensive_recurring_workflow" => {
             has(&[
                 "workflow",
@@ -1176,10 +1333,16 @@ async fn source_people(
             title: ap.title.clone(),
             location,
             timezone,
-            vantage: normalize_vantage(va.map(|v| v.vantage.as_str()).unwrap_or("")),
+            vantage: crate::response_design::effective_vantage(
+                &ap.title,
+                &normalize_vantage(va.map(|v| v.vantage.as_str()).unwrap_or("")),
+            ),
             can_observe: va.map(|v| v.can_observe.clone()).unwrap_or_default(),
             why_them: va.map(|v| v.why_them.clone()).unwrap_or_default(),
-            primary: va.map(|v| v.primary).unwrap_or(false),
+            primary: crate::response_design::effective_primary(
+                &ap.title,
+                va.map(|v| v.primary).unwrap_or(false),
+            ),
             route_to: va.map(|v| v.route_to.clone()).unwrap_or_default(),
             linkedin_url: ap.linkedin_url.clone(),
             // Search results are masked; email is filled later by enrichment.
@@ -1362,7 +1525,7 @@ async fn derive_icp(
         firmographic.push_str(pb.icp_note.trim());
     }
     let search_discipline = if pb.key.eq_ignore_ascii_case("outagehub") {
-        " OUTAGEHUB SEARCH DISCIPLINE: choose exactly one source-backed operating vertical for this pass (for example an operated charging network, diagnostic laboratory network, cold-storage operator, senior-care portfolio, telecom/NOC network, or generator/temporary-power response fleet). Return only 3-6 narrow organization keyword tags for that one vertical. Do not mix broad terms such as energy, field service, utilities, contractors, renewable, electrical, or operations. If prior learnings show that this vertical has already produced mostly misses, move to a different canonical vertical rather than broadening the keywords."
+        " OUTAGEHUB SEARCH DISCIPLINE: this play is EV charging only. Return 3-6 narrow tags for companies that OPERATE or monitor Canadian public/commercial EV-charging sites. Never broaden into cold storage, telecom, laboratories, generators, utilities, renewable developers, electrical contractors, equipment sellers, or installers. An account cannot advance until a completed location-specific historical utility-outage match is attached; a proposed analysis is not evidence."
     } else {
         ""
     };
@@ -1464,7 +1627,11 @@ async fn qualify_org(
 
 fn brand_qualification_guard(brand: &str) -> &'static str {
     if brand.eq_ignore_ascii_case("outagehub") {
-        "OUTAGEHUB ACCOUNT GUARD: A company is not qualified merely because it has offices, uses electricity, sells fuel or electrical equipment, installs generators or solar, runs generic field service, or names routing software. Customer delivery addresses are not the company's operated sites. Qualify either (a) direct first-party evidence of an outage-time classification, dispatch, escalation, continuity, transfer, hold, or communication decision, OR (b) a first-party operating footprint where grid loss obviously affects a time-sensitive service: an operated EV charging network, diagnostic laboratory network, cold-storage facilities, senior-care portfolio, telecom/NOC-managed sites, or a generator/temporary-power response fleet. Path (b) supports asking one cautious workflow hypothesis; it does not prove the private alarm, triage, or dispatch process. Record the public operating responsibility as evidence and leave the internal decision explicitly unverified. Reject contractors, installers, equipment sellers, and ordinary multi-office businesses unless they operate the relevant distributed service. A recent outage at a prospect site is never required."
+        "OUTAGEHUB ACCOUNT GUARD: This experiment is limited to companies that operate or monitor Canadian EV-charging sites. Sellers, installers, utilities, consultants, and every other vertical are rejected. Company and footprint fit are still insufficient: require a completed account-specific analysis that names one public charging location, one historical utility-outage area it overlapped, and a real timestamp. 'We could match locations' or an offer to prepare an example does not count. The internal Service Operations check remains a question. No historical result means research_needed and no outreach."
+    } else if brand.eq_ignore_ascii_case("wapahki") {
+        "WAPAHKI ACCOUNT GUARD: Product variety, several owned brands, private-label work, a broad catalog, or food manufacturing alone does not support a multi-touch robotics thesis. Require a first-party bridge to one identifiable physical candidate task: a named package or product form, station, handoff, line, machine, physical job duty, equipment project, facility expansion, or plant document. Also require one source-supported economic-pressure signal or a tightly bounded hypothesis grounded in evidence: persistent production hiring, shift coverage, overtime, throughput or capacity pressure, line stoppage, equipment utilization, short-run economics, changeover cost, sanitation burden, ergonomics, or safety. Never convert variety into frequent changeovers, manual packing, low-volume runs, staffing pain, or failed automation. If either the physical-task bridge or economic bridge is missing, record a research gap and keep the account at research_needed; do not make the recipient search the plant for a use case. A single routing note is the ceiling for weak evidence."
+    } else if brand.eq_ignore_ascii_case("gnk") {
+        "GNK ACCOUNT GUARD: Company fit is not problem fit. Before an account can reach copy, require public evidence for one specific recurring operating event and decision, one believable consequence such as settlement time, leakage, recovery, audit exposure, customer SLA, write-off, escalation, or constrained senior capacity, and either an external trigger or direct evidence of the mechanism/artifacts. A specialty category, several countries, separate department pages, portals, company scale, or the universal possibility that records sit apart is insufficient. The selected person must be close enough to the work to answer the decision-fork question. If a later touch would need to retract the premise, reject or hold the account now."
     } else {
         ""
     }
@@ -1484,8 +1651,7 @@ async fn assign_vantage(
         .collect();
     let user = format!(
         "These are REAL people at {company}. The hypothesis we're testing: {hyp}\n\nROSTER:\n{roster}\n\n\
-         For each person, assign the vantage point that best fits what they may observe, decide, or route \
-         (not their seniority). can_observe must be a cautious 5-15 word note about likely access. \
+         Work backward from the one response needed next: a workflow example, confirmation of a recurring problem, a technical boundary, an economic decision, or an internal route. For each person, assign the vantage point that best fits whether they can provide that response by observing, deciding, or routing (not their seniority). Distinguish problem witnesses, process owners, economic buyers, evaluators, and routers. Interns, students, trainees, and apprentices are route-only and never primary. Do not treat a function such as Sales or HR as automatically relevant or irrelevant; match it to the named hypothesis. can_observe must be a cautious 5-15 word note about likely access. \
          why_them must be a plain 6-18 word internal reason to contact them. Do not repeat their title, \
          lecture them about their role, or claim ownership that the title does not prove. Use `likely`, \
          `may`, or `could` where access is inferred. Also say whether they are a primary first contact, \
@@ -1959,6 +2125,16 @@ pub fn select_reuse_excluding(
         .filter(|lead| !excluded_lead_ids.contains(&lead.id))
         .collect::<Vec<_>>();
     let people = db.list_people(Some(brand), None)?;
+    let current_play = db.current_gtm_play(brand)?;
+    let rejected_lead_ids = if let Some(play) = current_play.as_ref() {
+        db.list_account_play_assessments(Some(brand))?
+            .into_iter()
+            .filter(|assessment| assessment.play_id == play.id && assessment.status == "rejected")
+            .map(|assessment| assessment.lead_id)
+            .collect::<HashSet<_>>()
+    } else {
+        HashSet::new()
+    };
 
     let mut by_lead: std::collections::HashMap<String, Vec<Person>> =
         std::collections::HashMap::new();
@@ -1981,6 +2157,15 @@ pub fn select_reuse_excluding(
     let mut ranked = leads
         .into_iter()
         .filter_map(|lead| {
+            // `leads.status` is legacy/global and may reflect a retired play.
+            // A new play must be able to re-research that inventory. Only a
+            // rejection attributed to the current play (or a database with no
+            // versioned play at all) blocks reuse.
+            if rejected_lead_ids.contains(&lead.id)
+                || (current_play.is_none() && lead.status.eq_ignore_ascii_case("rejected"))
+            {
+                return None;
+            }
             if pb
                 .max_employees
                 .is_some_and(|max| lead.headcount > 0 && lead.headcount > max)
@@ -2059,11 +2244,7 @@ pub fn select_reuse_excluding(
 }
 
 fn reusable_workflow_contact(person: &Person) -> bool {
-    let vantage = person.vantage.to_ascii_lowercase();
-    if !matches!(
-        vantage.as_str(),
-        "process_owner" | "operator" | "operational_executive"
-    ) {
+    if !crate::response_design::is_workflow_discovery_contact(&person.title, &person.vantage) {
         return false;
     }
     // Legacy contact maps occasionally promoted finance titles to
@@ -2106,28 +2287,23 @@ fn reuse_lead_score(lead: &Lead, people: &[Person]) -> i64 {
 }
 
 fn reuse_person_score(person: &Person) -> i64 {
-    let mut score = if person.primary { 100 } else { 0 };
+    // Role relevance is the primary ordering key. Email availability only
+    // breaks ties; it must never drop the best workflow owner before enrichment.
+    let mut score =
+        crate::response_design::contact_priority(&person.title, &person.vantage, person.primary)
+            as i64
+            * 10;
     if person.email_status.eq_ignore_ascii_case("verified") {
-        score += 80;
+        score += 2;
     } else if !person.email.trim().is_empty() {
-        score += 20;
+        score += 1;
     }
-    let vantage = person.vantage.to_ascii_lowercase();
-    score += match vantage.as_str() {
-        "process_owner" => 70,
-        "operator" => 65,
-        "operational_executive" => 55,
-        "economic_buyer" => 40,
-        "technical_evaluator" => 25,
-        "router" => 10,
-        _ => 0,
-    };
     score
 }
 
-/// Rewrite doctrine framing for already-qualified leads using the current
-/// business profile + thesis. No Apollo, no re-qualification rejects — the
-/// company stays; only the commercial "why them" is refreshed for better copy.
+/// Reassess doctrine framing for on-file leads using the current business
+/// profile, play, and official-site evidence. No Apollo is spent, but the same
+/// qualification policy may now reject a stale or weak account.
 #[allow(clippy::too_many_arguments)]
 pub async fn refresh_lead_context(
     db: &SharedDb,
@@ -2144,6 +2320,12 @@ pub async fn refresh_lead_context(
     }
     let active_play = db.current_gtm_play(&pb.key)?;
     let gtm_play_context = crate::gtm::sourcing_play_block(active_play.as_ref());
+    let allowed_signal_keys = db
+        .list_signal_definitions(Some(&pb.key))?
+        .into_iter()
+        .filter(|definition| definition.status == "active")
+        .map(|definition| definition.key)
+        .collect::<HashSet<_>>();
     // A refresh must be capable of learning something new. Reinterpreting the
     // same legacy CRM notes made weak hypotheses look more polished without
     // making them more true. Re-read the official site before reassessment;
@@ -2155,8 +2337,8 @@ pub async fn refresh_lead_context(
     };
     let researcher_ref = researcher.as_ref();
     let system = format!(
-        "You refresh commercial framing for companies already qualified for {name}. Motion: {motion}. \
-         Keep the company; rewrite why it fits now. Separate supported facts, inferences, and a \
+        "You reassess commercial framing for companies already on file for {name}. Motion: {motion}. \
+         Preserve supported account facts, but allow hard disqualifiers or insufficient fit to reject the active play. Separate supported facts, inferences, and a \
          falsifiable workflow hypothesis. Never invent customers, metrics, systems, or dollar impact. \
          Do not invent physical objects, stations, alarms, or private handoffs to make the hypothesis sound concrete. \
          Return only the requested structured data.",
@@ -2259,58 +2441,36 @@ pub async fn refresh_lead_context(
     for (mut lead, result) in results {
         match result {
             Ok(mut doc) => {
-                doc.structured_signals.retain(|signal| {
-                    credible_canonical_signal(&pb.key, &signal.definition_key, &signal.evidence)
-                });
-                doc.matched_signal_keys = doc
-                    .structured_signals
-                    .iter()
-                    .map(|signal| signal.definition_key.trim().to_string())
-                    .collect::<HashSet<_>>()
-                    .into_iter()
-                    .collect();
-                doc.matched_signal_keys.sort();
+                let routing_status = enforce_refresh_qualification(
+                    &mut doc,
+                    active_play.as_ref(),
+                    &allowed_signal_keys,
+                );
                 let structured_signals = doc.structured_signals.clone();
-                let assessment = active_play.as_ref().map(|play| {
-                    let matched = structured_signals
-                        .iter()
-                        .map(|signal| signal.definition_key.trim())
-                        .filter(|key| {
-                            play.required_signal_keys
-                                .iter()
-                                .any(|required| required == key)
-                        })
-                        .collect::<HashSet<_>>()
-                        .len();
-                    AccountPlayAssessment {
-                        lead_id: lead.id.clone(),
-                        brand: pb.key.clone(),
-                        play_id: play.id.clone(),
-                        play_version: play.version,
-                        status: if matched >= play.minimum_signal_matches.max(1) as usize
-                            && doc.play_fit_score >= 65
-                            && !doc.root_cause.trim().is_empty()
-                            && !doc.proof_fit.trim().is_empty()
-                            && doc.disqualifiers.is_empty()
-                        {
-                            "qualified".into()
-                        } else {
-                            "research_needed".into()
-                        },
-                        fit_score: doc.play_fit_score,
-                        matched_signal_keys: doc.matched_signal_keys.clone(),
-                        symptom: doc.symptom.clone(),
-                        root_cause: doc.root_cause.clone(),
-                        current_workaround: doc.current_workaround.clone(),
-                        why_now: doc.why_now.clone(),
-                        proof_fit: doc.proof_fit.clone(),
-                        evidence_gaps: doc.evidence_gaps.clone(),
-                        disqualifiers: doc.disqualifiers.clone(),
-                        source: "source.refresh".into(),
-                        ..Default::default()
-                    }
+                let assessment = active_play.as_ref().map(|play| AccountPlayAssessment {
+                    lead_id: lead.id.clone(),
+                    brand: pb.key.clone(),
+                    play_id: play.id.clone(),
+                    play_version: play.version,
+                    status: routing_status.clone(),
+                    fit_score: doc.play_fit_score,
+                    matched_signal_keys: doc.matched_signal_keys.clone(),
+                    symptom: doc.symptom.clone(),
+                    root_cause: doc.root_cause.clone(),
+                    current_workaround: doc.current_workaround.clone(),
+                    why_now: doc.why_now.clone(),
+                    proof_fit: doc.proof_fit.clone(),
+                    evidence_gaps: doc.evidence_gaps.clone(),
+                    disqualifiers: doc.disqualifiers.clone(),
+                    source: "source.refresh".into(),
+                    ..Default::default()
                 });
                 apply_lead_refresh(&mut lead, doc, thesis);
+                lead.status = if routing_status == "rejected" {
+                    "rejected".into()
+                } else {
+                    "qualified".into()
+                };
                 let lead_id = db.upsert_lead(&lead)?;
                 db.record_signal_candidates(
                     &pb.key,
@@ -2325,10 +2485,14 @@ pub async fn refresh_lead_context(
                     &pb.key,
                     "",
                     "",
-                    "refreshed",
-                    &format!("refreshed framing for {}", lead.name),
+                    if routing_status == "rejected" {
+                        "qualification_rejected"
+                    } else {
+                        "refreshed"
+                    },
+                    &format!("refreshed framing for {} → {}", lead.name, routing_status),
                 )?;
-                log_sourcing(format!("✓ refreshed {}", lead.name));
+                log_sourcing(format!("✓ refreshed {} → {}", lead.name, routing_status));
                 refreshed += 1;
             }
             Err(error) => {
@@ -2381,7 +2545,7 @@ async fn refresh_one_lead(
     let user = format!(
         "{context_block}{gtm_play_context}\n\nThis company is ALREADY on file. Reassess it against the active play and refresh the commercial \
          framing so outreach copy can explain exactly why THIS company is a fit for the thesis and \
-         for the business goals above. Do not reject the company. Prefer keeping prior observed_facts \
+         for the business goals above. Reject it for this play when source evidence is too weak or a hard blocker applies. Prefer keeping prior observed_facts \
          that still hold; tighten or replace weak inferences/hypothesis/mechanism.\n\n\
          THESIS: {thesis}\n\nON-FILE ACCOUNT:\n{facts}\n\n{website_block}{knowledge}\n\n\
          Rules: observed_facts must stay grounded in the on-file fields above, prior facts, or the \
@@ -2498,10 +2662,20 @@ mod tests {
     use std::collections::HashSet;
 
     use super::{
-        clamp_employee_ranges, company_identity_keys, credible_canonical_signal,
-        enforce_play_qualification, reusable_workflow_contact, reuse_lead_score,
-        reuse_person_score, select_reuse_excluding, source_candidate_target, OrgQual,
+        brand_qualification_guard, clamp_employee_ranges, company_identity_keys,
+        credible_canonical_signal, enforce_play_qualification, enforce_refresh_qualification,
+        reusable_workflow_contact, reuse_lead_score, reuse_person_score, select_reuse_excluding,
+        source_candidate_target, LeadRefresh, OrgQual,
     };
+
+    #[test]
+    fn wapahki_guard_requires_a_task_bridge_and_an_economic_bridge() {
+        let guard = brand_qualification_guard("wapahki");
+        assert!(guard.contains("Product variety"));
+        assert!(guard.contains("physical candidate task"));
+        assert!(guard.contains("economic-pressure signal"));
+        assert!(guard.contains("research_needed"));
+    }
 
     #[test]
     fn portfolio_identity_uses_both_apollo_id_and_canonical_domain() {
@@ -2562,7 +2736,7 @@ mod tests {
             "After a loss-of-power alarm, operators decide whether to dispatch maintenance or hold the response when a utility outage is reported."
         ));
     }
-    use crate::db::{Db, Lead, Person};
+    use crate::db::{AccountPlayAssessment, Db, Lead, Person};
     use crate::gtm::{default_plays, SignalCandidate};
     use crate::playbook::Playbooks;
 
@@ -2634,6 +2808,56 @@ mod tests {
         let thin = Lead::default();
         let people = vec![primary];
         assert!(reuse_lead_score(&rich, &people) > reuse_lead_score(&thin, &people));
+    }
+
+    #[test]
+    fn verification_cannot_outrank_a_more_relevant_workflow_role() {
+        let owner = Person {
+            title: "Director of Claims".into(),
+            vantage: "process_owner".into(),
+            email_status: "unknown".into(),
+            ..Default::default()
+        };
+        let verified_operator = Person {
+            title: "Claims Analyst".into(),
+            vantage: "operator".into(),
+            email: "analyst@example.com".into(),
+            email_status: "verified".into(),
+            ..Default::default()
+        };
+        assert!(reuse_person_score(&owner) > reuse_person_score(&verified_operator));
+    }
+
+    #[test]
+    fn refresh_can_reject_weak_or_disqualified_inventory() {
+        let play = default_plays()
+            .into_iter()
+            .find(|play| play.brand == "gnk")
+            .expect("gnk play");
+        let allowed = play
+            .required_signal_keys
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
+        let mut refresh = LeadRefresh {
+            observed_facts: vec!["The company has a claims department.".into()],
+            play_fit_score: 35,
+            root_cause: "Unproven".into(),
+            proof_fit: "Unproven".into(),
+            structured_signals: vec![SignalCandidate {
+                definition_key: "account.fit_evidence".into(),
+                evidence: "The company has a claims department.".into(),
+                confidence: 0.55,
+                ..Default::default()
+            }],
+            disqualifiers: vec!["The active play is outside the account's scope.".into()],
+            ..Default::default()
+        };
+
+        let status = enforce_refresh_qualification(&mut refresh, Some(&play), &allowed);
+        assert_eq!(status, "rejected");
+        assert!(refresh.structured_signals.is_empty());
+        assert_eq!(refresh.disqualifiers.len(), 1);
     }
 
     #[test]
@@ -2727,6 +2951,69 @@ mod tests {
     }
 
     #[test]
+    fn retired_play_rejection_can_be_researched_but_current_rejection_cannot() {
+        let db = std::sync::Arc::new(Db::open(":memory:").expect("open memory db"));
+        let old_reject_id = db
+            .upsert_lead(&Lead {
+                brand: "outagehub".into(),
+                apollo_org_id: "org-retired-reject".into(),
+                name: "Retired Play Reject".into(),
+                status: "rejected".into(),
+                ..Default::default()
+            })
+            .expect("insert old rejected lead");
+        db.upsert_person(&Person {
+            lead_id: old_reject_id.clone(),
+            brand: "outagehub".into(),
+            apollo_person_id: "person-retired-reject".into(),
+            name: "Operations Owner".into(),
+            title: "Director of Network Operations".into(),
+            vantage: "process_owner".into(),
+            ..Default::default()
+        })
+        .expect("insert old rejected person");
+
+        let current_reject_id = db
+            .upsert_lead(&Lead {
+                brand: "outagehub".into(),
+                apollo_org_id: "org-current-reject".into(),
+                name: "Current Play Reject".into(),
+                ..Default::default()
+            })
+            .expect("insert current rejected lead");
+        db.upsert_person(&Person {
+            lead_id: current_reject_id.clone(),
+            brand: "outagehub".into(),
+            apollo_person_id: "person-current-reject".into(),
+            name: "Service Operations Owner".into(),
+            title: "Director of Service Operations".into(),
+            vantage: "process_owner".into(),
+            ..Default::default()
+        })
+        .expect("insert current rejected person");
+        let play = db
+            .current_gtm_play("outagehub")
+            .expect("play query")
+            .expect("current play");
+        db.upsert_account_play_assessment(&AccountPlayAssessment {
+            lead_id: current_reject_id,
+            brand: "outagehub".into(),
+            play_id: play.id,
+            play_version: play.version,
+            status: "rejected".into(),
+            source: "test".into(),
+            ..Default::default()
+        })
+        .expect("current rejection");
+
+        let playbooks = Playbooks::load("playbooks").expect("load playbooks");
+        let playbook = playbooks.get("outagehub").expect("outagehub playbook");
+        let selected = select_reuse_excluding(&db, playbook, "outagehub", 2, 1, &HashSet::new())
+            .expect("select reusable inventory");
+        assert_eq!(selected.lead_ids, vec![old_reject_id]);
+    }
+
+    #[test]
     fn active_play_rejects_superficial_account_fit() {
         let play = default_plays()
             .into_iter()
@@ -2771,14 +3058,21 @@ mod tests {
             .cloned()
             .collect::<HashSet<_>>();
         let structured_signals = [
-            ("account.fit_evidence", "Runs a 24/7 operations desk."),
             (
-                "account.outage_sensitive_decision",
-                "Operators dispatch or hold after a loss-of-power alarm.",
+                "account.fit_evidence",
+                "Operates a Canadian EV charging network with public site locations.",
+            ),
+            (
+                "account.operated_ev_charging_network",
+                "The company operates an EV charging network with charging sites in Ontario.",
             ),
             (
                 "account.distributed_locations",
-                "Operates remote telecom towers and network sites across utility territories.",
+                "Operates multiple charging sites across Canada.",
+            ),
+            (
+                "account.historical_location_outage_match",
+                "On 2026-07-14 at 14:30, the charging site at 123 King Street overlapped a utility outage area in a utility report.",
             ),
         ]
         .into_iter()
@@ -2801,7 +3095,7 @@ mod tests {
         enforce_play_qualification(&mut qualification, Some(&play), &allowed);
 
         assert!(qualification.qualified);
-        assert_eq!(qualification.matched_signal_keys.len(), 3);
+        assert_eq!(qualification.matched_signal_keys.len(), 4);
         assert_eq!(qualification.routing_status, "qualified");
     }
 

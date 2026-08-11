@@ -1,0 +1,184 @@
+key = "outagehub"
+name = "OutageHub"
+summary = "Canada-wide power-outage intelligence: normalized live and historical utility data, geographic outage areas, provider coverage, and data-quality analytics through a REST API."
+
+known_facts = [
+  "OutageHub monitors Canadian utility providers and normalizes their public outage reports into one dataset.",
+  "OutageHub exposes live and historical outage records through a REST API with time-range, outage-detail, and provider endpoints.",
+  "Outage records can include provider, geographic polygon, affected-customer count, cause, outage type, planned status, start time, and estimated restoration time when the source utility publishes them.",
+  "OutageHub tracks provider-level completeness across seven critical outage-reporting fields and preserves completeness history for analytics and benchmarking.",
+  "OutageHub can use geographic outage areas to compare reported utility events with supplied locations and times.",
+  "Its value is external utility context around an operational decision, not replacing private telemetry or claiming private site status.",
+  "Andrew Gordienko is the founder.",
+  "Andrew can prepare a small location-matched historical example from public utility reports for a prospect's Canadian locations, clearly labeled as an outside-in example rather than proof of private site status.",
+]
+
+unknowns = [
+  "Legal incorporated name, incorporation jurisdiction, and incorporation date.",
+  "Full-time employee count, revenue, and financial statements available for an application.",
+  "Current technology-readiness level and documented R&D work plan.",
+  "Available matching funds, prior government assistance, and stacking constraints.",
+  "Quantified Canadian economic benefits, jobs, emissions impact, and customer evidence.",
+  "Committed utility, municipal, academic, or commercial pilot partners.",
+]
+
+goals = [
+  "Find organizations with an outage-sensitive operational decision where a location-matched external grid signal changes the outcome, and become the API/webhook their existing system (NOC, dispatch, ServiceNow, Salesforce) consumes — not another dashboard.",
+  "Find every credible funding, pilot, challenge, and advisory programme that could advance product development, validation, commercialization, or grid-resilience evidence.",
+  "Build funder relationships and complete strong applications without claiming eligibility that has not been verified.",
+]
+
+constraints = [
+  "Treat public outage information, private alarms, carrier telemetry, internal tickets, and site status as distinct data types.",
+  "Never state that OutageHub is eligible for a programme until every mandatory criterion is evidenced.",
+  "Never describe a repayable contribution, tax credit, loan, procurement, or challenge prize as a grant.",
+]
+
+[account_limits]
+max_new_contacts_per_account_per_day = 10
+max_active_contacts_per_account = 0
+max_unanswered_touches = 5
+
+[calendar]
+daily_touch_cap = 30
+quota_timezone = "America/Toronto"
+fallback_recipient_timezone = "America/Toronto"
+weekdays = ["mon", "tue", "wed", "thu", "fri"]
+window_start = 8
+window_end = 17
+preferred_hours = [8, 11, 14]
+learning_min_samples = 20
+
+[[calendar.rules]]
+key = "incident_operations_weekend_hypothesis"
+industries = ["telecom", "utility", "health", "senior", "emergency", "infrastructure", "network", "charging"]
+title_keywords = ["network operations", "noc", "incident", "emergency", "continuity", "dispatch", "site operations", "facilities", "reliability"]
+channels = ["email", "linkedin", "linkedin_request", "linkedin_or_email"]
+weekdays = ["tue", "wed", "thu", "sat", "sun"]
+window_start = 8
+window_end = 14
+preferred_hours = [8, 10, 12]
+rationale = "Explicit test hypothesis: genuine incident-operations roles in continuously operated sectors may review operational messages on weekends. This exception requires both a matching sector and title and must be replaced by observed response data when enough samples exist."
+
+[[calendar.rules]]
+key = "funding_and_public_sector_weekdays"
+industries = ["public funding", "government", "economic development"]
+title_keywords = ["program", "programme", "funding", "advisor", "innovation", "partnership"]
+channels = ["email"]
+weekdays = ["tue", "wed", "thu"]
+window_start = 9
+window_end = 16
+preferred_hours = [9, 11, 14]
+rationale = "Programme and public-sector enquiries remain weekday-only regardless of OutageHub's incident-operations weekend hypothesis."
+
+[[motions]]
+key = "customer_outbound"
+kind = "sales"
+objective = "Find organizations where external utility context can improve a specific outage-time classification or prioritization decision."
+
+[[motions]]
+key = "funding_pipeline"
+kind = "funding"
+objective = "Discover, qualify, pursue, and monitor non-dilutive funding and funded pilot opportunities."
+
+[[motions]]
+key = "pilot_partners"
+kind = "partnership"
+objective = "Find utilities, municipalities, research institutions, and operating partners for evidence-producing pilots."
+
+[funding]
+objective = "Fund product R&D, data coverage, operational validation, commercialization, and Canadian grid-resilience or clean-technology evidence."
+themes = [
+  "electric-grid reliability and resilience",
+  "utility and outage data",
+  "clean technology and energy innovation",
+  "Canadian technology R&D and commercialization",
+  "critical infrastructure and emergency operations",
+  "smart cities, geospatial data, and public-interest data",
+  "applied AI and decision support",
+]
+project_shapes = [
+  "R&D to improve location matching, event normalization, coverage, or evidence quality.",
+  "A bounded pilot with a utility, municipality, research institution, or multi-site operator.",
+  "Validation of whether external outage context changes classification, prioritization, dispatch, or continuity decisions.",
+  "Commercialization, export, or adoption work where the programme explicitly supports those activities.",
+]
+preferred_contact_titles = [
+  "Program Manager",
+  "Funding Program Officer",
+  "Innovation Advisor",
+  "Industrial Technology Advisor",
+  "Business Development Manager",
+  "Partnerships Manager",
+  "Innovation Manager",
+  "Grid Innovation",
+]
+min_words = 80
+max_words = 170
+default_touches = 2
+doctrine = """
+Funding outreach is a pre-application inquiry, not a sales pitch and not a request
+to award money by email. Lead with the named programme and one evidenced criterion.
+Describe one bounded OutageHub project shape, then ask one question that materially
+changes the go/no-go decision: applicant eligibility, eligible activity, project
+fit, intake timing, required partner, or the right advisor. Do not send generic
+seven-touch cadences to public servants. Prefer the programme's published contact;
+use Apollo to find a credible advisor or programme owner only when the official
+route is absent or a relationship is genuinely useful. A formal application,
+budget, work plan, evidence, and portal submission remain separate governed steps.
+"""
+
+[[funding.sources]]
+name = "Innovation Canada — business support"
+mode = "catalog"
+url = "https://www.canada.ca/en/services/science/innovation/funding.html"
+
+[[funding.sources]]
+name = "Clean Growth Hub"
+mode = "catalog"
+url = "https://ised-isde.canada.ca/site/clean-growth-hub/en"
+
+[[funding.sources]]
+name = "Ontario funding opportunities"
+mode = "catalog"
+url = "https://www.ontario.ca/page/available-funding-opportunities-ontario-government"
+
+[[funding.sources]]
+name = "NRC IRAP"
+mode = "program"
+url = "https://nrc.canada.ca/en/support-technology-innovation/financial-support-technology-innovation"
+apollo_organization_name = "National Research Council Canada"
+apollo_domains = ["nrc-cnrc.gc.ca", "nrc.canada.ca"]
+
+[[funding.sources]]
+name = "FedDev Ontario funding"
+mode = "catalog"
+url = "https://feddev-ontario.canada.ca/en/funding-southern-ontario"
+apollo_organization_name = "Federal Economic Development Agency for Southern Ontario"
+apollo_domains = ["feddev-ontario.canada.ca"]
+
+[[funding.sources]]
+name = "IESO Grid Innovation Fund"
+mode = "program"
+url = "https://www.ieso.ca/en/Get-Involved/Innovation/Grid-Innovation-Fund/Overview"
+apollo_organization_name = "Independent Electricity System Operator"
+apollo_domains = ["ieso.ca"]
+
+[[funding.sources]]
+name = "Ontario Centre of Innovation"
+mode = "catalog"
+url = "https://www.oc-innovation.ca/programs/"
+apollo_organization_name = "Ontario Centre of Innovation"
+apollo_domains = ["oc-innovation.ca"]
+
+[[funding.sources]]
+name = "Federal and Ontario live-call search"
+mode = "search"
+query = "Canada Ontario open funding call technology grid resilience utility data innovation grant contribution pilot"
+allowed_domains = [
+  "canada.ca",
+  "nrc.canada.ca",
+  "ontario.ca",
+  "ieso.ca",
+  "oc-innovation.ca",
+]
