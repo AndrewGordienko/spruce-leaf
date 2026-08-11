@@ -222,7 +222,16 @@ fn signal_label(key: &str) -> &str {
         "account.reachable_workflow_owner" => "a reachable workflow owner",
         "account.outage_sensitive_decision" => "an outage-sensitive operating decision",
         "account.distributed_locations" => "distributed locations",
+        "account.operated_ev_charging_network" => "an operated Canadian EV charging network",
+        "account.historical_location_outage_match" => {
+            "a verified charging-location / utility-outage match"
+        }
         "account.existing_operational_system" => "an existing operational workflow surface",
+        "account.specific_recurring_decision" => "a specific recurring decision",
+        "account.believable_operating_consequence" => "a believable operating consequence",
+        "account.external_trigger_or_mechanism_evidence" => {
+            "an external trigger or direct mechanism evidence"
+        }
         "account.bounded_repetitive_task" => "a bounded repetitive task",
         "account.format_variability" => "format or SKU variability",
         "account.exception_heavy_manual_work" => "manual exception handling",
@@ -775,6 +784,14 @@ impl Agent {
                 let accounts = step.accounts.unwrap_or(10).max(1) as usize;
                 let contacts = step.contacts.unwrap_or(3).max(1) as usize;
                 self.source_leads(&thesis, accounts, contacts).await
+            }
+            "research_account" => {
+                let query = if step.query.trim().is_empty() {
+                    step.thesis.trim()
+                } else {
+                    step.query.trim()
+                };
+                self.research_account(query, step.thesis.trim()).await
             }
             "run_full_motion" => {
                 let thesis = if step.thesis.trim().is_empty() {
@@ -2081,9 +2098,98 @@ impl Agent {
         }
     }
 
+    /// Target one existing account for a fresh official-site read and current
+    /// play assessment without starting another Apollo search wave.
+    async fn research_account(&self, query: &str, thesis: &str) -> String {
+        let query = query.trim();
+        if query.is_empty() {
+            return "Name the existing account to research.".into();
+        }
+        let leads = match self.db.list_leads(Some(&self.brand)) {
+            Ok(leads) => leads,
+            Err(error) => return format!("Could not inspect CRM accounts: {error:#}"),
+        };
+        let mut matches = leads
+            .iter()
+            .filter(|lead| {
+                lead.id.eq_ignore_ascii_case(query)
+                    || lead.name.eq_ignore_ascii_case(query)
+                    || lead.domain.eq_ignore_ascii_case(query)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if matches.is_empty() {
+            let needle = query.to_ascii_lowercase();
+            matches = leads
+                .into_iter()
+                .filter(|lead| {
+                    lead.name.to_ascii_lowercase().contains(&needle)
+                        || lead.domain.to_ascii_lowercase().contains(&needle)
+                })
+                .collect();
+        }
+        if matches.len() != 1 {
+            let names = matches
+                .iter()
+                .map(|lead| lead.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return format!(
+                "Account research needs one exact {} CRM match; found {}{}.",
+                self.brand,
+                matches.len(),
+                if names.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {names}")
+                }
+            );
+        }
+        let lead = matches.remove(0);
+        let refreshed = self
+            .do_refresh_context(thesis, std::slice::from_ref(&lead.id), true)
+            .await;
+        let Some(play) = self.db.current_gtm_play(&self.brand).ok().flatten() else {
+            return format!(
+                "Refreshed {refreshed} account(s), but no active GTM play is configured."
+            );
+        };
+        let Some(assessment) = self
+            .db
+            .account_play_assessment(&lead.id, &play.id)
+            .ok()
+            .flatten()
+        else {
+            return format!(
+                "Refreshed {refreshed} account(s), but {} has no current assessment.",
+                lead.name
+            );
+        };
+        let gaps = if assessment.evidence_gaps.is_empty() {
+            String::new()
+        } else {
+            format!(" Evidence gaps: {}.", assessment.evidence_gaps.join(" | "))
+        };
+        format!(
+            "Researched {} against {} v{} with no Apollo spend: {} (score {}, {}/{} required signals).{}",
+            lead.name,
+            play.name,
+            play.version,
+            assessment.status,
+            assessment.fit_score,
+            assessment.matched_signal_keys.len(),
+            play.minimum_signal_matches,
+            gaps,
+        )
+    }
+
     fn approve_outreach(&self) -> String {
-        match self.db.approve_touches(Some(&self.brand), None) {
-            Ok(n) => {
+        let pb = match self.playbooks.get(&self.brand) {
+            Ok(pb) => pb,
+            Err(error) => return format!("Approval failed: {error:#}"),
+        };
+        match crate::outreach::approve_ready_touches(&self.db, pb, None) {
+            Ok(approval) => {
                 let plan = self.businesses.get(&self.brand).and_then(|profile| {
                     crate::calendar::rebalance_approved_sales(&self.db, profile, chrono::Utc::now())
                 });
@@ -2097,11 +2203,14 @@ impl Agent {
                     .unwrap_or_else(|error| format!("calendar refresh failed: {error:#}"));
                 ui::activity(
                     "Approved outreach",
-                    format!("{n} touch(es) · {} · {schedule}", self.brand),
+                    format!(
+                        "{} touch(es) · {} held · {} · {schedule}",
+                        approval.touches_scheduled, approval.people_held, self.brand
+                    ),
                 );
                 format!(
-                    "Approved {n} drafted email touch(es) for {}. {schedule}.",
-                    self.brand,
+                    "Approved {} drafted email touch(es) for {}; held {} recipient(s) at the current GTM gate. {schedule}.",
+                    approval.touches_scheduled, self.brand, approval.people_held,
                 )
             }
             Err(e) => format!("Approval failed: {e:#}"),
@@ -2579,6 +2688,7 @@ For a pure conversational answer (no action to run), leave `steps` empty and put
 Actions (each is a step's `action`):\n\
 - run_campaign: hypothetical research-only campaign; no Apollo.\n\
 - source_leads: ONLY finds and qualifies Apollo accounts+people, then stops — it writes NO emails. Use only when the request is purely to find companies/people and contains no request to write, draft, sequence, or perform outreach. set thesis/accounts/contacts (defaults 10/3).\n\
+- research_account: re-read and reassess ONE existing CRM account against the current GTM play without Apollo. Put its exact name/domain/id in query and the research focus in thesis. Use this before targeted regeneration when a promising old account has stale, weak, or retired-play evidence.\n\
 - run_full_motion: end-to-end motion for a brand (never sends). The requested account count AND contacts-per-account count are a FULFILLMENT CONTRACT: persist through adaptive sourcing passes, contact shortfalls, weak hypotheses, and rejected copy; save misses as targeting corrections, retry rejected copy with its feedback, and replace an account that still lacks the requested number of current reviewed recipient sequences. Stop short only at a real provider/model-budget/search-exhaustion safety boundary and report filled/requested exactly. REUSE-FIRST: if the CRM already has enough accounts/people for that brand, it SKIPS Apollo, refreshes why those companies fit, and writes missing, rejected, or stale sequences. Current-policy reviewed drafts are preserved unless the operator explicitly asks to rewrite/redraft/refine/replace them. set thesis/accounts/contacts/touches (defaults 5/5/7). set force_new=true ONLY when they explicitly ask for new/fresh/more companies not already on file.\n\
 - enrich_people: reveal/verify sourced emails; phone only when explicit.\n\
 - plan_outreach: draft sequences for contacts ALREADY found (no account/people search). When the operator says 'I need X from person Y,' put Y's exact name/email/id in person and X in outcome. Do not reinterpret X as buyer-facing wording; the response planner will reduce it when it is not yet earned. A scoped request may reveal only those selected contacts whose email is still missing, because an email sequence must not silently shrink; skip that reveal when the operator says no Apollo/no enrichment/verified only. IMPORTANT SCOPE: 'first N people' with NO company/account count means N people TOTAL in CRM order: set limit=N and OMIT accounts/contacts. 'first N people in the first company' means accounts=1, contacts=N. 'N people for each of M companies' means accounts=M, contacts=N. contacts is always PER selected company, never a bare total. Preserve current-policy reviewed drafts on ordinary retries; safely replace unsent drafts only when the operator explicitly says rewrite/redraft/refine/replace. auto only when explicit.\n\
@@ -2609,11 +2719,11 @@ fn decision_schema(brands: &[&str]) -> Value {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["run_campaign", "source_leads", "run_full_motion", "enrich_people", "plan_outreach", "approve_outreach", "discover_opportunities", "list_opportunities", "resolve_opportunity_contacts", "plan_funding_outreach", "approve_funding_outreach", "prepare_application", "show_funnel", "show_calendar", "list_accounts", "show_learnings", "open_crm", "open_gtm", "search_knowledge"]
+                "enum": ["run_campaign", "source_leads", "research_account", "run_full_motion", "enrich_people", "plan_outreach", "approve_outreach", "discover_opportunities", "list_opportunities", "resolve_opportunity_contacts", "plan_funding_outreach", "approve_funding_outreach", "prepare_application", "show_funnel", "show_calendar", "list_accounts", "show_learnings", "open_crm", "open_gtm", "search_knowledge"]
             },
             "brand": { "type": "string", "enum": brands, "description": "The brand this step concerns. Leave empty only for portfolio-wide reads (they span all brands)." },
             "thesis": { "type": "string", "description": "The workflow/market to target for sourcing/campaign steps." },
-            "query": { "type": "string", "description": "For search_knowledge: the topic to look up in the ingested books." },
+            "query": { "type": "string", "description": "For search_knowledge: the book topic. For research_account: the exact existing account name/domain/id." },
             "outcome": { "type": "string", "description": "For plan_outreach or run_full_motion: the exact next response or action the operator wants from the named person. Preserve the user's words; leave empty when none is stated." },
             "person": { "type": "string", "description": "For a targeted plan_outreach request: exact existing person id, email, or name stated by the operator." },
             "accounts": { "type": "integer", "description": "For plan_outreach, number of existing companies in current CRM order to scope. Set 1 for 'the first company'." },

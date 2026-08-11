@@ -40,7 +40,7 @@ the signature supplies enough identity. Judge whether the operational question
 is worth correcting, not whether Andrew has inserted a conventional pitch.
 
 Calibrate by channel and stage. Every pure email must look like an email, with a
-short first-name greeting, a coherent message, and a signature rather than one
+short first-name salutation without Hi, Hello, or Hey, a coherent message, and a signature rather than one
 CRM-style paragraph. All follow-up emails must preserve the original subject
 with `re:` rather than looking like a scheduled content series. A reply-thread follow-up can pass without a question only when it
 clearly continues this person's thread and provides an obvious correction path,
@@ -69,6 +69,8 @@ Score the final wording on:
 
 - whether email one follows the brand-specific word band, usually in 4–10 spoken
   sentences, and whether every follow-up is materially shorter but substantive;
+  an explicit one-touch discovery contract may instead require a complete
+  two-sentence note and its shorter brand-specific band;
 - whether the subject is a plain, specific operating phrase of 3–9 words rather
   than a generic headline, broad topic label, question, number, or product
   label; sentence or title case is acceptable;
@@ -131,9 +133,13 @@ person," and "reply with X" are not low-friction human asks; they make the
 recipient complete Andrew's form. The recipient must be free to answer in
 ordinary language. Also fail invented task nouns used to manufacture
 specificity. A food-production footprint does not prove trays, cases, pouches,
-conveyors, changeovers, or any named station. When those details are not in the
-verified facts, the email must ask at the supported level and let the operator
-name the task.
+conveyors, or changeovers. A one-touch Wapahki contract may, however, put a
+generic final-packing or pack-out station entirely inside one explicit question
+when verified facts establish food manufacturing, co-packing, packaged
+products, or packaging capabilities. That is a bounded candidate for
+correction, not an asserted plant fact. More specific objects and equipment
+still require source support, and the recipient must never be asked to search
+the plant for Andrew's use case.
 
 Read for experiment narration. "The question concerns," "the premise was
 narrow," "the key distinction is," and repeated instructions about how little

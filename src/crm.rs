@@ -159,6 +159,20 @@ const BRANDS: &[BrandMeta] = &[
     },
 ];
 
+/// Browser icon for the local CRM. Keep this beside the app identity rather
+/// than in a separate asset pipeline: the CRM is a single-binary local tool,
+/// and the north-east arrow mirrors the mark in the persistent top bar.
+const FAVICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <defs>
+    <linearGradient id="arrow" x1="16" y1="48" x2="48" y2="16" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#91f2d5"/>
+      <stop offset="1" stop-color="#62bfff"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="15" fill="#0c1733"/>
+  <path d="M18 46 46 18M28 18h18v18" fill="none" stroke="url(#arrow)" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>"##;
+
 fn brand_meta(key: &str) -> Option<&'static BrandMeta> {
     BRANDS.iter().find(|b| b.key == key)
 }
@@ -536,6 +550,7 @@ pub fn router(
     };
     Router::new()
         .route("/", get(hub))
+        .route("/favicon.svg", get(favicon))
         .route("/b/:brand", get(brand_index))
         .route("/strategy", get(strategy_hub))
         .route("/strategy/:brand", get(strategy_brand))
@@ -571,6 +586,19 @@ pub fn router(
         )
         .layer(middleware::from_fn(local_write_guard))
         .with_state(state)
+}
+
+async fn favicon() -> impl IntoResponse {
+    (
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "image/svg+xml; charset=utf-8",
+            ),
+            (axum::http::header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        FAVICON_SVG,
+    )
 }
 
 /// The dashboard is deliberately loopback-only, but a remote web page can still
@@ -1227,9 +1255,9 @@ async fn approve_execution(
 ) -> impl IntoResponse {
     let mut brand = None;
     if let Ok(Some(person)) = state.db.get_person(&person_id) {
-        let _ = state
-            .db
-            .approve_touches(Some(&person.brand), Some(&person_id));
+        if let Ok(pb) = state.playbooks.get(&person.brand) {
+            let _ = crate::outreach::approve_ready_touches(&state.db, pb, Some(&person_id));
+        }
         if let Ok(profile) = state.businesses.get(&person.brand) {
             let _ = crate::calendar::rebalance_approved_sales(&state.db, profile, Utc::now());
         }
@@ -1671,6 +1699,7 @@ fn page_head(title: &str) -> String {
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">\
+         <link rel=\"icon\" type=\"image/svg+xml\" href=\"/favicon.svg\">\
          <title>{}</title>{}</head><body><div class=\"crm-shell\">",
         esc(title),
         SHEET_STYLE
@@ -4732,9 +4761,9 @@ a.brand-lockup { text-decoration: none; color: var(--ink); flex: 0 0 auto; }
 #[cfg(test)]
 mod tests {
     use super::{
-        brand_meta, brand_tab_counts, display_written_at, execution_dashboard, gtm_snapshot,
-        local_write_headers, render_gtm_lab, render_html, render_hub, render_strategy_brand,
-        render_strategy_hub, Crm, BRANDS,
+        brand_meta, brand_tab_counts, display_written_at, execution_dashboard, favicon,
+        gtm_snapshot, local_write_headers, page_head, render_gtm_lab, render_html, render_hub,
+        render_strategy_brand, render_strategy_hub, Crm, BRANDS, FAVICON_SVG,
     };
     use crate::business::Businesses;
     use crate::db::{
@@ -4743,7 +4772,31 @@ mod tests {
     };
     use crate::playbook::Playbooks;
     use axum::http::{HeaderMap, HeaderValue};
+    use axum::response::IntoResponse;
     use uuid::Uuid;
+
+    #[test]
+    fn every_crm_page_links_the_sales_os_favicon() {
+        let head = page_head("Sales CRM");
+        assert!(head.contains("<link rel=\"icon\" type=\"image/svg+xml\" href=\"/favicon.svg\">"));
+        assert!(FAVICON_SVG.contains("viewBox=\"0 0 64 64\""));
+        assert!(FAVICON_SVG.contains("#0c1733"));
+        assert!(FAVICON_SVG.contains("linearGradient"));
+    }
+
+    #[tokio::test]
+    async fn favicon_is_served_as_cacheable_svg() {
+        let response = favicon().await.into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            response.headers().get(axum::http::header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static("image/svg+xml; charset=utf-8"))
+        );
+        assert_eq!(
+            response.headers().get(axum::http::header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("public, max-age=86400"))
+        );
+    }
 
     #[test]
     fn local_dashboard_rejects_cross_site_browser_writes() {
@@ -4929,7 +4982,7 @@ mod tests {
         assert!(html.contains("Northern Cold Chain"));
         assert!(html.contains("Internal alarms cannot supply"));
         assert!(html.contains("88/100"));
-        assert!(html.contains("Historical location-matched outage replay"));
+        assert!(html.contains("Match public charging locations"));
         assert!(html.contains("Forward-deployed proof briefs"));
     }
 
@@ -5056,7 +5109,7 @@ mod tests {
 
         // Approval schedules email only; manual channel tasks remain drafts.
         assert_eq!(
-            db.approve_touches(Some("gnk"), Some(&person_id))
+            db.schedule_reviewed_touches(Some("gnk"), Some(&person_id))
                 .expect("approve"),
             3
         );

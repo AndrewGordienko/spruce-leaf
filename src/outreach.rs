@@ -14,6 +14,7 @@
 //! email when the prospect is not marked connected.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -50,10 +51,51 @@ pub struct PlanSummary {
     pub stopped_reason: Option<String>,
 }
 
+#[derive(Debug, Default)]
+pub struct ApprovalSummary {
+    pub touches_scheduled: usize,
+    pub people_held: usize,
+    pub hold_reasons: Vec<String>,
+}
+
 fn log_outreach(message: impl AsRef<str>) {
     if !crate::ui::fancy() {
         eprintln!("  · {}", message.as_ref());
     }
+}
+
+/// Promote reviewed drafts only after re-evaluating the current account,
+/// recipient, and play. Copy approval is never a substitute for GTM readiness.
+pub fn approve_ready_touches(
+    db: &SharedDb,
+    pb: &Playbook,
+    person_id: Option<&str>,
+) -> Result<ApprovalSummary> {
+    let mut summary = ApprovalSummary::default();
+    for person in db
+        .list_people(Some(&pb.key), None)?
+        .into_iter()
+        .filter(|person| person_id.is_none_or(|id| person.id == id))
+    {
+        if db.reviewed_draft_touch_count(Some(&pb.key), Some(&person.id))? == 0 {
+            continue;
+        }
+        let reason = match db.get_lead(&person.lead_id)? {
+            Some(lead) => crate::gtm::delivery_block_reason(db, pb, &lead, &person)?,
+            None => Some("account record is missing".into()),
+        };
+        if let Some(reason) = reason {
+            summary.people_held += 1;
+            summary
+                .hold_reasons
+                .push(format!("{}: {}", person.name, reason));
+            let _ = db.log_event(&pb.key, &person.id, "", "approval_held", &reason);
+            continue;
+        }
+        summary.touches_scheduled +=
+            db.schedule_reviewed_touches(Some(&pb.key), Some(&person.id))?;
+    }
+    Ok(summary)
 }
 
 /// One recipient shown in the live outreach progress tree.
@@ -523,6 +565,7 @@ fn provisional_channel(stage: usize) -> &'static str {
 fn provisional_day_offset(stage: usize, total: usize) -> i64 {
     const SEVEN_DAYS: [i64; 7] = [0, 3, 5, 9, 13, 17, 21];
     const FOUR_DAYS: [i64; 4] = [0, 3, 7, 14];
+    const TWO_DAYS: [i64; 2] = [0, 6];
     if total == 7 {
         SEVEN_DAYS
             .get(stage.saturating_sub(1))
@@ -533,6 +576,8 @@ fn provisional_day_offset(stage: usize, total: usize) -> i64 {
             .get(stage.saturating_sub(1))
             .copied()
             .unwrap_or(14)
+    } else if total == 2 {
+        TWO_DAYS.get(stage.saturating_sub(1)).copied().unwrap_or(6)
     } else if total <= 1 {
         0
     } else {
@@ -547,6 +592,7 @@ fn is_email_capable_channel(channel: &str) -> bool {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_building_checkpoint(
     db: &SharedDb,
     pb: &Playbook,
@@ -554,6 +600,8 @@ fn create_building_checkpoint(
     person: &crate::db::Person,
     gtm_context: &GtmActionContext,
     touches: usize,
+    generation_backend: &str,
+    generation_model: &str,
 ) -> Result<String> {
     db.interrupt_prior_building_sequences(&person.id)?;
     let sequence_id = db.create_sequence(&Sequence {
@@ -584,6 +632,8 @@ fn create_building_checkpoint(
             .map(|observation| observation.id.clone())
             .collect(),
         gtm_state: gtm_context.state.clone(),
+        generation_backend: generation_backend.into(),
+        generation_model: generation_model.into(),
         status: "building".into(),
         ..Default::default()
     })?;
@@ -709,7 +759,7 @@ pub async fn plan_pending(
     if let Some(ids) = only_person_ids {
         verified.retain(|person| ids.contains(&person.id));
     }
-    let selected = if person_filter.is_some() {
+    let selected = if person_filter.is_some() || only_person_ids.is_some() {
         verified
             .into_iter()
             .filter(|person| person_matches(person, person_filter))
@@ -722,6 +772,13 @@ pub async fn plan_pending(
     let mut people_held = 0usize;
     for p in selected {
         matched_people += 1;
+        if let Some(reason) =
+            crate::gtm::recipient_sequence_block_reason(db, &pb.key, &p.lead_id, &p)?
+        {
+            people_held += 1;
+            log_outreach(format!("held {}: {reason}", p.name));
+            continue;
+        }
         let context = crate::gtm::prepare_action(db, &pb.key, &p.lead_id, &p)?;
         if !context.sequence_ready_for(n_touches) {
             people_held += 1;
@@ -773,7 +830,7 @@ pub async fn plan_pending(
     // produced 21 touches and exhausted the provider's 12,288-token output
     // boundary before returning valid JSON. Account context is intentionally
     // repeated so one person's failure cannot discard everyone else's copy.
-    let max_recipients_per_call = 1;
+    let max_recipients_per_call = if n_touches == 1 { 4 } else { 1 };
     let leads = db.list_leads(Some(&pb.key))?;
     let roster = todo
         .iter()
@@ -813,7 +870,11 @@ pub async fn plan_pending(
         })
         .collect();
     let business_context = business_copy_context(business);
-    let performance_context = empirical_copy_context(db, &pb.key)?;
+    let performance_context = format!(
+        "{}\n\n{}",
+        empirical_copy_context(db, &pb.key)?,
+        copy_research_rule_context(db, &pb.key)?
+    );
     let stopped_reason = Arc::new(Mutex::new(None::<String>));
     let desired_outcome = desired_outcome.map(str::to_string);
     // Capacity checks and touch promotion form one small critical section. The
@@ -858,6 +919,8 @@ pub async fn plan_pending(
                 return people.into_iter().map(|_| None).collect::<Vec<_>>();
             }
             progress.group("preparing account context", &lead.name, &recipients);
+            let generation_backend = client.backend().as_str().to_string();
+            let generation_model = client.model_label();
             let gtm_contexts = people
                 .iter()
                 .filter_map(|(person, _)| {
@@ -870,7 +933,16 @@ pub async fn plan_pending(
                 .iter()
                 .filter_map(|(person, _)| {
                     let context = gtm_contexts.get(&person.id)?;
-                    match create_building_checkpoint(&db, pb, &lead, person, context, n_touches) {
+                    match create_building_checkpoint(
+                        &db,
+                        pb,
+                        &lead,
+                        person,
+                        context,
+                        n_touches,
+                        &generation_backend,
+                        &generation_model,
+                    ) {
                         Ok(sequence_id) => Some((person.id.clone(), sequence_id)),
                         Err(error) => {
                             log_outreach(format!(
@@ -1131,6 +1203,7 @@ pub async fn plan_pending(
 pub fn supported_touch_count(requested: usize) -> usize {
     match requested.max(1) {
         1 => 1,
+        2 => 2,
         7.. => 7,
         _ => 4,
     }
@@ -1154,6 +1227,9 @@ fn finalize_reviewed_draft(
 ) -> Result<FinalizedDraft> {
     let seq = &copy.sequence;
     let now = Utc::now();
+    let delivery_ready = auto_schedule
+        && gtm_context.sequence_ready_for(seq.touches.len())
+        && crate::gtm::delivery_block_reason(db, pb, lead, person)?.is_none();
     let mut touches_scheduled = 0usize;
     let mut touches_drafted = 0usize;
     for t in &seq.touches {
@@ -1187,7 +1263,7 @@ fn finalize_reviewed_draft(
         let can_automate = t.channel.eq_ignore_ascii_case("email")
             || (t.channel.eq_ignore_ascii_case("linkedin_or_email")
                 && person.linkedin_status != "connected");
-        let status = if can_automate && auto_schedule && passes && gtm_context.action_ready() {
+        let status = if can_automate && delivery_ready && passes {
             "scheduled"
         } else {
             "draft"
@@ -1313,11 +1389,12 @@ async fn plan_sequence(
     } = input;
     let account = planner_account_brief(account);
     let discovery_only = gtm_context.contains("GTM ACTION STATE: discovery_ready");
+    let effective_vantage = response_design::effective_vantage(&person.title, &person.vantage);
     let recipient = json!({
         "name": person.name,
         "first_name": person.first_name,
         "title": person.title,
-        "vantage": person.vantage,
+        "vantage": effective_vantage,
         "likely_access_internal_only": if discovery_only { "" } else { person.can_observe.as_str() },
         "role_response_contract_internal_only": response_design::for_person(person).prompt_value(),
         "operator_requested_outcome_internal_only": desired_outcome.unwrap_or("No narrower outcome supplied; choose the smallest useful cold response for this vantage and evidence state."),
@@ -1416,7 +1493,7 @@ async fn write_account_sequences(
             "name": person.name,
             "first_name": person.first_name,
             "title": person.title,
-            "vantage": person.vantage,
+            "vantage": response_design::effective_vantage(&person.title, &person.vantage),
             "likely_access_internal_only": if discovery_only { "" } else { person.can_observe.as_str() },
             "why_this_person_internal_only": if discovery_only { "Selected from verified title and mapped operating vantage only; do not infer access to the private workflow." } else { person.why_them.as_str() },
             "person_research_status": if person.linkedin_url.trim().is_empty() {
@@ -1445,10 +1522,17 @@ async fn write_account_sequences(
     };
     let writer_knowledge = knowledge.writer.block.clone();
     let brand_trigger_contract = brand_trigger_contract(&pb.key, n);
+    let t1_contract = if n == 1 {
+        "ONE-TOUCH OVERRIDE: This is a research opener, not a miniature commercial cadence. This instruction overrides any generic requirement below to state a seller difference, ask for a call, or offer two response paths. For a discovery_ready recipient, do not choose hold_for_research merely because the private workflow, historical incident, manual step, consequence, or mechanism is unproven; testing one such bounded premise as a question is the purpose of this lane. Hold only when no supplied fact explains account relevance, the title cannot credibly answer, or the premise cannot be kept hypothesis-safe. Write one complete note inside the configured word band with one verified reason for choosing this person, one concrete operating moment, and exactly one factual question answerable in a sentence. The factual question must be the final copy sentence before Andrew's signature. A relevant, low-risk correction from the workflow owner is a sufficient reason to answer. Do not add a capability sentence, research explanation, routing request, or recipient-benefit justification after the question."
+    } else {
+        "MULTI-TOUCH T1 CONTRACT: State one concrete seller difference in plain language and give one easy response path after the operating moment is clear."
+    };
     let writer_instructions = format!(
         r#"Write one {n}-touch no-reply sequence for each recipient. {planning_contract}
 
 {brand_trigger_contract}
+
+{t1_contract}
 
 Think through the buyer-safe brief and copy decision context. Return exactly one result for every person_key. First choose send_decision. Use send only when verified facts support the trigger, the title can credibly answer the ask, and one natural first note can test the hypothesis without pretending it is true. Otherwise choose hold_for_research, explain the missing evidence privately in decision_reason, and return no touches. Abstention is better than filler. For a send decision, privately state the operating decision, mechanism to test, strongest objection, recipient's reason to reply, and supported give-back. Never invent collateral, customer proof, or prior analysis.
 
@@ -1458,12 +1542,13 @@ T1 must use the brand-specific word band. Write it as one natural note, not as a
 
 Before returning T1, privately write five possible subjects and discard any that merely label the category, such as `utility status`, `power alarms`, `claim evidence`, `decision trail`, or `automation question`. Choose a 3-9 word subject that names the recognizable event, decision, object, or consequence in the email and gives this recipient an accurate reason to open. It should remain plain and forwardable, never clickbait. Then read the first two body lines aloud. Rewrite compressed phrases such as `make this decision consequential`, `the distinction I have in mind`, and `the practical difference is` into ordinary spoken English.
 
-For four touches use email/0, email/3, linkedin_request/7, email/14. For seven touches use email/0, email/3, linkedin_request/5, email/9, linkedin_or_email/13, email/17, linkedin_or_email/21. Every email-capable touch must look like an email: `Hi [First name],` on its own line, a coherent message, and the exact signature on its own line. T1 uses one plain, specific 3-9 word operational subject; sentence case or title case is fine. Later email-capable touches preserve it with one re: prefix. A linkedin_request has no subject, greeting, signature, pitch, meeting ask, or prior-email reference; it must stay under 300 characters. It must name the operating question or shared topic that makes connecting useful. Empty compliments such as `substantial remit`, `valuable perspective`, `impressive background`, or `I respect your work` fail.
+For one touch use email/0. For two touches use email/0 and email/6. For four touches use email/0, email/3, linkedin_request/7, email/14. For seven touches use email/0, email/3, linkedin_request/5, email/9, linkedin_or_email/13, email/17, linkedin_or_email/21. Every email-capable touch must look like an email: `[First name],` on its own line without Hi, Hello, or Hey, a coherent message, and the exact signature on its own line. T1 uses one plain, specific 3-9 word operational subject; sentence case or title case is fine. Later email-capable touches preserve it with one re: prefix. A linkedin_request has no subject, greeting, signature, pitch, meeting ask, or prior-email reference; it must stay under 300 characters. It must name the operating question or shared topic that makes connecting useful. Empty compliments such as `substantial remit`, `valuable perspective`, `impressive background`, or `I respect your work` fail.
 
 Purpose and goal are private CRM notes, never substitutes for buyer-facing prose. Before returning, read the whole sequence as the recipient. Remove generic lessons, fragments, surveys, framework language, and repeated retreat lines. In four touches, at most one touch may mainly say Andrew may be wrong, invite a correction/referral, or close; in seven touches the maximum is three. Rewrite any excess around mechanism, useful contribution, and the hard buyer objection. Never reveal play labels, experiment arms, confidence scores, or internal hypotheses."#,
         n = n,
         planning_contract = planning_contract,
         brand_trigger_contract = brand_trigger_contract,
+        t1_contract = t1_contract,
     );
     let writer_user = |recipients: &[Value]| {
         format!(
@@ -1688,7 +1773,19 @@ Purpose and goal are private CRM notes, never substitutes for buyer-facing prose
 }
 
 fn brand_trigger_contract(brand: &str, touches: usize) -> &'static str {
-    if brand == "outagehub" && touches >= 7 {
+    if brand == "gnk" && touches == 1 {
+        "GNK ONE-TOUCH DISCOVERY CONTRACT: Write one diagnostic email only. Lead with one supplied, source-backed company or role fact and one recognizable decision moment. Ask exactly one five-second factual question about whether the named reviewer can see the supporting record immediately or whether another step is needed. Do not claim the workflow is manual, fragmented, recurring, expensive, or consequential unless the account evidence states that directly. Do not mention GnK, pitch software, ask for a meeting, request a referral, offer collateral, or promise a follow-up. The sole goal is a correction or factual reply."
+    } else if brand == "gnk" {
+        "GNK RECOGNITION-FIRST CONTRACT: Copy is allowed only when research supplies all four account-level foundations: a specific recurring decision, a believable operating or economic consequence, an external trigger or direct evidence of the mechanism, and a recipient genuinely close to the work. Company category, scale, geography, department pages, portals, or a generally plausible cross-system workflow are not enough. T1 names the recognizable event and the decision fork, then asks exactly one question that is quick to answer: can the reviewer immediately see what supports the current position, or must someone rebuild the account from named source-safe records? The email may explain one concrete GnK intervention only after the fork is clear. Do not ask the recipient to develop the opportunity, diagnose importance, parse internal labels, or accept a meeting. Avoid 'the distinction I mean', 'my hypothesis is', 'that is the narrow point', 'one practical boundary', 'I am not suggesting', and all research-process narration. Follow-ups must advance with a sourced consequence, operational example, bounded proof, adjacent question, or useful route; never restate or retract T1. If the premise would need an apology or retraction, hold the account instead."
+    } else if brand == "wapahki" && touches == 1 {
+        "WAPAHKI ONE-TOUCH DISCOVERY CONTRACT: Write one 40–80 word plant-floor diagnostic email only. After the greeting, use exactly two body sentences: first, one supplied company fact; second, one factual question; then Andrew's signature. The question is the whole discovery ask and should normally be no more than 25 words: `At [generic final-packing station], is [the handoff] still staffed by hand because [one likely blocker] makes fixed equipment difficult?` Use that as a structural shape, never canned wording. Keep the hypothesized station, staffing consequence, and blocker entirely inside the question so none becomes an asserted company fact. Food manufacturing, co-packing, packaged products, or packaging capabilities support asking about generic final packing or pack-out; a tray, pouch, case, conveyor, machine, or exact movement still requires supplied evidence. Choose exactly one blocker such as sanitation, product shape, package variation, or reset time. Do not add an `or` alternative, line-speed clause, stoppage clause, second consequence, or second diagnostic. Product variety or private-label work never proves changeovers, manual work, or pressure. Do not ask the recipient to find a use case, classify variation, evaluate a robot, take a meeting, route the email, or review collateral. Do not mention Wapahki or pitch robotics."
+    } else if brand == "wapahki" {
+        "WAPAHKI PLANT-FIRST CONTRACT: T1 must follow this response path: one source-supported physical station or handoff; one observed operating condition; one suspected consequence such as staffing, overtime, throughput, stoppage, utilization, short-run economics, ergonomics, safety, sanitation, or changeover cost; one likely reason ordinary automation struggles; and exactly one factual question answerable from memory. Arrive with the candidate task and invite correction. Never ask the recipient to inspect the plant, identify any use case, classify where variation enters, or evaluate Wapahki's task boundary. Product variety, owned brands, and private-label work do not prove changeovers, manual packing, low volume, staffing pressure, or failed automation. Wapahki, robotics, and Andrew's robotics biography are optional and must not appear before the plant moment and question. T2 adds the suspected economic reason or one new operating fact. T3 is a plant-specific human connection reason, not a miniature pitch. T4 names one plausible alternative owner or closes without repeating the repeatability-versus-format thesis. Do not explain the normal-case/exception architecture before the recipient confirms why the job remains manual."
+    } else if brand == "outagehub" && touches == 1 {
+        "OUTAGEHUB ONE-TOUCH DISCOVERY CONTRACT: Write one diagnostic email only. Use one supplied fact about the recipient's operated Canadian locations, charging footprint, or outage-sensitive role. Name the exact moment an entire site goes dark and ask exactly one factual question: does the team check local utility status before its next equipment ticket, dispatch, or customer-status step, or do internal systems settle the cause? Choose only one downstream step. That question must be the final sentence before Andrew's signature; nothing may follow it. Do not claim a historical match, manual reconciliation, avoidable dispatch, delay, or multi-site effect unless supplied evidence proves it. Do not mention OutageHub, pitch an API, ask for a meeting or referral, offer an example, narrate the research, or create a follow-up."
+    } else if brand == "outagehub" && touches == 2 {
+        "OUTAGEHUB TWO-EMAIL EVIDENCE CONTRACT: This experiment targets operated Canadian EV-charging networks only. T1 names one exact incident moment: an entire charging site goes dark. State the useful job in operator language: determine whether the failure is upstream utility supply before opening an equipment/network ticket, dispatching a technician, or updating driver/customer status. Ask exactly one easy disqualifying question about whether Service Operations still checks the local utility map or whether telemetry settles the cause immediately. Do not ask the recipient to validate an invented multi-site prioritization theory. Do not use abstract phrases such as external context, operational action, reported interruption, reconcile records, classification path, or which response step takes the most time. T2 lands six days later and is allowed only when the account brief contains a real, location-specific historical match or measured example; provide the verified timestamp/location result and ask one short follow-on question. Never manufacture that asset or promise it before it exists. If no real historical example is present, hold the sequence rather than write filler. Two emails are the whole cadence; there is no LinkedIn touch, routing bump, disclaimer paragraph, or breakup email."
+    } else if brand == "outagehub" && touches >= 7 {
         "OUTAGEHUB SEVEN-TOUCH CONTRACT: A stable sourced fact about the prospect's operated site/network footprint can be the trigger; a recent utility outage is not required and must never be invented. T1 is a complete founder note, normally 100-150 words: directly explain why this person was chosen, describe one recognizable outage-time decision and a restrained practical consequence of uncertainty, name OutageHub and the specific outside utility context it could add beyond alarms or site calls, then offer a short conversation or email reply. Do not compress those ideas into internal-memo phrases or expand them into a dossier. T2 sharpens the diagnostic with one new distinction. T3 is only a human, recipient-specific reason to connect: no product explainer, collateral, meeting ask, or prior-email reference. T4 contributes a useful comparison or supported work product; a historical example is optional and may name a prospect location, incident, or outage window only when that detail appears in verified facts or the recipient first supplies it. T5 answers the strongest objection, usually what this adds beyond alarms, telemetry, or site calls. T6 routes once. T7 closes without another pitch. State the public-versus-private data limitation at most once across the sequence. Do not repeat the same utility-data mechanism in more than two touches or offer the same artifact twice."
     } else if brand == "outagehub" {
         "OUTAGEHUB FOUR-TOUCH CONTRACT: A stable sourced fact about the prospect's operated site/network footprint can be the trigger; a recent utility outage is not required and must never be invented. T1 should read like a complete 100-150 word founder note: why this person, one recognizable outage-time decision, a restrained practical consequence, one plain OutageHub explanation, and a short conversation or email reply. Do not compress those ideas into internal-memo phrases or expand them into a dossier. T2 must add one new diagnostic distinction and may offer one supported work product. A historical comparison may name a prospect location, incident, or outage window only when that detail appears in verified facts or the recipient first supplies it. T3 is only a human, recipient-specific reason to connect: no product explainer, historical comparison, collateral, meeting ask, or prior-email reference. T4 routes or closes the same question without explaining public outage data again. State the public-versus-private data limitation at most once across the sequence. Do not repeat the same utility-data mechanism in more than two touches."
@@ -1782,6 +1879,8 @@ async fn review_person_copy(
         critique,
         &reviewer_knowledge,
         Some(&person_progress),
+        Some(db),
+        &person.id,
     )
     .await?;
     if critique && sales_council_enabled(lean) {
@@ -1827,12 +1926,12 @@ fn sales_council_enabled(_lean_api: bool) -> bool {
     }
 }
 
-/// Production QA normally uses at most two model calls per recipient: one
-/// repair plus one independent verification, or one verification plus one
-/// semantic repair. A third call handles normal recovery; a fourth is available
-/// only when a semantic rewrite itself introduces an exact mechanical defect.
-/// Rust reruns its deterministic rules after every edit, so the recovery
-/// allowance cannot weaken the sendability envelope.
+/// Autoresearch-style copy loop. The rubric and deterministic envelope stay
+/// locked while the sequence is the editable candidate. Every failed audit is
+/// appended to the event ledger and compiled into a reusable brand rule; each
+/// repair produces a new candidate. Two consecutive clean independent audits
+/// are the convergence rule. A hard model-call budget prevents subjective QA
+/// from becoming an unbounded token sink.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn review_and_edit_sequence_lean(
     client: &Engine,
@@ -1845,6 +1944,8 @@ pub(crate) async fn review_and_edit_sequence_lean(
     critique: bool,
     knowledge: &str,
     progress: Option<&(dyn Fn(&str) + Send + Sync)>,
+    research_db: Option<&SharedDb>,
+    research_person_id: &str,
 ) -> Result<Vec<TouchReview>> {
     scrub_ai_punctuation(sequence);
     enforce_email_signatures(sequence, &pb.signature);
@@ -1868,21 +1969,32 @@ pub(crate) async fn review_and_edit_sequence_lean(
     }
 
     let review_system = pb.review_system_prompt(shared);
-
-    // Three calls cover the normal repair/verify path. A fourth is reserved
-    // only when a semantic rewrite introduces an exact deterministic defect;
-    // throwing away otherwise useful copy at that point is worse than one
-    // tightly scoped cleanup.
-    const MAX_QA_CALLS: usize = 4;
+    let max_qa_calls = std::env::var("SPRUCE_COPY_RESEARCH_MAX_QA_CALLS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(8)
+        .clamp(4, 16);
     let mut qa_calls = 0usize;
+    let mut research_round = 0usize;
 
-    // Mechanical findings are exact and cheap to validate. Most clear in one
-    // economical repair. One more economical attempt is allowed only when the
-    // first editor violates the repair contract or introduces another exact
-    // finding; rejecting the entire recipient for a missing field or a single
-    // word-count miss wastes an otherwise valid sequence.
     if !deterministic.is_empty() {
+        research_round += 1;
+        record_copy_research_attempt(
+            research_db,
+            pb,
+            research_person_id,
+            sequence,
+            research_round,
+            "mechanical_findings",
+            &deterministic,
+        );
         for round in 0..2 {
+            if qa_calls >= max_qa_calls {
+                return Err(anyhow!(
+                    "copy research budget exhausted before mechanical convergence: {}",
+                    deterministic.join("; ")
+                ));
+            }
             report_review_progress(
                 progress,
                 if round == 0 {
@@ -1930,6 +2042,16 @@ pub(crate) async fn review_and_edit_sequence_lean(
                 break;
             }
             if round == 1 {
+                research_round += 1;
+                record_copy_research_attempt(
+                    research_db,
+                    pb,
+                    research_person_id,
+                    sequence,
+                    research_round,
+                    "mechanical_repair_failed",
+                    &deterministic,
+                );
                 return Err(anyhow!(
                     "copy could not clear mechanical QA after one recovery: {}",
                     deterministic.join("; ")
@@ -1938,144 +2060,349 @@ pub(crate) async fn review_and_edit_sequence_lean(
         }
     }
 
-    // A single independent recipient-level check is the normal path. It sees
-    // the exact wording and cannot edit while judging it.
-    report_review_progress(progress, "running independent final verification");
-    let verification = request_copy_review_full(
-        client,
-        &review_system,
-        pb,
-        account,
-        contact,
-        sequence,
-        &[],
-        expected_touches,
-        true,
-        knowledge,
-    )
-    .await?;
-    qa_calls += 1;
-    validate_editor_stages(&verification, sequence)?;
-    let unresolved = verification_findings(&verification);
-    if unresolved.is_empty() {
-        report_review_progress(progress, "copy QA passed");
-        return Ok(approved_reviews(verification));
-    }
-
-    // Preserve an independent verifier. When the normal mechanical repair and
-    // verification used two calls, the one recovery call may address its exact
-    // semantic findings. If a prior contract failure already consumed that
-    // allowance, stop rather than opening an unbounded loop.
-    if qa_calls >= MAX_QA_CALLS {
-        return Err(anyhow!(
-            "copy did not clear independent verification after bounded recovery: {}",
-            unresolved.join(" | ")
-        ));
-    }
-
-    // Mechanically clean copy gets one coherent, targeted repair based on the
-    // independent verifier. The repair response grades its final wording; Rust
-    // independently reruns every envelope and evidence-safe rule afterward.
-    report_review_progress(
-        progress,
-        "repairing independent-verifier feedback · bounded repair",
-    );
-    let repair = request_copy_review_full(
-        client,
-        &review_system,
-        pb,
-        account,
-        contact,
-        sequence,
-        &unresolved,
-        expected_touches,
-        false,
-        knowledge,
-    )
-    .await?;
-    qa_calls += 1;
-    validate_editor_stages(&repair, sequence)?;
-    let apply_error = apply_targeted_repairs(sequence, &repair, &unresolved, expected_touches)
-        .err()
-        .map(|error| error.to_string());
-    scrub_ai_punctuation(sequence);
-    enforce_email_signatures(sequence, &pb.signature);
-    let mut after_repair = account_sequence_quality_issues(
-        pb,
-        shared,
-        account,
-        sequence,
-        &[],
-        expected_touches,
-        false,
-    );
-    if let Some(error) = apply_error {
-        after_repair.push(error);
-    }
-    after_repair.sort();
-    after_repair.dedup();
-
-    // A semantic edit can accidentally add a fourth question, miss a word
-    // band, or omit the requested body. Repair only those exact stages once;
-    // this is the reserved fourth call on the verify→repair recovery path.
-    let mut approval_doc = repair;
-    if !after_repair.is_empty() {
-        if qa_calls >= MAX_QA_CALLS {
-            return Err(anyhow!(
-                "semantic repair exhausted recovery with mechanical findings: {}",
-                after_repair.join("; ")
-            ));
-        }
+    let mut consecutive_clean_audits = 0usize;
+    let mut last_findings = Vec::<String>::new();
+    while qa_calls < max_qa_calls {
+        let novelty_audit = consecutive_clean_audits == 1;
         report_review_progress(
             progress,
-            "repairing post-review mechanical findings · final recovery",
+            if novelty_audit {
+                "running second independent no-new-problems audit"
+            } else {
+                "running independent research audit"
+            },
         );
-        let cleanup = request_copy_review(
+        let audit_knowledge = if novelty_audit {
+            format!(
+                "{knowledge}\n\nSECOND-PASS NOVELTY AUDIT: a prior independent audit found no actionable defect. Try to falsify that clean result by looking for one material issue it may have missed in recognition, consequence, evidence, role fit, reply cost, sequence progression, or natural voice. Do not invent a nitpick. Return clean only if the exact copy is genuinely ready unchanged."
+            )
+        } else {
+            knowledge.to_string()
+        };
+        let verification = request_copy_review_full(
             client,
             &review_system,
             pb,
             account,
             contact,
             sequence,
-            &after_repair,
+            &[],
+            expected_touches,
+            true,
+            &audit_knowledge,
+        )
+        .await?;
+        qa_calls += 1;
+        research_round += 1;
+        validate_editor_stages(&verification, sequence)?;
+        let unresolved = verification_findings(&verification);
+        if unresolved.is_empty() {
+            consecutive_clean_audits += 1;
+            record_copy_research_attempt(
+                research_db,
+                pb,
+                research_person_id,
+                sequence,
+                research_round,
+                if consecutive_clean_audits >= 2 {
+                    "converged"
+                } else {
+                    "clean_audit"
+                },
+                &[],
+            );
+            if consecutive_clean_audits >= 2 {
+                report_review_progress(progress, "copy research converged · two clean audits");
+                return Ok(approved_reviews(verification));
+            }
+            continue;
+        }
+
+        consecutive_clean_audits = 0;
+        last_findings = unresolved.clone();
+        record_copy_research_attempt(
+            research_db,
+            pb,
+            research_person_id,
+            sequence,
+            research_round,
+            "audit_findings",
+            &unresolved,
+        );
+        if qa_calls >= max_qa_calls {
+            break;
+        }
+
+        report_review_progress(
+            progress,
+            format!(
+                "research round {research_round} found {} issue(s) · regenerating candidate",
+                unresolved.len()
+            ),
+        );
+        let repair = request_copy_review_full(
+            client,
+            &review_system,
+            pb,
+            account,
+            contact,
+            sequence,
+            &unresolved,
             expected_touches,
             false,
             knowledge,
         )
         .await?;
         qa_calls += 1;
-        validate_editor_stages(&cleanup, sequence)?;
-        apply_targeted_repairs(sequence, &cleanup, &after_repair, expected_touches)?;
+        validate_editor_stages(&repair, sequence)?;
+        apply_targeted_repairs(sequence, &repair, &unresolved, expected_touches)?;
         scrub_ai_punctuation(sequence);
         enforce_email_signatures(sequence, &pb.signature);
-        let after_cleanup = account_sequence_quality_issues(
-            pb,
-            shared,
-            account,
-            sequence,
-            &[],
-            expected_touches,
-            false,
-        );
-        if !after_cleanup.is_empty() {
-            return Err(anyhow!(
-                "copy could not clear final mechanical recovery: {}",
-                after_cleanup.join("; ")
-            ));
+
+        let repair_grade = review_grade_findings(&repair);
+        if !repair_grade.is_empty() {
+            research_round += 1;
+            record_copy_research_attempt(
+                research_db,
+                pb,
+                research_person_id,
+                sequence,
+                research_round,
+                "repair_self_grade_findings",
+                &repair_grade,
+            );
         }
-        approval_doc = cleanup;
+
+        let mut mechanical_rounds = 0usize;
+        loop {
+            deterministic = account_sequence_quality_issues(
+                pb,
+                shared,
+                account,
+                sequence,
+                &[],
+                expected_touches,
+                false,
+            );
+            if deterministic.is_empty() {
+                break;
+            }
+            research_round += 1;
+            record_copy_research_attempt(
+                research_db,
+                pb,
+                research_person_id,
+                sequence,
+                research_round,
+                "repair_introduced_mechanical_findings",
+                &deterministic,
+            );
+            if qa_calls >= max_qa_calls || mechanical_rounds >= 2 {
+                last_findings = deterministic.clone();
+                break;
+            }
+            mechanical_rounds += 1;
+            report_review_progress(
+                progress,
+                "repair introduced exact findings · regenerating named stages",
+            );
+            let cleanup = request_copy_review(
+                client,
+                &review_system,
+                pb,
+                account,
+                contact,
+                sequence,
+                &deterministic,
+                expected_touches,
+                false,
+                knowledge,
+            )
+            .await?;
+            qa_calls += 1;
+            validate_editor_stages(&cleanup, sequence)?;
+            apply_targeted_repairs(sequence, &cleanup, &deterministic, expected_touches)?;
+            scrub_ai_punctuation(sequence);
+            enforce_email_signatures(sequence, &pb.signature);
+        }
+        if !deterministic.is_empty() {
+            break;
+        }
     }
 
-    debug_assert!(qa_calls <= MAX_QA_CALLS);
-    let repair_findings = review_grade_findings(&approval_doc);
-    if !repair_findings.is_empty() {
-        return Err(anyhow!(
-            "copy did not clear the bounded repair sendability gate: {}",
-            repair_findings.join(" | ")
-        ));
+    let reason = if last_findings.is_empty() {
+        "the fixed copy-research budget ended before two consecutive independent clean audits"
+            .to_string()
+    } else {
+        format!(
+            "the fixed copy-research budget ended with unresolved findings: {}",
+            last_findings.join(" | ")
+        )
+    };
+    Err(anyhow!("copy research did not converge: {reason}"))
+}
+
+fn record_copy_research_attempt(
+    db: Option<&SharedDb>,
+    pb: &Playbook,
+    person_id: &str,
+    sequence: &CopySequence,
+    round: usize,
+    status: &str,
+    findings: &[String],
+) {
+    let Some(db) = db else {
+        return;
+    };
+    let candidate = serde_json::to_string(&sequence.touches).unwrap_or_default();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    candidate.hash(&mut hasher);
+    let detail = json!({
+        "copy_policy_version": CURRENT_COPY_POLICY_VERSION,
+        "round": round,
+        "candidate_hash": format!("{:016x}", hasher.finish()),
+        "status": status,
+        "findings": findings,
+    });
+    let _ = db.log_event(
+        &pb.key,
+        person_id,
+        "",
+        "copy_research_attempt",
+        &detail.to_string(),
+    );
+    for finding in findings {
+        let (key, subject) = copy_research_rule(finding);
+        let compact = finding.chars().take(600).collect::<String>();
+        let _ = db.record_learning(&pb.key, "copy_research_rule", &subject, &key, &compact);
     }
-    report_review_progress(progress, "copy QA passed");
-    Ok(approved_reviews(approval_doc))
+}
+
+fn copy_research_rule(finding: &str) -> (String, String) {
+    let finding = finding.to_ascii_lowercase();
+    let category = if [
+        "invent",
+        "unsupported",
+        "unverified",
+        "evidence",
+        "not a fact",
+        "premise",
+    ]
+    .iter()
+    .any(|term| finding.contains(term))
+    {
+        Some((
+            "evidence_before_copy",
+            "Require problem evidence, not company fit",
+        ))
+    } else if [
+        "reason to answer",
+        "easy to answer",
+        "reply",
+        "recipient value",
+        "recognizable",
+        "develop the opportunity",
+    ]
+    .iter()
+    .any(|term| finding.contains(term))
+    {
+        Some((
+            "reply_likelihood",
+            "Lower the recipient's work and raise recognition",
+        ))
+    } else if [
+        "consequence",
+        "economic",
+        "material",
+        "why it matters",
+        "stakes",
+    ]
+    .iter()
+    .any(|term| finding.contains(term))
+    {
+        Some((
+            "consequence_missing",
+            "Name a believable operating consequence",
+        ))
+    } else if [
+        "repeat",
+        "restat",
+        "follow-up",
+        "follow up",
+        "sequence progression",
+        "same argument",
+    ]
+    .iter()
+    .any(|term| finding.contains(term))
+    {
+        Some((
+            "sequence_progression",
+            "Every follow-up must add something new",
+        ))
+    } else if [
+        "internal memo",
+        "generated",
+        "abstract",
+        "jargon",
+        "unnatural",
+        "framework",
+    ]
+    .iter()
+    .any(|term| finding.contains(term))
+    {
+        Some((
+            "natural_voice",
+            "Replace research language with operator language",
+        ))
+    } else if ["recipient", "role fit", "wrong contact", "vantage", "owner"]
+        .iter()
+        .any(|term| finding.contains(term))
+    {
+        Some((
+            "role_proximity",
+            "Use a recipient close enough to the decision",
+        ))
+    } else if [
+        "historical result",
+        "historical match",
+        "timestamp",
+        "location-specific",
+    ]
+    .iter()
+    .any(|term| finding.contains(term))
+    {
+        Some((
+            "proof_before_followup",
+            "Do not promise evidence before it exists",
+        ))
+    } else if [
+        "word",
+        "question",
+        "subject",
+        "signature",
+        "day offset",
+        "channel",
+        "forbidden phrase",
+    ]
+    .iter()
+    .any(|term| finding.contains(term))
+    {
+        Some((
+            "mechanical_sendability",
+            "Clear the exact sendability envelope",
+        ))
+    } else {
+        None
+    };
+    if let Some((key, subject)) = category {
+        return (key.to_string(), subject.to_string());
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    finding.hash(&mut hasher);
+    (
+        format!("provisional_{:016x}", hasher.finish()),
+        "Provisional independent-review finding".into(),
+    )
 }
 
 fn verification_findings(doc: &EditDoc) -> Vec<String> {
@@ -2286,7 +2613,7 @@ fn copy_contact(person: &crate::db::Person) -> CopyContact {
     CopyContact {
         name: person.name.clone(),
         title: person.title.clone(),
-        vantage: person.vantage.clone(),
+        vantage: response_design::effective_vantage(&person.title, &person.vantage),
         can_observe: person.can_observe.clone(),
         why_them: person.why_them.clone(),
         primary: person.primary,
@@ -3002,10 +3329,16 @@ async fn request_copy_review_with_tier(
         "SCHEMA CONTRACT: first grade the entire sequence for coherence, relevance, repetition, and whether a sensible recipient has a reason to answer. Then return exactly one review object for every stage 1 through {expected_touches}, even when only a subset needs repair. A sequence passes only at 85+ with no unresolved sequence issues. For an unnamed stage that does not need editing, preserve it with empty revised fields."
     );
     let brand_contract = brand_trigger_contract(&pb.key, expected_touches);
+    let sendability_contract = if expected_touches == 1 {
+        "ONE-TOUCH SENDABILITY: This is a bounded research opener. This rule overrides any generic demand for a seller difference, capability sentence, collateral, or meeting ask. Pass when a verified account/role fact explains why this person was chosen and leads to exactly one concrete operating question that the recipient can answer quickly and without face risk. The operating moment may be the explicitly labeled hypothesis; it does not need to be public fact, but it must remain inside the question and must not become an asserted event, mechanism, or consequence. A relevant correction from the workflow owner is enough reason to answer. The factual question may be the final sentence; do not demand a second recipient-benefit closing. Reject generic moments, invented consequences, research-process narration, or a question that asks the recipient to discover the use case."
+    } else {
+        "SENDABILITY: Reject T1 if it is merely a diagnostic question plus a vague capability sentence. Require one verified trigger, one operating decision, one concrete seller difference, and a role-relevant reason to answer. Curiosity is not recipient value. Never require or invent collateral. T2 must advance the mechanism. Any later touch must add a sourced fact, useful distinction, honest objection answer, route, or close rather than paraphrase."
+    };
     let user = format!(
-        "{task}\n\n{stage_contract}\n{brand_contract}\nCHANNEL: linkedin_request has no subject; linkedin_or_email must work as either a DM or a complete email fallback. A LinkedIn request must give a concrete operating reason to connect, not praise the recipient's remit, background, perspective, or work.\nINBOX TEST: grade T1's subject and first two lines before the rest. A subject that merely labels the category (`utility status`, `power alarms`, `claim evidence`, `decision trail`, `automation question`) fails even if relevant. Require a plain 3-9 word phrase naming the operating event, decision, object, or consequence that makes this exact email worth opening. No clickbait. Reject internal-memo prose such as `make this decision consequential`, `the distinction I have in mind`, and `the practical difference is`; Andrew must be able to say every line naturally aloud.\nSENDABILITY: reject T1 if it is merely a diagnostic question plus a vague capability sentence. Require one verified trigger, one operating decision, one concrete seller difference, and a role-relevant reason to answer. Curiosity is not recipient value. Never require or invent collateral. T2 must advance the mechanism. Any later touch must add a sourced fact, useful distinction, honest objection answer, route, or close rather than paraphrase.\nEVIDENCE: the verified facts below are exhaustive. The hypothesis is not fact. Never invent an internal event, system, practice, consequence, or ownership claim.\n\nSIGNATURE: {signature}\nVERIFIED FACTS: {facts}\nHYPOTHESIS, NOT FACT: {hypothesis}\nRECIPIENT: {name} ({title}, {vantage})\nLIKELY ACCESS, INTERNAL ONLY: {can_observe}\nROLE RESPONSE CONTRACT (private; test role fit, reply cost, and face risk without inventing personality):\n{role_contract}\nDETERMINISTIC FINDINGS: {deterministic}\n\nCURRENT SEQUENCE:\n{sequence}\n\nRELEVANT REVIEW KNOWLEDGE:\n{knowledge}",
+        "{task}\n\n{stage_contract}\n{brand_contract}\n{sendability_contract}\nCHANNEL: linkedin_request has no subject; linkedin_or_email must work as either a DM or a complete email fallback. A LinkedIn request must give a concrete operating reason to connect, not praise the recipient's remit, background, perspective, or work.\nINBOX TEST: grade T1's subject and first two lines before the rest. A subject that merely labels the category (`utility status`, `power alarms`, `claim evidence`, `decision trail`, `automation question`) fails even if relevant. Require a plain 3-9 word phrase naming the operating event, decision, object, or consequence that makes this exact email worth opening. No clickbait. Reject internal-memo prose such as `make this decision consequential`, `the distinction I have in mind`, and `the practical difference is`; Andrew must be able to say every line naturally aloud.\nEVIDENCE: the verified facts below are exhaustive. The hypothesis is not fact. Never invent an internal event, system, practice, consequence, or ownership claim.\n\nSIGNATURE: {signature}\nVERIFIED FACTS: {facts}\nHYPOTHESIS, NOT FACT: {hypothesis}\nRECIPIENT: {name} ({title}, {vantage})\nLIKELY ACCESS, INTERNAL ONLY: {can_observe}\nROLE RESPONSE CONTRACT (private; test role fit, reply cost, and face risk without inventing personality):\n{role_contract}\nDETERMINISTIC FINDINGS: {deterministic}\n\nCURRENT SEQUENCE:\n{sequence}\n\nRELEVANT REVIEW KNOWLEDGE:\n{knowledge}",
         task = task,
         brand_contract = brand_contract,
+        sendability_contract = sendability_contract,
         signature = pb.signature,
         facts = verified_facts,
         hypothesis = account.hypothesis,
@@ -3147,6 +3480,31 @@ fn empirical_copy_context(db: &SharedDb, brand: &str) -> Result<String> {
     }))?)
 }
 
+fn copy_research_rule_context(db: &SharedDb, brand: &str) -> Result<String> {
+    let rules = db.recent_learnings(Some(brand), Some("copy_research_rule"), 20)?;
+    if rules.is_empty() {
+        return Ok("OUTREACH RESEARCH RULES: no prior independent-review defects have been compiled for this copy policy yet.".into());
+    }
+    let rows = rules
+        .into_iter()
+        .map(|rule| {
+            let maturity = if rule.hits >= 2 {
+                "durable"
+            } else {
+                "provisional"
+            };
+            format!(
+                "- [{maturity}; {} observations] {}: {}",
+                rule.hits, rule.subject, rule.detail
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(format!(
+        "OUTREACH RESEARCH RULES (apply durable rules; treat one-off findings as provisional and never paste their wording):\n{rows}"
+    ))
+}
+
 fn person_matches(person: &crate::db::Person, filter: Option<&str>) -> bool {
     let Some(filter) = filter.map(str::trim).filter(|value| !value.is_empty()) else {
         return true;
@@ -3175,41 +3533,17 @@ fn select_people_for_planning(
             continue;
         };
         candidates.sort_by(|left, right| {
-            planning_priority(right)
-                .cmp(&planning_priority(left))
+            response_design::contact_priority(&right.title, &right.vantage, right.primary)
+                .cmp(&response_design::contact_priority(
+                    &left.title,
+                    &left.vantage,
+                    left.primary,
+                ))
                 .then_with(|| left.name.cmp(&right.name))
         });
         selected.extend(candidates.into_iter().take(per_account.max(1)));
     }
     selected
-}
-
-fn planning_priority(person: &crate::db::Person) -> i32 {
-    let vantage = person.vantage.to_ascii_lowercase();
-    let mut score = if person.primary { 100 } else { 0 };
-    score += match vantage.as_str() {
-        "process_owner" => 70,
-        "operator" => 65,
-        "operational_executive" => 55,
-        "economic_buyer" => 40,
-        "technical_evaluator" => 25,
-        "router" => 10,
-        _ => 0,
-    };
-    let title = person.title.to_ascii_lowercase();
-    if [
-        "recruit",
-        "talent",
-        "human resources",
-        "business development",
-        "sales",
-    ]
-    .iter()
-    .any(|term| title.contains(term))
-    {
-        score -= 60;
-    }
-    score
 }
 
 fn normalize_principle_ids(ids: &[String], allowed: &[String]) -> Vec<String> {
@@ -3329,7 +3663,7 @@ fn touch_word_band(pb: &Playbook, touch: &CopyTouch) -> (usize, usize) {
             // tolerance so a natural 69-word GnK note is not sent through two
             // model repairs merely to add a filler word to a 70-word target.
             1 => (
-                pb.min_words.saturating_sub(10),
+                pb.min_words.saturating_sub(20),
                 pb.max_words.saturating_add(10),
             ),
             // These are still emails, not caption-sized blurbs. T2 sharpens
@@ -3397,6 +3731,78 @@ fn touch_question_limit(stage: u32) -> usize {
     }
 }
 
+/// Count whole epistemic moves, not every cautious modal. Source-safe artifact
+/// language can naturally use "may be" once or twice; the failure mode we want
+/// to catch is a note that keeps reopening or apologizing for its hypothesis.
+fn gnk_hedge_moves(body: &str) -> usize {
+    let body = body.to_ascii_lowercase();
+    [
+        "my guess is",
+        "i assume",
+        "i wonder",
+        "i'm wondering",
+        "i am wondering",
+        "i do not know",
+        "i don't know",
+        "if this exists",
+        "if the answer",
+        "if the latter",
+        "there may be nothing",
+        "there might be nothing",
+        "may already solve",
+        "might already solve",
+        "could already solve",
+        "may already handle",
+        "might already handle",
+        "could already handle",
+        "perhaps",
+        "possibly",
+    ]
+    .iter()
+    .filter(|phrase| body.contains(**phrase))
+    .count()
+}
+
+fn wapahki_names_operating_consequence(body: &str) -> bool {
+    let body = body.to_ascii_lowercase();
+    [
+        "staffing",
+        "staffed by hand",
+        "staffed manually",
+        "needs people",
+        "need people",
+        "needs operators",
+        "need operators",
+        "vacan",
+        "hard-to-fill",
+        "hard to fill",
+        "overtime",
+        "throughput",
+        "output",
+        "line stop",
+        "stoppage",
+        "downtime",
+        "utilization",
+        "short run",
+        "short-run",
+        "ergonomic",
+        "injur",
+        "safety",
+        "sanitation",
+        "payback",
+        "capacity",
+        "bottleneck",
+        "shift coverage",
+        "idle",
+        "keep the line moving",
+        "cannot keep up",
+        "can't keep up",
+        "changeover cost",
+    ]
+    .iter()
+    .any(|marker| body.contains(marker))
+}
+
 fn mentions_outreach_asset(body: &str) -> bool {
     let body = body.to_ascii_lowercase();
     [
@@ -3436,6 +3842,60 @@ fn explains_outagehub_signal(body: &str) -> bool {
     ]
     .iter()
     .any(|term| body.contains(term))
+}
+
+fn names_historical_outage_result(body: &str) -> bool {
+    let body = body.to_ascii_lowercase();
+    let result = [
+        "i matched",
+        "we matched",
+        "i found",
+        "we found",
+        "overlapped",
+        "fell inside",
+        "reported at",
+    ]
+    .iter()
+    .any(|term| body.contains(term));
+    let place = ["location", "charging site", "station", "site in", " at "]
+        .iter()
+        .any(|term| body.contains(term));
+    let outage = ["utility outage", "utility report", "outage area"]
+        .iter()
+        .any(|term| body.contains(term));
+    let time = body.chars().any(|character| character.is_ascii_digit())
+        && [
+            "timestamp",
+            "2024",
+            "2025",
+            "2026",
+            "january",
+            "february",
+            "march",
+            "april",
+            "may",
+            "june",
+            "july",
+            "august",
+            "september",
+            "october",
+            "november",
+            "december",
+        ]
+        .iter()
+        .any(|term| body.contains(term));
+    let hypothetical = [
+        "can prepare",
+        "could prepare",
+        "would prepare",
+        "may match",
+        "could match",
+        "would match",
+        "example could",
+    ]
+    .iter()
+    .any(|term| body.contains(term));
+    result && place && outage && time && !hypothetical
 }
 
 fn states_outagehub_data_boundary(body: &str) -> bool {
@@ -3793,13 +4253,16 @@ fn sequence_quality_issues(
                     .find(|line| !line.is_empty())
                     .unwrap_or("");
                 let greeting_words = greeting.split_whitespace().count();
-                if !greeting.starts_with("Hi ")
-                    || !greeting.ends_with(',')
-                    || !(2..=4).contains(&greeting_words)
+                let greeting_lower = greeting.to_ascii_lowercase();
+                if !greeting.ends_with(',')
+                    || !(1..=3).contains(&greeting_words)
                     || greeting.contains('?')
+                    || greeting_lower.starts_with("hi ")
+                    || greeting_lower.starts_with("hello ")
+                    || greeting_lower.starts_with("hey ")
                 {
                     issues.push(format!(
-                        "stage {} must start with 'Hi [First name],' on its own line",
+                        "stage {} must start with '[First name],' on its own line without Hi, Hello, or Hey",
                         touch.stage
                     ));
                 }
@@ -3811,12 +4274,12 @@ fn sequence_quality_issues(
             // writer toward fragments. Word bands and the independent reviewer
             // carry style; this gate catches only empty or sprawling output.
             let sentence_limit_ok = if touch.stage == 1 {
-                (3..=12).contains(&sentences)
+                (2..=12).contains(&sentences)
             } else {
                 (1..=8).contains(&sentences)
             };
             if !sentence_limit_ok {
-                let expected = if touch.stage == 1 { "3–12" } else { "1–8" };
+                let expected = if touch.stage == 1 { "2–12" } else { "1–8" };
                 issues.push(format!(
                     "stage {} has {sentences} copy sentences (needs {expected})",
                     touch.stage
@@ -3838,12 +4301,91 @@ fn sequence_quality_issues(
             }
         }
         let question_limit = touch_question_limit(touch.stage);
-        if touch.body.matches('?').count() > question_limit {
+        let question_count = touch.body.matches('?').count();
+        if question_count > question_limit {
             issues.push(if touch.stage == 1 {
                 "stage 1 asks more than one central operating question plus one CTA".to_string()
             } else {
                 format!("stage {} asks more than one question", touch.stage)
             });
+        }
+        if pb.key == "gnk" && touch.stage == 1 {
+            if question_count != 1 {
+                issues.push(format!(
+                    "GnK stage 1 must contain exactly one five-second operating question (found {question_count})"
+                ));
+            }
+            let body = touch.body.to_ascii_lowercase();
+            if let Some(gnk_position) = body.find("gnk") {
+                if body
+                    .find('?')
+                    .is_none_or(|question_position| gnk_position < question_position)
+                {
+                    issues.push(
+                        "GnK stage 1 introduces the seller before the operating question; make the event and pain legible first"
+                            .into(),
+                    );
+                }
+            }
+            let hedge_moves = gnk_hedge_moves(&touch.body);
+            if hedge_moves > 1 {
+                issues.push(format!(
+                    "GnK stage 1 stacks {hedge_moves} hypothesis caveats (maximum 1); state one sharp guess and move to the easy question"
+                ));
+            }
+        }
+        if pb.key == "wapahki" && touch.stage == 1 {
+            if question_count != 1 {
+                issues.push(format!(
+                    "Wapahki stage 1 must contain exactly one factual plant-floor question (found {question_count})"
+                ));
+            }
+            let body = touch.body.to_ascii_lowercase();
+            if let Some(wapahki_position) = body.find("wapahki") {
+                if body
+                    .find('?')
+                    .is_none_or(|question_position| wapahki_position < question_position)
+                {
+                    issues.push(
+                        "Wapahki stage 1 introduces the robotics thesis before the plant-floor question"
+                            .into(),
+                    );
+                }
+            }
+            if !wapahki_names_operating_consequence(&touch.body) {
+                issues.push(
+                    "Wapahki stage 1 names no operating consequence; connect the candidate task to staffing, throughput, stoppage, utilization, economics, safety, or sanitation"
+                        .into(),
+                );
+            }
+            if let Some(question_end) = touch.body.rfind('?') {
+                let through_question = &touch.body[..=question_end];
+                let question_start = through_question[..question_end]
+                    .rfind(|character: char| matches!(character, '.' | '!' | '\n'))
+                    .map_or(0, |position| position + 1);
+                let question = through_question[question_start..].trim();
+                let question_words = question.split_whitespace().count();
+                if question_words > 30 {
+                    issues.push(format!(
+                        "Wapahki stage 1 question is {question_words} words (maximum 30); test one station, one staffing consequence, and one blocker only"
+                    ));
+                }
+                if question
+                    .split(|character: char| !character.is_alphabetic())
+                    .any(|word| word.eq_ignore_ascii_case("or"))
+                {
+                    issues.push(
+                        "Wapahki stage 1 uses an `or` alternative; ask one direct yes/no question without a fallback branch"
+                            .into(),
+                    );
+                }
+            }
+        }
+        if pb.key == "outagehub" && expected_touches == 1 && touch.stage == 1 && question_count != 1
+        {
+            issues.push(format!(
+                "OutageHub one-touch discovery must contain exactly one factual outage-time question (found {question_count})"
+            ));
         }
         if channel == "linkedin_request" && touch.body.chars().count() > 300 {
             issues.push(format!(
@@ -3913,7 +4455,12 @@ fn sequence_quality_issues(
     // may test the premise and the final email may make one ask; the connection
     // note should simply give a human reason to connect. The legacy sequence
     // has room for one additional routing question.
-    let question_touch_limit = if expected_touches == 4 { 3 } else { 4 };
+    let question_touch_limit = match expected_touches {
+        1 => 1,
+        2 => 2,
+        4 => 3,
+        _ => 4,
+    };
     if question_touches > question_touch_limit {
         issues.push(format!(
             "sequence asks questions in {question_touches} touches (maximum {question_touch_limit})"
@@ -3925,7 +4472,11 @@ fn sequence_quality_issues(
         .iter()
         .filter(|touch| is_retreat_or_route_touch(touch))
         .count();
-    let retreat_touch_limit = if expected_touches == 4 { 1 } else { 3 };
+    let retreat_touch_limit = match expected_touches {
+        1 | 2 => 0,
+        4 => 1,
+        _ => 3,
+    };
     if retreat_touches > retreat_touch_limit {
         issues.push(format!(
             "sequence relies on retreat, correction, routing, or closure in {retreat_touches} touches (maximum {retreat_touch_limit}; T2 must sharpen the mechanism and later touches must contribute value or answer the buyer objection)"
@@ -3959,14 +4510,32 @@ fn sequence_quality_issues(
     // second natural reference in a seven-touch thread is not a sendability
     // failure. The semantic reviewer still judges whether either mention is
     // seller-first or unnecessary.
-    if brand_mentions > 2 {
+    let brand_mention_limit = if matches!(pb.key.as_str(), "gnk" | "wapahki") {
+        1
+    } else {
+        2
+    };
+    if brand_mentions > brand_mention_limit {
         issues.push(format!(
-            "{} appears {brand_mentions} times (maximum 2 across the sequence)",
-            pb.name
+            "{} appears {brand_mentions} times (maximum {brand_mention_limit} across the sequence)",
+            pb.name,
         ));
     }
 
-    if pb.key == "outagehub" && expected_touches >= 4 {
+    if pb.key == "outagehub" && expected_touches == 2 {
+        let first = sequence.touches.iter().find(|touch| touch.stage == 1);
+        if first.is_some_and(|touch| touch.body.matches('?').count() != 1) {
+            issues
+                .push("OutageHub stage 1 must ask exactly one easy site-diagnosis question".into());
+        }
+        let second = sequence.touches.iter().find(|touch| touch.stage == 2);
+        if second.is_some_and(|touch| !names_historical_outage_result(&touch.body)) {
+            issues.push(
+                "OutageHub stage 2 must contribute a real location-specific historical result; hold the sequence when no verified example exists"
+                    .into(),
+            );
+        }
+    } else if pb.key == "outagehub" && expected_touches >= 4 {
         let first = sequence.touches.iter().find(|touch| touch.stage == 1);
         if first.is_some_and(|touch| !touch.body.to_ascii_lowercase().contains(&brand_name)) {
             issues.push(
@@ -4045,6 +4614,29 @@ fn sequence_quality_issues(
     } else if expected_touches == 4 {
         let expected_channels = ["email", "email", "linkedin_request", "email"];
         let expected_days = [0, 3, 7, 14];
+        for (index, expected) in expected_channels.iter().enumerate() {
+            if sequence
+                .touches
+                .get(index)
+                .is_some_and(|touch| !touch.channel.eq_ignore_ascii_case(expected))
+            {
+                issues.push(format!("stage {} should use {expected}", index + 1));
+            }
+            if sequence
+                .touches
+                .get(index)
+                .is_some_and(|touch| touch.day_offset != expected_days[index])
+            {
+                issues.push(format!(
+                    "stage {} should use day offset {}",
+                    index + 1,
+                    expected_days[index]
+                ));
+            }
+        }
+    } else if expected_touches == 2 {
+        let expected_channels = ["email", "email"];
+        let expected_days = [0, 6];
         for (index, expected) in expected_channels.iter().enumerate() {
             if sequence
                 .touches
@@ -4426,15 +5018,17 @@ fn review_edit_schema(n: usize) -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        affected_stages, apply_targeted_repairs, brand_trigger_contract, business_copy_context,
-        copy_sentence_count, format_progress_status, generic_subject_label,
-        has_forced_response_menu, is_email_capable_channel, is_empty_linkedin_praise,
-        is_retreat_or_route_touch, mentions_outreach_asset, narrates_internal_copy_logic,
-        normalize_dashes, normalize_principle_ids, normalize_thread_subjects, provisional_channel,
+        affected_stages, apply_targeted_repairs, approve_ready_touches, brand_trigger_contract,
+        business_copy_context, copy_research_rule, copy_sentence_count, format_progress_status,
+        generic_subject_label, gnk_hedge_moves, has_forced_response_menu, is_email_capable_channel,
+        is_empty_linkedin_praise, is_retreat_or_route_touch, mentions_outreach_asset,
+        names_historical_outage_result, narrates_internal_copy_logic, normalize_dashes,
+        normalize_principle_ids, normalize_thread_subjects, provisional_channel,
         provisional_day_offset, select_people_for_planning, sequence_quality_issues,
         supported_touch_count, touch_question_limit, touch_word_band,
-        unsupported_account_task_noun_issues, word_set_similarity, CopyAccount, CopySequence,
-        CopyTouch, EditDoc, EditReview, PlanProgressRecipient, PlanProgressUpdate, TouchReview,
+        unsupported_account_task_noun_issues, wapahki_names_operating_consequence,
+        word_set_similarity, CopyAccount, CopySequence, CopyTouch, EditDoc, EditReview,
+        PlanProgressRecipient, PlanProgressUpdate, TouchReview,
     };
 
     #[test]
@@ -4442,20 +5036,70 @@ mod tests {
         assert_eq!(supported_touch_count(7), 7);
         assert_eq!(supported_touch_count(9), 7);
         assert_eq!(supported_touch_count(4), 4);
+        assert_eq!(supported_touch_count(2), 2);
         assert_eq!(supported_touch_count(1), 1);
     }
     use crate::business::Businesses;
-    use crate::db::Person;
+    use crate::db::{Db, Lead, Person, Sequence, Touch, CURRENT_COPY_POLICY_VERSION};
     use crate::playbook::Playbooks;
 
     #[test]
-    fn outagehub_does_not_require_a_live_outage_as_the_copy_trigger() {
-        let contract = brand_trigger_contract("outagehub", 7);
-        assert!(contract.contains("recent utility outage"));
-        assert!(contract.contains("is not required"));
-        assert!(contract.contains("stable sourced fact"));
-        assert!(contract.contains("T7 closes"));
-        assert!(brand_trigger_contract("gnk", 7).is_empty());
+    fn outagehub_two_email_contract_requires_completed_historical_evidence() {
+        let contract = brand_trigger_contract("outagehub", 2);
+        assert!(contract.contains("EV-charging networks only"));
+        assert!(contract.contains("real, location-specific historical match"));
+        assert!(contract.contains("T2 lands six days later"));
+        assert!(contract.contains("there is no LinkedIn touch"));
+        let gnk = brand_trigger_contract("gnk", 4);
+        assert!(gnk.contains("specific recurring decision"));
+        assert!(gnk.contains("exactly one question"));
+        assert!(gnk.contains("never restate or retract T1"));
+        let wapahki = brand_trigger_contract("wapahki", 4);
+        assert!(wapahki.contains("physical station or handoff"));
+        assert!(wapahki.contains("suspected consequence"));
+        assert!(wapahki.contains("identify any use case"));
+    }
+
+    #[test]
+    fn outagehub_historical_followup_requires_a_completed_timed_result() {
+        assert!(names_historical_outage_result(
+            "I matched the charging site in Kingston to a utility outage area reported at 14:30 on 2026-07-14."
+        ));
+        assert!(!names_historical_outage_result(
+            "I can prepare a historical comparison for one charging location using a utility report."
+        ));
+        assert!(!names_historical_outage_result(
+            "I found a charging site inside a utility outage area."
+        ));
+    }
+
+    #[test]
+    fn copy_research_findings_compile_into_reusable_rule_categories() {
+        assert_eq!(
+            copy_research_rule("The premise is unsupported by account evidence").0,
+            "evidence_before_copy"
+        );
+        assert_eq!(
+            copy_research_rule("The recipient has no reason to answer").0,
+            "reply_likelihood"
+        );
+        assert_eq!(
+            copy_research_rule("The follow-up repeats the same argument").0,
+            "sequence_progression"
+        );
+    }
+
+    #[test]
+    fn wapahki_consequence_gate_distinguishes_a_task_from_a_business_wedge() {
+        assert!(!wapahki_names_operating_consequence(
+            "Operators place finished packs into cases at the end of the line."
+        ));
+        assert!(wapahki_names_operating_consequence(
+            "The station needs extra staffing to keep the line moving."
+        ));
+        assert!(wapahki_names_operating_consequence(
+            "Sanitation changeovers erase the short-run payback."
+        ));
     }
 
     #[test]
@@ -4530,6 +5174,59 @@ mod tests {
     }
 
     #[test]
+    fn gnk_counts_caveat_moves_without_penalizing_source_safe_artifact_language() {
+        assert_eq!(
+            gnk_hedge_moves(
+                "I assume the temperature record may be in telematics and the setpoint may be in the BOL."
+            ),
+            1
+        );
+        assert_eq!(
+            gnk_hedge_moves(
+                "I wonder whether this exists. It may already solve itself, and perhaps I have this wrong."
+            ),
+            3
+        );
+    }
+
+    #[test]
+    fn gnk_first_touch_rejects_solution_first_copy_and_multiple_questions() {
+        let playbooks = Playbooks::load("playbooks").expect("load playbooks");
+        let pb = playbooks.get("gnk").expect("gnk playbook");
+        let sequence = CopySequence {
+            touches: vec![CopyTouch {
+                stage: 1,
+                day_offset: 0,
+                channel: "email".into(),
+                subject: "Refrigerated rejection evidence".into(),
+                body: "Hi Kevin,\n\nGnK builds narrow systems for shipment records. I wonder whether a rejected refrigerated load creates a manual review. Perhaps someone still has to pull the temperature history, tender, bill of lading, and receiver paperwork together before deciding whether to dispute the deduction? Would a short call be useful?\n\nAndrew".into(),
+                purpose: "test the operating task".into(),
+                goal: "earn a reply".into(),
+            }],
+            applied_principles: Vec::new(),
+        };
+        let issues = sequence_quality_issues(pb, &playbooks.shared, &sequence, &[], 1, false);
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.contains("exactly one five-second")),
+            "issues were {issues:?}"
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.contains("introduces the seller")),
+            "issues were {issues:?}"
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.contains("hypothesis caveats")),
+            "issues were {issues:?}"
+        );
+    }
+
+    #[test]
     fn targeted_repairs_are_atomic_when_an_editor_omits_a_required_stage() {
         let touch = |stage, body: &str| CopyTouch {
             stage,
@@ -4586,7 +5283,7 @@ mod tests {
         let playbooks = Playbooks::load("playbooks").expect("load playbooks");
         let pb = playbooks.get("gnk").expect("gnk playbook");
         for (stage, expected) in [
-            (1, (100, 180)),
+            (1, (55, 140)),
             (2, (35, 145)),
             (4, (35, 120)),
             (6, (25, 80)),
@@ -4892,6 +5589,68 @@ mod tests {
                 .filter(|person| person.lead_id == "b")
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn manual_approval_cannot_schedule_an_oversized_account() {
+        let db = Db::open(":memory:").expect("open db");
+        let playbooks = Playbooks::load("playbooks").expect("load playbooks");
+        let pb = playbooks.get("gnk").expect("gnk playbook");
+        let lead_id = db
+            .upsert_lead(&Lead {
+                brand: "gnk".into(),
+                apollo_org_id: "oversized-org".into(),
+                name: "Oversized Account".into(),
+                headcount: 35_000,
+                status: "qualified".into(),
+                ..Default::default()
+            })
+            .expect("lead");
+        let person_id = db
+            .upsert_person(&Person {
+                lead_id: lead_id.clone(),
+                brand: "gnk".into(),
+                apollo_person_id: "oversized-person".into(),
+                name: "Pat Owner".into(),
+                title: "Operations Director".into(),
+                vantage: "process_owner".into(),
+                email: "pat@example.com".into(),
+                email_status: "verified".into(),
+                status: "verified".into(),
+                ..Default::default()
+            })
+            .expect("person");
+        let sequence_id = db
+            .create_sequence(&Sequence {
+                person_id: person_id.clone(),
+                lead_id: lead_id.clone(),
+                brand: "gnk".into(),
+                copy_policy_version: CURRENT_COPY_POLICY_VERSION,
+                status: "active".into(),
+                ..Default::default()
+            })
+            .expect("sequence");
+        db.insert_touch(&Touch {
+            sequence_id,
+            person_id: person_id.clone(),
+            lead_id,
+            brand: "gnk".into(),
+            stage: 1,
+            channel: "email".into(),
+            status: "draft".into(),
+            review_passes: Some(true),
+            ..Default::default()
+        })
+        .expect("touch");
+
+        let approval = approve_ready_touches(&db, pb, Some(&person_id)).expect("approval");
+        assert_eq!(approval.touches_scheduled, 0);
+        assert_eq!(approval.people_held, 1);
+        assert!(approval.hold_reasons[0].contains("account ceiling"));
+        assert_eq!(
+            db.list_touches_for_person(&person_id).unwrap()[0].status,
+            "draft"
         );
     }
 
@@ -5404,5 +6163,15 @@ mod tests {
         );
         assert_eq!(days, vec![0, 3, 5, 9, 13, 17, 21]);
         assert!(!channels.contains(&"call"));
+    }
+
+    #[test]
+    fn two_touch_evidence_experiment_is_email_only_on_days_zero_and_six() {
+        let channels = (1..=2).map(provisional_channel).collect::<Vec<_>>();
+        let days = (1..=2)
+            .map(|stage| provisional_day_offset(stage, 2))
+            .collect::<Vec<_>>();
+        assert_eq!(channels, vec!["email", "email"]);
+        assert_eq!(days, vec![0, 6]);
     }
 }

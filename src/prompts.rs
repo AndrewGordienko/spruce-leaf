@@ -112,7 +112,7 @@ pub fn contacts_user(pb: &Playbook, account: &Account, n: usize, knowledge: &str
     let base = format!(
         "At {acct} ({industry}, HQ {hq}), map {n} people to reach for {brand} about this workflow:\n\n\
 \"{hypothesis}\"\n\n\
-Choose people by VANTAGE POINT, not seniority. For each, set:\n\
+First identify the ONE response needed next: a concrete workflow example, confirmation that the problem recurs, a technical boundary, an economic decision, or an internal route. Then choose people by their ability to provide that response, not seniority or generic title prestige. A problem witness, process owner, economic buyer, evaluator, and router are different jobs in the outreach sequence. Do not pitch a witness as though they own budget, and do not ask a buyer to reconstruct an operator's daily work. Interns, students, trainees, and apprentices are route-only and can never be primary. A department such as Sales is neither automatically relevant nor irrelevant; it must match the named problem. For each person, set:\n\
   - vantage: exactly one of process_owner, operator, operational_executive, technical_evaluator, \
 economic_buyer, router.\n\
   - can_observe: what this person can credibly observe, explain, decide, or route.\n\

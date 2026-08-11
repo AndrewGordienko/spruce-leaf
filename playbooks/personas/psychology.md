@@ -30,6 +30,18 @@ The requested response must match the person's vantage:
 - A router should receive one easy routing request, not a compressed business
   case.
 
+This is also the contact-selection rule. Work backward from the required
+response before choosing a name: a problem witness, process owner, technical
+evaluator, economic buyer, and router perform different jobs in the outreach
+sequence. A verified email address does not make someone the right recipient,
+and a senior title does not prove workflow access.
+
+Interns, students, trainees, apprentices, and co-op placements are always
+route-only in cold outreach. They may know one part of the work, but must never
+receive an owner-level pitch, discovery request, or budget question. Conversely,
+do not globally penalize Sales, Business Development, HR, or another function:
+that function may be the exact process owner when the named problem lives there.
+
 ## Model the role, never the private personality
 
 Use title and mapped vantage only to estimate work context: what the person can

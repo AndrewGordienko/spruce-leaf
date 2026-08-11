@@ -274,7 +274,7 @@ impl Playbook {
     /// Compact people-mapping prompt. Copy rules are irrelevant at this stage.
     pub fn vantage_system_prompt(&self) -> String {
         format!(
-            "You map real people to the workflow vantage they may credibly have for {name}. Choose by likely access to the work, not seniority. Prefer a process owner or operator, then an operational executive. Use a router when ownership is unclear. Mark the strongest one or two as primary for ordering, but map every requested qualified recipient; primary status must not discard the rest. A title is evidence of proximity, not proof of ownership: never say a person owns, directly judges, or makes a decision unless the supplied title itself establishes that. Write can_observe and why_them as short, cautious internal notes in plain English, not outreach copy and not a paraphrase of the title. Return only the requested structured data.",
+            "You map real people to the workflow vantage they may credibly have for {name}. Work backward from the exact response needed next: a concrete workflow example, confirmation of a recurring problem, a technical boundary, an economic decision, or an internal route. Choose the person who can credibly provide that response, not the most senior or most reachable person. Distinguish a problem witness from a process owner and an economic buyer; do not send owner-level outreach to someone who can only observe one step. Prefer a process owner or operator for unconfirmed workflow discovery, then an operational executive. Use a router when ownership is unclear. Interns, students, trainees, and apprentices are route-only and never primary, even when they work in the relevant department. Do not apply blanket penalties to sales, business-development, HR, or other functions: a function is relevant when the named problem actually lives there. Mark the strongest one or two eligible people as primary for ordering, but map every requested qualified recipient; primary status must not discard the rest. A title is evidence of proximity, not proof of ownership: never say a person owns, directly judges, or makes a decision unless the supplied title itself establishes that. Write can_observe and why_them as short, cautious internal notes in plain English, not outreach copy and not a paraphrase of the title. Return only the requested structured data.",
             name = self.name,
         )
     }
@@ -306,11 +306,17 @@ impl Playbook {
         let seller_facts = self.verified_seller_facts.join(" | ");
         let forbidden = self.forbidden(shared).join(", ");
         let role_contract = if role == "WRITER" {
-            "Write like one founder contacting one operator. Use only supplied evidence, test one operating decision, keep inference explicitly uncertain, and make one role-appropriate ask. Concrete nouns and natural speech beat frameworks, but never name an object, station, machine, alarm, or private handoff that appears only in an internal hypothesis. Never script the recipient's reply with quoted words, categories, or a yes/no/referral menu. A correction or route is useful, but the note still needs a recipient-relevant reason to answer. Preserve a requested short discovery conversation plus email alternative when the recipient is a credible workflow owner and the hypothesis category is source-grounded."
+            "Write like one founder contacting one operator. Use only supplied evidence and test one operating decision with a point of view, not a stack of caveats. Lead with a recognizable event, show the painful task and practical consequence in concrete language, then ask one question the recipient can answer in five seconds. One uncertainty cue is enough. Concrete nouns and natural speech beat frameworks, but never name an object, station, machine, alarm, or private handoff that appears only in an internal hypothesis. Never script the recipient's reply with quoted words, categories, or a yes/no/referral menu. A correction or route is useful, but the note still needs a recipient-relevant reason to answer. Do not put a meeting request, email alternative, or seller mechanism ahead of the operating question."
+        } else if role == "PLANNER" && self.key == "gnk" {
+            "Choose the commercial angle only after checking that the brief contains a specific recurring decision, a believable consequence, an external trigger or direct mechanism evidence, and a recipient close to the work. Company fit is not problem fit. Compare three angles, then select the one whose decision fork the recipient will immediately recognize. T1 asks whether the reviewer can see what supports the current position or whether someone rebuilds it from named source-safe records. Do not make the recipient develop the opportunity, diagnose importance, evaluate GnK, or accept a meeting. Every follow-up must add a sourced operational example, consequence, bounded proof, adjacent question, or useful route. Hold if any foundation is missing or if the sequence would later need to retract its premise."
+        } else if role == "PLANNER" && self.key == "outagehub" {
+            "Plan a two-email founder experiment for operated Canadian EV-charging networks only. Require one source-backed charging-site footprint, a Service Operations or equivalent recipient, and a real location-specific historical utility match for the second email. T1 asks one easy question about an entire charging site going dark: does the team still check the local utility map before opening an equipment/network ticket, dispatching someone, or updating status, or does telemetry settle it immediately? T2 six days later contributes the verified timestamp/location result. Do not invent multi-site prioritization, abstract external-context value, a routing bump, LinkedIn touch, disclaimer paragraph, or breakup email. Hold when the historical example is absent."
+        } else if role == "PLANNER" && self.key == "wapahki" {
+            "Choose the commercial angle before copy is written. Compare three account-evidenced first-touch approaches and select the one with the clearest physical station or handoff, observed operating condition, suspected economic consequence, likely reason ordinary automation struggles, and factual question answerable from memory. Product variety alone cannot supply the station, changeover frequency, manual status, or pain. Plan T1 to earn one fact or correction; do not ask the recipient to identify a use case, classify variation, evaluate a robot boundary, or agree to a meeting. T2 adds the economic reason, T3 is human context, and T4 routes to one specific alternative owner or closes. Hold when the evidence cannot support that arc."
         } else if role == "PLANNER" {
             "Choose the commercial angle before copy is written. Compare three distinct first-touch approaches against the verified trigger, recipient vantage, strongest objection, and easiest useful reply. Select one coherent thread; do not blend candidates or plan filler stages. A short discovery conversation is a valid first ask for a credible workflow owner; preserve the operator's requested outcome when earned and offer an email answer as the easier path. Hold when the evidence cannot support a natural note."
         } else {
-            "Act as a skeptical recipient and independent copy chief. Passing means Andrew could send the exact words unchanged: evidence-safe, specific, natural aloud, easy to answer, and appropriate to the recipient's vantage. Reject polished research blurbs, repeated retreats, invented value, vague capability language, forced response menus, experiment narration, and any physical task noun that appears only in the hypothesis rather than verified facts. Do not approve unnatural copy merely because it is grammatical and mechanically valid."
+            "Act as a skeptical recipient and independent copy chief. Passing means Andrew could send the exact words unchanged: evidence-safe, specific, natural aloud, easy to answer, and appropriate to the recipient's vantage. Reward one recognizable event, one painful task, concrete artifacts, one practical consequence, a sharp hypothesis, and one five-second question. Reject careful internal hypothesis documents translated into outreach, stacked epistemic hedging, abstract labels such as decision-ready or review readiness, seller mechanisms introduced before the pain is legible, hard-to-parse questions, repeated escape hatches, polished research blurbs, invented value, vague capability language, forced response menus, and experiment narration. Do not approve unnatural copy merely because it is grammatical and mechanically valid."
         };
         // The prompt ablation suite showed that the 120-word writer excerpt was
         // an awkward half-measure: it exposed the role without enough of the
@@ -584,27 +590,62 @@ mod tests {
         assert!(copy.contains("The recipient does not owe Andrew market research"));
         assert!(copy.contains("PRIVATE RESPONSE-DESIGN DOCTRINE"));
         assert!(copy.contains("Before planning copy, name the one response"));
-        assert!(planner.contains("Choose the commercial angle before copy is written"));
-        assert!(planner.contains("short discovery conversation is a valid first ask"));
+        assert!(planner.contains("Choose the commercial angle only after checking"));
+        assert!(planner.contains("five-second question"));
+        assert!(planner.contains("Do not make the recipient develop the opportunity"));
         assert!(planner.contains("Your output is a private plan"));
         assert!(reviewer.contains("Act as a skeptical recipient"));
         assert!(reviewer.contains("forced response menus"));
         assert!(reviewer.contains("Correctness is not sendability"));
         assert!(copy.contains("=== GnK BUYER-FACING CONSTRAINTS"));
         assert!(copy.split_whitespace().count() < 1_500);
-        assert!(reviewer.split_whitespace().count() < 1_000);
+        assert!(reviewer.split_whitespace().count() < 1_250);
         assert!(!copy.contains("=== SHARED OUTREACH DOCTRINE"));
         assert!(!reviewer.contains("=== SHARED OUTREACH DOCTRINE"));
         assert!(!planner.contains("=== SHARED OUTREACH DOCTRINE"));
-        assert!(planner.split_whitespace().count() < 1_000);
-        assert_eq!((gnk.min_words, gnk.max_words), (110, 170));
+        assert!(planner.split_whitespace().count() < 1_200);
+        assert_eq!((gnk.min_words, gnk.max_words), (75, 130));
+        for phrase in [
+            "does this merit attention",
+            "if this exists",
+            "narrow additive system",
+            "prepare available records",
+            "would an email explanation be easier",
+            "compare notes",
+            "may already",
+            "tells me nothing",
+            "i cannot tell",
+            "the strongest counterpoint",
+            "wrong premise",
+            "correction to my earlier",
+            "i am not suggesting",
+            "rather than assume otherwise",
+            "keep the question limited",
+        ] {
+            assert!(gnk
+                .forbidden(&playbooks.shared)
+                .iter()
+                .any(|item| *item == phrase));
+        }
         let outagehub = playbooks.get("outagehub").expect("outagehub");
-        assert_eq!((outagehub.min_words, outagehub.max_words), (90, 160));
+        assert_eq!((outagehub.min_words, outagehub.max_words), (60, 95));
         assert!(outagehub
             .copy_system_prompt(&playbooks.shared)
-            .contains("normalized live and historical Canadian utility outage data"));
+            .contains("Generate exactly two emails"));
         let wapahki = playbooks.get("wapahki").expect("wapahki");
-        assert_eq!((wapahki.min_words, wapahki.max_words), (110, 170));
+        assert_eq!((wapahki.min_words, wapahki.max_words), (40, 80));
+        for phrase in [
+            "repeatable packing or handling step",
+            "where variation enters",
+            "normal placement",
+            "related product or case formats",
+            "identify any suitable use case",
+        ] {
+            assert!(wapahki
+                .forbidden(&playbooks.shared)
+                .iter()
+                .any(|item| *item == phrase));
+        }
         assert!(wapahki
             .review_system_prompt(&playbooks.shared)
             .contains("skeptical recipient"));

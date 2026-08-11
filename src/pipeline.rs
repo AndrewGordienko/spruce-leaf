@@ -14,6 +14,7 @@ use crate::knowledge::{core_strategy_block, Library};
 use crate::outreach;
 use crate::playbook::{self, Playbook, Shared};
 use crate::prompts;
+use crate::response_design;
 
 /// A live progress sink for the pipeline. The interactive UI implements this to
 /// paint a progress tree; the non-interactive path uses the no-op `()` impl.
@@ -100,15 +101,20 @@ async fn plan_account(
 ) -> Result<AccountPlan> {
     let mut contacts = find_contacts(run, &account, n_contacts).await?.contacts;
     contacts.sort_by(|left, right| {
-        contact_priority(right)
-            .cmp(&contact_priority(left))
+        response_design::contact_priority(&right.title, &right.vantage, right.primary)
+            .cmp(&response_design::contact_priority(
+                &left.title,
+                &left.vantage,
+                left.primary,
+            ))
             .then_with(|| left.name.cmp(&right.name))
     });
     contacts.truncate(2);
     run.reporter.account_contacts(&account.name, contacts.len());
 
     let plans = stream::iter(contacts.into_iter().map(|mut contact| {
-        contact.vantage = normalize_vantage(&contact.vantage);
+        contact.vantage = response_design::effective_vantage(&contact.title, &contact.vantage);
+        contact.primary = response_design::effective_primary(&contact.title, contact.primary);
         let account = account.clone();
         async move {
             let mut sequence = write_sequence(run, &account, &contact, n_touches).await?;
@@ -126,6 +132,8 @@ async fn plan_account(
                 run.critique,
                 &reviewer_knowledge,
                 None,
+                None,
+                "",
             )
             .await?;
             run.reporter.sequence_done(&account.name);
@@ -225,33 +233,5 @@ fn enforce_email_signatures(sequence: &mut Sequence, signature: &str) {
         if touch.channel.eq_ignore_ascii_case("email") {
             touch.body = playbook::enforce_signature(&touch.body, signature);
         }
-    }
-}
-
-fn contact_priority(contact: &Contact) -> i32 {
-    let mut score = if contact.primary { 100 } else { 0 };
-    score += match normalize_vantage(&contact.vantage).as_str() {
-        "process_owner" => 70,
-        "operator" => 65,
-        "operational_executive" => 55,
-        "economic_buyer" => 40,
-        "technical_evaluator" => 25,
-        "router" => 10,
-        _ => 0,
-    };
-    score
-}
-
-/// Normalize a model-supplied vantage to the canonical set for consistent badges.
-fn normalize_vantage(raw: &str) -> String {
-    let v = raw.trim().to_lowercase().replace([' ', '-'], "_");
-    match v.as_str() {
-        "process_owner"
-        | "operator"
-        | "operational_executive"
-        | "technical_evaluator"
-        | "economic_buyer"
-        | "router" => v,
-        _ => raw.trim().to_lowercase(),
     }
 }

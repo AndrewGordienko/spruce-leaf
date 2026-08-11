@@ -10,6 +10,8 @@ pub(crate) fn credible_outagehub_signal(key: &str, evidence: &str) -> bool {
     match key.trim() {
         "account.distributed_locations" => distributed_operating_footprint(&text),
         "account.outage_sensitive_decision" => outage_decision_or_exposure(&text),
+        "account.operated_ev_charging_network" => operated_ev_charging_network(&text),
+        "account.historical_location_outage_match" => historical_location_outage_match(&text),
         _ => true,
     }
 }
@@ -115,6 +117,118 @@ fn distributed_operating_footprint(text: &str) -> bool {
         ],
     );
     operating_site && distributed && !office_only && !customer_delivery_only
+}
+
+fn operated_ev_charging_network(text: &str) -> bool {
+    let operator = has(
+        text,
+        &[
+            "operates",
+            "operating",
+            "owns",
+            "manages",
+            "monitors",
+            "charging network",
+            "charging sites",
+        ],
+    );
+    let charging = has(
+        text,
+        &[
+            "ev charging",
+            "electric vehicle charging",
+            "charging station",
+            "charging site",
+            "charger network",
+        ],
+    );
+    let footprint = has(
+        text,
+        &[
+            "canada",
+            "canadian",
+            "ontario",
+            "quebec",
+            "alberta",
+            "british columbia",
+            "locations",
+            "sites",
+            "stations",
+            "network",
+        ],
+    );
+    operator && charging && footprint
+}
+
+fn historical_location_outage_match(text: &str) -> bool {
+    let completed_match = has(
+        text,
+        &[
+            "matched",
+            "overlapped",
+            "fell inside",
+            "was inside",
+            "historical result",
+            "historical match",
+        ],
+    );
+    let utility_event = has(
+        text,
+        &[
+            "utility outage",
+            "utility report",
+            "outage area",
+            "reported outage",
+        ],
+    );
+    let account_location = has(
+        text,
+        &[
+            "charging site",
+            "charging station",
+            "charger location",
+            "site at",
+            "site in",
+            "station at",
+            "station in",
+        ],
+    );
+    let time = text.chars().any(|character| character.is_ascii_digit())
+        && has(
+            text,
+            &[
+                "timestamp",
+                "date",
+                "time",
+                "2024",
+                "2025",
+                "2026",
+                "january",
+                "february",
+                "march",
+                "april",
+                "may",
+                "june",
+                "july",
+                "august",
+                "september",
+                "october",
+                "november",
+                "december",
+            ],
+        );
+    let hypothetical = has(
+        text,
+        &[
+            "could match",
+            "can match",
+            "would match",
+            "may match",
+            "example could",
+            "proposed",
+        ],
+    );
+    completed_match && utility_event && account_location && time && !hypothetical
 }
 
 fn outage_decision_or_exposure(text: &str) -> bool {

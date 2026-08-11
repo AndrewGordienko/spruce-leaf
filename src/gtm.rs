@@ -9,9 +9,10 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::db::{
-    CustomerDevelopmentRecord, GtmExperiment, GtmPlay, Person, SharedDb, SignalDefinition,
+    CustomerDevelopmentRecord, GtmExperiment, GtmPlay, Lead, Person, SharedDb, SignalDefinition,
     SignalObservation,
 };
+use crate::playbook::Playbook;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CustomerDevelopmentStage {
@@ -282,14 +283,11 @@ impl GtmActionContext {
         self.state == "action_ready"
     }
 
-    /// Discovery-ready means there is enough sourced company fit and verified
-    /// recipient vantage to write hypothesis-safe copy for human review. It
-    /// does not mean the private mechanism is proven. The cadence layer still
-    /// requires `action_ready()` before it may schedule anything, so allowing a
-    /// reviewed discovery sequence here cannot silently turn research into an
-    /// automated send.
-    pub fn sequence_ready_for(&self, _touches: usize) -> bool {
-        self.action_ready() || self.state == "discovery_ready"
+    /// Fully qualified accounts may enter a cadence. A source-backed account
+    /// with a reachable workflow contact may receive exactly one diagnostic
+    /// note; a lack of problem proof can never silently create follow-ups.
+    pub fn sequence_ready_for(&self, touches: usize) -> bool {
+        self.action_ready() || (touches == 1 && self.state == "discovery_ready")
     }
 
     /// Private context for the planner/writer. This is decision infrastructure,
@@ -382,7 +380,7 @@ impl GtmActionContext {
             .join("\n");
         let action = match self.state.as_str() {
             "action_ready" => "The account has enough sourced evidence for one narrow commercial note. Use only a supplied observation as the company-specific signal. Lead with a role-relevant implication and a credible point of view. A cold outcome may be a short working conversation, interest, correction, or referral; it is not yet a pilot or proof. Never invent collateral or claim an asset exists unless verified seller context explicitly supplies it.",
-            "discovery_ready" => "The company fit and this recipient's operating vantage are sourced, but the internal workflow problem is not public evidence. Write hypothesis-safe copy for manual review only: state supplied company facts and frame the private workflow as a question. A multi-touch draft may advance that one investigation with sharper distinctions, but must not manufacture proof, urgency, or a new claim in later touches. When the title is a credible operator, process owner, or operational executive and the public workflow category is specific, a short discovery conversation plus an email-reply alternative is permitted; discovery is not the same as a demo or product evaluation. A router should only be asked to route. Never claim that work is manual, expensive, recurring, fragmented, or cross-system. Never propose a proof, pilot, integration, or product evaluation.",
+            "discovery_ready" => "The company fit and this recipient's operating vantage are sourced, but the internal workflow problem is not public evidence. Write exactly one source-safe first email. Name one supplied company fact or recognizable operating moment and ask one five-second factual question. Do not ask for a meeting, pitch the seller, offer collateral, or create a follow-up. Never claim that work is manual, expensive, recurring, fragmented, cross-system, or painful. Never propose a proof, pilot, integration, or product evaluation.",
             _ => "The account does not yet have enough sourced evidence for a multi-touch sequence. Hold it for research or use one manual routing note; do not manufacture discovery questions or explain a proof, integration, pilot, or product.",
         };
         format!(
@@ -397,6 +395,103 @@ impl GtmActionContext {
     }
 }
 
+/// Whether a prospect has established the operating problem in their own
+/// words. This is deliberately stronger than public fit evidence and is the
+/// boundary before economic or technical contacts enter the motion.
+pub fn problem_confirmed_for_lead(db: &SharedDb, brand: &str, lead_id: &str) -> Result<bool> {
+    if db
+        .customer_development_for_lead(brand, lead_id)?
+        .is_some_and(|record| {
+            CUSTOMER_DEVELOPMENT_STAGES
+                .iter()
+                .position(|stage| stage.key == customer_development_stage(&record))
+                .unwrap_or(0)
+                >= 2
+        })
+    {
+        return Ok(true);
+    }
+    Ok(db
+        .list_active_signal_observations(Some(brand), Some(lead_id), None)?
+        .iter()
+        .any(|observation| {
+            observation.definition_key == "conversation.problem_confirmed"
+                && matches!(observation.status.as_str(), "observed" | "verified")
+        }))
+}
+
+/// A contact-specific cold-outreach boundary. Routers are held for explicit
+/// one-off routing work instead of entering a commercial cadence. Economic,
+/// enterprise, and technical contacts wait until a human confirms the problem.
+pub fn recipient_sequence_block_reason(
+    db: &SharedDb,
+    brand: &str,
+    lead_id: &str,
+    person: &Person,
+) -> Result<Option<String>> {
+    if crate::response_design::is_route_only_contact(&person.title, &person.vantage) {
+        return Ok(Some(
+            "recipient is route-only; hold for one bounded manual routing request".into(),
+        ));
+    }
+    if crate::response_design::requires_confirmed_problem(&person.title, &person.vantage)
+        && !problem_confirmed_for_lead(db, brand, lead_id)?
+    {
+        return Ok(Some(
+            "economic/technical recipient requires a prospect-confirmed problem first".into(),
+        ));
+    }
+    Ok(None)
+}
+
+/// Final cold-email delivery boundary shared by approval and the cadence
+/// engine. Re-evaluating immediately before SMTP keeps stale scheduled rows,
+/// old play versions, and oversized legacy accounts from bypassing policy.
+pub fn delivery_block_reason(
+    db: &SharedDb,
+    playbook: &Playbook,
+    lead: &Lead,
+    person: &Person,
+) -> Result<Option<String>> {
+    if playbook
+        .max_employees
+        .is_some_and(|max| lead.headcount > 0 && lead.headcount > max)
+    {
+        return Ok(Some(format!(
+            "{} employees exceeds the {}-employee account ceiling",
+            lead.headcount,
+            playbook.max_employees.unwrap_or_default()
+        )));
+    }
+    if let Some(reason) = recipient_sequence_block_reason(db, &playbook.key, &lead.id, person)? {
+        return Ok(Some(reason));
+    }
+    let context = prepare_action(db, &playbook.key, &lead.id, person)?;
+    let one_touch_discovery = if context.state == "discovery_ready" {
+        match db.active_sequence_for_person(&person.id)? {
+            Some(sequence_id) => {
+                let current = db
+                    .sequence_gtm_attribution(&sequence_id)?
+                    .is_some_and(|sequence| {
+                        sequence.copy_policy_version == crate::db::CURRENT_COPY_POLICY_VERSION
+                            && sequence.gtm_state == "discovery_ready"
+                    });
+                current && db.list_touches_for_sequence(&sequence_id)?.len() == 1
+            }
+            None => false,
+        }
+    } else {
+        false
+    };
+    if !context.action_ready() && !one_touch_discovery {
+        return Ok(Some(format!(
+            "current GTM state '{}' is not eligible for delivery",
+            context.state
+        )));
+    }
+    Ok(None)
+}
+
 /// Resolve the current versioned play, live evidence, and stable experiment arm
 /// before an agent plans copy. An experiment assignment is durable: re-drafting
 /// the same person cannot silently move them between control and variant.
@@ -406,7 +501,6 @@ pub fn prepare_action(
     lead_id: &str,
     person: &Person,
 ) -> Result<GtmActionContext> {
-    db.expire_signal_observations()?;
     let play = db.current_gtm_play(brand)?;
     let assessment = match &play {
         Some(play) => db.account_play_assessment(lead_id, &play.id)?,
@@ -419,6 +513,7 @@ pub fn prepare_action(
     if let Some(assessment) = &assessment {
         observations.retain(|observation| {
             observation.definition_key == "contact.workflow_vantage"
+                || observation.definition_key == "conversation.problem_confirmed"
                 || assessment
                     .matched_signal_keys
                     .contains(&observation.definition_key)
@@ -454,14 +549,8 @@ pub fn prepare_action(
     // verified process owners and still be permanently held as "no owner".
     let has_reachable_channel = person.email_status.eq_ignore_ascii_case("verified")
         || !person.linkedin_url.trim().is_empty();
-    let has_workflow_vantage = matches!(
-        person.vantage.trim().to_ascii_lowercase().as_str(),
-        "process_owner"
-            | "operator"
-            | "operational_executive"
-            | "economic_buyer"
-            | "technical_evaluator"
-    );
+    let has_workflow_vantage =
+        crate::response_design::is_workflow_discovery_contact(&person.title, &person.vantage);
     if has_reachable_channel
         && has_workflow_vantage
         && observations.iter().any(|observation| {
@@ -474,6 +563,9 @@ pub fn prepare_action(
     matched_signal_keys.sort();
     matched_signal_keys.dedup();
 
+    let has_source_backed_account_fact = db
+        .get_lead(lead_id)?
+        .is_some_and(|lead| !lead.observed_facts.is_empty());
     let state = play.as_ref().map_or("no_play", |play| {
         let matched = play
             .required_signal_keys
@@ -486,35 +578,19 @@ pub fn prepare_action(
         // Pipeline after the play changed. Require a current versioned account
         // assessment for this motion; inventory without one is still reusable,
         // but it must be refreshed before copy can pass the gate.
-        let assessment_allows_action = if brand == "outagehub" {
-            assessment
-                .as_ref()
-                .is_some_and(|assessment| assessment.status == "qualified")
-        } else if brand == "gnk" {
-            // GnK qualification runs before people are mapped, so an account
-            // can be marked research-needed solely because the reachable-owner
-            // signal is not knowable yet. Once a verified operating contact is
-            // actually mapped, let the live signal count decide readiness. The
-            // mandatory guard below still requires fit, a recurring material
-            // workflow, and that reachable owner; the cross-system mechanism
-            // may remain the hypothesis the email is trying to test.
-            assessment.as_ref().is_none_or(|assessment| {
-                matches!(assessment.status.as_str(), "qualified" | "research_needed")
-            })
-        } else {
-            assessment
-                .as_ref()
-                .is_none_or(|assessment| assessment.status == "qualified")
-        };
+        // The current GnK and OutageHub experiments require problem proof, not
+        // merely company plausibility. Research-needed accounts may be retained
+        // for later investigation, but cold copy cannot develop the opportunity
+        // for us.
+        let assessment_allows_action = assessment
+            .as_ref()
+            .is_some_and(|assessment| assessment.status == "qualified");
         if assessment_allows_action
             && matched >= play.minimum_signal_matches.max(1) as usize
             && mandatory_action_signals_present(brand, &matched_signal_keys)
         {
             "action_ready"
-        } else if brand == "gnk"
-            && matched_signal_keys.contains(&"account.fit_evidence".to_string())
-            && matched_signal_keys.contains(&"account.reachable_workflow_owner".to_string())
-        {
+        } else if has_source_backed_account_fact && has_reachable_channel && has_workflow_vantage {
             "discovery_ready"
         } else {
             "research_required"
@@ -549,11 +625,19 @@ pub fn prepare_action(
 
 fn mandatory_action_signals_present(brand: &str, matched: &[String]) -> bool {
     let required: &[&str] = if brand.eq_ignore_ascii_case("outagehub") {
-        &["account.fit_evidence", "account.distributed_locations"]
+        &[
+            "account.fit_evidence",
+            "account.operated_ev_charging_network",
+            "account.distributed_locations",
+            "account.historical_location_outage_match",
+            "account.reachable_workflow_owner",
+        ]
     } else if brand.eq_ignore_ascii_case("gnk") {
         &[
             "account.fit_evidence",
-            "account.expensive_recurring_workflow",
+            "account.specific_recurring_decision",
+            "account.believable_operating_consequence",
+            "account.external_trigger_or_mechanism_evidence",
             "account.reachable_workflow_owner",
         ]
     } else {
@@ -675,13 +759,19 @@ pub fn default_signal_definitions() -> Vec<SignalDefinition> {
     definitions.extend([
         signal_definition("outagehub", "account.outage_sensitive_decision", "Outage-sensitive decision", "The account operates a time-sensitive decision in which external grid status or restoration context could change dispatch, escalation, hold, transfer, or communication."),
         signal_definition("outagehub", "account.distributed_locations", "Distributed locations", "The account operates multiple or remote locations across utility territories, making location matching operationally relevant."),
+        signal_definition("outagehub", "account.operated_ev_charging_network", "Operated EV charging network", "First-party evidence shows the account operates, manages, or monitors a Canadian EV-charging site network rather than merely selling or installing charging equipment."),
+        signal_definition("outagehub", "account.historical_location_outage_match", "Historical location-outage match", "A completed account-specific analysis names a charging location and timestamp that overlapped a reported utility outage area. A proposed or hypothetical match does not count."),
         signal_definition("outagehub", "account.existing_operational_system", "Existing operational system", "The account names or evidences an existing NOC, dispatch, CMMS, SCADA, ServiceNow, Salesforce, or equivalent workflow surface."),
         signal_definition("gnk", "account.expensive_recurring_workflow", "Expensive recurring workflow", "The account evidences a recurring decision, exception, investigation, delay, or handoff with material operational consequences."),
         signal_definition("gnk", "account.cross_system_reconciliation", "Cross-system reconciliation", "People appear to reconcile records, evidence, or decisions across systems that do not supply the required coordination layer."),
+        signal_definition("gnk", "account.specific_recurring_decision", "Specific recurring decision", "Public evidence identifies the repeated operating event and the concrete decision or fork that follows; company category or department presence is insufficient."),
+        signal_definition("gnk", "account.believable_operating_consequence", "Believable operating consequence", "Public evidence connects the decision to settlement time, leakage, recoveries, audit exposure, customer SLA, write-offs, escalation, or constrained senior capacity."),
+        signal_definition("gnk", "account.external_trigger_or_mechanism_evidence", "External trigger or mechanism evidence", "A source names the event, artifacts, records, systems, or handoff that makes the hypothesized reconstruction mechanism account-specific rather than universal."),
         signal_definition("gnk", "account.reachable_workflow_owner", "Reachable workflow owner", "A mid-market workflow owner or close observer is identifiable and reachable for a founder-led diagnostic conversation."),
         signal_definition("wapahki", "account.bounded_repetitive_task", "Bounded repetitive task", "A specific physical motion or handoff repeats enough within a production run to be described and measured."),
         signal_definition("wapahki", "account.format_variability", "Format variability", "SKU, case, orientation, changeover, or presentation variability plausibly defeats conventional fixed automation."),
         signal_definition("wapahki", "account.exception_heavy_manual_work", "Manual exception handling", "Operators remain in the task because misfeeds, damage, sanitation, changeovers, or other exceptions require judgment or dexterity."),
+        signal_definition("wapahki", "account.manual_task_economic_pressure", "Manual-task economic pressure", "First-party evidence links the candidate task or station to staffing, overtime, throughput, stoppage, utilization, short-run economics, changeover cost, sanitation, ergonomics, or safety."),
     ]);
     definitions
 }
@@ -712,56 +802,56 @@ pub fn default_plays() -> Vec<GtmPlay> {
         GtmPlay {
             brand: "outagehub".into(),
             key: "historical_outage_replay".into(),
-            version: 7,
-            name: "Historical location-matched outage replay".into(),
+            version: 8,
+            name: "EV charging historical outage check".into(),
             lifecycle: "testing".into(),
             motion: "internal_pipeline_to_forward_deployed_proof".into(),
-            target_icp: "Operators with a source-backed distributed operating footprint where a location-specific outage decision is plausible. Public research must establish the real sites or assets; the diagnostic note may test the exact decision rather than pretend the internal workflow is already known. An internal NOC, dispatch, or software surface strengthens fit but need not be public. Exclude electric utilities, energy developers, generation-asset owners, contractors, installers, and equipment sellers unless they themselves operate a distributed customer or site service where public local-utility outage reports change an operating decision; utility benchmarking is a separate play.".into(),
-            target_vantages: vec!["process_owner".into(), "operator".into(), "technical_evaluator".into(), "router".into()],
-            required_signal_keys: vec!["account.fit_evidence".into(), "account.outage_sensitive_decision".into(), "account.distributed_locations".into()],
-            minimum_signal_matches: 2,
-            hypothesis: "Location-matched public utility context changes a live classification, dispatch, escalation, hold, transfer, or communication decision.".into(),
-            action_policy: "Use the verified footprint to ask one concrete question about the current decision path. Treat the decision and mechanism as hypotheses. If the problem is confirmed, offer one small historical event review; do not lead with an API, webhook, dashboard, or pilot.".into(),
+            target_icp: "Operators of Canadian EV-charging networks with a source-backed site footprint and an account-specific historical match between one public charging location and a reported utility outage area. Exclude equipment sellers, installers, utilities, consultants, and every non-charging vertical from this experiment.".into(),
+            target_vantages: vec!["process_owner".into(), "operator".into(), "technical_evaluator".into()],
+            required_signal_keys: vec!["account.fit_evidence".into(), "account.operated_ev_charging_network".into(), "account.distributed_locations".into(), "account.historical_location_outage_match".into()],
+            minimum_signal_matches: 4,
+            hypothesis: "When an entire charging site goes dark, Service Operations may still check the local utility map before opening an equipment/network ticket, dispatching someone, or updating status.".into(),
+            action_policy: "Run a ten-person founder-led EV experiment only after preparing an account-specific historical timestamp/location result. Send two emails: T1 asks one easy disqualifying site-diagnosis question; T2 six days later contributes the verified historical result. No LinkedIn, routing bump, product-disclaimer paragraph, or breakup email.".into(),
             proof_type: "historical_replay".into(),
-            proof_description: "Replay a few known incidents by matching affected locations to public utility events and compare when useful external context became available.".into(),
-            success_metric: "Time to correct classification and the number of historical decisions that would have changed before a manual lookup or site call.".into(),
-            kill_condition: "Reliable utility context already arrives before the decision, or the matched context would not change any action.".into(),
+            proof_description: "Match public charging locations to historical utility outage areas, recording the location, utility timestamp, and what a feed or webhook would have returned.".into(),
+            success_metric: "Whether utility status is checked manually today and whether the verified historical signal could change diagnosis, dispatch, or customer status.".into(),
+            kill_condition: "Telemetry already settles upstream utility cause immediately, Service Operations never checks utility status, or no verified location-specific historical match exists.".into(),
             source_refs: vec!["playbooks/outagehub.toml".into(), "youtube:wNnU2BJILPA@509".into()],
             ..Default::default()
         },
         GtmPlay {
             brand: "gnk".into(),
             key: "closed_case_reconstruction".into(),
-            version: 2,
-            name: "Closed-case workflow reconstruction".into(),
+            version: 3,
+            name: "Recurring decision reconstruction".into(),
             lifecycle: "testing".into(),
             motion: "internal_pipeline_to_forward_deployed_proof".into(),
-            target_icp: "Reachable mid-market workflow owners dealing with costly recurring exceptions, investigations, or reconciliation across existing systems.".into(),
+            target_icp: "Reachable mid-market workflow owners where public evidence supports one specific recurring decision, a believable consequence, and either an external trigger or direct evidence of the mechanism. Company category and generic workflow plausibility do not qualify.".into(),
             target_vantages: vec!["process_owner".into(), "operator".into(), "operational_executive".into(), "router".into()],
-            required_signal_keys: vec!["account.fit_evidence".into(), "account.expensive_recurring_workflow".into(), "account.cross_system_reconciliation".into(), "account.reachable_workflow_owner".into()],
-            minimum_signal_matches: 3,
-            hypothesis: "A missing decision, coordination, or evidence-reconstruction layer causes repeated handling time, delay, risk, or constrained capacity.".into(),
-            action_policy: "Open on one concrete workflow and earn a correction. After confirmation, test a small set of closed cases before proposing a bounded paid build.".into(),
+            required_signal_keys: vec!["account.fit_evidence".into(), "account.specific_recurring_decision".into(), "account.believable_operating_consequence".into(), "account.external_trigger_or_mechanism_evidence".into()],
+            minimum_signal_matches: 4,
+            hypothesis: "A source-backed trigger creates a recurring decision whose supporting position is not immediately visible, forcing someone to reconstruct it from separate records with a meaningful operating consequence.".into(),
+            action_policy: "Open on the exact event and decision fork. Ask whether the reviewer can immediately see what supports the current position or whether someone rebuilds it from the named records. Do not ask the recipient to diagnose importance or evaluate GnK. Each follow-up must add evidence, consequence, a bounded test, or a useful route; hold rather than retract the premise.".into(),
             proof_type: "closed_case_reconstruction".into(),
             proof_description: "Reconstruct a small sample of closed cases using the proposed decision or evidence workflow and compare it with the current process.".into(),
-            success_metric: "Handling time, evidence completeness, exceptions resolved, and decisions reached without manual cross-system reconstruction.".into(),
-            kill_condition: "The workflow is not frequent or consequential, is already handled well, or no bounded data sample can demonstrate a better result.".into(),
+            success_metric: "Settlement or resolution time, leakage or recoveries, audit exposure, customer SLA, and senior reviewer capacity affected by reconstruction.".into(),
+            kill_condition: "The decision is not recurring or consequential, no source-backed trigger or mechanism exists, the position is immediately visible, or the recipient is not close enough to answer.".into(),
             source_refs: vec!["playbooks/gnk.toml".into(), "youtube:wNnU2BJILPA@509".into()],
             ..Default::default()
         },
         GtmPlay {
             brand: "wapahki".into(),
             key: "task_exception_review".into(),
-            version: 3,
+            version: 4,
             name: "Task-and-exception feasibility review".into(),
             lifecycle: "testing".into(),
             motion: "internal_pipeline_to_forward_deployed_proof".into(),
-            target_icp: "Food manufacturers with one bounded repetitive task whose SKU, format, or exception variability keeps it manual.".into(),
+            target_icp: "Food manufacturers where first-party evidence identifies one physical station or handoff and a credible economic reason that the work remaining manual matters. Product variety alone is insufficient.".into(),
             target_vantages: vec!["process_owner".into(), "operator".into(), "technical_evaluator".into(), "router".into()],
-            required_signal_keys: vec!["account.fit_evidence".into(), "account.bounded_repetitive_task".into(), "account.format_variability".into(), "account.exception_heavy_manual_work".into()],
+            required_signal_keys: vec!["account.fit_evidence".into(), "account.bounded_repetitive_task".into(), "account.format_variability".into(), "account.exception_heavy_manual_work".into(), "account.manual_task_economic_pressure".into()],
             minimum_signal_matches: 3,
             hypothesis: "The normal motion is repeatable enough for a flexible cell while people can retain a bounded set of exceptions that make fixed automation uneconomic.".into(),
-            action_policy: "In cold outreach, earn only a correction, referral, or first-hand description of one named task, what changes between runs, and which exceptions interrupt it. After a human reply, read the account's customer-development record and ask for only its next missing commitment. Never infer validation from a send, compliment, or meeting; never ask a non-responsive cold prospect for a pilot or LOI.".into(),
+            action_policy: "Cold outreach starts from one source-supported station or handoff, one suspected economic consequence, and one likely blocker to ordinary automation. Ask one factual question the recipient can answer from memory; never ask them to identify a use case or evaluate Wapahki's architecture. After a human reply, read the account's customer-development record and ask for only its next missing commitment. Never infer validation from a send, compliment, or meeting; never ask a non-responsive cold prospect for a pilot or LOI.".into(),
             proof_type: "task_feasibility_review".into(),
             proof_description: "Review a task sketch, short video, or representative SKU/changeover set; model the normal motion, exceptions, rate, and technical boundaries.".into(),
             success_metric: "Required rate, intervention frequency, changeover burden, task coverage, and a clear technical/economic stop condition.".into(),
@@ -871,9 +961,20 @@ mod tests {
                     ..Default::default()
                 },
                 SignalCandidate {
-                    definition_key: "account.expensive_recurring_workflow".into(),
-                    evidence: "Adjusters manually review every exception, adding handling time."
-                        .into(),
+                    definition_key: "account.specific_recurring_decision".into(),
+                    evidence: "After every disputed rejection, claims decides whether to pursue recovery or write it off.".into(),
+                    confidence: 0.9,
+                    ..Default::default()
+                },
+                SignalCandidate {
+                    definition_key: "account.believable_operating_consequence".into(),
+                    evidence: "The review affects recoveries, settlement time, and senior reviewer capacity.".into(),
+                    confidence: 0.9,
+                    ..Default::default()
+                },
+                SignalCandidate {
+                    definition_key: "account.external_trigger_or_mechanism_evidence".into(),
+                    evidence: "A public claims guide requires policy, investigation, and prior-action records before escalation.".into(),
                     confidence: 0.9,
                     ..Default::default()
                 },
@@ -890,11 +991,13 @@ mod tests {
             brand: "gnk".into(),
             play_id: play.id,
             play_version: play.version,
-            status: "research_needed".into(),
-            fit_score: 70,
+            status: "qualified".into(),
+            fit_score: 85,
             matched_signal_keys: vec![
                 "account.fit_evidence".into(),
-                "account.expensive_recurring_workflow".into(),
+                "account.specific_recurring_decision".into(),
+                "account.believable_operating_consequence".into(),
+                "account.external_trigger_or_mechanism_evidence".into(),
             ],
             source: "test-before-contact-mapping".into(),
             ..Default::default()
@@ -942,19 +1045,32 @@ mod tests {
             "test",
         )
         .expect("discovery signal");
+        let play = db
+            .current_gtm_play("gnk")
+            .expect("play query")
+            .expect("play");
+        db.upsert_account_play_assessment(&AccountPlayAssessment {
+            lead_id: discovery_lead_id.clone(),
+            brand: "gnk".into(),
+            play_id: play.id,
+            play_version: play.version,
+            status: "research_needed".into(),
+            fit_score: 60,
+            matched_signal_keys: vec!["account.fit_evidence".into()],
+            source: "test-current-assessment".into(),
+            ..Default::default()
+        })
+        .expect("discovery assessment");
         let discovery_person = db.get_person(&discovery_person_id).unwrap().unwrap();
         let discovery = prepare_action(&db, "gnk", &discovery_lead_id, &discovery_person)
             .expect("discovery context");
-        assert_eq!(discovery.state, "discovery_ready");
-        assert!(discovery.sequence_ready_for(1));
-        assert!(discovery.sequence_ready_for(7));
+        assert_eq!(discovery.state, "research_required");
+        assert!(!discovery.sequence_ready_for(1));
+        assert!(!discovery.sequence_ready_for(7));
         assert!(!discovery.action_ready());
         assert!(discovery
             .copy_prompt_block()
-            .contains("Never claim that work is manual"));
-        assert!(discovery
-            .copy_prompt_block()
-            .contains("short discovery conversation plus an email-reply alternative is permitted"));
+            .contains("Hold it for research"));
         drop(db);
         remove_temp_db(&path);
     }
@@ -1036,7 +1152,7 @@ mod tests {
     }
 
     #[test]
-    fn generic_cold_storage_footprint_can_earn_a_cautious_discovery_note() {
+    fn generic_cold_storage_footprint_cannot_enter_the_ev_experiment() {
         let path = std::env::temp_dir().join(format!(
             "spruce-outage-signal-test-{}.sqlite",
             Uuid::new_v4()
@@ -1104,16 +1220,14 @@ mod tests {
         assert!(!context
             .matched_signal_keys
             .contains(&"account.outage_sensitive_decision".to_string()));
-        assert!(context.action_ready());
-        assert!(context
-            .copy_prompt_block()
-            .contains("Treat everything else as a question"));
+        assert!(!context.action_ready());
+        assert!(!context.sequence_ready_for(2));
         drop(db);
         remove_temp_db(&path);
     }
 
     #[test]
-    fn complementary_account_facts_can_support_a_cautious_outage_hypothesis() {
+    fn operated_ev_network_with_historical_match_is_action_ready() {
         let path = std::env::temp_dir().join(format!(
             "spruce-outage-combined-signal-test-{}.sqlite",
             Uuid::new_v4()
@@ -1124,7 +1238,7 @@ mod tests {
             .upsert_lead(&Lead {
                 brand: "outagehub".into(),
                 apollo_org_id: "org-operated-cold-storage".into(),
-                name: "Operated Cold Storage".into(),
+                name: "Operated Charging Network".into(),
                 ..Default::default()
             })
             .expect("lead");
@@ -1145,22 +1259,25 @@ mod tests {
             &[
                 SignalCandidate {
                     definition_key: "account.fit_evidence".into(),
-                    evidence:
-                        "The operator runs automated cold-storage warehouses in three provinces."
-                            .into(),
+                    evidence: "The company operates a Canadian EV charging network with public charging sites.".into(),
                     confidence: 0.9,
                     ..Default::default()
                 },
                 SignalCandidate {
                     definition_key: "account.distributed_locations".into(),
-                    evidence: "Facilities are located across Ontario, Alberta, and Quebec.".into(),
+                    evidence: "The operator runs multiple charging sites across Canada.".into(),
                     confidence: 0.9,
                     ..Default::default()
                 },
                 SignalCandidate {
-                    definition_key: "account.outage_sensitive_decision".into(),
-                    evidence: "The company provides refrigerated operations around the clock."
-                        .into(),
+                    definition_key: "account.operated_ev_charging_network".into(),
+                    evidence: "The company operates an EV charging network with charging sites in Ontario.".into(),
+                    confidence: 0.9,
+                    ..Default::default()
+                },
+                SignalCandidate {
+                    definition_key: "account.historical_location_outage_match".into(),
+                    evidence: "On 2026-07-14 at 14:30, the charging site at 123 King Street overlapped a utility outage area in a utility report.".into(),
                     confidence: 0.9,
                     ..Default::default()
                 },
@@ -1176,14 +1293,15 @@ mod tests {
             &[
                 "account.fit_evidence",
                 "account.distributed_locations",
-                "account.outage_sensitive_decision",
+                "account.operated_ev_charging_network",
+                "account.historical_location_outage_match",
             ],
         );
         let person = db.get_person(&person_id).unwrap().unwrap();
         let context = prepare_action(&db, "outagehub", &lead_id, &person).expect("context");
         assert!(context
             .matched_signal_keys
-            .contains(&"account.outage_sensitive_decision".to_string()));
+            .contains(&"account.historical_location_outage_match".to_string()));
         assert!(context.action_ready());
         drop(db);
         remove_temp_db(&path);
@@ -1258,6 +1376,21 @@ mod tests {
         assert_eq!(signal.source_kind, "official_job_posting");
         assert_eq!(signal.freshness_seconds, 30 * 86_400);
         assert!(signal.description.contains("does not prove pain"));
+    }
+
+    #[test]
+    fn wapahki_catalog_includes_manual_task_economics() {
+        let definitions = default_signal_definitions();
+        let signal = definitions
+            .iter()
+            .find(|definition| {
+                definition.brand == "wapahki"
+                    && definition.key == "account.manual_task_economic_pressure"
+            })
+            .expect("manual-task economic signal");
+
+        assert!(signal.description.contains("staffing"));
+        assert!(signal.description.contains("throughput"));
     }
 
     #[test]

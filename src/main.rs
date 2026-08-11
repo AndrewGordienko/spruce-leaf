@@ -66,7 +66,7 @@ use std::time::{Duration, SystemTime};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 
 use business::Businesses;
@@ -95,7 +95,7 @@ struct Cli {
     businesses: String,
 
     /// Inference provider. OpenAI uses the Responses API; others use local CLIs.
-    #[arg(long, global = true, value_enum, default_value_t = Backend::Openai)]
+    #[arg(long, global = true, value_enum, default_value_t = Backend::Codex)]
     backend: Backend,
 
     /// Model override for the selected backend. Omit to use its default.
@@ -176,6 +176,15 @@ enum Command {
         contacts: usize,
     },
 
+    /// Re-read and reassess one existing CRM account against the current GTM play (no Apollo).
+    Research {
+        /// Exact account name/domain/id, or an unambiguous name fragment.
+        account: String,
+        /// Optional research focus added to the active brand motion.
+        #[arg(long, default_value = "")]
+        thesis: String,
+    },
+
     /// Reveal + verify emails for sourced people (Apollo enrichment, costs credits).
     Enrich {
         #[arg(long, default_value_t = 50, value_parser = positive_usize)]
@@ -253,7 +262,8 @@ enum Command {
         /// Actually send email continuously. Default previews once and exits.
         #[arg(long)]
         live: bool,
-        /// Continuously source, enrich, and draft toward funnel targets. Requires --live.
+        /// Continuously source, enrich, and draft toward funnel targets.
+        /// Without --live, outbound email remains disabled.
         #[arg(long)]
         autopilot: bool,
         /// Seconds between cadence passes.
@@ -586,6 +596,88 @@ fn main() -> Result<()> {
             Ok(())
         }
 
+        Command::Research { account, thesis } => {
+            let mut matches = db
+                .list_leads(Some(&cli.brand))?
+                .into_iter()
+                .filter(|lead| {
+                    lead.id.eq_ignore_ascii_case(account.trim())
+                        || lead.name.eq_ignore_ascii_case(account.trim())
+                        || lead.domain.eq_ignore_ascii_case(account.trim())
+                })
+                .collect::<Vec<_>>();
+            if matches.is_empty() {
+                let needle = account.trim().to_ascii_lowercase();
+                matches = db
+                    .list_leads(Some(&cli.brand))?
+                    .into_iter()
+                    .filter(|lead| {
+                        lead.name.to_ascii_lowercase().contains(&needle)
+                            || lead.domain.to_ascii_lowercase().contains(&needle)
+                    })
+                    .collect();
+            }
+            if matches.len() != 1 {
+                let found = matches
+                    .iter()
+                    .map(|lead| lead.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(anyhow!(
+                    "account query must resolve to exactly one {} lead; found {}{}",
+                    cli.brand,
+                    matches.len(),
+                    if found.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {found}")
+                    }
+                ));
+            }
+            let lead = matches.remove(0);
+            let client = make_engine(&rt, &cli)?;
+            let playbooks = load_playbooks(&cli)?;
+            let pb = playbooks.get(&cli.brand)?;
+            let businesses = load_businesses(&cli)?;
+            let business = businesses.get(&cli.brand)?;
+            let lib = rt.block_on(async { library.read().await.clone() });
+            eprintln!(
+                "\u{2192} [{}] re-researching {} against the current play (no Apollo)",
+                pb.name, lead.name
+            );
+            let refreshed = rt.block_on(sourcing::refresh_lead_context(
+                &db,
+                &client,
+                pb,
+                &business.operating_context(),
+                &lib,
+                &thesis,
+                std::slice::from_ref(&lead.id),
+                1,
+            ))?;
+            let play = db
+                .current_gtm_play(&cli.brand)?
+                .ok_or_else(|| anyhow!("no active GTM play for {}", cli.brand))?;
+            let assessment = db
+                .account_play_assessment(&lead.id, &play.id)?
+                .ok_or_else(|| {
+                    anyhow!("research produced no current assessment for {}", lead.name)
+                })?;
+            println!(
+                "\u{2713} refreshed {refreshed} account(s): {} is {} for {} v{} (score {}, signals {}).",
+                lead.name,
+                assessment.status,
+                play.name,
+                play.version,
+                assessment.fit_score,
+                assessment.matched_signal_keys.len(),
+            );
+            if !assessment.evidence_gaps.is_empty() {
+                println!("  evidence gaps: {}", assessment.evidence_gaps.join(" | "));
+            }
+            Ok(())
+        }
+
         Command::Enrich { limit, phone } => {
             let apollo = make_apollo()?;
             eprintln!(
@@ -650,15 +742,62 @@ fn main() -> Result<()> {
                     let mut account_people = people
                         .iter()
                         .filter(|person| person.lead_id == lead.id)
+                        .filter(|_person| {
+                            !pb.max_employees
+                                .is_some_and(|max| lead.headcount > 0 && lead.headcount > max)
+                        })
+                        .filter(|person| {
+                            crate::gtm::recipient_sequence_block_reason(
+                                &db, &cli.brand, &lead.id, person,
+                            )
+                            .is_ok_and(|reason| reason.is_none())
+                        })
+                        .filter(|person| {
+                            crate::gtm::prepare_action(&db, &cli.brand, &lead.id, person)
+                                .is_ok_and(|context| context.sequence_ready_for(touches))
+                        })
                         .cloned()
                         .collect::<Vec<_>>();
-                    account_people.sort_by_key(|person| !person.primary);
+                    account_people.sort_by(|left, right| {
+                        response_design::contact_priority(
+                            &right.title,
+                            &right.vantage,
+                            right.primary,
+                        )
+                        .cmp(&response_design::contact_priority(
+                            &left.title,
+                            &left.vantage,
+                            left.primary,
+                        ))
+                        .then_with(|| left.name.cmp(&right.name))
+                    });
                     selected.extend(account_people.into_iter().take(per_account));
-                    if selected.len() >= total {
-                        break;
-                    }
                 }
-                selected.truncate(total);
+                // Treat --limit as a portfolio target, not merely "the first N
+                // rows." Preserve already-approved recipients inside the target,
+                // then prefer untouched qualified contacts over repeatedly paying
+                // to regenerate a weak recipient who already failed review.
+                let mut ranked = selected
+                    .into_iter()
+                    .enumerate()
+                    .map(|(order, person)| {
+                        let rank =
+                            if db.person_has_current_reviewed_sequence(&person.id, touches)? {
+                                0
+                            } else if !db.person_has_current_policy_attempt(&person.id)? {
+                                1
+                            } else {
+                                2
+                            };
+                        Ok((rank, order, person))
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                ranked.sort_by_key(|(rank, order, _)| (*rank, *order));
+                let selected = ranked
+                    .into_iter()
+                    .take(total)
+                    .map(|(_, _, person)| person)
+                    .collect::<Vec<_>>();
                 Some(
                     selected
                         .into_iter()
@@ -755,14 +894,23 @@ fn main() -> Result<()> {
         }
 
         Command::Approve { person } => {
-            let n = db.approve_touches(Some(&cli.brand), person.as_deref())?;
+            let playbooks = load_playbooks(&cli)?;
+            let pb = playbooks.get(&cli.brand)?;
+            let approval = outreach::approve_ready_touches(&db, pb, person.as_deref())?;
             let businesses = load_businesses(&cli)?;
             let profile = businesses.get(&cli.brand)?;
             let plan = calendar::rebalance_approved_sales(&db, profile, chrono::Utc::now())?;
             println!(
-                "\u{2713} approved {n} touch(es) \u{2192} {} email(s) placed across {} active day(s); {} new conversation(s) admitted.",
-                plan.emails, plan.active_days, plan.admitted_people
+                "\u{2713} approved {} touch(es) \u{2192} {} email(s) placed across {} active day(s); {} new conversation(s) admitted; {} recipient(s) held by GTM policy.",
+                approval.touches_scheduled,
+                plan.emails,
+                plan.active_days,
+                plan.admitted_people,
+                approval.people_held,
             );
+            for reason in approval.hold_reasons.iter().take(5) {
+                println!("  held: {reason}");
+            }
             Ok(())
         }
 
@@ -791,11 +939,6 @@ fn main() -> Result<()> {
             if live && compliance.physical_address.trim().is_empty() {
                 anyhow::bail!(
                     "refusing live sending: COMPLIANCE_ADDRESS is unset (required for CASL/CAN-SPAM)"
-                );
-            }
-            if autopilot && !live {
-                anyhow::bail!(
-                    "--autopilot is a continuous process and requires `daemon --live`; cold drafts remain approval-gated"
                 );
             }
             if live {
@@ -834,6 +977,32 @@ fn main() -> Result<()> {
                 interval_secs: interval,
                 ..Default::default()
             };
+            // Fill-only autopilot is deliberately safe to run without mailbox
+            // credentials. Preview the cadence once (read-only), then keep the
+            // sourcing/enrichment/drafting supervisor in the foreground. The
+            // worker's auto_schedule default is false, so new copy remains
+            // behind the normal human approval gate as well as the dry-run
+            // delivery boundary.
+            if autopilot && !live {
+                rt.block_on(cadence::run_daemon(
+                    db.clone(),
+                    playbooks.clone(),
+                    businesses.clone(),
+                    compliance,
+                    cfg,
+                ))?;
+                let autopilot_client = make_engine(&rt, &cli)?;
+                rt.block_on(jobs::run_daemon(
+                    db,
+                    autopilot_client,
+                    playbooks,
+                    businesses,
+                    library,
+                    cli.concurrency,
+                    interval,
+                ));
+                return Ok(());
+            }
             // Inbox polling runs alongside live cadence only. A dry preview is
             // intentionally read-only and must not mark inbound mail handled.
             if live {
@@ -1564,11 +1733,18 @@ fn positive_i64(raw: &str) -> std::result::Result<i64, String> {
 
 #[cfg(test)]
 mod startup_tests {
-    use super::{bind_available_crm_listener, is_spruce_crm, CrmEndpoint};
+    use super::{bind_available_crm_listener, is_spruce_crm, Backend, Cli, CrmEndpoint};
     use crate::crm::CRM_PROTOCOL_REV;
+    use clap::Parser;
     use std::io::{Read, Write};
     use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
     use std::thread;
+
+    #[test]
+    fn codex_is_the_default_inference_backend() {
+        let cli = Cli::try_parse_from(["spruce-leaf"]).expect("parse defaults");
+        assert_eq!(cli.backend, Backend::Codex);
+    }
 
     #[test]
     fn free_port_selection_skips_an_occupied_preference() {

@@ -30,9 +30,14 @@ use uuid::Uuid;
 
 /// Increment when the buyer-facing copy contract changes materially. The CRM
 /// only presents sequences approved under the current policy.
-// v11 adds role-level response contracts and honors requested multi-recipient
-// account coverage. Older copy did not receive those planning/review checks.
-pub const CURRENT_COPY_POLICY_VERSION: i64 = 12;
+// v16 raises the GnK account threshold from plausible workflow fit to a sourced
+// recurring decision + consequence + trigger/mechanism, and changes OutageHub
+// cold outreach to an evidence-first two-email EV-operator experiment. Older
+// copy did not receive those checks and must never remain sendable.
+// v19 adds a tightly bounded one-touch discovery lane. Accounts without the
+// evidence required for a cadence may receive one source-safe factual question,
+// but still cannot enter a follow-up sequence until the workflow is proven.
+pub const CURRENT_COPY_POLICY_VERSION: i64 = 19;
 
 /// A real company sourced from Apollo and (optionally) qualified against a brand
 /// thesis. Everything the model *guesses* stays in the inference/hypothesis
@@ -141,6 +146,10 @@ pub struct Sequence {
     /// research_required | discovery_ready | action_ready | no_play
     pub gtm_state: String,
     pub copy_policy_version: i64,
+    /// Exact generation lane used for this persisted copy. These snapshots make
+    /// reply outcomes attributable even after the operator changes backends.
+    pub generation_backend: String,
+    pub generation_model: String,
     pub status: String,
     pub current_stage: i64,
     pub created_at: String,
@@ -357,6 +366,16 @@ pub struct GtmOutcome {
     pub experiment_id: String,
     pub experiment_assignment_id: String,
     pub signal_observation_ids: Vec<String>,
+    pub touch_id: String,
+    pub touch_stage: i64,
+    pub contact_title: String,
+    pub contact_vantage: String,
+    pub account_hypothesis: String,
+    pub play_version: i64,
+    pub experiment_arm: String,
+    pub copy_policy_version: i64,
+    pub generation_backend: String,
+    pub generation_model: String,
     pub value: f64,
     pub detail: String,
     pub source: String,
@@ -743,6 +762,8 @@ impl Db {
             ("sequences", "signal_observation_ids", "TEXT DEFAULT '[]'"),
             ("sequences", "gtm_state", "TEXT DEFAULT ''"),
             ("sequences", "copy_policy_version", "INTEGER DEFAULT 0"),
+            ("sequences", "generation_backend", "TEXT DEFAULT ''"),
+            ("sequences", "generation_model", "TEXT DEFAULT ''"),
             ("touches", "recipient_timezone", "TEXT DEFAULT ''"),
             ("touches", "scheduled_rule", "TEXT DEFAULT ''"),
             ("touches", "schedule_reason", "TEXT DEFAULT ''"),
@@ -757,6 +778,16 @@ impl Db {
             ("opportunity_touches", "schedule_reason", "TEXT DEFAULT ''"),
             ("replies", "conversation_id", "TEXT DEFAULT ''"),
             ("gtm_experiments", "baseline_sends", "INTEGER DEFAULT 0"),
+            ("gtm_outcomes", "touch_id", "TEXT DEFAULT ''"),
+            ("gtm_outcomes", "touch_stage", "INTEGER DEFAULT 0"),
+            ("gtm_outcomes", "contact_title", "TEXT DEFAULT ''"),
+            ("gtm_outcomes", "contact_vantage", "TEXT DEFAULT ''"),
+            ("gtm_outcomes", "account_hypothesis", "TEXT DEFAULT ''"),
+            ("gtm_outcomes", "play_version", "INTEGER DEFAULT 0"),
+            ("gtm_outcomes", "experiment_arm", "TEXT DEFAULT ''"),
+            ("gtm_outcomes", "copy_policy_version", "INTEGER DEFAULT 0"),
+            ("gtm_outcomes", "generation_backend", "TEXT DEFAULT ''"),
+            ("gtm_outcomes", "generation_model", "TEXT DEFAULT ''"),
         ] {
             ensure_column(&conn, table, column, definition)?;
         }
@@ -1118,8 +1149,9 @@ impl Db {
         conn.execute(
             "INSERT INTO sequences (id,person_id,lead_id,brand,thesis,applied_principles,\
              play_id,play_version,experiment_id,experiment_arm,experiment_assignment_id,\
-             signal_observation_ids,gtm_state,copy_policy_version,status,current_stage,created_at) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+             signal_observation_ids,gtm_state,copy_policy_version,generation_backend,generation_model,\
+             status,current_stage,created_at) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
             params![
                 id,
                 s.person_id,
@@ -1135,6 +1167,8 @@ impl Db {
                 js(&s.signal_observation_ids),
                 s.gtm_state,
                 copy_policy_version,
+                s.generation_backend,
+                s.generation_model,
                 status_or(&s.status, "active"),
                 s.current_stage,
                 now()
@@ -1518,10 +1552,13 @@ impl Db {
         let start = start.to_rfc3339();
         let end = end.to_rfc3339();
         let regular: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM touches WHERE brand=?1 AND due_at>=?2 AND due_at<?3
-             AND lower(channel) IN ('email','linkedin_or_email')
-             AND status IN ('scheduled','sent')",
-            params![brand, start, end],
+            "SELECT COUNT(*) FROM touches t
+             JOIN sequences s ON s.id=t.sequence_id
+             WHERE t.brand=?1 AND t.due_at>=?2 AND t.due_at<?3
+             AND lower(t.channel) IN ('email','linkedin_or_email')
+             AND (t.status='sent' OR (t.status='scheduled'
+                  AND s.status='active' AND s.copy_policy_version=?4))",
+            params![brand, start, end, CURRENT_COPY_POLICY_VERSION],
             |r| r.get(0),
         )?;
         let opportunities: i64 = conn.query_row(
@@ -1816,26 +1853,31 @@ impl Db {
                 "SELECT t.due_at,t.stage,t.channel,t.status,p.name,l.name,t.purpose,
                         t.recipient_timezone,t.scheduled_rule
                  FROM touches t
+                 JOIN sequences s ON s.id=t.sequence_id
                  JOIN people p ON p.id=t.person_id
                  JOIN leads l ON l.id=t.lead_id
                  WHERE t.brand=?1 AND t.status='scheduled'
+                   AND s.status='active' AND s.copy_policy_version=?3
                  ORDER BY t.due_at ASC LIMIT ?2",
             )?;
-            let rows = stmt.query_map(params![brand, limit as i64], |row| {
-                Ok(CalendarEntry {
-                    brand: brand.to_string(),
-                    due_at: row.get(0)?,
-                    stage: row.get(1)?,
-                    channel: row.get(2)?,
-                    status: row.get(3)?,
-                    recipient: row.get(4)?,
-                    account: row.get(5)?,
-                    purpose: row.get(6)?,
-                    recipient_timezone: row.get(7)?,
-                    scheduled_rule: row.get(8)?,
-                    motion: "sales".into(),
-                })
-            })?;
+            let rows = stmt.query_map(
+                params![brand, limit as i64, CURRENT_COPY_POLICY_VERSION],
+                |row| {
+                    Ok(CalendarEntry {
+                        brand: brand.to_string(),
+                        due_at: row.get(0)?,
+                        stage: row.get(1)?,
+                        channel: row.get(2)?,
+                        status: row.get(3)?,
+                        recipient: row.get(4)?,
+                        account: row.get(5)?,
+                        purpose: row.get(6)?,
+                        recipient_timezone: row.get(7)?,
+                        scheduled_rule: row.get(8)?,
+                        motion: "sales".into(),
+                    })
+                },
+            )?;
             entries.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
         }
         {
@@ -1884,6 +1926,20 @@ impl Db {
             .unwrap_or_default())
     }
 
+    pub fn touch_by_message_id(&self, brand: &str, message_id: &str) -> Result<Option<Touch>> {
+        if message_id.trim().is_empty() {
+            return Ok(None);
+        }
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT * FROM touches WHERE brand=?1 AND message_id=?2 LIMIT 1",
+                params![brand, message_id.trim()],
+                |row| Ok(row_to_touch(row)),
+            )
+            .optional()?)
+    }
+
     /// Mark a touch's outcome and stamp send metadata.
     pub fn set_touch_status(
         &self,
@@ -1927,11 +1983,37 @@ impl Db {
         Ok(())
     }
 
-    /// Approve drafted email-capable touches (draft → scheduled) for a person or
-    /// whole brand. Conditional LinkedIn/email touches resolve at send time from
-    /// the operator-maintained connection state. Pure LinkedIn tasks remain
-    /// manual drafts and never enter the daemon queue.
-    pub fn approve_touches(&self, brand: Option<&str>, person_id: Option<&str>) -> Result<usize> {
+    /// Count reviewed drafts that a higher-level policy gate may schedule.
+    pub(crate) fn reviewed_draft_touch_count(
+        &self,
+        brand: Option<&str>,
+        person_id: Option<&str>,
+    ) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM touches WHERE status='draft' \
+             AND (lower(channel)='email' OR (lower(channel)='linkedin_or_email' AND \
+                  COALESCE((SELECT linkedin_status FROM people WHERE people.id=touches.person_id),'unknown')<>'connected')) \
+             AND review_passes=1 \
+             AND EXISTS ( \
+               SELECT 1 FROM sequences s WHERE s.id=touches.sequence_id \
+                 AND s.status='active' AND s.copy_policy_version=?3 \
+             ) \
+             AND (?1 IS NULL OR brand=?1) AND (?2 IS NULL OR person_id=?2)",
+            params![brand, person_id, CURRENT_COPY_POLICY_VERSION],
+            |row| row.get(0),
+        )?;
+        Ok(n.max(0) as usize)
+    }
+
+    /// Low-level draft → scheduled transition. Callers must pass through the GTM
+    /// delivery gate first; keeping this crate-private prevents a UI action from
+    /// accidentally treating copy review as account qualification.
+    pub(crate) fn schedule_reviewed_touches(
+        &self,
+        brand: Option<&str>,
+        person_id: Option<&str>,
+    ) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
         let n = conn.execute(
             "UPDATE touches SET status='scheduled' WHERE status='draft' \
@@ -1971,6 +2053,7 @@ impl Db {
     ) -> Result<bool> {
         let expected_touches = match expected_touches {
             1 => 1,
+            2 => 2,
             7 => 7,
             _ => 4,
         };
@@ -1997,6 +2080,23 @@ impl Db {
         Ok(exists == 1)
     }
 
+    /// Whether this recipient has already consumed a generation attempt under
+    /// the active copy contract. Portfolio filling uses this to try fresh
+    /// qualified inventory before spending again on a current-policy reject;
+    /// failures from retired policies remain eligible for a clean attempt.
+    pub fn person_has_current_policy_attempt(&self, person_id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let exists: i64 = conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sequences
+                WHERE person_id=?1 AND copy_policy_version=?2
+            )",
+            params![person_id, CURRENT_COPY_POLICY_VERSION],
+            |row| row.get(0),
+        )?;
+        Ok(exists == 1)
+    }
+
     /// How many people at an account already have a complete, reviewed sequence
     /// under the current copy policy and requested touch shape.
     pub fn lead_current_reviewed_sequence_count(
@@ -2006,6 +2106,7 @@ impl Db {
     ) -> Result<usize> {
         let expected_touches = match expected_touches {
             1 => 1,
+            2 => 2,
             7 => 7,
             _ => 4,
         };
@@ -4006,9 +4107,11 @@ impl Db {
         conn.execute(
             "INSERT INTO gtm_outcomes
              (id,brand,kind,lead_id,person_id,sequence_id,conversation_id,play_id,experiment_id,
-              experiment_assignment_id,signal_observation_ids,value,detail,source,fingerprint,
-              occurred_at,created_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
+              experiment_assignment_id,signal_observation_ids,touch_id,touch_stage,contact_title,
+              contact_vantage,account_hypothesis,play_version,experiment_arm,copy_policy_version,
+              generation_backend,generation_model,value,detail,source,fingerprint,occurred_at,created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,
+                     ?19,?20,?21,?22,?23,?24,?25,?26,?27)
              ON CONFLICT(brand,fingerprint) DO NOTHING",
             params![
                 id,
@@ -4022,6 +4125,16 @@ impl Db {
                 outcome.experiment_id,
                 outcome.experiment_assignment_id,
                 js(&outcome.signal_observation_ids),
+                outcome.touch_id,
+                outcome.touch_stage,
+                outcome.contact_title,
+                outcome.contact_vantage,
+                outcome.account_hypothesis,
+                outcome.play_version,
+                outcome.experiment_arm,
+                outcome.copy_policy_version,
+                outcome.generation_backend,
+                outcome.generation_model,
                 outcome.value,
                 outcome.detail,
                 outcome.source,
@@ -4485,6 +4598,8 @@ fn row_to_sequence(r: &Row) -> Sequence {
         signal_observation_ids: jd(&g(r, "signal_observation_ids")),
         gtm_state: g(r, "gtm_state"),
         copy_policy_version: r.get("copy_policy_version").unwrap_or(0),
+        generation_backend: g(r, "generation_backend"),
+        generation_model: g(r, "generation_model"),
         status: g(r, "status"),
         current_stage: r.get("current_stage").unwrap_or(0),
         created_at: g(r, "created_at"),
@@ -4640,6 +4755,16 @@ fn row_to_gtm_outcome(r: &Row) -> GtmOutcome {
         experiment_id: g(r, "experiment_id"),
         experiment_assignment_id: g(r, "experiment_assignment_id"),
         signal_observation_ids: jd(&g(r, "signal_observation_ids")),
+        touch_id: g(r, "touch_id"),
+        touch_stage: r.get("touch_stage").unwrap_or(0),
+        contact_title: g(r, "contact_title"),
+        contact_vantage: g(r, "contact_vantage"),
+        account_hypothesis: g(r, "account_hypothesis"),
+        play_version: r.get("play_version").unwrap_or(0),
+        experiment_arm: g(r, "experiment_arm"),
+        copy_policy_version: r.get("copy_policy_version").unwrap_or(0),
+        generation_backend: g(r, "generation_backend"),
+        generation_model: g(r, "generation_model"),
         value: r.get("value").unwrap_or(0.0),
         detail: g(r, "detail"),
         source: g(r, "source"),
@@ -5293,6 +5418,8 @@ CREATE TABLE IF NOT EXISTS sequences (
     thesis TEXT,
     applied_principles TEXT DEFAULT '[]',
     copy_policy_version INTEGER DEFAULT 0,
+    generation_backend TEXT DEFAULT '',
+    generation_model TEXT DEFAULT '',
     status TEXT DEFAULT 'active',
     current_stage INTEGER DEFAULT 0,
     created_at TEXT
@@ -5534,6 +5661,16 @@ CREATE TABLE IF NOT EXISTS gtm_outcomes (
     experiment_id TEXT DEFAULT '',
     experiment_assignment_id TEXT DEFAULT '',
     signal_observation_ids TEXT DEFAULT '[]',
+    touch_id TEXT DEFAULT '',
+    touch_stage INTEGER DEFAULT 0,
+    contact_title TEXT DEFAULT '',
+    contact_vantage TEXT DEFAULT '',
+    account_hypothesis TEXT DEFAULT '',
+    play_version INTEGER DEFAULT 0,
+    experiment_arm TEXT DEFAULT '',
+    copy_policy_version INTEGER DEFAULT 0,
+    generation_backend TEXT DEFAULT '',
+    generation_model TEXT DEFAULT '',
     value REAL NOT NULL DEFAULT 0,
     detail TEXT DEFAULT '',
     source TEXT NOT NULL,
@@ -5737,8 +5874,8 @@ CREATE INDEX IF NOT EXISTS idx_jobs_claim ON jobs(status, next_run_at, priority)
 mod tests {
     use super::{
         AccountPlayAssessment, ApplicationBrief, ConversationMessage, CustomerDevelopmentRecord,
-        Db, GtmExperiment, Job, Lead, Mailbox, Meeting, Opportunity, OpportunityContact,
-        OpportunityTouch, Person, Sequence, Touch, CURRENT_COPY_POLICY_VERSION,
+        Db, GtmExperiment, GtmOutcome, Job, Lead, Mailbox, Meeting, Opportunity,
+        OpportunityContact, OpportunityTouch, Person, Sequence, Touch, CURRENT_COPY_POLICY_VERSION,
     };
     use chrono::{TimeZone, Utc};
     use uuid::Uuid;
@@ -6424,7 +6561,7 @@ mod tests {
             .expect("touch");
         }
 
-        assert_eq!(db.approve_touches(Some("gnk"), None).unwrap(), 1);
+        assert_eq!(db.schedule_reviewed_touches(Some("gnk"), None).unwrap(), 1);
         assert_eq!(
             db.get_person(&connected).unwrap().unwrap().linkedin_status,
             "connected"
@@ -6644,9 +6781,39 @@ mod tests {
         let due = Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap();
         let start = Utc.with_ymd_and_hms(2026, 8, 10, 0, 0, 0).unwrap();
         let end = Utc.with_ymd_and_hms(2026, 8, 11, 0, 0, 0).unwrap();
+        let lead_id = db
+            .upsert_lead(&Lead {
+                brand: "gnk".into(),
+                apollo_org_id: "capacity-org".into(),
+                name: "Capacity Account".into(),
+                ..Default::default()
+            })
+            .expect("insert capacity lead");
+        let person_id = db
+            .upsert_person(&Person {
+                lead_id: lead_id.clone(),
+                brand: "gnk".into(),
+                apollo_person_id: "capacity-person".into(),
+                name: "Capacity Person".into(),
+                ..Default::default()
+            })
+            .expect("insert capacity person");
+        let sequence_id = db
+            .create_sequence(&Sequence {
+                person_id: person_id.clone(),
+                lead_id: lead_id.clone(),
+                brand: "gnk".into(),
+                status: "active".into(),
+                copy_policy_version: CURRENT_COPY_POLICY_VERSION,
+                ..Default::default()
+            })
+            .expect("insert current sequence");
         for index in 0..30 {
             db.insert_touch(&Touch {
                 id: format!("gnk-{index}"),
+                sequence_id: sequence_id.clone(),
+                person_id: person_id.clone(),
+                lead_id: lead_id.clone(),
                 brand: "gnk".into(),
                 status: match index {
                     0 => "sent",
@@ -6660,6 +6827,28 @@ mod tests {
             })
             .expect("insert gnk touch");
         }
+        let stale_sequence_id = db
+            .create_sequence(&Sequence {
+                person_id: person_id.clone(),
+                lead_id: lead_id.clone(),
+                brand: "gnk".into(),
+                status: "active".into(),
+                copy_policy_version: CURRENT_COPY_POLICY_VERSION - 1,
+                ..Default::default()
+            })
+            .expect("insert stale sequence");
+        db.insert_touch(&Touch {
+            id: "gnk-stale-scheduled".into(),
+            sequence_id: stale_sequence_id,
+            person_id,
+            lead_id,
+            brand: "gnk".into(),
+            status: "scheduled".into(),
+            channel: "email".into(),
+            due_at: due.to_rfc3339(),
+            ..Default::default()
+        })
+        .expect("insert stale scheduled touch");
         db.insert_touch(&Touch {
             id: "wapahki-1".into(),
             brand: "wapahki".into(),
@@ -6684,6 +6873,7 @@ mod tests {
                 .unwrap(),
             0
         );
+        assert_eq!(db.upcoming_calendar("gnk", 20).unwrap().len(), 1);
     }
 
     #[test]
@@ -6780,11 +6970,11 @@ mod tests {
             .current_gtm_play("outagehub")
             .expect("load current play")
             .expect("seeded outagehub play");
-        assert_eq!(play.version, 7);
-        assert_eq!(play.minimum_signal_matches, 2);
+        assert_eq!(play.version, 8);
+        assert_eq!(play.minimum_signal_matches, 4);
         assert!(play
             .required_signal_keys
-            .contains(&"account.outage_sensitive_decision".to_string()));
+            .contains(&"account.historical_location_outage_match".to_string()));
         assert!(!play
             .required_signal_keys
             .contains(&"account.existing_operational_system".to_string()));
@@ -6848,7 +7038,7 @@ mod tests {
         let experiment_id = db
             .create_gtm_experiment(&GtmExperiment {
                 brand: "outagehub".into(),
-                play_id: play.id,
+                play_id: play.id.clone(),
                 name: "Correction CTA".into(),
                 experiment_type: "copy_only".into(),
                 hypothesis: "A correction CTA increases positive replies.".into(),
@@ -6872,6 +7062,80 @@ mod tests {
             .expect("reuse arm");
         assert_eq!(first.id, second.id);
         assert_eq!(first.arm, second.arm);
+
+        let sequence_id = db
+            .create_sequence(&Sequence {
+                person_id: "person-1".into(),
+                lead_id: lead_id.clone(),
+                brand: "outagehub".into(),
+                play_id: play.id.clone(),
+                play_version: 7,
+                experiment_id: experiment_id.clone(),
+                experiment_arm: first.arm.clone(),
+                experiment_assignment_id: first.id.clone(),
+                signal_observation_ids: vec!["signal-1".into()],
+                copy_policy_version: CURRENT_COPY_POLICY_VERSION,
+                generation_backend: "codex".into(),
+                generation_model: "gpt-5.6-terra".into(),
+                status: "active".into(),
+                ..Default::default()
+            })
+            .expect("create attributed sequence");
+        let touch_id = db
+            .insert_touch(&Touch {
+                sequence_id: sequence_id.clone(),
+                person_id: "person-1".into(),
+                lead_id: lead_id.clone(),
+                brand: "outagehub".into(),
+                stage: 1,
+                channel: "email".into(),
+                status: "sent".into(),
+                message_id: "<message-1@example.com>".into(),
+                ..Default::default()
+            })
+            .expect("create attributed touch");
+        assert_eq!(
+            db.touch_by_message_id("outagehub", "<message-1@example.com>")
+                .expect("find touch")
+                .map(|touch| touch.id),
+            Some(touch_id.clone())
+        );
+
+        db.record_gtm_outcome(&GtmOutcome {
+            brand: "outagehub".into(),
+            kind: "positive_reply".into(),
+            lead_id,
+            person_id: "person-1".into(),
+            sequence_id,
+            play_id: play.id,
+            experiment_id,
+            experiment_assignment_id: first.id,
+            signal_observation_ids: vec!["signal-1".into()],
+            touch_id,
+            touch_stage: 1,
+            contact_title: "Operations Manager".into(),
+            contact_vantage: "process_owner".into(),
+            account_hypothesis: "A sourced operating hypothesis".into(),
+            play_version: 7,
+            experiment_arm: first.arm,
+            copy_policy_version: CURRENT_COPY_POLICY_VERSION,
+            generation_backend: "codex".into(),
+            generation_model: "gpt-5.6-terra".into(),
+            fingerprint: "attribution-roundtrip".into(),
+            ..Default::default()
+        })
+        .expect("record attributed outcome");
+        let outcome = db
+            .list_gtm_outcomes(Some("outagehub"), 1)
+            .expect("list outcomes")
+            .pop()
+            .expect("attributed outcome");
+        assert_eq!(outcome.touch_stage, 1);
+        assert_eq!(outcome.contact_vantage, "process_owner");
+        assert_eq!(outcome.account_hypothesis, "A sourced operating hypothesis");
+        assert_eq!(outcome.experiment_arm, second.arm);
+        assert_eq!(outcome.generation_backend, "codex");
+        assert_eq!(outcome.generation_model, "gpt-5.6-terra");
     }
 
     #[test]
