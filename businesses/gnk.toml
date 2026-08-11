@@ -1,0 +1,56 @@
+key = "gnk"
+name = "GnK"
+summary = "A small senior software and AI team that builds custom systems for expensive, organization-specific workflows."
+
+known_facts = [
+  "GnK builds custom software and AI systems.",
+  "The commercial motion is founder-led and starts by validating a concrete workflow before proposing a bounded build.",
+]
+
+unknowns = [
+  "Current delivery capacity and preferred project start dates.",
+  "Minimum commercially viable project size.",
+  "Industries or technical stacks that should be excluded this quarter.",
+]
+
+goals = [
+  "Find organizations with an expensive recurring workflow (plausibly $1M+/year in cost, loss, risk, delay, recoverable revenue, or constrained capacity) where humans compensate for a missing decision/coordination/reconciliation layer between systems they already own.",
+  "Reach the person closest to that workflow and earn a correction, referral, or discovery conversation that quantifies the economic problem.",
+  "Land a narrow paid pilot that proves measurable value, then expand into a recurring $40k+/month software/AI engagement.",
+]
+
+constraints = [
+  "Do not position GnK as an AI agency with spare capacity.",
+  "Do not invent savings, internal systems, or urgency.",
+]
+
+[account_limits]
+max_new_contacts_per_account_per_day = 10
+max_active_contacts_per_account = 0
+max_unanswered_touches = 5
+
+[calendar]
+daily_touch_cap = 30
+quota_timezone = "Europe/London"
+fallback_recipient_timezone = "America/Toronto"
+weekdays = ["mon", "tue", "wed", "thu", "fri"]
+window_start = 8
+window_end = 17
+preferred_hours = [9, 11, 14]
+learning_min_samples = 20
+
+[[calendar.rules]]
+key = "technical_operator_mornings"
+title_keywords = ["engineering", "technology", "operations", "data", "systems"]
+vantages = ["process_owner", "operator", "technical_evaluator"]
+channels = ["email", "linkedin", "linkedin_request", "linkedin_or_email"]
+weekdays = ["tue", "wed", "thu"]
+window_start = 8
+window_end = 16
+preferred_hours = [8, 10, 13]
+rationale = "Initial hypothesis: hands-on technical and operating roles are more reachable before the middle of their local working day; keep weekday-only until observed outcomes support a change."
+
+[[motions]]
+key = "customer_outbound"
+kind = "sales"
+objective = "Create qualified custom-software opportunities through hypothesis-led founder outreach."

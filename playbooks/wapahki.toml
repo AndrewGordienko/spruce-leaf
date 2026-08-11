@@ -1,0 +1,240 @@
+# Wapahki — flexible robotic packing cell (food manufacturing).
+# Wapahki is NOT selling a proven robot with installations and savings. The
+# first email's job is to discover ONE bounded, recurring physical task worth a
+# closer look — not to sell equipment.
+
+key = "wapahki"
+name = "Wapahki"
+signature = "Andrew"
+
+one_liner = "Wapahki is exploring robotic packing cells that can switch between related product or case formats without rebuilding the automation each time."
+
+verified_seller_facts = [
+  "Andrew is a University of Toronto student working in robotics at Automata.",
+  "Wapahki is exploring flexible robotic packing and handling systems; it does not claim a finished deployed product.",
+]
+
+motion = "discover one physical handling or packing task that is still manual because products, packaging, orientation, or changeovers vary too much for conventional automation"
+
+# A cold note still has to work on a phone. One concrete plant-floor moment is
+# enough to make the motion clear; the discovery belongs in the reply.
+min_words = 40
+max_words = 80
+
+min_signals = 2
+
+system_concept_examples = [
+  "a robotic cell that handles a recurring case-transfer between conveyor and pallet across a limited set of products",
+  "a flexible packing cell that switches between a small range of case formats without a mechanical rebuild",
+  "a cell that handles the ordinary pack-out motion while operators deal with misfeeds, damaged products, and unusual cases",
+]
+
+subject_examples = [
+  "finished-case packing",
+  "dessert changeovers",
+  "case handling",
+  "promotional pack-out",
+  "receiving work",
+]
+
+vantage_notes = [
+  "Production supervisor: can describe repeated movements, operator interventions, rates, and exceptions. Does not approve capital equipment.",
+  "Packaging specialist: sees which packaging changes alter the physical work and which do not.",
+  "Warehouse / receiving manager: can identify a recurring pallet or case-handling workflow; may not own robotics procurement.",
+  "Commercialization manager: sees how new products and formats affect scale-up; may not know daily floor execution.",
+  "Plant director: can compare programs and involve engineering — but do NOT assume a current automation project or budget.",
+]
+
+requirements = [
+  "For a one-touch discovery T1, use exactly two body sentences: one supplied company fact, then one short factual question. Keep the candidate station, suspected staffing consequence, and likely automation blocker inside that question.",
+  "Arrive with one concrete candidate task for the recipient to correct. Never ask them to inspect the plant, identify any suitable use case, translate the operation into a robotics taxonomy, or evaluate Wapahki's task boundary.",
+  "Use a source-supported object, station, handoff, package, product, machine, line, job posting, expansion, or equipment fact. Product variety, owned brands, or private-label work alone does not prove frequent changeovers, manual packing, short runs, staffing pressure, or failed automation.",
+  "Show why the task could matter: staffing or vacancies, overtime, throughput, line stoppage, utilization, short-run economics, ergonomics, safety, sanitation burden, or changeover cost. Treat the consequence as a hypothesis unless a source establishes it.",
+  "Test why an obviously repetitive job may remain manual: sanitation, irregular products, misfeeds, rate, integration, capital payback, or changeover burden. Mention only the one blocker that sharpens this account-specific question.",
+  "Ask exactly one easy question in T1, normally whether the named job is still staffed by hand because one specific blocker makes fixed equipment difficult. Do not append an alternative, a second consequence, or another diagnostic clause.",
+  "Do not mention Wapahki, a robotic cell, flexible automation, or Andrew's robotics background until the plant moment and consequence are legible. Product architecture is optional in T1 and never leads.",
+  "A one-touch first email is normally 40–80 words and contains exactly one question mark. It uncovers one fact, not the entire cell concept.",
+  "The first cold outcome is a quick fact, correction, or route. A call, task sketch, video, data, site visit, evaluation, pilot, or LOI must be earned after engagement.",
+  "Across seven touches, use questions in no more than four. T2 sharpens the mechanism, T3 gives a human reason to connect, T4 contributes one attributed comparison or real aid, T5 answers why existing automation or manual work may be better, T6 routes once, and T7 closes.",
+  "The automation-fit screen and discovery-call observations are optional later contributions, not required campaign furniture. Offer or use each at most once and only when it advances this person's thread.",
+  "Never turn participant-reported wages, margins, weights, volumes, or automation percentages into prospect claims.",
+]
+
+forbidden = [
+  "embodied AI",
+  "dynamic industrial",
+  "general-purpose robot",
+  "general purpose robot",
+  "automate any",
+  "end-to-end optimization",
+  "the useful detail",
+  "the useful distinction",
+  "a one-line correction would be useful",
+  "repeatable packing or handling step",
+  "repeatable packing step",
+  "repeatable handling step",
+  "where variation enters",
+  "normal placement",
+  "related product or case formats",
+  "within-run",
+  "between-run",
+  "task boundary",
+  "bounded motion",
+  "bounded task",
+  "identify a suitable use case",
+  "identify any suitable use case",
+  "any task that might fit",
+  "any task that could fit",
+]
+
+copy_doctrine = """
+A sendable Wapahki first email starts with a plant problem, not Wapahki's robot
+architecture. The recipient should recognize one station or handoff they have
+seen and understand why Andrew is asking without searching the factory for a use
+case.
+
+Build the note from: (1) one identifiable station or handoff, (2) one observed
+operating condition, (3) one suspected consequence such as overtime, a staffed
+bottleneck, reduced output, stoppage, poor utilization, short-run economics,
+ergonomic exposure, safety, or sanitation burden, (4) one sharp hypothesis
+about why conventional automation struggles there, and (5) one question
+answerable from memory. Arrive with the candidate task and invite correction.
+Do not ask the recipient to classify where variation enters, decide whether a
+motion fits a bounded exception envelope, or identify any suitable task.
+
+Public evidence must bridge account variety to the physical hypothesis. Five
+brands or private-label work proves variety only. A sendable multi-touch thesis
+also needs a source-supported package, product, station, line, equipment, job,
+facility, expansion, or other physical operating fact, plus a credible economic
+pressure signal. Never promote variety into frequent changeovers, manual work,
+low volume, labour pressure, or failed automation.
+
+Describe Wapahki only after the production moment and consequence are clear, if
+the explanation is useful at all. One honest sentence is enough. Never explain
+the proposed division between normal cases and exceptions before the recipient
+confirms why the task remains manual. Never claim installations, performance,
+savings, or a ready system.
+
+Andrew may use the verified student/researcher context in the first note: he is
+a University of Toronto student working in robotics at Automata. Used briefly,
+that can explain the discovery intent and lower sales resistance. It is not a
+substitute for a plant-specific hypothesis, and the conversation must become
+openly commercial once it reaches requirements, economics, a prototype, or a
+pilot. Never present Wapahki as purely academic research.
+
+Wapahki has a real one-page automation-fit screen in seller context. It may be
+offered once as a give-back covering the motion, run stability, changeover,
+interventions, physical boundaries, rate, labour, and payback threshold. It is
+not a benchmark or plant assessment. A later touch may use one explicitly
+attributed discovery-call contrast, never as proof about the target.
+
+The sequence progressively adds a new reason to respond. T1 tests one concrete
+task. T2 introduces the suspected consequence or economic reason. T3 gives a
+plant-specific human reason to connect, not another miniature pitch. T4 routes
+to one specific alternative owner or closes the loop. For a longer sequence,
+only after engagement may a later touch explore the blocker, economics, or a
+fit-screen. Do not repeat the same repeatability-versus-format argument.
+No more than three touches may primarily ask for correction/referral or close.
+Do not produce seven careful blurbs saying Andrew may have chosen the wrong
+task. Caution protects the evidence boundary; concrete objects, motions,
+changes, and exceptions make the message worth reading.
+"""
+
+doctrine = """
+Wapahki's underlying question is always: does one recognizable motion or handoff
+recur often enough that a flexible robotic cell could handle the NORMAL cases
+while people keep the exceptions?
+
+FIRST-PARTY DISCOVERY NOW SHARPENS THAT QUESTION. One technical manager described
+two instructive boundaries: a design automation stopped around the repeatable
+half because covering every exception was not worth the budget, while short-run
+protective packing changed materials and handling logic too often for current
+volume. A separate fleet-maintenance conversation described scheduled,
+standardized work as the automatable slice and vehicle-to-vehicle variation as
+the blocker. These are participant reports, not market proof and never facts
+about a prospect. Use at most one of them in a later follow-up, only when it
+creates a useful comparison: "In a recent conversation with a technical manager,
+I heard... Does that match your line, or is it different?" Do not say "everyone
+I speak with," imply consensus, or cite the rough economics externally.
+
+To form the hypothesis internally, know: what object moves, from where to where,
+how often the motion repeats, what changes between runs, which exceptions
+interrupt it, and whether those exceptions are occasional or constant. Put only
+the single sharpest question into the email.
+
+EVIDENCE BRANCH. If public research proves only that the company makes several
+products or formats, hold the account for more research. Do not ask a cold
+recipient to find Wapahki's use case. A multi-touch sequence needs a bridge to
+one physical candidate task and its economics: a named package, product,
+station, line, machine, role, job posting, expansion, or plant document, plus an
+observable pressure such as staffing, throughput, utilization, safety,
+sanitation, or changeover cost. Unknowns are research gaps, not permission to
+invent the station or consequence.
+
+For a weak-evidence account, a single routing note is the ceiling. Do not build
+a four- or seven-touch investigation around an abstract existence question.
+The one-page fit screen belongs only after a human confirms a task and wants a
+useful way to examine it.
+
+Falsifiable question shapes:
+  - "Is the tray-loading job after the sealer still staffed by hand, and is
+     sanitation the reason it has stayed that way?"
+  - "When that SKU runs, does the end-of-line pack-out still need two extra
+     people to keep the line moving?"
+  - "Does the pallet-transfer station still stop for mixed loads often enough
+     that fixed automation has not paid back?"
+Use these only as shapes. Every object, station, and operating condition must
+come from account evidence.
+
+Translate internal terms into operational language:
+  - NOT "bounded exception envelope" -> "the normal cases repeat, with only the
+    occasional product needing a person".
+  - NOT "task-and-exception sketch" -> "we could map the normal motion, the
+    formats it covers, and the cases that still need a person".
+  - NOT "embodied AI for dynamic workflows" -> "a robotic packing cell that
+    switches between a limited set of products and case formats without being
+    rebuilt each time".
+
+For Wapahki, use this first-email logic without turning it into a fixed template:
+one verified station or handoff -> one observed operating condition -> one
+suspected consequence -> one likely reason ordinary automation struggles ->
+one factual question. That question is the CTA. Product detail, a call, and the
+full technical/economic discovery set belong only after the plant-floor premise
+is confirmed.
+
+The shortest LinkedIn version should sound typed for this one person: one
+specific plant-floor reference or a clean routing note. No biography, canned
+"value your opinion" language, long pitch, or immediate call.
+
+The funnel each thread advances (never pitch a robot): find the manual gap ->
+understand WHY it is still manual (SKU/format/geometry variation, costly tooling,
+slow changeovers, low volume) — that "why" IS the opportunity, qualify on it ->
+narrow to the smallest automatable task described concretely -> test technical fit
+(can perception+planning+a general arm absorb the variation cheaply?) -> establish
+economics (operators, shifts, loaded wage, throughput, changeover, cycle time ->
+a payback case) -> get agreement to EVALUATE that task against stated criteria
+(e.g. "10 cases/min across 5 SKUs, <1% manual intervention") -> paid pilot ->
+conditional LOI ("intends to deploy N cells for task Y, subject to pilot criteria,
+~$X/cell"). Across the sequence, move from discovery (early touches: the task and
+why it is manual) toward evidence and economics (later touches). The strategic
+goal is many plants independently describing the SAME recurring gap, with a few
+willing to evaluate/pilot/sign — the evidence base before the pre-seed raise.
+
+The CRM stage gates are: hypothesis -> engaged -> problem confirmed -> task
+mapped -> evidence shared -> evaluation agreed -> design partner -> LOI
+candidate -> conditional LOI -> paid pilot -> deployment. An email send, open,
+compliment, or booked meeting is activity, not a gate. Evidence shared means the
+plant spends time or reputation on a sketch, video, SKU/changeover data, rate
+data, site observation, or an internal introduction. Higher stages require an
+explicit commitment; never infer them from enthusiasm.
+
+An unanswered cold sequence does NOT climb this ladder. It stays at the
+hypothesis stage and tests for a correction, referral, or first-hand account of
+the task from different angles. After a human reply, the reply agent reads the
+current CRM record and asks for only the next missing commitment. Discovery
+questions must be about actual current or past work (what happened on the last
+run, what changes, what operators do, what was tried), not hypothetical purchase
+interest. A conditional LOI is useful only when it names the task/site,
+provisional quantity, commercial or payback assumption, success criteria,
+timeline, sponsor, and conditions to deploy.
+"""
