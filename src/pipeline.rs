@@ -49,7 +49,10 @@ pub struct Run<'a> {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn run(
+/// Generate model-only campaign material for prompt experimentation. This path
+/// has no provider identities, evidence lineage, opportunity gates, or durable
+/// CRM writes and therefore must never be treated as production outreach.
+pub async fn simulate(
     client: &Engine,
     pb: &Playbook,
     shared: &Shared,

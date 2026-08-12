@@ -598,6 +598,11 @@ fn delivery_block_reason_inner(
                 "sequence is not attributed to the current facility/use-case opportunity".into(),
             ));
         }
+        if !db.sequence_owns_active_opportunity_thread(&sequence_id)? {
+            return Ok(Some(
+                "sequence recipient is not the active cold thread for this opportunity".into(),
+            ));
+        }
         touch_count = db.list_touches_for_sequence(&sequence_id)?.len();
     }
     let context = prepare_action(db, &playbook.key, &lead.id, person)?;

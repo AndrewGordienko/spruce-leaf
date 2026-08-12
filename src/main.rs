@@ -12,7 +12,7 @@
 //!
 //! Subcommands:
 //!   spruce-leaf            (default) interactive REPL + live CRM
-//!   spruce-leaf run "..."  one-shot campaign, filed in the CRM
+//!   spruce-leaf simulate "..."  synthetic prompt experiment, never filed or sent
 //!   spruce-leaf crm        just serve the CRM dashboard
 
 mod agent;
@@ -133,8 +133,8 @@ enum Command {
     /// (default) Launch the interactive spruce-leaf REPL with a live CRM.
     Repl,
 
-    /// Run one campaign non-interactively and file it in the CRM.
-    Run {
+    /// Generate a synthetic prompt experiment. Never writes to the execution db or CRM.
+    Simulate {
         /// The thesis: the expensive workflow / market to target.
         thesis: String,
         #[arg(long, default_value_t = 5, value_parser = positive_usize)]
@@ -501,7 +501,7 @@ fn main() -> Result<()> {
             Ok(())
         }
 
-        Command::Run {
+        Command::Simulate {
             thesis,
             accounts,
             contacts,
@@ -519,7 +519,7 @@ fn main() -> Result<()> {
                 cli.backend.as_str(),
             );
             let lib = rt.block_on(async { library.read().await.clone() });
-            let campaign = rt.block_on(pipeline::run(
+            let campaign = rt.block_on(pipeline::simulate(
                 &client,
                 pb,
                 &playbooks.shared,
@@ -532,16 +532,15 @@ fn main() -> Result<()> {
                 critique,
                 &(),
             ))?;
+            let rendered = report::render(&campaign);
             if let Some(path) = report {
-                std::fs::write(&path, report::render(&campaign))
-                    .with_context(|| format!("writing {path}"))?;
+                std::fs::write(&path, &rendered).with_context(|| format!("writing {path}"))?;
                 eprintln!("wrote {path}");
+            } else {
+                println!("{rendered}");
             }
-            let (ac, ct, to) = rt.block_on(async { store.write().await.ingest(campaign) })?;
-            println!(
-                "\u{2713} filed {ac} accounts, {ct} contacts, {to} touches into {}.\n  \
-                 view: spruce-leaf crm   (reuses or opens a free localhost port)",
-                cli.store
+            eprintln!(
+                "\u{2713} synthetic simulation complete; no accounts, contacts, or touches were filed"
             );
             Ok(())
         }

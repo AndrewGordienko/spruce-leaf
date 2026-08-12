@@ -43,7 +43,7 @@ The send-capable path is:
 13. The cadence rechecks GTM eligibility at `src/cadence.rs:108`, recipient-local timing at `src/cadence.rs:223`, account fan-out at `src/cadence.rs:262`, and wins an atomic send claim at `src/cadence.rs:334`.
 14. Inbox polling enters at `src/inbox.rs:26`; thread-aware handling is at `src/reply_agent.rs:87`; attributed reply learning is at `src/reply_agent.rs:496`.
 
-`pipeline::run` at `src/pipeline.rs:52` is a separate JSON-CRM research/demo path. It does not populate the SQLite send queue and must not be used to explain production delivery behavior.
+`pipeline::simulate` is a separate, explicitly synthetic prompt-experiment path. It does not populate either CRM or the SQLite send queue and must not be used to explain production delivery behavior.
 
 ## Ten-message trace
 

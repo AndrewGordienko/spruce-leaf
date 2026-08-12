@@ -604,9 +604,6 @@ fn create_building_checkpoint(
     generation_model: &str,
 ) -> Result<String> {
     db.interrupt_prior_building_sequences(&person.id)?;
-    if let Some(opportunity) = &gtm_context.opportunity {
-        db.activate_opportunity_stakeholder(&opportunity.id, &person.id)?;
-    }
     let sequence_id = db.create_sequence(&Sequence {
         person_id: person.id.clone(),
         lead_id: lead.id.clone(),

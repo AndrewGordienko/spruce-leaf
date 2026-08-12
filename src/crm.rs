@@ -29,7 +29,6 @@ use chrono::{DateTime, Datelike, Local, NaiveDate, Utc, Weekday};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
-use uuid::Uuid;
 
 use crate::business::{BusinessProfile, Businesses};
 use crate::db::{
@@ -39,7 +38,6 @@ use crate::db::{
     OpportunityTouch, Person, ProofBrief, SalesOpportunity, SharedDb, SignalDefinition,
     SignalObservation, Touch,
 };
-use crate::domain::Campaign;
 use crate::knowledge::{Library, SharedLibrary};
 use crate::metrics::{self, Funnel};
 use crate::playbook::{Playbook, Playbooks, Shared as SharedDoctrine};
@@ -209,83 +207,6 @@ impl Store {
         let json = serde_json::to_string_pretty(&self.data)?;
         crate::storage::atomic_write(&self.path, json)
             .with_context(|| format!("writing CRM store {}", self.path.display()))
-    }
-
-    /// Append a finished campaign and persist. Returns (accounts, contacts, touches) added.
-    pub fn ingest(&mut self, campaign: Campaign) -> Result<(usize, usize, usize)> {
-        let now = Utc::now().to_rfc3339();
-        let (mut n_ac, mut n_ct, mut n_to) = (0, 0, 0);
-
-        for plan in campaign.accounts {
-            let a = plan.account;
-            let contacts: Vec<CrmContact> = plan
-                .contacts
-                .into_iter()
-                .map(|c| {
-                    let touches: Vec<CrmTouch> = c
-                        .sequence
-                        .touches
-                        .into_iter()
-                        .map(|t| {
-                            let review = c.reviews.iter().find(|r| r.stage == t.stage);
-                            CrmTouch {
-                                stage: t.stage,
-                                day_offset: t.day_offset,
-                                channel: t.channel,
-                                subject: t.subject,
-                                body: t.body,
-                                purpose: t.purpose,
-                                goal: t.goal,
-                                status: StageStatus::Pending,
-                                review_passes: review.map(|r| r.passes),
-                                review_issues: review.map(|r| r.issues.clone()).unwrap_or_default(),
-                                created_at: now.clone(),
-                            }
-                        })
-                        .collect();
-                    n_ct += 1;
-                    n_to += touches.len();
-                    CrmContact {
-                        id: Uuid::new_v4().to_string(),
-                        name: c.contact.name,
-                        title: c.contact.title,
-                        vantage: c.contact.vantage,
-                        can_observe: c.contact.can_observe,
-                        why_them: c.contact.why_them,
-                        primary: c.contact.primary,
-                        route_to: c.contact.route_to,
-                        applied_principles: c.sequence.applied_principles,
-                        touches,
-                    }
-                })
-                .collect();
-
-            n_ac += 1;
-            self.data.accounts.push(CrmAccount {
-                id: Uuid::new_v4().to_string(),
-                brand: campaign.brand.clone(),
-                name: a.name,
-                industry: a.industry,
-                hq: a.hq,
-                thesis: campaign.thesis.clone(),
-                observed_facts: a.observed_facts,
-                inferences: a.inferences,
-                hypothesis: a.hypothesis,
-                mechanism: a.mechanism,
-                consequence_metric: a.consequence_metric,
-                signals: a.signals,
-                system_concept: a.system_concept,
-                hard_buyer_question: a.hard_buyer_question,
-                kill_condition: a.kill_condition,
-                magnitude_note: a.magnitude_note,
-                applied_principles: a.applied_principles,
-                created_at: now.clone(),
-                contacts,
-            });
-        }
-
-        self.save()?;
-        Ok((n_ac, n_ct, n_to))
     }
 }
 
@@ -4931,8 +4852,8 @@ mod tests {
     };
     use crate::business::Businesses;
     use crate::db::{
-        AccountPlayAssessment, CustomerDevelopmentRecord, Db, Lead, Mailbox, Person, Reply,
-        Sequence, SignalObservation, Touch,
+        AccountPlayAssessment, CustomerDevelopmentRecord, Db, Lead, Mailbox,
+        OpportunityStakeholder, Person, Reply, Sequence, SignalObservation, Touch,
     };
     use crate::playbook::Playbooks;
     use axum::http::{HeaderMap, HeaderValue};
@@ -5293,13 +5214,23 @@ mod tests {
                 brand: "gnk".into(),
                 play_id: play.id,
                 play_version: play.version,
-                sales_opportunity_id,
+                sales_opportunity_id: sales_opportunity_id.clone(),
                 gtm_state: "action_ready".into(),
                 copy_policy_version: crate::db::CURRENT_COPY_POLICY_VERSION,
                 status: "active".into(),
                 ..Default::default()
             })
             .expect("insert sequence");
+        db.upsert_opportunity_stakeholder(&OpportunityStakeholder {
+            sales_opportunity_id: sales_opportunity_id.clone(),
+            person_id: person_id.clone(),
+            role: "process_owner".into(),
+            status: "mapped".into(),
+            ..Default::default()
+        })
+        .expect("map stakeholder");
+        db.activate_opportunity_stakeholder(&sales_opportunity_id, &person_id)
+            .expect("activate stakeholder thread");
         for (index, channel) in ["email", "email", "linkedin_request", "email"]
             .iter()
             .enumerate()

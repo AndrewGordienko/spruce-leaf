@@ -23,7 +23,7 @@ use crate::knowledge::SharedLibrary;
 use crate::pipeline;
 use crate::playbook::Playbooks;
 use crate::ui;
-use crate::{enrich, metrics, opportunity, outreach, sourcing};
+use crate::{enrich, metrics, opportunity, outreach, report, sourcing};
 
 /// How many past turns to feed back for continuity.
 const HISTORY_TURNS: usize = 6;
@@ -763,7 +763,7 @@ impl Agent {
         };
 
         match step.action.as_str() {
-            "run_campaign" => {
+            "simulate_campaign" => {
                 let thesis = if step.thesis.trim().is_empty() {
                     input.to_string()
                 } else {
@@ -772,7 +772,7 @@ impl Agent {
                 let accounts = step.accounts.unwrap_or(5).max(1) as usize;
                 let contacts = step.contacts.unwrap_or(5).max(1) as usize;
                 let touches = step.touches.unwrap_or(7).max(1) as usize;
-                self.run_campaign(&thesis, accounts, contacts, touches)
+                self.simulate_campaign(&thesis, accounts, contacts, touches)
                     .await
             }
             "source_leads" => {
@@ -900,7 +900,7 @@ impl Agent {
         }
     }
 
-    async fn run_campaign(
+    async fn simulate_campaign(
         &self,
         thesis: &str,
         accounts: usize,
@@ -919,7 +919,7 @@ impl Agent {
         let view = ui::CampaignView::start(header, self.client.stats());
 
         let lib = self.library.read().await.clone();
-        let result = pipeline::run(
+        let result = pipeline::simulate(
             &self.client,
             pb,
             &self.playbooks.shared,
@@ -940,19 +940,12 @@ impl Agent {
 
         let campaign = match result {
             Ok(c) => c,
-            Err(e) => return format!("Campaign failed: {e:#}"),
+            Err(e) => return format!("Simulation failed: {e:#}"),
         };
-
-        let mut store = self.store.write().await;
-        match store.ingest(campaign) {
-            Ok((ac, ct, to)) => format!(
-                "Filed {ac} accounts, {ct} contacts, and {to} touches into the CRM \u{2014} view at \
-                 {}. (Only the observed facts are meant to be stated as fact; verify the rest \
-                 before any outreach.)",
-                self.crm_url()
-            ),
-            Err(e) => format!("Ran the campaign but failed to file it: {e:#}"),
-        }
+        format!(
+            "Synthetic simulation only; nothing was filed in the CRM or execution database.\n\n{}",
+            report::render(&campaign)
+        )
     }
 
     /// Source real organizations and people into the durable execution db.
@@ -2702,7 +2695,7 @@ MULTIPLE brands or things in one request → emit one step per (brand, action), 
 For a pure conversational answer (no action to run), leave `steps` empty and put the answer in `reply`.\n\n\
 {brand_mode}\n\n\
 Actions (each is a step's `action`):\n\
-- run_campaign: hypothetical research-only campaign; no Apollo.\n\
+- simulate_campaign: synthetic prompt experiment only; no Apollo, provider identities, source lineage, CRM writes, scheduling, or sending. Never use it when the operator asks for real people, real outreach, or market coverage.\n\
 - source_leads: ONLY finds and qualifies Apollo accounts+people, then stops — it writes NO emails. Use only when the request is purely to find companies/people and contains no request to write, draft, sequence, or perform outreach. set thesis/accounts/contacts (defaults 10/3).\n\
 - research_account: re-read and reassess ONE existing CRM account against the current GTM play without Apollo. Put its exact name/domain/id in query and the research focus in thesis. Use this before targeted regeneration when a promising old account has stale, weak, or retired-play evidence.\n\
 - run_full_motion: end-to-end motion for a brand (never sends). The requested account count is the outreach FULFILLMENT CONTRACT; contacts-per-account controls contact mapping, while cold copy opens with exactly one carefully ranked person per account. Persist through adaptive sourcing passes, contact shortfalls, weak hypotheses, and rejected copy; save misses as targeting corrections, retry rejected copy with its feedback, and replace an account that still lacks one current reviewed recipient sequence. Stop short only at a real provider/model-budget/search-exhaustion safety boundary and report filled/requested exactly. REUSE-FIRST: if the CRM already has enough accounts/people for that brand, it SKIPS Apollo, refreshes why those companies fit, and writes missing, rejected, or stale sequences. Current-policy reviewed drafts are preserved unless the operator explicitly asks to rewrite/redraft/refine/replace them. set thesis/accounts/contacts/touches (defaults 5/5/7). set force_new=true ONLY when they explicitly ask for new/fresh/more companies not already on file.\n\
@@ -2735,7 +2728,7 @@ fn decision_schema(brands: &[&str]) -> Value {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["run_campaign", "source_leads", "research_account", "run_full_motion", "enrich_people", "plan_outreach", "approve_outreach", "discover_opportunities", "list_opportunities", "resolve_opportunity_contacts", "plan_funding_outreach", "approve_funding_outreach", "prepare_application", "show_funnel", "show_calendar", "list_accounts", "show_learnings", "open_crm", "open_gtm", "search_knowledge"]
+                "enum": ["simulate_campaign", "source_leads", "research_account", "run_full_motion", "enrich_people", "plan_outreach", "approve_outreach", "discover_opportunities", "list_opportunities", "resolve_opportunity_contacts", "plan_funding_outreach", "approve_funding_outreach", "prepare_application", "show_funnel", "show_calendar", "list_accounts", "show_learnings", "open_crm", "open_gtm", "search_knowledge"]
             },
             "brand": { "type": "string", "enum": brands, "description": "The brand this step concerns. Leave empty only for portfolio-wide reads (they span all brands)." },
             "thesis": { "type": "string", "description": "The workflow/market to target for sourcing/campaign steps." },

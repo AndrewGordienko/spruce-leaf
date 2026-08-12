@@ -1049,6 +1049,65 @@ impl Db {
              )",
             params![CURRENT_COPY_POLICY_VERSION],
         )?;
+        // Databases predating opportunity-level thread enforcement may contain
+        // more than one active sequence for the same facility/use case. Keep
+        // the newest/current-policy row, pause the rest, cancel their unsent
+        // work, then install the hard uniqueness invariant.
+        conn.execute(
+            "UPDATE sequences SET status='paused'
+             WHERE status='active' AND trim(COALESCE(sales_opportunity_id,''))<>''
+               AND id IN (
+                 SELECT older.id FROM sequences older
+                 JOIN sequences newer
+                   ON newer.sales_opportunity_id=older.sales_opportunity_id
+                  AND newer.status='active' AND newer.id<>older.id
+                 WHERE older.status='active'
+                   AND trim(COALESCE(older.sales_opportunity_id,''))<>''
+                   AND (
+                     newer.copy_policy_version>older.copy_policy_version OR
+                     (newer.copy_policy_version=older.copy_policy_version AND
+                       COALESCE(newer.created_at,'')>COALESCE(older.created_at,'')) OR
+                     (newer.copy_policy_version=older.copy_policy_version AND
+                       COALESCE(newer.created_at,'')=COALESCE(older.created_at,'') AND
+                       newer.rowid>older.rowid)
+                   )
+               )",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE touches SET status='cancelled',
+                    error='Cancelled because another recipient owns this opportunity cold thread.'
+             WHERE status IN ('draft','scheduled') AND EXISTS (
+               SELECT 1 FROM sequences s
+               WHERE s.id=touches.sequence_id AND s.status='paused'
+                 AND trim(COALESCE(s.sales_opportunity_id,''))<>''
+             )",
+            [],
+        )?;
+        let timestamp = now();
+        conn.execute(
+            "UPDATE opportunity_stakeholders SET active_thread=0,updated_at=?1
+             WHERE sales_opportunity_id IN (
+               SELECT sales_opportunity_id FROM sequences
+               WHERE status='active' AND trim(COALESCE(sales_opportunity_id,''))<>''
+             )",
+            params![timestamp],
+        )?;
+        conn.execute(
+            "UPDATE opportunity_stakeholders SET active_thread=1,status='active',updated_at=?1
+             WHERE EXISTS (
+               SELECT 1 FROM sequences s
+               WHERE s.status='active'
+                 AND s.sales_opportunity_id=opportunity_stakeholders.sales_opportunity_id
+                 AND s.person_id=opportunity_stakeholders.person_id
+             )",
+            params![timestamp],
+        )?;
+        conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_sequence_per_sales_opportunity
+             ON sequences(sales_opportunity_id)
+             WHERE status='active' AND trim(COALESCE(sales_opportunity_id,''))<>'';",
+        )?;
         Ok(())
     }
 
@@ -1972,6 +2031,7 @@ impl Db {
         Ok(id)
     }
 
+    #[allow(dead_code)] // Deliberate manual handoff API; promotion is the normal production path.
     pub fn activate_opportunity_stakeholder(
         &self,
         sales_opportunity_id: &str,
@@ -1979,21 +2039,64 @@ impl Db {
     ) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
+        let mapped: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM opportunity_stakeholders
+             WHERE sales_opportunity_id=?1 AND person_id=?2",
+            params![sales_opportunity_id, person_id],
+            |row| row.get(0),
+        )?;
+        if mapped == 0 {
+            anyhow::bail!("person is not mapped to this sales opportunity");
+        }
+        let conflicting_person: Option<String> = tx
+            .query_row(
+                "SELECT person_id FROM sequences
+                 WHERE sales_opportunity_id=?1 AND status='active' AND person_id<>?2
+                 ORDER BY created_at DESC,rowid DESC LIMIT 1",
+                params![sales_opportunity_id, person_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(conflicting_person) = conflicting_person {
+            anyhow::bail!(
+                "sales opportunity already has an active cold sequence for person {conflicting_person}; stop it before switching recipients"
+            );
+        }
+        let timestamp = now();
         tx.execute(
             "UPDATE opportunity_stakeholders SET active_thread=0,updated_at=?2
              WHERE sales_opportunity_id=?1",
-            params![sales_opportunity_id, now()],
+            params![sales_opportunity_id, timestamp],
         )?;
         let updated = tx.execute(
             "UPDATE opportunity_stakeholders SET active_thread=1,status='active',updated_at=?3
              WHERE sales_opportunity_id=?1 AND person_id=?2",
-            params![sales_opportunity_id, person_id, now()],
+            params![sales_opportunity_id, person_id, timestamp],
         )?;
-        if updated == 0 {
-            anyhow::bail!("person is not mapped to this sales opportunity");
-        }
+        debug_assert_eq!(updated, 1);
         tx.commit()?;
         Ok(())
+    }
+
+    /// The sequence-level send invariant, independent of what the dashboard
+    /// happens to display. Legacy unattributed sequences return true so their
+    /// existing archival/test behavior is preserved; current production GTM
+    /// gates separately require a non-empty opportunity attribution.
+    pub fn sequence_owns_active_opportunity_thread(&self, sequence_id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let owns: i64 = conn.query_row(
+            "SELECT CASE
+               WHEN trim(COALESCE(s.sales_opportunity_id,''))='' THEN 1
+               WHEN EXISTS (
+                 SELECT 1 FROM opportunity_stakeholders os
+                 WHERE os.sales_opportunity_id=s.sales_opportunity_id
+                   AND os.person_id=s.person_id AND os.active_thread=1
+               ) THEN 1 ELSE 0 END
+             FROM sequences s WHERE s.id=?1",
+            params![sequence_id],
+            |row| row.get(0),
+        )?;
+        Ok(owns != 0)
     }
 
     pub fn list_opportunity_stakeholders(
@@ -2502,7 +2605,53 @@ impl Db {
     ) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
-        if let Some(old_id) = replaced_sequence_id.filter(|id| !id.is_empty()) {
+        let (person_id, sales_opportunity_id): (String, String) = tx
+            .query_row(
+                "SELECT person_id,COALESCE(sales_opportunity_id,'') FROM sequences
+                 WHERE id=?1 AND status='building'",
+                params![sequence_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow::anyhow!("the building sequence is no longer promotable"))?;
+        let replaced_sequence_id = replaced_sequence_id.filter(|id| !id.is_empty());
+        if !sales_opportunity_id.trim().is_empty() {
+            let mapped: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM opportunity_stakeholders
+                 WHERE sales_opportunity_id=?1 AND person_id=?2",
+                params![sales_opportunity_id, person_id],
+                |row| row.get(0),
+            )?;
+            if mapped == 0 {
+                anyhow::bail!("sequence recipient is not mapped to its sales opportunity");
+            }
+            let conflict: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT id,person_id FROM sequences
+                     WHERE sales_opportunity_id=?1 AND status='active' AND id<>?2
+                       AND (?3 IS NULL OR id<>?3)
+                     ORDER BY created_at DESC,rowid DESC LIMIT 1",
+                    params![sales_opportunity_id, sequence_id, replaced_sequence_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if let Some((conflict_id, conflict_person)) = conflict {
+                anyhow::bail!(
+                    "sales opportunity already has active sequence {conflict_id} for person {conflict_person}; stop it before promoting another cold thread"
+                );
+            }
+        }
+        if let Some(old_id) = replaced_sequence_id {
+            let old_owner: Option<String> = tx
+                .query_row(
+                    "SELECT person_id FROM sequences WHERE id=?1 AND status='active'",
+                    params![old_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if old_owner.as_deref() != Some(person_id.as_str()) {
+                anyhow::bail!("the prior active sequence does not belong to this recipient");
+            }
             let sent: i64 = tx.query_row(
                 "SELECT COUNT(*) FROM touches WHERE sequence_id=?1 AND status='sent'",
                 params![old_id],
@@ -2530,6 +2679,23 @@ impl Db {
         )?;
         if promoted == 0 {
             anyhow::bail!("the building sequence is no longer promotable");
+        }
+        if !sales_opportunity_id.trim().is_empty() {
+            let timestamp = now();
+            tx.execute(
+                "UPDATE opportunity_stakeholders SET active_thread=0,updated_at=?2
+                 WHERE sales_opportunity_id=?1",
+                params![sales_opportunity_id, timestamp],
+            )?;
+            let activated = tx.execute(
+                "UPDATE opportunity_stakeholders
+                 SET active_thread=1,status='active',updated_at=?3
+                 WHERE sales_opportunity_id=?1 AND person_id=?2",
+                params![sales_opportunity_id, person_id, timestamp],
+            )?;
+            if activated == 0 {
+                anyhow::bail!("sequence recipient is not mapped to its sales opportunity");
+            }
         }
         tx.commit()?;
         Ok(())
@@ -2608,6 +2774,11 @@ impl Db {
              JOIN people p ON p.id=t.person_id \
              WHERE t.status='scheduled' AND t.due_at<=?1 \
                AND s.status='active' AND s.copy_policy_version=?3 \
+               AND (trim(COALESCE(s.sales_opportunity_id,''))='' OR EXISTS ( \
+                 SELECT 1 FROM opportunity_stakeholders os \
+                 WHERE os.sales_opportunity_id=s.sales_opportunity_id \
+                   AND os.person_id=s.person_id AND os.active_thread=1 \
+               )) \
                AND p.status NOT IN ('replied','unsubscribed','bounced','suppressed') \
                AND (?2 IS NULL OR t.brand=?2) \
                AND NOT EXISTS ( \
@@ -2636,6 +2807,11 @@ impl Db {
              WHERE t.brand=?1 AND t.status='scheduled'
                AND lower(t.channel) IN ('email','linkedin_or_email')
                AND s.status='active' AND s.copy_policy_version=?2
+               AND (trim(COALESCE(s.sales_opportunity_id,''))='' OR EXISTS (
+                 SELECT 1 FROM opportunity_stakeholders os
+                 WHERE os.sales_opportunity_id=s.sales_opportunity_id
+                   AND os.person_id=s.person_id AND os.active_thread=1
+               ))
                AND p.status NOT IN ('replied','unsubscribed','bounced','suppressed')
              ORDER BY s.created_at ASC,t.stage ASC,t.id ASC",
         )?;
@@ -2657,6 +2833,11 @@ impl Db {
              AND EXISTS (
                SELECT 1 FROM sequences s WHERE s.id=touches.sequence_id
                  AND s.status='active' AND s.copy_policy_version=?2
+                 AND (trim(COALESCE(s.sales_opportunity_id,''))='' OR EXISTS (
+                   SELECT 1 FROM opportunity_stakeholders os
+                   WHERE os.sales_opportunity_id=s.sales_opportunity_id
+                     AND os.person_id=s.person_id AND os.active_thread=1
+                 ))
              )",
             params![id, CURRENT_COPY_POLICY_VERSION],
         )? == 1)
@@ -3152,6 +3333,11 @@ impl Db {
              AND EXISTS ( \
                SELECT 1 FROM sequences s WHERE s.id=touches.sequence_id \
                  AND s.status='active' AND s.copy_policy_version=?3 \
+                 AND (trim(COALESCE(s.sales_opportunity_id,''))='' OR EXISTS ( \
+                   SELECT 1 FROM opportunity_stakeholders os \
+                   WHERE os.sales_opportunity_id=s.sales_opportunity_id \
+                     AND os.person_id=s.person_id AND os.active_thread=1 \
+                 )) \
              ) \
              AND (?1 IS NULL OR brand=?1) AND (?2 IS NULL OR person_id=?2)",
             params![brand, person_id, CURRENT_COPY_POLICY_VERSION],
@@ -3177,6 +3363,11 @@ impl Db {
              AND EXISTS (
                SELECT 1 FROM sequences s WHERE s.id=touches.sequence_id
                  AND s.status='active' AND s.copy_policy_version=?3
+                 AND (trim(COALESCE(s.sales_opportunity_id,''))='' OR EXISTS (
+                   SELECT 1 FROM opportunity_stakeholders os
+                   WHERE os.sales_opportunity_id=s.sales_opportunity_id
+                     AND os.person_id=s.person_id AND os.active_thread=1
+                 ))
              ) \
              AND (?1 IS NULL OR brand=?1) AND (?2 IS NULL OR person_id=?2)",
             params![brand, person_id, CURRENT_COPY_POLICY_VERSION],
@@ -7837,8 +8028,9 @@ mod tests {
         all_declared_sources_exhausted, evidence_names_operating_site,
         facility_observation_for_task, AccountPlayAssessment, ApplicationBrief,
         ConversationMessage, CustomerDevelopmentRecord, Db, EvidenceClaim, GtmExperiment,
-        GtmOutcome, Job, Lead, Mailbox, Meeting, Opportunity, OpportunityContact, OpportunityTouch,
-        Person, SalesOpportunity, Sequence, SignalObservation, Touch, CURRENT_COPY_POLICY_VERSION,
+        GtmOutcome, Job, Lead, Mailbox, Meeting, Opportunity, OpportunityContact,
+        OpportunityStakeholder, OpportunityTouch, Person, SalesOpportunity, Sequence,
+        SignalObservation, Touch, CURRENT_COPY_POLICY_VERSION,
     };
     use chrono::{TimeZone, Utc};
     use uuid::Uuid;
@@ -9593,6 +9785,116 @@ mod tests {
                 .expect("load rewrite feedback"),
             vec!["council rejected the copy".to_string()]
         );
+    }
+
+    #[test]
+    fn one_sales_opportunity_cannot_activate_two_cold_recipients() {
+        let db = Db::open(":memory:").expect("open memory db");
+        let lead_id = db
+            .upsert_lead(&Lead {
+                brand: "outagehub".into(),
+                apollo_org_id: "org-one-thread".into(),
+                name: "One Thread Networks".into(),
+                domain: "one-thread.example".into(),
+                ..Default::default()
+            })
+            .expect("insert lead");
+        let market_account_id = db
+            .market_account_for_lead(&lead_id)
+            .expect("account query")
+            .expect("canonical account")
+            .id;
+        let opportunity_id = db
+            .upsert_sales_opportunity(&SalesOpportunity {
+                brand: "outagehub".into(),
+                market_account_id,
+                lead_id: lead_id.clone(),
+                play_id: "outagehub-ev".into(),
+                kind: "outage_decision".into(),
+                title: "EV outage attribution".into(),
+                task_or_decision: "Route charging incidents using utility outage context".into(),
+                status: "qualified".into(),
+                ..Default::default()
+            })
+            .expect("insert opportunity");
+        let first_person = db
+            .upsert_person(&Person {
+                lead_id: lead_id.clone(),
+                brand: "outagehub".into(),
+                apollo_person_id: "first-thread-owner".into(),
+                name: "First Owner".into(),
+                ..Default::default()
+            })
+            .expect("insert first person");
+        let second_person = db
+            .upsert_person(&Person {
+                lead_id: lead_id.clone(),
+                brand: "outagehub".into(),
+                apollo_person_id: "second-thread-owner".into(),
+                name: "Second Owner".into(),
+                ..Default::default()
+            })
+            .expect("insert second person");
+        for (person_id, priority) in [(&first_person, 10), (&second_person, 20)] {
+            db.upsert_opportunity_stakeholder(&OpportunityStakeholder {
+                sales_opportunity_id: opportunity_id.clone(),
+                person_id: person_id.clone(),
+                role: "process_owner".into(),
+                priority,
+                status: "mapped".into(),
+                ..Default::default()
+            })
+            .expect("map stakeholder");
+        }
+
+        let first_sequence = db
+            .create_sequence(&Sequence {
+                person_id: first_person.clone(),
+                lead_id: lead_id.clone(),
+                brand: "outagehub".into(),
+                sales_opportunity_id: opportunity_id.clone(),
+                copy_policy_version: CURRENT_COPY_POLICY_VERSION,
+                status: "building".into(),
+                ..Default::default()
+            })
+            .expect("create first building sequence");
+        db.promote_building_sequence(&first_sequence, None, &[])
+            .expect("promote first cold thread");
+        assert!(db
+            .sequence_owns_active_opportunity_thread(&first_sequence)
+            .expect("first thread state"));
+
+        let second_sequence = db
+            .create_sequence(&Sequence {
+                person_id: second_person.clone(),
+                lead_id: lead_id.clone(),
+                brand: "outagehub".into(),
+                sales_opportunity_id: opportunity_id.clone(),
+                copy_policy_version: CURRENT_COPY_POLICY_VERSION,
+                status: "building".into(),
+                ..Default::default()
+            })
+            .expect("create second building sequence");
+        let error = db
+            .promote_building_sequence(&second_sequence, None, &[])
+            .expect_err("second cold thread must be blocked");
+        assert!(error.to_string().contains("already has active sequence"));
+        assert!(db
+            .activate_opportunity_stakeholder(&opportunity_id, &second_person)
+            .expect_err("dashboard activation cannot bypass the sequence invariant")
+            .to_string()
+            .contains("active cold sequence"));
+
+        db.stop_sequence(&first_sequence, "stopped", "cancelled")
+            .expect("stop first thread");
+        db.promote_building_sequence(&second_sequence, None, &[])
+            .expect("promote deliberate handoff");
+        assert!(db
+            .sequence_owns_active_opportunity_thread(&second_sequence)
+            .expect("second thread state"));
+        assert!(!db
+            .sequence_owns_active_opportunity_thread(&first_sequence)
+            .expect("first thread no longer owns opportunity"));
     }
 
     #[test]
