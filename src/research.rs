@@ -600,9 +600,18 @@ fn role_search_queries(brand: &str, focus: &str, company: &str, domain: &str) ->
     let company = company.replace('"', " ");
     if brand == "wapahki" {
         let focus = focus.to_ascii_lowercase();
-        let roles = if ["machine tend", "press", "fixture", "cnc", "assembly"]
-            .iter()
-            .any(|term| focus.contains(term))
+        let roles = if [
+            "machine tend",
+            "press tend",
+            "press loading",
+            "stamping",
+            "metal press",
+            "fixture loading",
+            "cnc",
+            "repetitive assembly",
+        ]
+        .iter()
+        .any(|term| focus.contains(term))
         {
             "(\"machine operator\" OR \"press operator\" OR \"cnc operator\" OR \"production assembler\" OR \"fixture loading\" OR \"parts loading\" OR \"manufacturing operator\" OR \"quality inspector\")"
         } else if [
@@ -1468,6 +1477,14 @@ mod tests {
         );
         assert!(machine_queries[0].contains("press operator"));
         assert!(!machine_queries[0].contains("order picker"));
+        let food_queries = role_search_queries(
+            "wapahki",
+            "food packaging line with staffing pressure",
+            "Example Foods",
+            "examplefoods.ca",
+        );
+        assert!(food_queries[0].contains("packaging operator"));
+        assert!(!food_queries[0].contains("press operator"));
         assert!(trusted_ats_host("pivotalhr.fitzii.com"));
         assert_eq!(
             job_location_priority(
