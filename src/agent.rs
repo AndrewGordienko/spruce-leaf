@@ -1000,6 +1000,7 @@ impl Agent {
             accounts,
             contacts,
             None,
+            None,
             candidate_limit,
             self.concurrency.max(1),
             Some(progress),

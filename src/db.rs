@@ -427,6 +427,11 @@ pub struct Facility {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SalesOpportunity {
     pub id: String,
+    /// Stable company + facility + play + task identity. Unlike the display
+    /// title, this must not change when copy or explanatory prose is refined.
+    pub identity_key: String,
+    /// Stable identity of the task/decision within its facility or account.
+    pub task_key: String,
     pub brand: String,
     pub market_account_id: String,
     pub lead_id: String,
@@ -459,6 +464,7 @@ pub struct EvidenceClaim {
     pub brand: String,
     pub lead_id: String,
     pub facility_id: String,
+    pub task_key: String,
     pub claim_type: String,
     pub claim_text: String,
     pub source_url: String,
@@ -968,6 +974,9 @@ impl Db {
             ("sequences", "generation_backend", "TEXT DEFAULT ''"),
             ("sequences", "generation_model", "TEXT DEFAULT ''"),
             ("sequences", "sales_opportunity_id", "TEXT DEFAULT ''"),
+            ("sales_opportunities", "identity_key", "TEXT DEFAULT ''"),
+            ("sales_opportunities", "task_key", "TEXT DEFAULT ''"),
+            ("evidence_claims", "task_key", "TEXT DEFAULT ''"),
             ("touches", "recipient_timezone", "TEXT DEFAULT ''"),
             ("touches", "scheduled_rule", "TEXT DEFAULT ''"),
             ("touches", "schedule_reason", "TEXT DEFAULT ''"),
@@ -995,6 +1004,12 @@ impl Db {
         ] {
             ensure_column(&conn, table, column, definition)?;
         }
+        conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_sales_opportunities_identity
+             ON sales_opportunities(identity_key) WHERE identity_key<>'';
+             CREATE INDEX IF NOT EXISTS idx_evidence_claims_scope
+             ON evidence_claims(sales_opportunity_id,facility_id,task_key,status);",
+        )?;
         // One-time lineage cleanup for databases created before official-site
         // refreshes became canonical. History stays queryable; only active
         // readiness stops counting older model summaries as current evidence.
@@ -1174,6 +1189,54 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Persist segment membership at the canonical-company level. Provider
+    /// candidates and repeated queries may revisit the same company, but the
+    /// coverage denominator counts it once per segment.
+    pub fn link_lead_to_market_segment(
+        &self,
+        lead_id: &str,
+        segment_id: &str,
+        source_name: &str,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let market_account_id: String = conn.query_row(
+            "SELECT market_account_id FROM brand_account_memberships WHERE lead_id=?1 LIMIT 1",
+            params![lead_id],
+            |row| row.get(0),
+        )?;
+        let existed = conn
+            .query_row(
+                "SELECT 1 FROM market_segment_accounts
+                 WHERE segment_id=?1 AND market_account_id=?2",
+                params![segment_id, market_account_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        let timestamp = now();
+        conn.execute(
+            "INSERT INTO market_segment_accounts
+             (id,segment_id,market_account_id,source_name,first_seen_at,last_seen_at)
+             VALUES (?1,?2,?3,?4,?5,?5)
+             ON CONFLICT(segment_id,market_account_id) DO UPDATE SET
+              source_name=excluded.source_name,last_seen_at=excluded.last_seen_at",
+            params![
+                Uuid::new_v4().to_string(),
+                segment_id,
+                market_account_id,
+                source_name,
+                timestamp
+            ],
+        )?;
+        conn.execute(
+            "UPDATE market_segments SET
+              accounts_discovered=(SELECT COUNT(*) FROM market_segment_accounts WHERE segment_id=?1),
+              updated_at=?2 WHERE id=?1",
+            params![segment_id, timestamp],
+        )?;
+        Ok(!existed)
+    }
+
     pub fn upsert_market_segment(&self, segment: &MarketSegment) -> Result<String> {
         if segment.brand.trim().is_empty() || segment.key.trim().is_empty() {
             anyhow::bail!("market segment requires brand and key");
@@ -1204,10 +1267,12 @@ impl Db {
               name=excluded.name,geography=excluded.geography,wedge=excluded.wedge,
               unit_of_analysis=excluded.unit_of_analysis,
               enumeration_sources=excluded.enumeration_sources,status=excluded.status,
-              estimated_total=excluded.estimated_total,
-              accounts_discovered=excluded.accounts_discovered,
-              accounts_with_opportunities=excluded.accounts_with_opportunities,
-              source_exhausted=excluded.source_exhausted,updated_at=excluded.updated_at",
+              estimated_total=CASE WHEN excluded.estimated_total>0
+                THEN excluded.estimated_total ELSE market_segments.estimated_total END,
+              accounts_discovered=MAX(market_segments.accounts_discovered,excluded.accounts_discovered),
+              accounts_with_opportunities=MAX(market_segments.accounts_with_opportunities,excluded.accounts_with_opportunities),
+              source_exhausted=MAX(market_segments.source_exhausted,excluded.source_exhausted),
+              updated_at=excluded.updated_at",
             params![
                 id,
                 segment.brand,
@@ -1325,7 +1390,35 @@ impl Db {
             ),
             &self.list_market_segments(Some(&assessment.brand))?,
         );
+        let task_key = observations
+            .iter()
+            .find(|observation| {
+                matches!(
+                    observation.definition_key.as_str(),
+                    "account.bounded_repetitive_task"
+                        | "account.specific_recurring_decision"
+                        | "account.outage_sensitive_decision"
+                )
+            })
+            .map(|observation| {
+                format!(
+                    "source-task:{:016x}",
+                    stable_hash(&format!(
+                        "{}|{}",
+                        observation.definition_key,
+                        observation.source_url.trim().to_ascii_lowercase()
+                    ))
+                )
+            })
+            .unwrap_or_else(|| {
+                format!(
+                    "task:{:016x}",
+                    stable_hash(&normalize_identity_text(&task_or_decision))
+                )
+            });
         let opportunity = SalesOpportunity {
+            identity_key: String::new(),
+            task_key: task_key.clone(),
             brand: assessment.brand.clone(),
             market_account_id: account.id,
             lead_id: assessment.lead_id.clone(),
@@ -1360,11 +1453,14 @@ impl Db {
             ..Default::default()
         };
         let opportunity_id = self.upsert_sales_opportunity(&opportunity)?;
-        for observation in observations {
-            let _ = self.upsert_evidence_claim(&EvidenceClaim {
+        let claims = observations
+            .into_iter()
+            .map(|observation| EvidenceClaim {
                 sales_opportunity_id: opportunity_id.clone(),
                 brand: assessment.brand.clone(),
                 lead_id: assessment.lead_id.clone(),
+                facility_id: opportunity.facility_id.clone(),
+                task_key: task_key.clone(),
                 claim_type: observation.definition_key,
                 claim_text: observation.evidence.clone(),
                 source_url: observation.source_url,
@@ -1373,8 +1469,9 @@ impl Db {
                 status: observation.status,
                 observed_at: observation.observed_at,
                 ..Default::default()
-            });
-        }
+            })
+            .collect::<Vec<_>>();
+        self.replace_evidence_claims(&opportunity_id, &claims)?;
         for person in self
             .list_people(Some(&assessment.brand), None)?
             .into_iter()
@@ -1461,14 +1558,28 @@ impl Db {
                 timestamp,
             ],
         )?;
+        let enumeration_sources: Vec<String> = conn
+            .query_row(
+                "SELECT enumeration_sources FROM market_segments WHERE id=?1",
+                params![run.segment_id],
+                |row| row.get::<_, String>(0),
+            )
+            .map(|raw| jd(&raw))
+            .unwrap_or_default();
+        let mut stmt =
+            conn.prepare("SELECT source_name,exhausted FROM coverage_runs WHERE segment_id=?1")?;
+        let source_states = stmt
+            .query_map(params![run.segment_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? != 0))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let all_sources_exhausted =
+            all_declared_sources_exhausted(&enumeration_sources, &source_states);
         conn.execute(
             "UPDATE market_segments SET
-              accounts_discovered=COALESCE((SELECT SUM(candidates_seen) FROM coverage_runs WHERE segment_id=?1),0),
-              source_exhausted=CASE WHEN EXISTS(SELECT 1 FROM coverage_runs WHERE segment_id=?1)
-                 AND NOT EXISTS(SELECT 1 FROM coverage_runs WHERE segment_id=?1 AND exhausted=0)
-                 THEN 1 ELSE 0 END,
-              updated_at=?2 WHERE id=?1",
-            params![run.segment_id, timestamp],
+              accounts_discovered=(SELECT COUNT(*) FROM market_segment_accounts WHERE segment_id=?1),
+              source_exhausted=?3,updated_at=?2 WHERE id=?1",
+            params![run.segment_id, timestamp, all_sources_exhausted],
         )?;
         Ok(id)
     }
@@ -1563,16 +1674,62 @@ impl Db {
                 "sales opportunity requires brand, account, lead, play, title, and task/decision"
             );
         }
+        let task_key = if opportunity.task_key.trim().is_empty() {
+            format!(
+                "task:{:016x}",
+                stable_hash(&normalize_identity_text(&opportunity.task_or_decision))
+            )
+        } else {
+            opportunity.task_key.trim().to_ascii_lowercase()
+        };
+        let identity_key = if opportunity.identity_key.trim().is_empty() {
+            sales_opportunity_identity_key(opportunity, &task_key)
+        } else {
+            opportunity.identity_key.trim().to_ascii_lowercase()
+        };
         let conn = self.conn.lock().unwrap();
-        let existing: Option<String> = conn
-            .query_row(
-                "SELECT id FROM sales_opportunities
-                 WHERE brand=?1 AND lead_id=?2 AND play_id=?3
-                 ORDER BY updated_at DESC LIMIT 1",
-                params![opportunity.brand, opportunity.lead_id, opportunity.play_id],
+        let existing: Option<String> = if !opportunity.id.trim().is_empty() {
+            conn.query_row(
+                "SELECT id FROM sales_opportunities WHERE id=?1",
+                params![opportunity.id],
                 |row| row.get(0),
             )
-            .optional()?;
+            .optional()?
+        } else {
+            None
+        };
+        let existing = match existing {
+            Some(id) => Some(id),
+            None => conn
+                .query_row(
+                    "SELECT id FROM sales_opportunities WHERE identity_key=?1 LIMIT 1",
+                    params![identity_key],
+                    |row| row.get(0),
+                )
+                .optional()?,
+        };
+        // Adopt a pre-identity row only when its old display-level identity is
+        // an exact match. Crucially, never select merely by company + play:
+        // that was the collapse that overwrote a second facility or task.
+        let existing = match existing {
+            Some(id) => Some(id),
+            None => conn
+                .query_row(
+                    "SELECT id FROM sales_opportunities
+                     WHERE identity_key='' AND brand=?1 AND lead_id=?2 AND play_id=?3
+                       AND title=?4 AND facility_id=?5
+                     ORDER BY updated_at DESC LIMIT 1",
+                    params![
+                        opportunity.brand,
+                        opportunity.lead_id,
+                        opportunity.play_id,
+                        opportunity.title,
+                        opportunity.facility_id
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()?,
+        };
         let existed = existing.is_some();
         let id = existing.unwrap_or_else(|| {
             if opportunity.id.is_empty() {
@@ -1585,21 +1742,14 @@ impl Db {
         if !existed {
             conn.execute(
                 "INSERT INTO sales_opportunities
-             (id,brand,market_account_id,lead_id,segment_id,facility_id,play_id,kind,title,
+             (id,identity_key,task_key,brand,market_account_id,lead_id,segment_id,facility_id,play_id,kind,title,
               task_or_decision,mechanism,consequence,system_concept,proof_offer,evidence_status,
               priority_tier,fit_score,status,evidence_gaps,created_at,updated_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?20)
-             ON CONFLICT(brand,lead_id,play_id,title) DO UPDATE SET
-              market_account_id=excluded.market_account_id,segment_id=excluded.segment_id,
-              facility_id=excluded.facility_id,kind=excluded.kind,
-              task_or_decision=excluded.task_or_decision,mechanism=excluded.mechanism,
-              consequence=excluded.consequence,system_concept=excluded.system_concept,
-              proof_offer=excluded.proof_offer,evidence_status=excluded.evidence_status,
-              priority_tier=excluded.priority_tier,fit_score=excluded.fit_score,
-              status=excluded.status,evidence_gaps=excluded.evidence_gaps,
-              updated_at=excluded.updated_at",
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?22)",
                 params![
                     id,
+                    identity_key,
+                    task_key,
                     opportunity.brand,
                     opportunity.market_account_id,
                     opportunity.lead_id,
@@ -1626,12 +1776,15 @@ impl Db {
         // owns the stable id and must update that exact row.
         conn.execute(
             "UPDATE sales_opportunities SET
-              market_account_id=?2,segment_id=?3,facility_id=?4,kind=?5,title=?6,
-              task_or_decision=?7,mechanism=?8,consequence=?9,system_concept=?10,
-              proof_offer=?11,evidence_status=?12,priority_tier=?13,fit_score=?14,
-              status=?15,evidence_gaps=?16,updated_at=?17 WHERE id=?1",
+              identity_key=?2,task_key=?3,market_account_id=?4,segment_id=?5,
+              facility_id=?6,kind=?7,title=?8,task_or_decision=?9,mechanism=?10,
+              consequence=?11,system_concept=?12,proof_offer=?13,evidence_status=?14,
+              priority_tier=?15,fit_score=?16,status=?17,evidence_gaps=?18,
+              updated_at=?19 WHERE id=?1",
             params![
                 id,
+                identity_key,
+                task_key,
                 opportunity.market_account_id,
                 opportunity.segment_id,
                 opportunity.facility_id,
@@ -1710,95 +1863,41 @@ impl Db {
         .map_err(Into::into)
     }
 
+    #[allow(dead_code)]
     pub fn upsert_evidence_claim(&self, claim: &EvidenceClaim) -> Result<String> {
-        if claim.sales_opportunity_id.trim().is_empty()
-            || claim.claim_type.trim().is_empty()
-            || claim.claim_text.trim().is_empty()
-            || claim.source_url.trim().is_empty()
-            || claim.source_excerpt.trim().is_empty()
-        {
-            anyhow::bail!(
-                "evidence claim requires opportunity, type, claim, exact source URL, and excerpt"
-            );
-        }
-        let domain = if claim.source_domain.trim().is_empty() {
-            source_domain(&claim.source_url)
-        } else {
-            claim.source_domain.trim().to_ascii_lowercase()
-        };
-        if domain.is_empty() {
-            anyhow::bail!("evidence claim source URL has no canonical domain");
-        }
-        let lineage_key = if claim.lineage_key.trim().is_empty() {
-            format!(
-                "{:016x}",
-                stable_hash(&format!(
-                    "{}|{}|{}|{}",
-                    claim.sales_opportunity_id,
-                    claim.claim_type,
-                    claim.source_url.trim().to_ascii_lowercase(),
-                    claim.source_excerpt.trim().to_ascii_lowercase()
-                ))
-            )
-        } else {
-            claim.lineage_key.clone()
-        };
-        let independence_group = if claim.independence_group.trim().is_empty() {
-            domain.clone()
-        } else {
-            claim.independence_group.trim().to_ascii_lowercase()
-        };
         let conn = self.conn.lock().unwrap();
-        let existing: Option<String> = conn
-            .query_row(
-                "SELECT id FROM evidence_claims
-                 WHERE sales_opportunity_id=?1 AND lineage_key=?2",
-                params![claim.sales_opportunity_id, lineage_key],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let id = existing.unwrap_or_else(|| {
-            if claim.id.is_empty() {
-                Uuid::new_v4().to_string()
-            } else {
-                claim.id.clone()
-            }
-        });
+        upsert_evidence_claim_on(&conn, claim)
+    }
+
+    /// Replace the active evidence set for one opportunity in a single
+    /// transaction. Claims from an earlier task framing remain auditable but
+    /// are superseded before the new set can authorize copy.
+    pub fn replace_evidence_claims(
+        &self,
+        sales_opportunity_id: &str,
+        claims: &[EvidenceClaim],
+    ) -> Result<Vec<String>> {
+        if sales_opportunity_id.trim().is_empty()
+            || claims
+                .iter()
+                .any(|claim| claim.sales_opportunity_id.trim() != sales_opportunity_id.trim())
+        {
+            anyhow::bail!("replacement claims must all belong to one opportunity");
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
         let timestamp = now();
-        conn.execute(
-            "INSERT INTO evidence_claims
-             (id,sales_opportunity_id,brand,lead_id,facility_id,claim_type,claim_text,
-              source_url,source_title,source_excerpt,source_locator,source_domain,lineage_key,
-              independence_group,confidence,status,observed_at,created_at,updated_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?18)
-             ON CONFLICT(sales_opportunity_id,lineage_key) DO UPDATE SET
-              claim_text=excluded.claim_text,source_title=excluded.source_title,
-              source_excerpt=excluded.source_excerpt,source_locator=excluded.source_locator,
-              source_domain=excluded.source_domain,independence_group=excluded.independence_group,
-              confidence=excluded.confidence,status=excluded.status,
-              observed_at=excluded.observed_at,updated_at=excluded.updated_at",
-            params![
-                id,
-                claim.sales_opportunity_id,
-                claim.brand,
-                claim.lead_id,
-                claim.facility_id,
-                claim.claim_type,
-                claim.claim_text,
-                claim.source_url,
-                claim.source_title,
-                claim.source_excerpt,
-                claim.source_locator,
-                domain,
-                lineage_key,
-                independence_group,
-                claim.confidence.clamp(0.0, 1.0),
-                status_or(&claim.status, "observed"),
-                status_or(&claim.observed_at, &timestamp),
-                timestamp,
-            ],
+        tx.execute(
+            "UPDATE evidence_claims SET status='superseded',updated_at=?2
+             WHERE sales_opportunity_id=?1 AND status IN ('observed','verified')",
+            params![sales_opportunity_id, timestamp],
         )?;
-        Ok(id)
+        let mut ids = Vec::with_capacity(claims.len());
+        for claim in claims {
+            ids.push(upsert_evidence_claim_on(&tx, claim)?);
+        }
+        tx.commit()?;
+        Ok(ids)
     }
 
     pub fn list_evidence_claims(
@@ -5706,6 +5805,8 @@ fn row_to_facility(r: &Row) -> Facility {
 fn row_to_sales_opportunity(r: &Row) -> SalesOpportunity {
     let mut opportunity = SalesOpportunity {
         id: g(r, "id"),
+        identity_key: g(r, "identity_key"),
+        task_key: g(r, "task_key"),
         brand: g(r, "brand"),
         market_account_id: g(r, "market_account_id"),
         lead_id: g(r, "lead_id"),
@@ -5738,6 +5839,7 @@ fn row_to_evidence_claim(r: &Row) -> EvidenceClaim {
         brand: g(r, "brand"),
         lead_id: g(r, "lead_id"),
         facility_id: g(r, "facility_id"),
+        task_key: g(r, "task_key"),
         claim_type: g(r, "claim_type"),
         claim_text: g(r, "claim_text"),
         source_url: g(r, "source_url"),
@@ -6605,6 +6707,47 @@ fn opportunity_title(task_or_decision: &str) -> String {
     }
 }
 
+fn normalize_identity_text(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn all_declared_sources_exhausted(
+    declared_sources: &[String],
+    source_states: &[(String, bool)],
+) -> bool {
+    !declared_sources.is_empty()
+        && declared_sources.iter().all(|declared| {
+            let declared = declared.to_ascii_lowercase();
+            let matching = source_states
+                .iter()
+                .filter(|(source, _)| {
+                    let source = source.to_ascii_lowercase();
+                    declared.contains(&source) || source.contains(&declared)
+                })
+                .collect::<Vec<_>>();
+            !matching.is_empty() && matching.iter().all(|(_, exhausted)| *exhausted)
+        })
+}
+
+fn sales_opportunity_identity_key(opportunity: &SalesOpportunity, task_key: &str) -> String {
+    format!(
+        "opportunity:{:016x}",
+        stable_hash(&format!(
+            "{}|{}|{}|{}|{}|{}",
+            opportunity.brand.trim().to_ascii_lowercase(),
+            opportunity.market_account_id.trim(),
+            opportunity.facility_id.trim(),
+            opportunity.play_id.trim(),
+            opportunity.kind.trim().to_ascii_lowercase(),
+            task_key.trim().to_ascii_lowercase(),
+        ))
+    )
+}
+
 fn opportunity_evidence_status(
     brand: &str,
     assessment_status: &str,
@@ -6893,6 +7036,98 @@ fn source_domain(raw: &str) -> String {
         .next()
         .unwrap_or("")
         .to_string()
+}
+
+fn upsert_evidence_claim_on(conn: &Connection, claim: &EvidenceClaim) -> Result<String> {
+    if claim.sales_opportunity_id.trim().is_empty()
+        || claim.claim_type.trim().is_empty()
+        || claim.claim_text.trim().is_empty()
+        || claim.source_url.trim().is_empty()
+        || claim.source_excerpt.trim().is_empty()
+    {
+        anyhow::bail!(
+            "evidence claim requires opportunity, type, claim, exact source URL, and excerpt"
+        );
+    }
+    let domain = if claim.source_domain.trim().is_empty() {
+        source_domain(&claim.source_url)
+    } else {
+        claim.source_domain.trim().to_ascii_lowercase()
+    };
+    if domain.is_empty() {
+        anyhow::bail!("evidence claim source URL has no canonical domain");
+    }
+    let lineage_key = if claim.lineage_key.trim().is_empty() {
+        format!(
+            "{:016x}",
+            stable_hash(&format!(
+                "{}|{}|{}|{}",
+                claim.sales_opportunity_id,
+                claim.claim_type,
+                claim.source_url.trim().to_ascii_lowercase(),
+                claim.source_excerpt.trim().to_ascii_lowercase()
+            ))
+        )
+    } else {
+        claim.lineage_key.clone()
+    };
+    let independence_group = if claim.independence_group.trim().is_empty() {
+        domain.clone()
+    } else {
+        claim.independence_group.trim().to_ascii_lowercase()
+    };
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT id FROM evidence_claims
+             WHERE sales_opportunity_id=?1 AND lineage_key=?2",
+            params![claim.sales_opportunity_id, lineage_key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let id = existing.unwrap_or_else(|| {
+        if claim.id.is_empty() {
+            Uuid::new_v4().to_string()
+        } else {
+            claim.id.clone()
+        }
+    });
+    let timestamp = now();
+    conn.execute(
+        "INSERT INTO evidence_claims
+         (id,sales_opportunity_id,brand,lead_id,facility_id,task_key,claim_type,claim_text,
+          source_url,source_title,source_excerpt,source_locator,source_domain,lineage_key,
+          independence_group,confidence,status,observed_at,created_at,updated_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?19)
+         ON CONFLICT(sales_opportunity_id,lineage_key) DO UPDATE SET
+          facility_id=excluded.facility_id,task_key=excluded.task_key,
+          claim_text=excluded.claim_text,source_title=excluded.source_title,
+          source_excerpt=excluded.source_excerpt,source_locator=excluded.source_locator,
+          source_domain=excluded.source_domain,independence_group=excluded.independence_group,
+          confidence=excluded.confidence,status=excluded.status,
+          observed_at=excluded.observed_at,updated_at=excluded.updated_at",
+        params![
+            id,
+            claim.sales_opportunity_id,
+            claim.brand,
+            claim.lead_id,
+            claim.facility_id,
+            claim.task_key,
+            claim.claim_type,
+            claim.claim_text,
+            claim.source_url,
+            claim.source_title,
+            claim.source_excerpt,
+            claim.source_locator,
+            domain,
+            lineage_key,
+            independence_group,
+            claim.confidence.clamp(0.0, 1.0),
+            status_or(&claim.status, "observed"),
+            status_or(&claim.observed_at, &timestamp),
+            timestamp,
+        ],
+    )?;
+    Ok(id)
 }
 
 fn normalize_linkedin_status(status: &str) -> &'static str {
@@ -7230,6 +7465,17 @@ CREATE TABLE IF NOT EXISTS coverage_runs (
     UNIQUE(segment_id,source_name,query_fingerprint),
     FOREIGN KEY(segment_id) REFERENCES market_segments(id)
 );
+CREATE TABLE IF NOT EXISTS market_segment_accounts (
+    id TEXT PRIMARY KEY,
+    segment_id TEXT NOT NULL,
+    market_account_id TEXT NOT NULL,
+    source_name TEXT NOT NULL,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    UNIQUE(segment_id,market_account_id),
+    FOREIGN KEY(segment_id) REFERENCES market_segments(id),
+    FOREIGN KEY(market_account_id) REFERENCES market_accounts(id)
+);
 CREATE TABLE IF NOT EXISTS facilities (
     id TEXT PRIMARY KEY,
     market_account_id TEXT NOT NULL,
@@ -7250,6 +7496,8 @@ CREATE TABLE IF NOT EXISTS facilities (
 );
 CREATE TABLE IF NOT EXISTS sales_opportunities (
     id TEXT PRIMARY KEY,
+    identity_key TEXT NOT NULL DEFAULT '',
+    task_key TEXT NOT NULL DEFAULT '',
     brand TEXT NOT NULL,
     market_account_id TEXT NOT NULL,
     lead_id TEXT NOT NULL,
@@ -7270,7 +7518,7 @@ CREATE TABLE IF NOT EXISTS sales_opportunities (
     evidence_gaps TEXT NOT NULL DEFAULT '[]',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    UNIQUE(brand,lead_id,play_id,title),
+    UNIQUE(identity_key),
     FOREIGN KEY(market_account_id) REFERENCES market_accounts(id),
     FOREIGN KEY(lead_id) REFERENCES leads(id)
 );
@@ -7280,6 +7528,7 @@ CREATE TABLE IF NOT EXISTS evidence_claims (
     brand TEXT NOT NULL,
     lead_id TEXT NOT NULL,
     facility_id TEXT DEFAULT '',
+    task_key TEXT DEFAULT '',
     claim_type TEXT NOT NULL,
     claim_text TEXT NOT NULL,
     source_url TEXT NOT NULL,
@@ -7319,6 +7568,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_cold_thread_per_sales_opportuni
 ON opportunity_stakeholders(sales_opportunity_id) WHERE active_thread=1;
 CREATE INDEX IF NOT EXISTS idx_sales_opportunities_brand_priority
 ON sales_opportunities(brand,priority_tier,fit_score DESC);
+CREATE INDEX IF NOT EXISTS idx_market_segment_accounts_account
+ON market_segment_accounts(market_account_id,segment_id);
 CREATE INDEX IF NOT EXISTS idx_evidence_claims_opportunity_type
 ON evidence_claims(sales_opportunity_id,claim_type);
 CREATE TABLE IF NOT EXISTS gtm_experiments (
@@ -7583,8 +7834,9 @@ CREATE INDEX IF NOT EXISTS idx_jobs_claim ON jobs(status, next_run_at, priority)
 #[cfg(test)]
 mod tests {
     use super::{
-        evidence_names_operating_site, facility_observation_for_task, AccountPlayAssessment,
-        ApplicationBrief, ConversationMessage, CustomerDevelopmentRecord, Db, GtmExperiment,
+        all_declared_sources_exhausted, evidence_names_operating_site,
+        facility_observation_for_task, AccountPlayAssessment, ApplicationBrief,
+        ConversationMessage, CustomerDevelopmentRecord, Db, EvidenceClaim, GtmExperiment,
         GtmOutcome, Job, Lead, Mailbox, Meeting, Opportunity, OpportunityContact, OpportunityTouch,
         Person, SalesOpportunity, Sequence, SignalObservation, Touch, CURRENT_COPY_POLICY_VERSION,
     };
@@ -7754,6 +8006,237 @@ mod tests {
         assert_eq!(gnk_account.id, outage_account.id);
         assert_eq!(gnk_account.id, wapahki_account.id);
         assert_eq!(db.list_market_accounts(None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn segment_seed_does_not_reset_coverage_and_membership_counts_canonical_accounts() {
+        let db = Db::open(":memory:").expect("open memory db");
+        let mut segment = db
+            .list_market_segments(Some("wapahki"))
+            .unwrap()
+            .into_iter()
+            .find(|segment| segment.key == "ontario_food_case_palletizing")
+            .expect("default segment");
+        segment.estimated_total = 500;
+        segment.accounts_discovered = 17;
+        segment.accounts_with_opportunities = 4;
+        db.upsert_market_segment(&segment).unwrap();
+        db.upsert_market_segment(&super::MarketSegment {
+            brand: segment.brand.clone(),
+            key: segment.key.clone(),
+            version: segment.version,
+            name: segment.name.clone(),
+            geography: segment.geography.clone(),
+            wedge: segment.wedge.clone(),
+            unit_of_analysis: segment.unit_of_analysis.clone(),
+            enumeration_sources: segment.enumeration_sources.clone(),
+            status: "active".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let preserved = db
+            .list_market_segments(Some("wapahki"))
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == segment.id)
+            .unwrap();
+        assert_eq!(preserved.estimated_total, 500);
+        assert_eq!(preserved.accounts_discovered, 17);
+        assert_eq!(preserved.accounts_with_opportunities, 4);
+
+        let first_lead = db
+            .upsert_lead(&Lead {
+                brand: "wapahki".into(),
+                apollo_org_id: "segment-org-one".into(),
+                name: "Segment Foods".into(),
+                domain: "segmentfoods.example".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(db
+            .link_lead_to_market_segment(&first_lead, &segment.id, "apollo")
+            .unwrap());
+        assert!(!db
+            .link_lead_to_market_segment(&first_lead, &segment.id, "apollo")
+            .unwrap());
+        let counted = db
+            .list_market_segments(Some("wapahki"))
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == segment.id)
+            .unwrap();
+        assert_eq!(counted.accounts_discovered, 1);
+    }
+
+    #[test]
+    fn one_exhausted_provider_cannot_complete_a_multi_source_segment() {
+        let declared = vec![
+            "official registries/directories".into(),
+            "company facility pages and job postings".into(),
+            "Apollo enrichment after enumeration".into(),
+        ];
+        assert!(!all_declared_sources_exhausted(
+            &declared,
+            &[("apollo".into(), true)]
+        ));
+        assert!(all_declared_sources_exhausted(
+            &["Apollo enrichment".into()],
+            &[("apollo".into(), true)]
+        ));
+        assert!(!all_declared_sources_exhausted(
+            &["Apollo enrichment".into()],
+            &[("apollo".into(), false)]
+        ));
+    }
+
+    #[test]
+    fn one_company_can_hold_distinct_tasks_inside_one_brand_play() {
+        let db = Db::open(":memory:").expect("open memory db");
+        let lead_id = db
+            .upsert_lead(&Lead {
+                brand: "wapahki".into(),
+                apollo_org_id: "multi-task-org".into(),
+                name: "Multi Task Foods".into(),
+                domain: "multitask.example".into(),
+                ..Default::default()
+            })
+            .expect("insert lead");
+        let account = db
+            .market_account_for_lead(&lead_id)
+            .expect("account query")
+            .expect("canonical account");
+        let base = SalesOpportunity {
+            brand: "wapahki".into(),
+            market_account_id: account.id,
+            lead_id: lead_id.clone(),
+            facility_id: "facility-one".into(),
+            play_id: "play-one".into(),
+            kind: "physical_task".into(),
+            title: "Ontario line task".into(),
+            task_or_decision: "Operator case packing".into(),
+            task_key: "case-packing".into(),
+            ..Default::default()
+        };
+        let case_id = db
+            .upsert_sales_opportunity(&base)
+            .expect("insert case task");
+        let pallet_id = db
+            .upsert_sales_opportunity(&SalesOpportunity {
+                task_or_decision: "Operator palletizing".into(),
+                task_key: "palletizing".into(),
+                ..base.clone()
+            })
+            .expect("insert pallet task");
+        assert_ne!(case_id, pallet_id);
+        assert_eq!(
+            db.list_sales_opportunities(Some("wapahki"), Some(&lead_id))
+                .unwrap()
+                .len(),
+            2
+        );
+        let renamed_case_id = db
+            .upsert_sales_opportunity(&SalesOpportunity {
+                title: "Refined case-packing title".into(),
+                ..base
+            })
+            .expect("update same task identity");
+        assert_eq!(renamed_case_id, case_id);
+        assert_eq!(
+            db.list_sales_opportunities(Some("wapahki"), Some(&lead_id))
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn replacing_evidence_supersedes_absent_claims_and_binds_current_scope() {
+        let db = Db::open(":memory:").expect("open memory db");
+        let opportunity_id = "opportunity-one";
+        // Evidence claims only require the stable opportunity id at this unit
+        // boundary; the production materializer creates the parent first.
+        let first = EvidenceClaim {
+            sales_opportunity_id: opportunity_id.into(),
+            brand: "wapahki".into(),
+            lead_id: "lead-one".into(),
+            facility_id: "facility-one".into(),
+            task_key: "case-packing".into(),
+            claim_type: "account.bounded_repetitive_task".into(),
+            claim_text: "Operators pack cases.".into(),
+            source_url: "https://example.com/job".into(),
+            source_excerpt: "Operators pack cases.".into(),
+            status: "observed".into(),
+            ..Default::default()
+        };
+        let old_pressure = EvidenceClaim {
+            claim_type: "account.manual_task_economic_pressure".into(),
+            claim_text: "The old task required lifting.".into(),
+            source_excerpt: "The old task required lifting.".into(),
+            ..first.clone()
+        };
+        // Foreign keys are enforced in production, so provide the parent rows
+        // through the public opportunity path before replacing the claim set.
+        let lead_id = db
+            .upsert_lead(&Lead {
+                brand: "wapahki".into(),
+                apollo_org_id: "claim-org".into(),
+                name: "Claim Foods".into(),
+                domain: "claim.example".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let account = db.market_account_for_lead(&lead_id).unwrap().unwrap();
+        let actual_opportunity_id = db
+            .upsert_sales_opportunity(&SalesOpportunity {
+                id: opportunity_id.into(),
+                brand: "wapahki".into(),
+                market_account_id: account.id,
+                lead_id: lead_id.clone(),
+                play_id: "play-one".into(),
+                kind: "physical_task".into(),
+                title: "Case packing".into(),
+                task_or_decision: "Operators pack cases".into(),
+                task_key: "case-packing".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let scoped = |mut claim: EvidenceClaim| {
+            claim.sales_opportunity_id = actual_opportunity_id.clone();
+            claim.lead_id = lead_id.clone();
+            claim
+        };
+        db.replace_evidence_claims(
+            &actual_opportunity_id,
+            &[scoped(first.clone()), scoped(old_pressure)],
+        )
+        .unwrap();
+        let current = EvidenceClaim {
+            claim_text: "Operators pack finished cases.".into(),
+            source_excerpt: "Operators pack finished cases.".into(),
+            ..first
+        };
+        db.replace_evidence_claims(&actual_opportunity_id, &[scoped(current)])
+            .unwrap();
+        let claims = db
+            .list_evidence_claims(Some(&actual_opportunity_id), Some("wapahki"))
+            .unwrap();
+        assert_eq!(
+            claims
+                .iter()
+                .filter(|claim| claim.status == "observed")
+                .count(),
+            1
+        );
+        assert!(claims.iter().any(|claim| {
+            claim.claim_type == "account.manual_task_economic_pressure"
+                && claim.status == "superseded"
+        }));
+        let active = claims
+            .iter()
+            .find(|claim| claim.status == "observed")
+            .unwrap();
+        assert_eq!(active.facility_id, "facility-one");
+        assert_eq!(active.task_key, "case-packing");
     }
 
     #[test]

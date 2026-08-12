@@ -171,6 +171,10 @@ enum Command {
     Source {
         /// The thesis: the expensive workflow / market to target.
         thesis: String,
+        /// Exact persisted market-segment key. Prevents a mixed ICP query from
+        /// being heuristically credited to the wrong coverage ledger.
+        #[arg(long)]
+        segment: Option<String>,
         /// Research only these employer domains (comma-separated); bypasses broad ICP discovery.
         #[arg(long, value_delimiter = ',')]
         domains: Vec<String>,
@@ -577,6 +581,7 @@ fn main() -> Result<()> {
 
         Command::Source {
             thesis,
+            segment,
             domains,
             accounts,
             contacts,
@@ -609,6 +614,7 @@ fn main() -> Result<()> {
                 } else {
                     Some(domains.as_slice())
                 },
+                segment.as_deref(),
                 None,
                 cli.concurrency,
                 None,

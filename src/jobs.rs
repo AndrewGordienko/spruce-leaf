@@ -293,6 +293,7 @@ async fn execute(
                 contacts,
                 None,
                 None,
+                None,
                 concurrency,
                 None,
             )

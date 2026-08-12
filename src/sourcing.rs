@@ -15,7 +15,7 @@
 //!   4. people search + vantage — real people at the org, mapped to a vantage
 //!   5. upsert into the SQLite spine
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures::stream::{self, StreamExt};
 use serde::Deserialize;
@@ -159,7 +159,7 @@ struct LeadRefresh {
 
 // --- Structured-output shapes ---------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct Icp {
     #[serde(default)]
     keywords: Vec<String>,
@@ -268,6 +268,7 @@ pub async fn source(
     n_accounts: usize,
     n_contacts: usize,
     exact_domains: Option<&[String]>,
+    segment_key: Option<&str>,
     candidate_limit: Option<usize>,
     concurrency: usize,
     progress: Option<SourceProgressReporter>,
@@ -324,6 +325,32 @@ pub async fn source(
         "Applying the active GTM play, business constraints, and prior qualification learnings",
         "active",
     );
+    let available_segments = db.list_market_segments(Some(&pb.key)).unwrap_or_default();
+    let market_segment = if let Some(segment_key) = segment_key.filter(|key| !key.trim().is_empty())
+    {
+        Some(
+            available_segments
+                .iter()
+                .find(|segment| segment.key.eq_ignore_ascii_case(segment_key.trim()))
+                .ok_or_else(|| {
+                    anyhow!(
+                        "unknown {} market segment '{}'; available: {}",
+                        pb.key,
+                        segment_key,
+                        available_segments
+                            .iter()
+                            .map(|segment| segment.key.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                })?,
+        )
+    } else {
+        // Infer only from the operator's thesis. Generated Apollo keywords are
+        // deliberately excluded from segment identity; the brand guard can add
+        // broad terms and used to make almost every OutageHub run look telecom.
+        choose_source_segment(&pb.key, thesis, &Icp::default(), &available_segments)
+    };
     let mut icp = derive_icp(
         client,
         &icp_system,
@@ -333,7 +360,12 @@ pub async fn source(
         thesis,
     )
     .await?;
-    apply_brand_icp_guard(&pb.key, thesis, &mut icp);
+    apply_brand_icp_guard(
+        &pb.key,
+        thesis,
+        market_segment.as_ref().map(|segment| segment.key.as_str()),
+        &mut icp,
+    );
     icp.employee_ranges = clamp_employee_ranges(icp.employee_ranges, pb.max_employees);
     log_sourcing(format!(
         "{} ICP · keywords [{}] · locations [{}] · titles [{}]",
@@ -357,8 +389,6 @@ pub async fn source(
         "complete",
     );
 
-    let available_segments = db.list_market_segments(Some(&pb.key)).unwrap_or_default();
-    let market_segment = choose_source_segment(&pb.key, thesis, &icp, &available_segments);
     let query_fingerprint = source_query_fingerprint(
         &pb.key,
         market_segment
@@ -841,16 +871,17 @@ pub async fn source(
 
     let mut ranked = quals
         .into_iter()
-        .filter_map(|(org, result)| match result {
-            Ok(qualification)
-                if matches!(
-                    qualification.routing_status.as_str(),
-                    "qualified" | "research_needed" | "research_required"
-                ) =>
-            {
-                Some((org, qualification))
-            }
-            _ => None,
+        .map(|(org, result)| {
+            let qualification = result.unwrap_or_else(|error| OrgQual {
+                routing_status: "research_required".into(),
+                reject_reason: format!("Qualification could not complete: {error}"),
+                evidence_gaps: vec![
+                    "Qualification provider failed; preserve this enumerated company for a retry."
+                        .into(),
+                ],
+                ..Default::default()
+            });
+            (org, qualification)
         })
         .collect::<Vec<_>>();
     ranked.sort_by(|left, right| {
@@ -873,14 +904,22 @@ pub async fn source(
             })
             .then_with(|| left.0.name.cmp(&right.0.name))
     });
-    let selected_count = ranked.len().min(n_accounts);
+    let eligible = |qualification: &&(ApolloOrg, OrgQual)| {
+        matches!(
+            qualification.1.routing_status.as_str(),
+            "qualified" | "research_needed" | "research_required"
+        )
+    };
+    let selected_count = ranked.iter().filter(eligible).count().min(n_accounts);
     let selected_qualified = ranked
         .iter()
+        .filter(eligible)
         .take(selected_count)
         .filter(|(_, qualification)| qualification.routing_status == "qualified")
         .count();
     let selected_medium = ranked
         .iter()
+        .filter(eligible)
         .take(selected_count)
         .filter(|(_, qualification)| qualification.routing_status == "research_needed")
         .count();
@@ -901,10 +940,13 @@ pub async fn source(
         if selected_count > 0 { "complete" } else { "warning" },
     );
 
-    // Persist the highest-ranked leads and their play-version assessment, then
-    // source people only at those winners.
+    // Persist every evaluated company before choosing the current research
+    // queue. Ranking controls whose committee is mapped now; it must never
+    // decide whether a company exists in the market ledger, because the Apollo
+    // cursor will advance past this page.
     let mut winners: Vec<(ApolloOrg, Lead, String)> = Vec::new();
-    for (org, q) in ranked.into_iter().take(n_accounts) {
+    let mut segment_accounts_added = 0i64;
+    for (org, q) in ranked {
         let routing_status = if q.routing_status.is_empty() {
             "research_needed".to_string()
         } else {
@@ -963,6 +1005,11 @@ pub async fn source(
             assessment.lead_id = lead_id.clone();
             db.upsert_account_play_assessment(&assessment)?;
         }
+        if let Some(segment) = &market_segment {
+            if db.link_lead_to_market_segment(&lead_id, &segment.id, "apollo")? {
+                segment_accounts_added += 1;
+            }
+        }
         db.log_event(
             &pb.key,
             "",
@@ -980,7 +1027,13 @@ pub async fn source(
         } else if routing_status == "research_required" {
             summary.leads_research_required += 1;
         }
-        winners.push((org, lead, lead_id));
+        if matches!(
+            routing_status.as_str(),
+            "qualified" | "research_needed" | "research_required"
+        ) && winners.len() < n_accounts
+        {
+            winners.push((org, lead, lead_id));
+        }
     }
     if let Some(segment) = &market_segment {
         if let Some(mut coverage) = db
@@ -993,7 +1046,7 @@ pub async fn source(
                     && run.query_fingerprint == query_fingerprint
             })
         {
-            coverage.accounts_added += winners.len() as i64;
+            coverage.accounts_added += segment_accounts_added;
             let _ = db.upsert_coverage_run(&coverage);
         }
     }
@@ -3034,24 +3087,29 @@ fn compact_list(values: &[String], limit: usize) -> String {
 /// long-term market visible without collapsing every sourcing pass into one
 /// narrow vertical. Qualification and evidence strength determine easy,
 /// medium, and hard priority after discovery.
-fn apply_brand_icp_guard(brand: &str, thesis: &str, icp: &mut Icp) {
+fn apply_brand_icp_guard(brand: &str, thesis: &str, segment_key: Option<&str>, icp: &mut Icp) {
     let thesis = thesis.to_ascii_lowercase();
+    let segment_key = segment_key.unwrap_or_default().to_ascii_lowercase();
     let coverage: &[&str] = if brand.eq_ignore_ascii_case("wapahki") {
-        let warehouse_segment = [
-            "warehouse",
-            "distribution",
-            "3pl",
-            "fulfillment",
-            "logistics",
-        ]
-        .iter()
-        .any(|term| thesis.contains(term));
-        let food_segment = !["outside food", "non-food", "excluding food"]
-            .iter()
-            .any(|term| thesis.contains(term))
-            && ["food", "beverage", "bakery", "dairy"]
+        let warehouse_segment = segment_key == "ontario_warehouse_case_handling"
+            || (segment_key.is_empty()
+                && [
+                    "warehouse",
+                    "distribution",
+                    "3pl",
+                    "fulfillment",
+                    "logistics",
+                ]
                 .iter()
-                .any(|term| thesis.contains(term));
+                .any(|term| thesis.contains(term)));
+        let food_segment = segment_key == "ontario_food_case_palletizing"
+            || (segment_key.is_empty()
+                && !["outside food", "non-food", "excluding food"]
+                    .iter()
+                    .any(|term| thesis.contains(term))
+                && ["food", "beverage", "bakery", "dairy"]
+                    .iter()
+                    .any(|term| thesis.contains(term)));
         // Apollo organization keywords are discovery categories, not workflow
         // evidence. Task/equipment phrases ("palletizing", "material
         // handling", "robotics") overwhelmingly return integrators and
@@ -3147,24 +3205,113 @@ fn apply_brand_icp_guard(brand: &str, thesis: &str, icp: &mut Icp) {
             ]
         }
     } else if brand.eq_ignore_ascii_case("gnk") {
-        &[
-            "insurance operations",
-            "logistics operations",
-            "manufacturing operations",
-            "field services",
-            "construction operations",
-            "healthcare services",
-        ]
+        let disallowed: &[&str] = match segment_key.as_str() {
+            "canada_construction_delay_evidence" => &[
+                "logistics",
+                "freight",
+                "fulfillment",
+                "medical billing",
+                "claims administration",
+            ],
+            "canada_specialty_claims_admin" => &[
+                "logistics",
+                "freight",
+                "fulfillment",
+                "construction",
+                "contractor",
+            ],
+            _ => &[
+                "construction",
+                "contractor",
+                "medical billing",
+                "claims administration",
+                "insurance operations",
+            ],
+        };
+        icp.keywords.retain(|keyword| {
+            let keyword = keyword.to_ascii_lowercase();
+            !disallowed.iter().any(|term| keyword.contains(term))
+        });
+        match segment_key.as_str() {
+            "canada_construction_delay_evidence" => &[
+                "construction operations",
+                "general contractor",
+                "specialty contractor",
+                "industrial contractor",
+            ],
+            "canada_specialty_claims_admin" => &[
+                "claims administration",
+                "medical billing",
+                "insurance operations",
+                "third party administrator",
+            ],
+            _ => &[
+                "third party logistics",
+                "freight transportation",
+                "contract logistics",
+                "fulfillment services",
+            ],
+        }
     } else if brand.eq_ignore_ascii_case("outagehub") {
-        &[
-            "EV charging network",
-            "telecommunications network",
-            "cold storage",
-            "data center",
-            "multi-site retail",
-            "facilities management",
-            "backup power service",
-        ]
+        let disallowed: &[&str] = match segment_key.as_str() {
+            "canada_telecom_site_continuity" => &[
+                "ev charging",
+                "electric vehicle charging",
+                "charging point",
+                "backup power",
+                "generator",
+                "cold storage",
+                "data center",
+                "retail",
+                "facilities management",
+            ],
+            "canada_backup_power_dispatch" => &[
+                "ev charging",
+                "electric vehicle charging",
+                "charging point",
+                "telecommunications",
+                "fiber network",
+                "tower infrastructure",
+                "cold storage",
+                "data center",
+                "retail",
+            ],
+            _ => &[
+                "telecommunications",
+                "fiber network",
+                "tower infrastructure",
+                "backup power",
+                "generator",
+                "cold storage",
+                "data center",
+                "retail",
+                "facilities management",
+            ],
+        };
+        icp.keywords.retain(|keyword| {
+            let keyword = keyword.to_ascii_lowercase();
+            !disallowed.iter().any(|term| keyword.contains(term))
+        });
+        match segment_key.as_str() {
+            "canada_telecom_site_continuity" => &[
+                "telecommunications network",
+                "wireless internet service provider",
+                "fiber network operator",
+                "tower infrastructure",
+            ],
+            "canada_backup_power_dispatch" => &[
+                "backup power service",
+                "generator service",
+                "emergency power maintenance",
+                "generator rental",
+            ],
+            _ => &[
+                "EV charging network",
+                "electric vehicle charging operator",
+                "charging point operator",
+                "EV charging software",
+            ],
+        }
     } else {
         return;
     };
@@ -4462,6 +4609,7 @@ mod tests {
         apply_brand_icp_guard(
             "wapahki",
             "Ontario warehouses and distribution centres",
+            Some("ontario_warehouse_case_handling"),
             &mut icp,
         );
         assert!(!icp.keywords.contains(&"material handling".to_string()));
@@ -4479,6 +4627,7 @@ mod tests {
         apply_brand_icp_guard(
             "wapahki",
             "Ontario product manufacturing outside food with machine tending",
+            Some("ontario_manufacturing_machine_tending"),
             &mut non_food,
         );
         assert!(!non_food
@@ -4487,6 +4636,33 @@ mod tests {
         assert!(non_food
             .keywords
             .contains(&"automotive manufacturing".to_string()));
+    }
+
+    #[test]
+    fn explicit_outage_segment_cannot_be_polluted_by_other_wedges() {
+        let mut icp = Icp {
+            keywords: vec!["telecommunications network".into(), "cold storage".into()],
+            ..Default::default()
+        };
+        apply_brand_icp_guard(
+            "outagehub",
+            "Canadian distributed operations",
+            Some("canada_ev_charging_operations"),
+            &mut icp,
+        );
+        assert!(icp
+            .keywords
+            .iter()
+            .any(|term| term == "EV charging network"));
+        assert!(!icp
+            .keywords
+            .iter()
+            .any(|term| term == "backup power service"));
+        assert!(!icp
+            .keywords
+            .iter()
+            .any(|term| term == "telecommunications network"));
+        assert!(!icp.keywords.iter().any(|term| term == "data center"));
     }
 
     #[test]
