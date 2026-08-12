@@ -332,7 +332,7 @@ pub async fn source(
         thesis,
     )
     .await?;
-    apply_brand_icp_guard(&pb.key, &mut icp);
+    apply_brand_icp_guard(&pb.key, thesis, &mut icp);
     icp.employee_ranges = clamp_employee_ranges(icp.employee_ranges, pb.max_employees);
     log_sourcing(format!(
         "{} ICP · keywords [{}] · locations [{}] · titles [{}]",
@@ -2513,7 +2513,10 @@ async fn derive_icp(
          Return Apollo filters that will surface companies plausibly having this expensive workflow \
          AND that fit what the business (above) is actually trying to accomplish — not merely a loose \
          keyword match. Include the job titles/seniorities of the people who would OWN or OBSERVE the \
-         workflow (by vantage, not just seniority). Keep keywords concrete and industry-specific. \
+         workflow (by vantage, not just seniority). Organization keywords must describe BUYER \
+         categories or industries, never the task, equipment, automation method, product, or vendor \
+         category being sold; those mechanism words attract suppliers instead of operators. Keep \
+         keywords concrete and industry-specific. \
          Employee ranges must use Apollo's bucket format like \"51,200\".{firmographic} If the thesis \
          implies a region, set locations.{search_discipline}\n\n{doctrine}",
         motion = pb.motion,
@@ -2794,17 +2797,80 @@ fn compact_list(values: &[String], limit: usize) -> String {
 /// long-term market visible without collapsing every sourcing pass into one
 /// narrow vertical. Qualification and evidence strength determine easy,
 /// medium, and hard priority after discovery.
-fn apply_brand_icp_guard(brand: &str, icp: &mut Icp) {
+fn apply_brand_icp_guard(brand: &str, thesis: &str, icp: &mut Icp) {
+    let thesis = thesis.to_ascii_lowercase();
     let coverage: &[&str] = if brand.eq_ignore_ascii_case("wapahki") {
-        &[
-            "food manufacturing",
-            "beverage manufacturing",
-            "consumer goods manufacturing",
-            "contract manufacturing",
-            "warehousing",
-            "distribution center",
-            "fulfillment center",
+        // Apollo organization keywords are discovery categories, not workflow
+        // evidence. Task/equipment phrases ("palletizing", "material
+        // handling", "robotics") overwhelmingly return integrators and
+        // equipment dealers. The task is established after enumeration from
+        // first-party facility/job evidence.
+        icp.keywords.retain(|keyword| {
+            let keyword = keyword.to_ascii_lowercase();
+            ![
+                "robot",
+                "automation",
+                "material handling",
+                "pallet",
+                "case pack",
+                "tray load",
+                "machine feed",
+                "machine tend",
+                "conveyor",
+                "order pick",
+                "tote",
+                "forklift",
+                "packaging machine",
+            ]
+            .iter()
+            .any(|term| keyword.contains(term))
+        });
+        if [
+            "warehouse",
+            "distribution",
+            "3pl",
+            "fulfillment",
+            "logistics",
         ]
+        .iter()
+        .any(|term| thesis.contains(term))
+        {
+            &[
+                "warehousing",
+                "third party logistics",
+                "logistics and supply chain",
+                "distribution center",
+                "fulfillment center",
+                "contract logistics",
+                "cold storage",
+                "wholesale distribution",
+            ]
+        } else if ["food", "beverage", "bakery", "dairy"]
+            .iter()
+            .any(|term| thesis.contains(term))
+        {
+            &[
+                "food manufacturing",
+                "food production",
+                "beverage manufacturing",
+                "bakery manufacturing",
+                "dairy manufacturing",
+                "meat processing",
+                "contract food manufacturing",
+                "consumer packaged goods",
+            ]
+        } else {
+            &[
+                "automotive manufacturing",
+                "plastics manufacturing",
+                "metal fabrication",
+                "medical device manufacturing",
+                "consumer goods manufacturing",
+                "contract manufacturing",
+                "industrial manufacturing",
+                "building materials manufacturing",
+            ]
+        }
     } else if brand.eq_ignore_ascii_case("gnk") {
         &[
             "insurance operations",
@@ -4094,7 +4160,7 @@ mod tests {
     }
 
     #[test]
-    fn wapahki_icp_keeps_broad_market_terms_and_adds_core_coverage() {
+    fn wapahki_icp_uses_buyer_categories_not_equipment_terms() {
         let mut icp = Icp {
             keywords: vec!["material handling".into(), "robotics".into()],
             employee_ranges: vec![],
@@ -4102,10 +4168,15 @@ mod tests {
             titles: vec![],
             seniorities: vec![],
         };
-        apply_brand_icp_guard("wapahki", &mut icp);
-        assert!(icp.keywords.contains(&"food manufacturing".to_string()));
-        assert!(icp.keywords.contains(&"material handling".to_string()));
+        apply_brand_icp_guard(
+            "wapahki",
+            "Ontario warehouses and distribution centres",
+            &mut icp,
+        );
+        assert!(!icp.keywords.contains(&"material handling".to_string()));
+        assert!(!icp.keywords.contains(&"robotics".to_string()));
         assert!(icp.keywords.contains(&"warehousing".to_string()));
+        assert!(icp.keywords.contains(&"third party logistics".to_string()));
     }
 
     #[test]
