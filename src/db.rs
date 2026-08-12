@@ -1390,7 +1390,19 @@ impl Db {
             .into_iter()
             .filter(|person| person.lead_id == assessment.lead_id)
         {
-            self.upsert_person(&person)?;
+            let role = stakeholder_role(&person.title, &person.vantage);
+            self.upsert_opportunity_stakeholder(&OpportunityStakeholder {
+                sales_opportunity_id: opportunity_id.clone(),
+                person_id: person.id,
+                role: role.clone(),
+                relationship_to_task: person.why_them,
+                can_observe: person.can_observe,
+                can_decide: stakeholder_decision_scope(&role).into(),
+                priority: stakeholder_priority(&role),
+                status: "mapped".into(),
+                source: "contact_research".into(),
+                ..Default::default()
+            })?;
         }
         Ok(opportunity_id)
     }
@@ -1980,10 +1992,14 @@ impl Db {
         // the committee is not authorization to contact the committee.
         let opportunity_id: Option<String> = conn
             .query_row(
-                "SELECT id FROM sales_opportunities
-                 WHERE brand=?1 AND lead_id=?2 AND status<>'rejected'
-                 ORDER BY CASE priority_tier WHEN 'easy' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
-                          fit_score DESC,updated_at DESC LIMIT 1",
+                "SELECT o.id FROM sales_opportunities o
+                 JOIN gtm_plays gp ON gp.id=o.play_id
+                 WHERE o.brand=?1 AND o.lead_id=?2 AND o.status<>'rejected'
+                   AND gp.lifecycle IN ('proven','testing')
+                 ORDER BY CASE gp.lifecycle WHEN 'proven' THEN 0 ELSE 1 END,
+                          gp.version DESC,
+                          CASE o.priority_tier WHEN 'easy' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
+                          o.fit_score DESC,o.updated_at DESC LIMIT 1",
                 params![p.brand, p.lead_id],
                 |row| row.get(0),
             )
