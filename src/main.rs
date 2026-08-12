@@ -822,8 +822,8 @@ fn main() -> Result<()> {
                 });
                 let per_account = contacts.unwrap_or(usize::MAX);
                 let total = limit.unwrap_or(usize::MAX);
-                let mut selected = Vec::new();
-                for lead in leads.into_iter().take(account_count) {
+                let mut eligible_accounts = Vec::new();
+                for (account_order, lead) in leads.into_iter().enumerate() {
                     let mut account_people = people
                         .iter()
                         .filter(|person| person.lead_id == lead.id)
@@ -837,27 +837,56 @@ fn main() -> Result<()> {
                             )
                             .is_ok_and(|reason| reason.is_none())
                         })
-                        .filter(|person| {
+                        .filter_map(|person| {
                             crate::gtm::prepare_action(&db, &cli.brand, &lead.id, person)
-                                .is_ok_and(|context| context.sequence_ready_for(touches))
+                                .ok()
+                                .filter(|context| context.sequence_ready_for(touches))
+                                .map(|context| {
+                                    (
+                                        person.clone(),
+                                        match context.state.as_str() {
+                                            "action_ready" => 0u8,
+                                            "discovery_ready" => 1u8,
+                                            _ => 2u8,
+                                        },
+                                    )
+                                })
                         })
-                        .cloned()
                         .collect::<Vec<_>>();
                     account_people.sort_by(|left, right| {
                         response_design::contact_priority(
-                            &right.title,
-                            &right.vantage,
-                            right.primary,
+                            &right.0.title,
+                            &right.0.vantage,
+                            right.0.primary,
                         )
                         .cmp(&response_design::contact_priority(
-                            &left.title,
-                            &left.vantage,
-                            left.primary,
+                            &left.0.title,
+                            &left.0.vantage,
+                            left.0.primary,
                         ))
-                        .then_with(|| left.name.cmp(&right.name))
+                        .then_with(|| left.0.name.cmp(&right.0.name))
                     });
-                    selected.extend(account_people.into_iter().take(per_account));
+                    if let Some(state_priority) = account_people.iter().map(|(_, rank)| *rank).min()
+                    {
+                        eligible_accounts.push((state_priority, account_order, account_people));
+                    }
                 }
+                // `--accounts` is a count of eligible sales accounts, not a
+                // window over raw insertion order. Hard/rejected rows must not
+                // consume the window and hide older action- or discovery-ready
+                // opportunities.
+                eligible_accounts
+                    .sort_by_key(|(state_priority, order, _)| (*state_priority, *order));
+                let selected = eligible_accounts
+                    .into_iter()
+                    .take(account_count)
+                    .flat_map(|(_, _, people)| {
+                        people
+                            .into_iter()
+                            .map(|(person, _)| person)
+                            .take(per_account)
+                    })
+                    .collect::<Vec<_>>();
                 // Treat --limit as a portfolio target, not merely "the first N
                 // rows." Preserve already-approved recipients inside the target,
                 // then prefer untouched qualified contacts over repeatedly paying
