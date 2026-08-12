@@ -36,6 +36,7 @@ mod knowledge;
 mod mailbox;
 mod metrics;
 mod opportunity;
+mod outage_evidence;
 mod outreach;
 mod outreach_ablation;
 mod outreach_eval;
@@ -170,6 +171,9 @@ enum Command {
     Source {
         /// The thesis: the expensive workflow / market to target.
         thesis: String,
+        /// Research only these employer domains (comma-separated); bypasses broad ICP discovery.
+        #[arg(long, value_delimiter = ',')]
+        domains: Vec<String>,
         #[arg(long, default_value_t = 10, value_parser = positive_usize)]
         accounts: usize,
         #[arg(long, default_value_t = 3, value_parser = positive_usize)]
@@ -185,10 +189,23 @@ enum Command {
         thesis: String,
     },
 
+    /// Intersect official public charging locations with historical OutageHub polygons.
+    OutageEvidence {
+        /// Historical OutageHub JSON archive containing outage polygons.
+        #[arg(long)]
+        archive: String,
+        /// Evidence report consumed by OutageHub account research.
+        #[arg(long, default_value = ".spruce/outage-location-matches.json")]
+        output: String,
+    },
+
     /// Reveal + verify emails for sourced people (Apollo enrichment, costs credits).
     Enrich {
         #[arg(long, default_value_t = 50, value_parser = positive_usize)]
         limit: usize,
+        /// Enrich one exact person id, email, or unambiguous name instead of the brand backlog.
+        #[arg(long)]
+        person: Option<String>,
         /// Request phone enrichment (extra credits; requires APOLLO_WEBHOOK_URL).
         #[arg(long)]
         phone: bool,
@@ -490,6 +507,7 @@ fn main() -> Result<()> {
             let client = make_engine(&rt, &cli)?;
             let playbooks = load_playbooks(&cli)?;
             let pb = playbooks.get(&cli.brand)?;
+            let touches = outreach::supported_touch_count_for_brand(&cli.brand, touches);
             eprintln!(
                 "\u{2192} [{}] {thesis}\n\u{2192} {accounts}\u{00d7}{contacts}\u{00d7}{touches} \
                  (critique={critique}) via {} CLI",
@@ -559,6 +577,7 @@ fn main() -> Result<()> {
 
         Command::Source {
             thesis,
+            domains,
             accounts,
             contacts,
         } => {
@@ -585,13 +604,23 @@ fn main() -> Result<()> {
                 &thesis,
                 accounts,
                 contacts,
+                if domains.is_empty() {
+                    None
+                } else {
+                    Some(domains.as_slice())
+                },
                 None,
                 cli.concurrency,
                 None,
             ))?;
             println!(
-                "\u{2713} {} orgs \u{2192} {} qualified leads, {} people.\n  next: spruce-leaf --brand {} enrich",
-                s.orgs_found, s.leads_qualified, s.people_added, cli.brand
+                "\u{2713} {} orgs \u{2192} {} easy, {} medium, {} hard-research leads; {} people.\n  next: spruce-leaf --brand {} enrich",
+                s.orgs_found,
+                s.leads_qualified,
+                s.leads_research_needed,
+                s.leads_research_required,
+                s.people_added,
+                cli.brand
             );
             Ok(())
         }
@@ -678,8 +707,63 @@ fn main() -> Result<()> {
             Ok(())
         }
 
-        Command::Enrich { limit, phone } => {
+        Command::OutageEvidence { archive, output } => {
+            eprintln!(
+                "\u{2192} matching official Ontario charging locations to historical OutageHub polygons"
+            );
+            let report = rt.block_on(outage_evidence::build_report(
+                Path::new(&archive),
+                Path::new(&output),
+            ))?;
+            let networks = report
+                .matches
+                .iter()
+                .map(|matched| matched.network.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len();
+            println!(
+                "\u{2713} {} verified location/polygon matches across {} station networks written to {}.",
+                report.matches.len(),
+                networks,
+                output
+            );
+            Ok(())
+        }
+
+        Command::Enrich {
+            limit,
+            person,
+            phone,
+        } => {
             let apollo = make_apollo()?;
+            let only_person_ids = if let Some(filter) = person.as_deref() {
+                let filter = filter.trim();
+                let matches = db
+                    .list_people(Some(&cli.brand), None)?
+                    .into_iter()
+                    .filter(|candidate| {
+                        candidate.id.eq_ignore_ascii_case(filter)
+                            || candidate.email.eq_ignore_ascii_case(filter)
+                            || candidate.name.eq_ignore_ascii_case(filter)
+                    })
+                    .collect::<Vec<_>>();
+                if matches.len() != 1 {
+                    return Err(anyhow!(
+                        "--person '{}' matched {} people in {}; use the exact person id",
+                        filter,
+                        matches.len(),
+                        cli.brand
+                    ));
+                }
+                Some(
+                    matches
+                        .into_iter()
+                        .map(|candidate| candidate.id)
+                        .collect::<std::collections::HashSet<_>>(),
+                )
+            } else {
+                None
+            };
             eprintln!(
                 "\u{2192} [{}] enriching + verifying up to {limit} people\u{2026}",
                 cli.brand
@@ -690,7 +774,7 @@ fn main() -> Result<()> {
                 Some(&cli.brand),
                 limit,
                 phone,
-                None,
+                only_person_ids.as_ref(),
                 None,
             ))?;
             println!(
@@ -721,6 +805,7 @@ fn main() -> Result<()> {
             let client = make_engine(&rt, &cli)?;
             let playbooks = load_playbooks(&cli)?;
             let pb = playbooks.get(&cli.brand)?;
+            let touches = outreach::supported_touch_count_for_brand(&cli.brand, touches);
             let businesses = load_businesses(&cli)?;
             let business = businesses.get(&cli.brand)?;
             let lib = rt.block_on(async { library.read().await.clone() });

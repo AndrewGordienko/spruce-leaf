@@ -62,6 +62,7 @@ pub async fn run(
     critique: bool,
     reporter: &dyn Progress,
 ) -> Result<Campaign> {
+    let n_touches = outreach::supported_touch_count_for_brand(&pb.key, n_touches);
     let run = Run {
         client,
         pb,
@@ -86,6 +87,32 @@ pub async fn run(
     .try_collect::<Vec<AccountPlan>>()
     .await?;
 
+    for left in 0..plans.len() {
+        for right in (left + 1)..plans.len() {
+            let Some(left_contact) = plans[left].contacts.first() else {
+                continue;
+            };
+            let Some(right_contact) = plans[right].contacts.first() else {
+                continue;
+            };
+            if let Some((body_similarity, question_similarity)) =
+                outreach::cross_recipient_structural_similarity(
+                    &left_contact.sequence,
+                    &right_contact.sequence,
+                    &pb.signature,
+                )
+            {
+                return Err(anyhow::anyhow!(
+                    "cross-recipient structural duplication between {} and {}: T1 body {:.0}% similar and main question {:.0}% similar",
+                    left_contact.contact.name,
+                    right_contact.contact.name,
+                    body_similarity * 100.0,
+                    question_similarity * 100.0,
+                ));
+            }
+        }
+    }
+
     Ok(Campaign {
         brand: pb.key.clone(),
         thesis: thesis.to_string(),
@@ -109,7 +136,9 @@ async fn plan_account(
             ))
             .then_with(|| left.name.cmp(&right.name))
     });
-    contacts.truncate(2);
+    // Map broadly, then contact only the best-supported workflow owner first.
+    // Reaching additional people at the account requires an explicit later run.
+    contacts.truncate(1);
     run.reporter.account_contacts(&account.name, contacts.len());
 
     let plans = stream::iter(contacts.into_iter().map(|mut contact| {

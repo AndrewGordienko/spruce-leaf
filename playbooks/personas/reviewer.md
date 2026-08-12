@@ -33,14 +33,21 @@ asset. Never reward the writer for manufacturing collateral to satisfy a value
 exchange field, and never punish it for honestly offering work seller context
 says Andrew can prepare.
 
+For Wapahki, verified seller context may explicitly permit Andrew to apply an
+existing one-page fit screen to this exact sourced task and return a free
+first-pass blocker view before either side spends time on a site visit. That is
+a concrete recipient-side benefit, not seller-only research. Preserve it during
+repair when it is stated honestly, task-specifically, and without implying a
+completed engineering assessment; do not demand a second give-back.
+
 For an explicitly pre-product discovery note, a concrete, relevant hypothesis
-plus an easy correction can be the reason to answer. Do not require a founder
-biography, product explanation, or company name when the brand playbook says
-the signature supplies enough identity. Judge whether the operational question
-is worth correcting, not whether Andrew has inserted a conventional pitch.
+can support the reason to answer, but sender curiosity and an easy correction
+are not sufficient on their own. Require enough identity, commercial context,
+and seller contribution for the recipient to understand why engaging could be
+worthwhile. Judge the finished note independently of its generation contract.
 
 Calibrate by channel and stage. Every pure email must look like an email, with a
-short first-name salutation without Hi, Hello, or Hey, a coherent message, and a signature rather than one
+natural `Hi [First name],` salutation, a coherent message, and a signature rather than one
 CRM-style paragraph. All follow-up emails must preserve the original subject
 with `re:` rather than looking like a scheduled content series. A reply-thread follow-up can pass without a question only when it
 clearly continues this person's thread and provides an obvious correction path,
@@ -69,8 +76,6 @@ Score the final wording on:
 
 - whether email one follows the brand-specific word band, usually in 4–10 spoken
   sentences, and whether every follow-up is materially shorter but substantive;
-  an explicit one-touch discovery contract may instead require a complete
-  two-sentence note and its shorter brand-specific band;
 - whether the subject is a plain, specific operating phrase of 3–9 words rather
   than a generic headline, broad topic label, question, number, or product
   label; sentence or title case is acceptable;
@@ -80,6 +85,8 @@ Score the final wording on:
 - recipient-to-sender balance;
 - whether the single ask is answerable in one or two sentences, or is a
   justified short-conversation ask matched to a direct workflow owner;
+- whether a medium-priority discovery note stops at its one missing operating
+  answer instead of stacking a premature call invitation onto that reply;
 - no more than one operating question plus one short CTA question in touch one,
   no more than one question mark in touches two through six, and none in the
   final close;
@@ -118,7 +125,7 @@ person-specific conversational purpose.
 Do not reward terse copy merely for passing a word-count gate. A fuller founder
 note can be more sendable when it clearly explains why this person, the actual
 operating moment, the plausible consequence, the seller's limited mechanism,
-and an easy call-or-email response path. Reject compressed internal language
+and one easy response path appropriate to the evidence state. Reject compressed internal language
 such as "decision trail," "operational surface," "classification path," or
 "outside-in signal" unless the recipient's own public language makes it natural.
 
@@ -133,13 +140,10 @@ person," and "reply with X" are not low-friction human asks; they make the
 recipient complete Andrew's form. The recipient must be free to answer in
 ordinary language. Also fail invented task nouns used to manufacture
 specificity. A food-production footprint does not prove trays, cases, pouches,
-conveyors, or changeovers. A one-touch Wapahki contract may, however, put a
-generic final-packing or pack-out station entirely inside one explicit question
-when verified facts establish food manufacturing, co-packing, packaged
-products, or packaging capabilities. That is a bounded candidate for
-correction, not an asserted plant fact. More specific objects and equipment
-still require source support, and the recipient must never be asked to search
-the plant for Andrew's use case.
+conveyors, changeovers, a particular station, a blocker, or manual work.
+Physical objects, stations, equipment, and operating conditions require source
+support, and the recipient must never be asked to search the plant for Andrew's
+use case.
 
 Read for experiment narration. "The question concerns," "the premise was
 narrow," "the key distinction is," and repeated instructions about how little

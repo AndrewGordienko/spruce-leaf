@@ -59,6 +59,8 @@ fn distributed_operating_footprint(text: &str) -> bool {
         text,
         &[
             "multiple",
+            "two",
+            "three",
             "several",
             "across",
             "province",
@@ -128,6 +130,7 @@ fn operated_ev_charging_network(text: &str) -> bool {
             "owns",
             "manages",
             "monitors",
+            "monitoring",
             "charging network",
             "charging sites",
         ],
@@ -168,6 +171,8 @@ fn historical_location_outage_match(text: &str) -> bool {
             "overlapped",
             "fell inside",
             "was inside",
+            "inside reported",
+            "within reported",
             "historical result",
             "historical match",
         ],
@@ -186,11 +191,18 @@ fn historical_location_outage_match(text: &str) -> bool {
         &[
             "charging site",
             "charging station",
+            "charging location",
             "charger location",
             "site at",
             "site in",
             "station at",
             "station in",
+            "facility at",
+            "facility in",
+            "location at",
+            "location in",
+            "store at",
+            "asset at",
         ],
     );
     let time = text.chars().any(|character| character.is_ascii_digit())
@@ -286,6 +298,7 @@ fn outage_decision_or_exposure(text: &str) -> bool {
             "manages",
             "maintains",
             "monitors",
+            "monitoring",
             "oversees",
         ],
     );

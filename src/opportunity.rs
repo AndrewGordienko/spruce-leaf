@@ -266,6 +266,69 @@ impl ResearchClient {
         Ok(limit_chars(&text, MAX_DOCUMENT_CHARS))
     }
 
+    /// Best-effort public web discovery for account research when no paid Jina
+    /// Search key is configured. The caller must still validate every returned
+    /// URL and read the underlying page before treating anything as evidence;
+    /// search snippets themselves are never evidence.
+    pub async fn public_search(&self, query: &str) -> Result<String> {
+        static SEARCH_SLOTS: std::sync::OnceLock<tokio::sync::Semaphore> =
+            std::sync::OnceLock::new();
+        static SEARCH_BLOCKED_UNTIL: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if now < SEARCH_BLOCKED_UNTIL.load(std::sync::atomic::Ordering::Relaxed) {
+            bail!("public web search is cooling down after a rate-limit response");
+        }
+        let _permit = SEARCH_SLOTS
+            .get_or_init(|| tokio::sync::Semaphore::new(1))
+            .acquire()
+            .await
+            .map_err(|_| anyhow!("public-search concurrency gate closed"))?;
+        let after_wait = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if after_wait < SEARCH_BLOCKED_UNTIL.load(std::sync::atomic::Ordering::Relaxed) {
+            bail!("public web search is cooling down after a rate-limit response");
+        }
+        // Keep the no-key endpoint civil and below its burst limit. This search
+        // is best-effort, so a small serialized delay is preferable to a 429
+        // storm that makes every concurrent account look evidence-free.
+        tokio::time::sleep(std::time::Duration::from_millis(1_750)).await;
+
+        // Brave's browser page embeds organic result URLs in rendered state.
+        // Callers validate and read every underlying page; this HTML is
+        // discovery only and never enters a model prompt.
+        let mut brave_url = reqwest::Url::parse("https://search.brave.com/search")?;
+        brave_url.query_pairs_mut().append_pair("q", query.trim());
+        let brave = self
+            .http
+            .get(brave_url)
+            .send()
+            .await
+            .context("calling public web search")?;
+        let brave_status = brave.status();
+        let brave_text = brave.text().await.unwrap_or_default();
+        if !brave_status.is_success() {
+            if brave_status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                SEARCH_BLOCKED_UNTIL.store(
+                    after_wait.saturating_add(300),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            bail!(
+                "public web search returned {brave_status}: {}",
+                limit_chars(&brave_text, 300)
+            );
+        }
+        // Do not truncate before URL extraction: Brave places results after a
+        // large stylesheet. The caller immediately reduces this to a few URLs.
+        Ok(brave_text)
+    }
+
     pub async fn search(&self, query: &str, allowed_domains: &[String]) -> Result<String> {
         let key = self
             .jina_key

@@ -39,6 +39,7 @@ impl Funnel {
 }
 
 pub fn funnel(db: &SharedDb, brand: Option<&str>) -> Result<Funnel> {
+    let leads = db.list_leads(brand)?;
     let people = db.list_people(brand, None)?;
     let opportunities = db.list_opportunities(brand, None)?;
     let opportunity_contacts = match brand {
@@ -68,7 +69,10 @@ pub fn funnel(db: &SharedDb, brand: Option<&str>) -> Result<Funnel> {
 
     Ok(Funnel {
         brand: brand.unwrap_or("all").to_string(),
-        leads: db.list_leads(brand)?.len(),
+        leads: leads
+            .iter()
+            .filter(|lead| lead.status.eq_ignore_ascii_case("qualified"))
+            .count(),
         people: people.len(),
         verified: count(&|p| p.email_status == "verified"),
         // Current status is not a history: a contacted person later becomes

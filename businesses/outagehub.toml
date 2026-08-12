@@ -23,6 +23,7 @@ unknowns = [
 ]
 
 goals = [
+  "Reach every credible API customer whose Canadian location-specific decision can improve with normalized utility-outage data, prioritized easy to medium to hard.",
   "Find organizations with an outage-sensitive operational decision where a location-matched external grid signal changes the outcome, and become the API/webhook their existing system (NOC, dispatch, ServiceNow, Salesforce) consumes — not another dashboard.",
   "Find every credible funding, pilot, challenge, and advisory programme that could advance product development, validation, commercialization, or grid-resilience evidence.",
   "Build funder relationships and complete strong applications without claiming eligibility that has not been verified.",

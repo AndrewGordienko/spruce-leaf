@@ -296,23 +296,27 @@ impl Playbook {
     }
 
     fn compact_role_system_prompt(&self, role: &str, persona: &str, shared: &Shared) -> String {
-        let requirements = self
-            .requirements
-            .iter()
-            .map(|rule| format!("- {rule}"))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let requirements = if role == "REVIEWER" {
+            "- Judge recipient value, evidence safety, commercial clarity, and reply likelihood independently.\n- Do not infer that a writer-requested structure, question shape, or correction path should pass.\n- Use the verified seller facts only to check whether the claimed contribution is real."
+                .to_string()
+        } else {
+            self.requirements
+                .iter()
+                .map(|rule| format!("- {rule}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
         let subjects = self.subject_examples.join(" | ");
         let seller_facts = self.verified_seller_facts.join(" | ");
         let forbidden = self.forbidden(shared).join(", ");
         let role_contract = if role == "WRITER" {
             "Write like one founder contacting one operator. Use only supplied evidence and test one operating decision with a point of view, not a stack of caveats. Lead with a recognizable event, show the painful task and practical consequence in concrete language, then ask one question the recipient can answer in five seconds. One uncertainty cue is enough. Concrete nouns and natural speech beat frameworks, but never name an object, station, machine, alarm, or private handoff that appears only in an internal hypothesis. Never script the recipient's reply with quoted words, categories, or a yes/no/referral menu. A correction or route is useful, but the note still needs a recipient-relevant reason to answer. Do not put a meeting request, email alternative, or seller mechanism ahead of the operating question."
         } else if role == "PLANNER" && self.key == "gnk" {
-            "Choose the commercial angle only after checking that the brief contains a specific recurring decision, a believable consequence, an external trigger or direct mechanism evidence, and a recipient close to the work. Company fit is not problem fit. Compare three angles, then select the one whose decision fork the recipient will immediately recognize. T1 asks whether the reviewer can see what supports the current position or whether someone rebuilds it from named source-safe records. Do not make the recipient develop the opportunity, diagnose importance, evaluate GnK, or accept a meeting. Every follow-up must add a sourced operational example, consequence, bounded proof, adjacent question, or useful route. Hold if any foundation is missing or if the sequence would later need to retract its premise."
+            "Rank the market easy, medium, then hard. Multi-touch planning requires a recurring decision, consequence, mechanism, and close recipient. A one-touch medium account may proceed when the recurring decision OR direct mechanism and close recipient are supported; ask one honest question about the missing term. Compare three account-specific angles. T1 explains one concrete GnK contribution and offers a natural short conversation with an email answer as the easier path. Never make the recipient invent the opportunity or use a universal workflow template."
         } else if role == "PLANNER" && self.key == "outagehub" {
-            "Plan a two-email founder experiment for operated Canadian EV-charging networks only. Require one source-backed charging-site footprint, a Service Operations or equivalent recipient, and a real location-specific historical utility match for the second email. T1 asks one easy question about an entire charging site going dark: does the team still check the local utility map before opening an equipment/network ticket, dispatching someone, or updating status, or does telemetry settle it immediately? T2 six days later contributes the verified timestamp/location result. Do not invent multi-site prioritization, abstract external-context value, a routing bump, LinkedIn touch, disclaimer paragraph, or breakup email. Hold when the historical example is absent."
+            "Cover distributed Canadian operators across charging, telecom, facilities, cold storage, data centres, service dispatch, backup power, and adjacent sectors. Require a source-backed footprint, one exact outage-time decision, and a nearby operator. A one-touch medium account may proceed without a historical match. A two-email easy account requires a real location/polygon match and T2 contributes that timestamp/location result. Explain OutageHub's API contribution and never prescribe a universal outage/ticket binary or claim private site status."
         } else if role == "PLANNER" && self.key == "wapahki" {
-            "Choose the commercial angle before copy is written. Compare three account-evidenced first-touch approaches and select the one with the clearest physical station or handoff, observed operating condition, suspected economic consequence, likely reason ordinary automation struggles, and factual question answerable from memory. Product variety alone cannot supply the station, changeover frequency, manual status, or pain. Plan T1 to earn one fact or correction; do not ask the recipient to identify a use case, classify variation, evaluate a robot boundary, or agree to a meeting. T2 adds the economic reason, T3 is human context, and T4 routes to one specific alternative owner or closes. Hold when the evidence cannot support that arc."
+            "Cover factories and warehouses broadly, starting Ontario then Canada, and rank easy, medium, then hard. Every T1 needs one source-supported physical task or handoff and a close recipient. Easy accounts also support economic pressure and may use a cadence. A medium account may receive one task-specific email that asks whether the suspected consequence exists. Plan a natural founder/researcher T1 with Andrew's University of Toronto and Automata context, one Wapahki contribution, and a call-or-email path. Never ask the recipient to identify a use case from scratch."
         } else if role == "PLANNER" {
             "Choose the commercial angle before copy is written. Compare three distinct first-touch approaches against the verified trigger, recipient vantage, strongest objection, and easiest useful reply. Select one coherent thread; do not blend candidates or plan filler stages. A short discovery conversation is a valid first ask for a credible workflow owner; preserve the operator's requested outcome when earned and offer an email answer as the easier path. Hold when the evidence cannot support a natural note."
         } else {
@@ -590,13 +594,19 @@ mod tests {
         assert!(copy.contains("The recipient does not owe Andrew market research"));
         assert!(copy.contains("PRIVATE RESPONSE-DESIGN DOCTRINE"));
         assert!(copy.contains("Before planning copy, name the one response"));
-        assert!(planner.contains("Choose the commercial angle only after checking"));
-        assert!(planner.contains("five-second question"));
-        assert!(planner.contains("Do not make the recipient develop the opportunity"));
+        assert!(planner.contains("Rank the market easy, medium, then hard"));
+        assert!(planner.contains("natural short conversation"));
+        assert!(planner.contains("Never make the recipient invent the opportunity"));
         assert!(planner.contains("Your output is a private plan"));
         assert!(reviewer.contains("Act as a skeptical recipient"));
         assert!(reviewer.contains("forced response menus"));
         assert!(reviewer.contains("Correctness is not sendability"));
+        assert!(reviewer.contains("independently"));
+        assert!(!reviewer.contains("Name GnK once in T1"));
+        for prompt in [&copy, &planner, &reviewer] {
+            assert!(!prompt.contains("immediately see"));
+            assert!(!prompt.contains("another step"));
+        }
         assert!(copy.contains("=== GnK BUYER-FACING CONSTRAINTS"));
         assert!(copy.split_whitespace().count() < 1_500);
         assert!(reviewer.split_whitespace().count() < 1_250);
@@ -629,11 +639,11 @@ mod tests {
         }
         let outagehub = playbooks.get("outagehub").expect("outagehub");
         assert_eq!((outagehub.min_words, outagehub.max_words), (60, 95));
-        assert!(outagehub
-            .copy_system_prompt(&playbooks.shared)
-            .contains("Generate exactly two emails"));
+        let outagehub_copy = outagehub.copy_system_prompt(&playbooks.shared);
+        assert!(outagehub_copy.contains("one-email discovery test"));
+        assert!(outagehub_copy.contains("two-email evidence sequence"));
         let wapahki = playbooks.get("wapahki").expect("wapahki");
-        assert_eq!((wapahki.min_words, wapahki.max_words), (40, 80));
+        assert_eq!((wapahki.min_words, wapahki.max_words), (100, 180));
         for phrase in [
             "repeatable packing or handling step",
             "where variation enters",

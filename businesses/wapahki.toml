@@ -1,6 +1,6 @@
 key = "wapahki"
 name = "Wapahki"
-summary = "An early-stage Toronto robotics venture exploring flexible robotic packing cells for bounded, repetitive food-manufacturing tasks."
+summary = "An early-stage Toronto robotics venture developing flexible robotic arms and cells for recurring factory and warehouse tasks."
 
 known_facts = [
   "Wapahki is exploring a flexible robotic packing cell.",
@@ -9,6 +9,7 @@ known_facts = [
   "It does not yet claim installations or proven savings.",
   "Andrew has completed two first-party discovery calls about the economics and workflow boundaries of physical automation: one spanning factory design/packing work and one spanning fleet maintenance.",
   "Andrew has a one-page working automation-fit screen covering the object and motion, run stability, changeover, intervention frequency, sanitation/guarding/damage boundaries, rate, labour, and payback threshold. He may share it freely as a research aid, not as a validated assessment.",
+  "Andrew may apply that screen to a named public task and return a free first-pass blocker view intended to rule out poor automation candidates before either side spends time on a site visit; it remains a research aid, not an engineering assessment.",
 ]
 
 unknowns = [
@@ -22,6 +23,7 @@ unknowns = [
 ]
 
 goals = [
+  "Build toward selling robotic arms and cells across every plausible Ontario factory and warehouse, then expand across Canada; prioritize easy tasks first, then medium and hard deployments.",
   "Find recurring physical tasks repetitive enough for a robot but too variable for conventional automation to handle economically, and capture WHY existing automation breaks down (the market opportunity).",
   "Prefer partial-automation wedges where a stable high-volume core can be automated while people retain fragile, irregular, safety-critical, or otherwise non-deterministic exceptions.",
   "Quantify one bounded task's economics (operators, shifts, wage burden, throughput, changeover, payback) until it can be drawn, modeled, priced, and reproduced in the lab.",
