@@ -6721,6 +6721,7 @@ const ONTARIO_SITE_NAMES: &[&str] = &[
     "Burlington",
     "Caledon",
     "Cambridge",
+    "Dunnville",
     "Etobicoke",
     "Guelph",
     "Halton Hills",
@@ -7607,6 +7608,9 @@ mod tests {
         ));
         assert!(evidence_names_operating_site(
             "The Brantford role loads cartons into cases and palletizes finished goods."
+        ));
+        assert!(evidence_names_operating_site(
+            "The Dunnville posting lists manual packing and repetitive work."
         ));
     }
 

@@ -3905,6 +3905,7 @@ pub async fn refresh_lead_context(
     thesis: &str,
     lead_ids: &[String],
     concurrency: usize,
+    force_refresh: bool,
 ) -> Result<usize> {
     if lead_ids.is_empty() {
         return Ok(0);
@@ -3972,7 +3973,11 @@ pub async fn refresh_lead_context(
                         && DateTime::parse_from_rfc3339(&observation.observed_at)
                             .is_ok_and(|observed| observed.with_timezone(&Utc) >= refresh_cutoff)
                 });
-        if recently_refreshed {
+        // Background campaign assembly reuses a recent official-site read, but
+        // an explicit `research ACCOUNT` request must be able to test a newly
+        // supplied source or thesis immediately. Treating those as equivalent
+        // made operator research appear successful while doing zero work.
+        if recently_refreshed && !force_refresh {
             continue;
         }
         if let Some(lead) = db.get_lead(id)? {

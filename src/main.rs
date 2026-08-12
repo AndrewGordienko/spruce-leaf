@@ -683,6 +683,7 @@ fn main() -> Result<()> {
                 &thesis,
                 std::slice::from_ref(&lead.id),
                 1,
+                true,
             ))?;
             let play = db
                 .current_gtm_play(&cli.brand)?

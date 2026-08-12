@@ -1391,7 +1391,7 @@ impl Agent {
                 .collect::<Vec<_>>();
             lead_ids.sort();
             lead_ids.dedup();
-            self.do_refresh_context("", &lead_ids, true).await;
+            self.do_refresh_context("", &lead_ids, true, false).await;
         }
 
         // A bare "first N people" means the first N sequenceable people, not
@@ -1479,7 +1479,8 @@ impl Agent {
                                 candidate_leads.len()
                             ),
                         );
-                        self.do_refresh_context("", &candidate_leads, true).await;
+                        self.do_refresh_context("", &candidate_leads, true, false)
+                            .await;
                         for person in &all_people {
                             if ready_count(person_ids) >= target {
                                 break;
@@ -1766,7 +1767,7 @@ impl Agent {
             // This also lets legacy accounts remain candidates for cheap reuse
             // without silently treating their old framing as current truth.
             refreshed_total += self
-                .do_refresh_context(thesis, &reuse.lead_ids, false)
+                .do_refresh_context(thesis, &reuse.lead_ids, false, false)
                 .await;
 
             // Preserve already-reviewed current-policy work on an ordinary run.
@@ -2052,6 +2053,7 @@ impl Agent {
         thesis: &str,
         lead_ids: &[String],
         show_result: bool,
+        force_refresh: bool,
     ) -> usize {
         if lead_ids.is_empty() {
             return 0;
@@ -2077,6 +2079,7 @@ impl Agent {
             thesis,
             lead_ids,
             self.concurrency.max(1),
+            force_refresh,
         )
         .await;
         drop(work);
@@ -2159,7 +2162,7 @@ impl Agent {
         }
         let lead = matches.remove(0);
         let refreshed = self
-            .do_refresh_context(thesis, std::slice::from_ref(&lead.id), true)
+            .do_refresh_context(thesis, std::slice::from_ref(&lead.id), true, true)
             .await;
         let Some(play) = self.db.current_gtm_play(&self.brand).ok().flatten() else {
             return format!(

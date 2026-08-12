@@ -145,7 +145,11 @@ pub async fn research_company(
         let seeded_reads = futures::future::join_all(
             seeded_urls
                 .iter()
-                .map(|seeded_url| read_page(research, seeded_url)),
+                // Curated job URLs can still put several thousand characters of
+                // navigation ahead of the actual employer and duties. Read the
+                // full discovery window, validate that full text, then reduce it
+                // to the evidence-bearing lines below.
+                .map(|seeded_url| read_page_for_links(research, seeded_url)),
         )
         .await;
         for (seeded_url, seeded_text) in seeded_urls.into_iter().zip(seeded_reads) {
@@ -169,6 +173,11 @@ pub async fn research_company(
                         &mut job_corpus
                     } else {
                         &mut corpus
+                    };
+                    let seeded_text = if has_task_evidence {
+                        job_evidence_window(&seeded_text, &pb.key, &org.name, PER_PAGE_CHARS)
+                    } else {
+                        limit_chars(&seeded_text, PER_PAGE_CHARS)
                     };
                     append_source_section(
                         target,
@@ -450,7 +459,7 @@ pub async fn research_company(
                     job_pages.push((
                         job_location_priority(&pb.key, &job_url, &job_text),
                         job_url,
-                        limit_chars(&job_text, PER_PAGE_CHARS),
+                        job_evidence_window(&job_text, &pb.key, &org.name, PER_PAGE_CHARS),
                         official,
                     ));
                 }
@@ -1145,6 +1154,7 @@ fn trusted_job_mirror_host(host: &str) -> bool {
         "glassdoor.com",
         "careerbeacon.com",
         "jobbank.gc.ca",
+        "guichetemplois.gc.ca",
         "talent.com",
         "adzuna.ca",
         "swooped.co",
@@ -1171,6 +1181,17 @@ fn job_page_has_task_evidence(text: &str, brand: &str) -> bool {
             "machine operator",
             "batch",
             "lift",
+            // Canadian Job Bank publishes the same employer-attributed role in
+            // English and French. These terms intentionally mirror the narrow
+            // physical-task boundary above; they are not a generic French-page
+            // acceptance shortcut.
+            "emball",
+            "palette",
+            "empiler",
+            "charger manuellement",
+            "alimenter et décharger",
+            "tâches répétitives",
+            "manipuler des charges",
         ]
     } else {
         &[
@@ -1184,6 +1205,100 @@ fn job_page_has_task_evidence(text: &str, brand: &str) -> bool {
         ]
     };
     terms.iter().filter(|term| text.contains(**term)).count() >= 2
+}
+
+/// Preserve the employer, location and duty-bearing parts of a job page when
+/// navigation would otherwise consume the fixed research window. Search and
+/// seed pages are still validated against the full fetched text before this is
+/// called; this function only decides which already-read lines reach the model.
+fn job_evidence_window(text: &str, brand: &str, company: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+
+    let company_terms = company
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .map(str::trim)
+        .filter(|word| word.len() >= 4)
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    let brand_terms: &[&str] = if brand == "wapahki" {
+        &[
+            "task",
+            "responsibil",
+            "duties",
+            "location",
+            "published",
+            "posted",
+            "pack",
+            "pallet",
+            "stack",
+            "conveyor",
+            "container",
+            "machine",
+            "lift",
+            "repetitive",
+            "manual",
+            "physical",
+            "fast-paced",
+            "shift",
+            "tâche",
+            "responsabil",
+            "emplacement",
+            "publi",
+            "emball",
+            "palette",
+            "empiler",
+            "convoyeur",
+            "contenant",
+            "machine",
+            "charger",
+            "décharger",
+            "répétiti",
+            "manuel",
+            "physique",
+            "quart",
+        ]
+    } else {
+        &[
+            "task",
+            "responsibil",
+            "duties",
+            "location",
+            "published",
+            "posted",
+            "claim",
+            "reconcil",
+            "exception",
+            "compliance",
+            "recovery",
+            "audit",
+            "case management",
+        ]
+    };
+
+    let lines = text.lines().collect::<Vec<_>>();
+    let mut keep = vec![false; lines.len()];
+    for (index, line) in lines.iter().enumerate() {
+        let lower = line.to_ascii_lowercase();
+        let metadata = index < 6
+            || company_terms.iter().any(|term| lower.contains(term))
+            || brand_terms.iter().any(|term| lower.contains(term));
+        if metadata {
+            let start = index.saturating_sub(1);
+            let end = (index + 1).min(lines.len().saturating_sub(1));
+            for slot in keep.iter_mut().take(end + 1).skip(start) {
+                *slot = true;
+            }
+        }
+    }
+    let selected = lines
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(line, keep)| keep.then_some(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    limit_chars(&selected, max_chars)
 }
 
 fn is_image_url(url: &reqwest::Url) -> bool {
@@ -1318,11 +1433,11 @@ fn brief_schema() -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        compact_page_text, company_mentioned, job_location_priority, job_page_has_task_evidence,
-        linked_job_page_credible, ranked_internal_links, relevant_internal_links,
-        relevant_job_links, research_page_usable, research_seed_urls_from_json,
-        role_search_queries, search_result_urls, trusted_ats_host, trusted_job_mirror_host,
-        CompanyBrief,
+        compact_page_text, company_mentioned, job_evidence_window, job_location_priority,
+        job_page_has_task_evidence, linked_job_page_credible, ranked_internal_links,
+        relevant_internal_links, relevant_job_links, research_page_usable,
+        research_seed_urls_from_json, role_search_queries, search_result_urls, trusted_ats_host,
+        trusted_job_mirror_host, CompanyBrief,
     };
 
     #[test]
@@ -1476,6 +1591,21 @@ mod tests {
             "Performs packing and stacking on the production line",
             "wapahki"
         ));
+        assert!(job_page_has_task_evidence(
+            "Tâches répétitives: charger manuellement les contenants et manipuler des charges",
+            "wapahki"
+        ));
+        assert!(trusted_job_mirror_host("www.guichetemplois.gc.ca"));
+        let long_job = format!(
+            "Title: production labourer\n{}\nEmployer: Original Foods Limited\nLocation: Dunnville, ON\nTasks: Remove filled containers from conveyors.\nManually pack goods into boxes.\nWork conditions: Repetitive tasks and handling heavy loads.",
+            "Navigation and generic links\n".repeat(600)
+        );
+        let evidence = job_evidence_window(&long_job, "wapahki", "Original Foods Limited", 1_000);
+        assert!(evidence.contains("Original Foods Limited"));
+        assert!(evidence.contains("Dunnville"));
+        assert!(evidence.contains("Remove filled containers"));
+        assert!(evidence.contains("Repetitive tasks"));
+        assert!(evidence.chars().count() <= 1_000);
         let queries = role_search_queries(
             "wapahki",
             "Ontario warehouse case handling",
