@@ -112,6 +112,7 @@ pub async fn research_company(
     research: &ResearchClient,
     pb: &Playbook,
     org: &ApolloOrg,
+    research_focus: &str,
 ) -> Option<CompanyBrief> {
     let domain = org.domain();
     if domain.trim().is_empty() {
@@ -371,7 +372,7 @@ pub async fn research_company(
     // whose hostname has no relationship to the company domain. Search
     // snippets never enter the evidence corpus.
     if job_signals_enabled() && matches!(pb.key.as_str(), "wapahki" | "gnk") {
-        let role_queries = role_search_queries(&pb.key, &org.name, &domain);
+        let role_queries = role_search_queries(&pb.key, research_focus, &org.name, &domain);
         let search_reads = futures::future::join_all(
             role_queries
                 .iter()
@@ -530,6 +531,7 @@ pub async fn research_company(
         "COMPANY: {name} ({domain})\n\n\
          THE MOTION we are researching for (find evidence relevant to THIS, and a specific gap \
          this company plausibly has that fits it):\n{motion}\n\n\
+         CURRENT BOUNDED SEGMENT / RESEARCH FOCUS:\n{research_focus}\n\n\
          WEBSITE TEXT (the ONLY thing you may treat as fact):\n{corpus}\n\n\
          Every item in observed_facts, signals, and hiring_signals MUST begin with the exact \
          source URL in square brackets, for example `[https://example.com/claims] fact`. Do not \
@@ -546,6 +548,7 @@ pub async fn research_company(
         name = org.name,
         domain = domain,
         motion = pb.motion,
+        research_focus = research_focus,
         corpus = corpus,
     );
 
@@ -593,22 +596,55 @@ fn bracketed_source(value: &str) -> Option<&str> {
         .map(|(source, _)| source)
 }
 
-fn role_search_queries(brand: &str, company: &str, domain: &str) -> Vec<String> {
+fn role_search_queries(brand: &str, focus: &str, company: &str, domain: &str) -> Vec<String> {
     let company = company.replace('"', " ");
     if brand == "wapahki" {
-        let roles = "(\"packaging operator\" OR \"order picker\" OR palletizing OR \"material handler\" OR \"production operator\" OR \"pallet repair\" OR assembler OR shipper OR forklift)";
+        let focus = focus.to_ascii_lowercase();
+        let roles = if ["machine tend", "press", "fixture", "cnc", "assembly"]
+            .iter()
+            .any(|term| focus.contains(term))
+        {
+            "(\"machine operator\" OR \"press operator\" OR \"cnc operator\" OR \"production assembler\" OR \"fixture loading\" OR \"parts loading\" OR \"manufacturing operator\" OR \"quality inspector\")"
+        } else if [
+            "warehouse",
+            "distribution",
+            "3pl",
+            "fulfillment",
+            "logistics",
+        ]
+        .iter()
+        .any(|term| focus.contains(term))
+        {
+            "(\"order picker\" OR \"case picker\" OR \"warehouse associate\" OR \"material handler\" OR \"pallet builder\" OR replenishment OR shipper OR receiver OR forklift)"
+        } else {
+            "(\"packaging operator\" OR \"production operator\" OR palletizing OR \"case packing\" OR \"line operator\" OR \"material handler\" OR assembler OR sanitation)"
+        };
         vec![
             format!("site:{domain} (Ontario OR Canada) {roles}"),
             format!("site:{domain} {roles} careers"),
             format!("\"{company}\" {roles} jobs"),
         ]
-    } else {
+    } else if brand == "gnk" {
+        let focus = focus.to_ascii_lowercase();
+        let roles = if ["construction", "contractor", "delay", "change order"]
+            .iter()
+            .any(|term| focus.contains(term))
+        {
+            "(\"project controls\" OR \"change order\" OR RFI OR \"daily report\" OR delay OR claims OR scheduler)"
+        } else if ["3pl", "logistics", "freight", "transport"]
+            .iter()
+            .any(|term| focus.contains(term))
+        {
+            "(exceptions OR accessorial OR detention OR claims OR POD OR \"proof of delivery\" OR billing OR audit)"
+        } else {
+            "(claims OR compliance OR recovery OR adjudication OR adjuster OR analyst OR audit)"
+        };
         vec![
-            format!(
-                "site:{domain} (claims OR compliance OR recovery OR analyst) (careers OR jobs)"
-            ),
-            format!("\"{company}\" claims operations compliance recovery analyst jobs"),
+            format!("site:{domain} {roles} (careers OR jobs)"),
+            format!("\"{company}\" {roles} jobs"),
         ]
+    } else {
+        Vec::new()
     }
 }
 
@@ -1412,13 +1448,26 @@ mod tests {
             "Performs packing and stacking on the production line",
             "wapahki"
         ));
-        let queries = role_search_queries("wapahki", "FGF Brands", "fgfbrands.com");
+        let queries = role_search_queries(
+            "wapahki",
+            "Ontario warehouse case handling",
+            "FGF Brands",
+            "fgfbrands.com",
+        );
         assert_eq!(queries.len(), 3);
         assert!(queries[0].contains("site:fgfbrands.com"));
         assert!(queries[0].contains("Ontario OR Canada"));
         assert!(queries[1].contains("forklift"));
-        assert!(queries[1].contains("pallet repair"));
+        assert!(queries[1].contains("case picker"));
         assert!(queries[2].contains("\"FGF Brands\""));
+        let machine_queries = role_search_queries(
+            "wapahki",
+            "Ontario machine tending and press loading",
+            "Example Parts",
+            "exampleparts.ca",
+        );
+        assert!(machine_queries[0].contains("press operator"));
+        assert!(!machine_queries[0].contains("order picker"));
         assert!(trusted_ats_host("pivotalhr.fitzii.com"));
         assert_eq!(
             job_location_priority(

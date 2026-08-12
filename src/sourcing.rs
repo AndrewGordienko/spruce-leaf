@@ -1094,7 +1094,7 @@ async fn qualify_candidate(
     } else {
         let (research_block, research_sources) = match researcher {
             Some(researcher) => {
-                match research::research_company(client, researcher, pb, &org).await {
+                match research::research_company(client, researcher, pb, &org, thesis).await {
                     Some(brief) => {
                         log_sourcing(format!(
                             "research {} · sources [{}]",
@@ -2800,6 +2800,18 @@ fn compact_list(values: &[String], limit: usize) -> String {
 fn apply_brand_icp_guard(brand: &str, thesis: &str, icp: &mut Icp) {
     let thesis = thesis.to_ascii_lowercase();
     let coverage: &[&str] = if brand.eq_ignore_ascii_case("wapahki") {
+        let warehouse_segment = [
+            "warehouse",
+            "distribution",
+            "3pl",
+            "fulfillment",
+            "logistics",
+        ]
+        .iter()
+        .any(|term| thesis.contains(term));
+        let food_segment = ["food", "beverage", "bakery", "dairy"]
+            .iter()
+            .any(|term| thesis.contains(term));
         // Apollo organization keywords are discovery categories, not workflow
         // evidence. Task/equipment phrases ("palletizing", "material
         // handling", "robotics") overwhelmingly return integrators and
@@ -2825,16 +2837,42 @@ fn apply_brand_icp_guard(brand: &str, thesis: &str, icp: &mut Icp) {
             .iter()
             .any(|term| keyword.contains(term))
         });
-        if [
-            "warehouse",
-            "distribution",
-            "3pl",
-            "fulfillment",
-            "logistics",
-        ]
-        .iter()
-        .any(|term| thesis.contains(term))
-        {
+        icp.keywords.retain(|keyword| {
+            let keyword = keyword.to_ascii_lowercase();
+            let irrelevant = if warehouse_segment {
+                [
+                    "food manufacturing",
+                    "food production",
+                    "beverage manufacturing",
+                    "automotive manufacturing",
+                    "medical device manufacturing",
+                    "metal fabrication",
+                ]
+                .as_slice()
+            } else if food_segment {
+                [
+                    "warehousing",
+                    "third party logistics",
+                    "logistics and supply chain",
+                    "automotive manufacturing",
+                    "medical device manufacturing",
+                    "metal fabrication",
+                ]
+                .as_slice()
+            } else {
+                [
+                    "food manufacturing",
+                    "food production",
+                    "beverage manufacturing",
+                    "bakery manufacturing",
+                    "warehousing",
+                    "third party logistics",
+                ]
+                .as_slice()
+            };
+            !irrelevant.iter().any(|term| keyword.contains(term))
+        });
+        if warehouse_segment {
             &[
                 "warehousing",
                 "third party logistics",
@@ -2845,10 +2883,7 @@ fn apply_brand_icp_guard(brand: &str, thesis: &str, icp: &mut Icp) {
                 "cold storage",
                 "wholesale distribution",
             ]
-        } else if ["food", "beverage", "bakery", "dairy"]
-            .iter()
-            .any(|term| thesis.contains(term))
-        {
+        } else if food_segment {
             &[
                 "food manufacturing",
                 "food production",
@@ -3718,7 +3753,7 @@ pub async fn refresh_lead_context(
                         annual_revenue_printed: lead.revenue.clone(),
                         ..Default::default()
                     };
-                    research::research_company(client, researcher, pb, &org)
+                    research::research_company(client, researcher, pb, &org, &thesis)
                         .await
                         .map(|brief| brief.as_facts_block())
                         .unwrap_or_default()
