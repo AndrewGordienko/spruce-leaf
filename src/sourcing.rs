@@ -2021,11 +2021,9 @@ async fn source_people(
     // VERIFIED contacts and blank rows. Filing extra candidates lets a different
     // contact backfill anyone who doesn't verify; sequencing later caps at
     // n_contacts of the strongest verified people per company.
-    let source_pool = n_contacts
-        .saturating_mul(CONTACT_BACKFILL_FACTOR)
-        .max(n_contacts);
+    let source_pool = n_contacts.saturating_mul(CONTACT_BACKFILL_FACTOR).max(8);
     let preferred_locations = preferred_contact_locations(&pb.key);
-    let people = gather_people(apollo, org, icp, source_pool, &preferred_locations).await;
+    let people = gather_people(apollo, &pb.key, org, icp, source_pool, &preferred_locations).await;
     if people.is_empty() {
         log_sourcing(format!("no people found for {} (all strategies)", org.name));
         return Ok(0);
@@ -2098,6 +2096,7 @@ async fn source_people(
 /// when Apollo's org-id index is empty or the search record has no domain.
 async fn gather_people(
     apollo: &Apollo,
+    brand: &str,
     org: &ApolloOrg,
     icp: &Icp,
     n_contacts: usize,
@@ -2115,7 +2114,74 @@ async fn gather_people(
         domain = resolve_domain(apollo, org).await;
     }
 
-    // Ordered strategies: most targeted first so kept contacts are best-fit, then
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<ApolloPerson> = Vec::new();
+
+    // One deliberate search per committee role. Keep at most one strong result
+    // from each role before filling the bench, so a page of operations managers
+    // cannot masquerade as a mapped buying committee.
+    for (role, titles) in committee_title_groups(brand) {
+        let mut role_found = false;
+        let location_attempts = if preferred_locations.is_empty() {
+            vec![Vec::new()]
+        } else {
+            vec![preferred_locations.to_vec(), Vec::new()]
+        };
+        for locations in location_attempts {
+            if role_found {
+                break;
+            }
+            let filters = if !domain.is_empty() {
+                PeopleFilters {
+                    organization_domains: vec![domain.clone()],
+                    titles: titles.iter().map(|title| (*title).to_string()).collect(),
+                    locations,
+                    page: 1,
+                    per_page: 10,
+                    ..Default::default()
+                }
+            } else {
+                PeopleFilters {
+                    organization_ids: vec![org.id.clone()],
+                    titles: titles.iter().map(|title| (*title).to_string()).collect(),
+                    locations,
+                    page: 1,
+                    per_page: 10,
+                    ..Default::default()
+                }
+            };
+            match apollo.search_people(&filters).await {
+                Ok(people) => {
+                    let preferred = people
+                        .iter()
+                        .position(|person| committee_role_for_title(&person.title) == role)
+                        .or_else(|| (!people.is_empty()).then_some(0));
+                    if let Some(index) = preferred {
+                        let person = people[index].clone();
+                        let key = if !person.id.is_empty() {
+                            person.id.clone()
+                        } else {
+                            format!(
+                                "{}|{}",
+                                person.full_name().to_lowercase(),
+                                person.title.to_lowercase()
+                            )
+                        };
+                        if seen.insert(key) {
+                            out.push(person);
+                            role_found = true;
+                        }
+                    }
+                }
+                Err(error) => log_sourcing(format!(
+                    "committee people search ({role}) failed for {}: {error:#}",
+                    org.name
+                )),
+            }
+        }
+    }
+
+    // Ordered fallback strategies: most targeted first so remaining bench rows
     // progressively broader so we still reach the count.
     let mut attempts: Vec<(&str, PeopleFilters)> = Vec::new();
     if !preferred_locations.is_empty() && !domain.is_empty() {
@@ -2195,8 +2261,6 @@ async fn gather_people(
         ));
     }
 
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut out: Vec<ApolloPerson> = Vec::new();
     for (label, filters) in attempts {
         if out.len() >= want {
             break;
@@ -2238,6 +2302,149 @@ fn preferred_contact_locations(brand: &str) -> Vec<String> {
         vec!["Canada".into()]
     } else {
         Vec::new()
+    }
+}
+
+fn committee_title_groups(brand: &str) -> Vec<(&'static str, &'static [&'static str])> {
+    let witness: &'static [&'static str] = if brand.eq_ignore_ascii_case("wapahki") {
+        &[
+            "production supervisor",
+            "warehouse supervisor",
+            "shift supervisor",
+            "operations supervisor",
+            "team lead",
+        ]
+    } else if brand.eq_ignore_ascii_case("outagehub") {
+        &[
+            "NOC supervisor",
+            "field service supervisor",
+            "technical support supervisor",
+            "service operations supervisor",
+        ]
+    } else {
+        &[
+            "operations supervisor",
+            "claims supervisor",
+            "case management supervisor",
+            "revenue cycle supervisor",
+            "logistics supervisor",
+        ]
+    };
+    let owner: &'static [&'static str] = if brand.eq_ignore_ascii_case("wapahki") {
+        &[
+            "plant manager",
+            "production manager",
+            "warehouse manager",
+            "distribution centre manager",
+            "operations manager",
+            "director operations",
+        ]
+    } else if brand.eq_ignore_ascii_case("outagehub") {
+        &[
+            "network operations manager",
+            "service operations manager",
+            "charging operations manager",
+            "field service manager",
+            "maintenance manager",
+            "director service operations",
+        ]
+    } else {
+        &[
+            "operations manager",
+            "claims operations manager",
+            "revenue cycle manager",
+            "project controls manager",
+            "logistics operations manager",
+            "director operations",
+        ]
+    };
+    vec![
+        ("problem_witness", witness),
+        ("process_owner", owner),
+        (
+            "constraint_owner",
+            &[
+                "quality manager",
+                "safety manager",
+                "sanitation manager",
+                "compliance manager",
+            ],
+        ),
+        (
+            "technical_evaluator",
+            &[
+                "automation manager",
+                "controls manager",
+                "engineering manager",
+                "maintenance manager",
+                "IT systems manager",
+                "integration manager",
+            ],
+        ),
+        (
+            "economic_buyer",
+            &[
+                "vice president operations",
+                "general manager",
+                "chief operating officer",
+                "president",
+            ],
+        ),
+        (
+            "procurement_legal",
+            &[
+                "procurement manager",
+                "purchasing manager",
+                "strategic sourcing manager",
+            ],
+        ),
+    ]
+}
+
+fn committee_role_for_title(title: &str) -> &'static str {
+    let text = format!(" {} ", title.trim().to_ascii_lowercase());
+    if [" procurement ", " purchasing ", " strategic sourcing "]
+        .iter()
+        .any(|term| text.contains(term))
+    {
+        "procurement_legal"
+    } else if [" quality ", " safety ", " sanitation ", " compliance "]
+        .iter()
+        .any(|term| text.contains(term))
+    {
+        "constraint_owner"
+    } else if [
+        " automation ",
+        " controls ",
+        " engineering ",
+        " maintenance ",
+        " it systems ",
+        " integration ",
+    ]
+    .iter()
+    .any(|term| text.contains(term))
+    {
+        "technical_evaluator"
+    } else if [
+        " vice president ",
+        " vp ",
+        " general manager ",
+        " chief operating officer ",
+        " president ",
+    ]
+    .iter()
+    .any(|term| text.contains(term))
+    {
+        "economic_buyer"
+    } else if [" supervisor ", " team lead ", " coordinator "]
+        .iter()
+        .any(|term| text.contains(term))
+    {
+        "problem_witness"
+    } else if text.contains(" manager ") {
+        "process_owner"
+    } else {
+        "router"
     }
 }
 
@@ -3695,13 +3902,35 @@ mod tests {
     use super::{
         apply_brand_icp_guard, augment_gnk_signals, augment_outage_signals,
         augment_wapahki_signals, brand_candidate_precheck, brand_qualification_guard,
-        clamp_employee_ranges, company_identity_keys, credible_canonical_signal,
-        enforce_play_qualification, enforce_refresh_qualification, may_revisit_owned_account,
-        merge_prior_refresh_evidence, preferred_contact_locations, qualification_skip_keys_for_run,
-        reusable_workflow_contact, reuse_lead_score, reuse_person_score, select_reuse_excluding,
-        source_candidate_target, Icp, LeadRefresh, OrgQual,
+        clamp_employee_ranges, committee_role_for_title, committee_title_groups,
+        company_identity_keys, credible_canonical_signal, enforce_play_qualification,
+        enforce_refresh_qualification, may_revisit_owned_account, merge_prior_refresh_evidence,
+        preferred_contact_locations, qualification_skip_keys_for_run, reusable_workflow_contact,
+        reuse_lead_score, reuse_person_score, select_reuse_excluding, source_candidate_target, Icp,
+        LeadRefresh, OrgQual,
     };
     use crate::apollo::ApolloOrg;
+
+    #[test]
+    fn committee_mapping_has_six_distinct_commercial_roles() {
+        let groups = committee_title_groups("wapahki");
+        assert_eq!(groups.len(), 6);
+        assert_eq!(groups[0].0, "problem_witness");
+        assert!(groups.iter().any(|(role, _)| *role == "process_owner"));
+        assert!(groups
+            .iter()
+            .any(|(role, _)| *role == "technical_evaluator"));
+        assert!(groups.iter().any(|(role, _)| *role == "economic_buyer"));
+        assert_eq!(
+            committee_role_for_title("Production Supervisor"),
+            "problem_witness"
+        );
+        assert_eq!(
+            committee_role_for_title("Controls Engineering Manager"),
+            "technical_evaluator"
+        );
+        assert_eq!(committee_role_for_title("VP Operations"), "economic_buyer");
+    }
 
     #[test]
     fn outage_facts_are_mapped_to_missing_canonical_labels() {
