@@ -635,16 +635,35 @@ fn role_search_queries(brand: &str, focus: &str, company: &str, domain: &str) ->
         ]
     } else if brand == "gnk" {
         let focus = focus.to_ascii_lowercase();
-        let roles = if ["construction", "contractor", "delay", "change order"]
-            .iter()
-            .any(|term| focus.contains(term))
-        {
-            "(\"project controls\" OR \"change order\" OR RFI OR \"daily report\" OR delay OR claims OR scheduler)"
-        } else if ["3pl", "logistics", "freight", "transport"]
-            .iter()
-            .any(|term| focus.contains(term))
+        // Segment identity wins over ambiguous problem words. "Delay" and
+        // "claims" occur throughout logistics; letting either choose the
+        // construction vocabulary sent 3PL research toward RFIs and schedulers.
+        let roles = if [
+            "3pl",
+            "logistics",
+            "freight",
+            "transport",
+            "warehouse",
+            "fulfillment",
+            "cold chain",
+            "cold-chain",
+        ]
+        .iter()
+        .any(|term| focus.contains(term))
         {
             "(exceptions OR accessorial OR detention OR claims OR POD OR \"proof of delivery\" OR billing OR audit)"
+        } else if [
+            "construction",
+            "contractor",
+            "change order",
+            "project controls",
+            "rfi",
+            "daily report",
+        ]
+        .iter()
+        .any(|term| focus.contains(term))
+        {
+            "(\"project controls\" OR \"change order\" OR RFI OR \"daily report\" OR delay OR claims OR scheduler)"
         } else {
             "(claims OR compliance OR recovery OR adjudication OR adjuster OR analyst OR audit)"
         };
@@ -1485,6 +1504,15 @@ mod tests {
         );
         assert!(food_queries[0].contains("packaging operator"));
         assert!(!food_queries[0].contains("press operator"));
+        let logistics_queries = role_search_queries(
+            "gnk",
+            "Canadian 3PL logistics delay claims and proof-of-delivery decisions",
+            "Example Logistics",
+            "examplelogistics.ca",
+        );
+        assert!(logistics_queries[0].contains("proof of delivery"));
+        assert!(logistics_queries[0].contains("detention"));
+        assert!(!logistics_queries[0].contains("project controls"));
         assert!(trusted_ats_host("pivotalhr.fitzii.com"));
         assert_eq!(
             job_location_priority(
