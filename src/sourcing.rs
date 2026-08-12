@@ -2809,9 +2809,12 @@ fn apply_brand_icp_guard(brand: &str, thesis: &str, icp: &mut Icp) {
         ]
         .iter()
         .any(|term| thesis.contains(term));
-        let food_segment = ["food", "beverage", "bakery", "dairy"]
+        let food_segment = !["outside food", "non-food", "excluding food"]
             .iter()
-            .any(|term| thesis.contains(term));
+            .any(|term| thesis.contains(term))
+            && ["food", "beverage", "bakery", "dairy"]
+                .iter()
+                .any(|term| thesis.contains(term));
         // Apollo organization keywords are discovery categories, not workflow
         // evidence. Task/equipment phrases ("palletizing", "material
         // handling", "robotics") overwhelmingly return integrators and
@@ -4212,6 +4215,25 @@ mod tests {
         assert!(!icp.keywords.contains(&"robotics".to_string()));
         assert!(icp.keywords.contains(&"warehousing".to_string()));
         assert!(icp.keywords.contains(&"third party logistics".to_string()));
+
+        let mut non_food = Icp {
+            keywords: vec!["food manufacturing".into(), "automotive suppliers".into()],
+            employee_ranges: vec![],
+            locations: vec![],
+            titles: vec![],
+            seniorities: vec![],
+        };
+        apply_brand_icp_guard(
+            "wapahki",
+            "Ontario product manufacturing outside food with machine tending",
+            &mut non_food,
+        );
+        assert!(!non_food
+            .keywords
+            .contains(&"food manufacturing".to_string()));
+        assert!(non_food
+            .keywords
+            .contains(&"automotive manufacturing".to_string()));
     }
 
     #[test]
