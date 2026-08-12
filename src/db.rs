@@ -64,7 +64,7 @@ use uuid::Uuid;
 // an evidence-linked opportunity. A company may belong to several portfolio
 // brands; copy is attributable to one facility/use case and one mapped buying
 // committee while only one cold thread is active at a time.
-pub const CURRENT_COPY_POLICY_VERSION: i64 = 31;
+pub const CURRENT_COPY_POLICY_VERSION: i64 = 32;
 
 /// A real company sourced from Apollo and (optionally) qualified against a brand
 /// thesis. Everything the model *guesses* stays in the inference/hypothesis
@@ -1306,17 +1306,12 @@ impl Db {
                 "No exact operating facility is linked to the physical task evidence.".into(),
             );
         }
-        let evidence_status = match assessment.status.as_str() {
-            "qualified"
-                if !observations.is_empty()
-                    && (!assessment.brand.eq_ignore_ascii_case("wapahki")
-                        || !facility_id.is_empty()) =>
-            {
-                "action_ready"
-            }
-            "qualified" | "research_needed" if !observations.is_empty() => "discovery_ready",
-            _ => "research_required",
-        };
+        let evidence_status = opportunity_evidence_status(
+            &assessment.brand,
+            &assessment.status,
+            !observations.is_empty(),
+            !facility_id.is_empty(),
+        );
         let priority_tier = match evidence_status {
             "action_ready" => "easy",
             "discovery_ready" => "medium",
@@ -5709,7 +5704,7 @@ fn row_to_facility(r: &Row) -> Facility {
 }
 
 fn row_to_sales_opportunity(r: &Row) -> SalesOpportunity {
-    SalesOpportunity {
+    let mut opportunity = SalesOpportunity {
         id: g(r, "id"),
         brand: g(r, "brand"),
         market_account_id: g(r, "market_account_id"),
@@ -5731,7 +5726,9 @@ fn row_to_sales_opportunity(r: &Row) -> SalesOpportunity {
         evidence_gaps: jd(&g(r, "evidence_gaps")),
         created_at: g(r, "created_at"),
         updated_at: g(r, "updated_at"),
-    }
+    };
+    enforce_sales_opportunity_boundaries(&mut opportunity);
+    opportunity
 }
 
 fn row_to_evidence_claim(r: &Row) -> EvidenceClaim {
@@ -6605,6 +6602,43 @@ fn opportunity_title(task_or_decision: &str) -> String {
         let mut title = compact.chars().take(117).collect::<String>();
         title.push_str("...");
         title
+    }
+}
+
+fn opportunity_evidence_status(
+    brand: &str,
+    assessment_status: &str,
+    has_observations: bool,
+    has_facility: bool,
+) -> &'static str {
+    if !has_observations || (brand.eq_ignore_ascii_case("wapahki") && !has_facility) {
+        return "research_required";
+    }
+    match assessment_status {
+        "qualified" => "action_ready",
+        "research_needed" => "discovery_ready",
+        _ => "research_required",
+    }
+}
+
+/// Persisted opportunity rows can predate a stricter commercial boundary. The
+/// reader applies the same non-negotiable invariant as materialization so the
+/// dashboard never labels a facility-less Wapahki task medium while the live
+/// delivery gate correctly holds it as research.
+fn enforce_sales_opportunity_boundaries(opportunity: &mut SalesOpportunity) {
+    if !opportunity.brand.eq_ignore_ascii_case("wapahki")
+        || !opportunity.facility_id.trim().is_empty()
+    {
+        return;
+    }
+    opportunity.evidence_status = "research_required".into();
+    opportunity.priority_tier = "hard".into();
+    if opportunity.status != "rejected" {
+        opportunity.status = "research".into();
+    }
+    let gap = "No exact operating facility is linked to the physical task evidence.";
+    if !opportunity.evidence_gaps.iter().any(|item| item == gap) {
+        opportunity.evidence_gaps.push(gap.into());
     }
 }
 
@@ -7551,7 +7585,7 @@ mod tests {
         evidence_names_operating_site, facility_observation_for_task, AccountPlayAssessment,
         ApplicationBrief, ConversationMessage, CustomerDevelopmentRecord, Db, GtmExperiment,
         GtmOutcome, Job, Lead, Mailbox, Meeting, Opportunity, OpportunityContact, OpportunityTouch,
-        Person, Sequence, SignalObservation, Touch, CURRENT_COPY_POLICY_VERSION,
+        Person, SalesOpportunity, Sequence, SignalObservation, Touch, CURRENT_COPY_POLICY_VERSION,
     };
     use chrono::{TimeZone, Utc};
     use uuid::Uuid;
@@ -7574,6 +7608,33 @@ mod tests {
         assert!(evidence_names_operating_site(
             "The Brantford role loads cartons into cases and palletizes finished goods."
         ));
+    }
+
+    #[test]
+    fn wapahki_opportunity_without_exact_facility_remains_hard_research() {
+        assert_eq!(
+            super::opportunity_evidence_status("wapahki", "qualified", true, false),
+            "research_required"
+        );
+        assert_eq!(
+            super::opportunity_evidence_status("wapahki", "research_needed", true, true),
+            "discovery_ready"
+        );
+        let mut opportunity = SalesOpportunity {
+            brand: "wapahki".into(),
+            evidence_status: "discovery_ready".into(),
+            priority_tier: "medium".into(),
+            status: "mapped".into(),
+            ..Default::default()
+        };
+        super::enforce_sales_opportunity_boundaries(&mut opportunity);
+        assert_eq!(opportunity.evidence_status, "research_required");
+        assert_eq!(opportunity.priority_tier, "hard");
+        assert_eq!(opportunity.status, "research");
+        assert!(opportunity
+            .evidence_gaps
+            .iter()
+            .any(|gap| gap.contains("exact operating facility")));
     }
 
     #[test]

@@ -3975,6 +3975,20 @@ fn has_natural_response_path(body: &str) -> bool {
     exact_path || email_path || conversation_path || useful_asset_path || direct_question_path
 }
 
+fn asks_recipient_to_find_wapahki_task(body: &str) -> bool {
+    let body = body.to_ascii_lowercase();
+    [
+        "which step recurs most",
+        "which step repeats most",
+        "which step takes the most",
+        "which part takes the most",
+        "what takes the most operator time",
+        "what takes most operator time",
+    ]
+    .iter()
+    .any(|marker| body.contains(marker))
+}
+
 fn mentions_outreach_asset(body: &str) -> bool {
     let body = body.to_ascii_lowercase();
     [
@@ -4470,6 +4484,12 @@ fn sequence_quality_issues(
         }
         if pb.key == "wapahki" && touch.stage == 1 {
             let body = touch.body.to_ascii_lowercase();
+            if asks_recipient_to_find_wapahki_task(&touch.body) {
+                issues.push(
+                    "Wapahki stage 1 asks the recipient to find or prioritize a task; arrive with one sourced candidate task and ask only for its missing operating boundary"
+                        .into(),
+                );
+            }
             let has_university_context = body.contains("university of toronto")
                 || body.contains("u of t")
                 || body.contains("uoft");
@@ -5269,6 +5289,16 @@ mod tests {
         ));
         assert!(wapahki_names_operating_consequence(
             "The role description calls for regular 35–40 lb lifting."
+        ));
+    }
+
+    #[test]
+    fn wapahki_rejects_asking_the_recipient_to_choose_the_task() {
+        assert!(super::asks_recipient_to_find_wapahki_task(
+            "Of pallet building, wrapping, and staging, which step recurs most and takes the most operator time?"
+        ));
+        assert!(!super::asks_recipient_to_find_wapahki_task(
+            "Does the pallet movement from wrapping to staging normally follow the same path?"
         ));
     }
 
