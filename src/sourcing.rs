@@ -40,6 +40,7 @@ use crate::research;
 /// companies from ending up short of verified, sequenceable contacts.
 const CONTACT_BACKFILL_FACTOR: usize = 2;
 const QUALIFICATION_POLICY_TAG: &str = "qv29";
+const PORTFOLIO_REUSE_MARKER: &str = "__spruce_portfolio_reuse__";
 
 /// What one `source` run accomplished.
 #[derive(Debug, Default)]
@@ -398,6 +399,23 @@ pub async fn source(
         })
         .filter(|domain| !domain.is_empty())
         .collect::<Vec<_>>();
+    // Exact-domain research commonly points at a company that another Spruce
+    // Leaf brand already knows. A canonical company may support several
+    // independent opportunities, so reuse its firmographics before asking an
+    // external provider to rediscover it. Qualification still runs separately
+    // for the target brand and active play.
+    let portfolio_leads = db.list_leads(None).unwrap_or_default();
+    let portfolio_orgs = portfolio_orgs_for_exact_domains(&portfolio_leads, &exact_domains);
+    let portfolio_domains = portfolio_orgs
+        .iter()
+        .map(|org| canonical_company_domain(&org.domain()))
+        .collect::<HashSet<_>>();
+    let provider_domains = exact_domains
+        .iter()
+        .filter(|domain| !portfolio_domains.contains(*domain))
+        .cloned()
+        .collect::<Vec<_>>();
+    let portfolio_reused = portfolio_orgs.len();
     let durable_skip_keys = db
         .durable_qualification_skip_keys(&pb.key, QUALIFICATION_POLICY_TAG)
         .unwrap_or_default()
@@ -416,13 +434,30 @@ pub async fn source(
     report_source(
         progress.as_ref(),
         "apollo",
-        "Searching Apollo",
-        format!("Looking for about {want_candidates} candidates across a resumable market sweep"),
+        if portfolio_reused > 0 {
+            "Reusing portfolio accounts"
+        } else {
+            "Searching Apollo"
+        },
+        if portfolio_reused > 0 {
+            format!(
+                "{portfolio_reused} exact-domain accounts already known · {} remaining provider lookups",
+                provider_domains.len()
+            )
+        } else {
+            format!(
+                "Looking for about {want_candidates} candidates across a resumable market sweep"
+            )
+        },
         "active",
     );
-    let mut fresh: Vec<ApolloOrg> = Vec::new();
-    let mut fresh_keys = HashSet::<String>::new();
-    let mut orgs_found = 0usize;
+    let mut fresh: Vec<ApolloOrg> = portfolio_orgs;
+    let mut fresh_keys = fresh
+        .iter()
+        .flat_map(org_identity_keys)
+        .filter(|key| key.starts_with("domain:"))
+        .collect::<HashSet<_>>();
+    let mut orgs_found = portfolio_reused;
     let mut skipped_known = 0usize;
     let max_source_pages = std::env::var("SPRUCE_MAX_SOURCE_PAGES")
         .ok()
@@ -431,6 +466,8 @@ pub async fn source(
         .clamp(1, 500);
     let source_pages = if exact_domains.is_empty() {
         max_source_pages
+    } else if provider_domains.is_empty() {
+        0
     } else {
         1
     };
@@ -444,19 +481,20 @@ pub async fn source(
         1
     };
     let mut last_page = start_page.saturating_sub(1);
-    let mut source_exhausted = prior_coverage.as_ref().is_some_and(|run| run.exhausted);
+    let mut source_exhausted = (explicit_domain_rerun && provider_domains.is_empty())
+        || prior_coverage.as_ref().is_some_and(|run| run.exhausted);
     for page in start_page..start_page.saturating_add(source_pages) {
         if source_exhausted && exact_domains.is_empty() {
             break;
         }
-        let page_orgs = apollo
+        let page_orgs = match apollo
             .search_organizations(&OrgFilters {
                 keywords: if exact_domains.is_empty() {
                     icp.keywords.clone()
                 } else {
                     Vec::new()
                 },
-                domains: exact_domains.clone(),
+                domains: provider_domains.clone(),
                 employee_ranges: if exact_domains.is_empty() {
                     icp.employee_ranges.clone()
                 } else {
@@ -471,7 +509,25 @@ pub async fn source(
                 per_page,
                 ..Default::default()
             })
-            .await?;
+            .await
+        {
+            Ok(orgs) => orgs,
+            Err(error) if explicit_domain_rerun && !fresh.is_empty() => {
+                report_source(
+                    progress.as_ref(),
+                    "apollo",
+                    "Provider coverage incomplete",
+                    format!(
+                        "Continuing with {portfolio_reused} portfolio accounts; {} exact domains remain unresolved · {}",
+                        provider_domains.len(),
+                        first_line(&error.to_string())
+                    ),
+                    "warning",
+                );
+                break;
+            }
+            Err(error) => return Err(error),
+        };
         last_page = page;
         if page_orgs.is_empty() {
             source_exhausted = true;
@@ -960,20 +1016,34 @@ pub async fn source(
     );
     let mut people_counts =
         stream::iter(winners.into_iter().map(|(org, lead, lead_id)| async move {
-            let result = source_people(
+            let reused = reuse_portfolio_people(
                 db,
-                client,
-                apollo,
-                pb,
-                vantage_system,
-                &org,
-                &lead,
+                &pb.key,
                 &lead_id,
-                icp,
-                n_contacts,
-                fallback_recipient_timezone,
-            )
-            .await;
+                &lead.domain,
+                n_contacts.saturating_mul(CONTACT_BACKFILL_FACTOR).max(8),
+            );
+            let result = match reused {
+                Err(error) => Err(error),
+                Ok(reused) if reused >= n_contacts || (explicit_domain_rerun && reused > 0) => {
+                    Ok(reused)
+                }
+                Ok(reused) => source_people(
+                    db,
+                    client,
+                    apollo,
+                    pb,
+                    vantage_system,
+                    &org,
+                    &lead,
+                    &lead_id,
+                    icp,
+                    n_contacts.saturating_sub(reused),
+                    fallback_recipient_timezone,
+                )
+                .await
+                .map(|added| reused + added),
+            };
             (org.name, result)
         }))
         .buffer_unordered(concurrency.max(4));
@@ -1998,6 +2068,173 @@ fn is_missing_evidence(item: &str) -> bool {
     ]
     .iter()
     .any(|needle| value.contains(needle))
+}
+
+/// Reuse canonical company identity for an exact-domain run. This is not
+/// qualification reuse: the returned organization is still judged against the
+/// target brand's current play and receives fresh official-site research.
+fn portfolio_orgs_for_exact_domains(leads: &[Lead], exact_domains: &[String]) -> Vec<ApolloOrg> {
+    if exact_domains.is_empty() {
+        return Vec::new();
+    }
+    let wanted = exact_domains
+        .iter()
+        .map(|domain| canonical_company_domain(domain))
+        .filter(|domain| !domain.is_empty())
+        .collect::<HashSet<_>>();
+    let mut best = HashMap::<String, &Lead>::new();
+    for lead in leads {
+        let domain = canonical_company_domain(&lead.domain);
+        if !wanted.contains(&domain) {
+            continue;
+        }
+        let replace = best.get(&domain).is_none_or(|current| {
+            portfolio_lead_profile_score(lead) > portfolio_lead_profile_score(current)
+        });
+        if replace {
+            best.insert(domain, lead);
+        }
+    }
+    exact_domains
+        .iter()
+        .filter_map(|raw_domain| {
+            let domain = canonical_company_domain(raw_domain);
+            let lead = best.get(&domain)?;
+            Some(ApolloOrg {
+                id: if lead.apollo_org_id.trim().is_empty() {
+                    format!("portfolio-domain:{domain}")
+                } else {
+                    lead.apollo_org_id.clone()
+                },
+                name: lead.name.clone(),
+                website_url: format!("https://{domain}"),
+                primary_domain: domain,
+                industry: lead.industry.clone(),
+                estimated_num_employees: lead.headcount,
+                organization_city: lead.hq.clone(),
+                annual_revenue_printed: lead.revenue.clone(),
+                // This marker prevents a redundant Apollo hydration call. It
+                // is removed before the org reaches qualification; all task
+                // evidence must come from the new official-site research.
+                technology_names: vec![PORTFOLIO_REUSE_MARKER.into()],
+                ..Default::default()
+            })
+        })
+        .collect()
+}
+
+fn portfolio_lead_profile_score(lead: &Lead) -> i64 {
+    i64::from(!lead.apollo_org_id.trim().is_empty()) * 16
+        + i64::from(!lead.industry.trim().is_empty()) * 8
+        + i64::from(lead.headcount > 0) * 4
+        + i64::from(!lead.hq.trim().is_empty()) * 2
+        + i64::from(!lead.observed_facts.is_empty())
+}
+
+/// Copy real people already verified for the same canonical company into the
+/// target brand's contact map. Their identity and verification are reusable;
+/// their brand-specific sales rationale is deliberately cleared. `upsert_person`
+/// then maps each person to the current target-brand opportunity committee.
+fn reuse_portfolio_people(
+    db: &SharedDb,
+    brand: &str,
+    target_lead_id: &str,
+    domain: &str,
+    limit: usize,
+) -> Result<usize> {
+    let domain = canonical_company_domain(domain);
+    if domain.is_empty() || limit == 0 {
+        return Ok(0);
+    }
+    let matching_lead_ids = db
+        .list_leads(None)?
+        .into_iter()
+        .filter(|lead| canonical_company_domain(&lead.domain) == domain)
+        .map(|lead| lead.id)
+        .collect::<HashSet<_>>();
+    let mut candidates = db
+        .list_people(None, None)?
+        .into_iter()
+        .filter(|person| matching_lead_ids.contains(&person.lead_id))
+        .filter(|person| {
+            !matches!(
+                person.status.to_ascii_lowercase().as_str(),
+                "held" | "suppressed" | "unsubscribed"
+            ) && !person.email_status.eq_ignore_ascii_case("invalid")
+                && crate::response_design::contact_priority(
+                    &person.title,
+                    &person.vantage,
+                    person.primary,
+                ) >= 25
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        reuse_person_score(right)
+            .cmp(&reuse_person_score(left))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+
+    let mut seen = HashSet::new();
+    let mut filed = 0usize;
+    for source in candidates {
+        let identity = reusable_person_identity(&source);
+        if identity.is_empty() || !seen.insert(identity) {
+            continue;
+        }
+        let person = Person {
+            lead_id: target_lead_id.to_string(),
+            brand: brand.to_string(),
+            apollo_person_id: if source.apollo_person_id.trim().is_empty() {
+                format!("portfolio:{}", source.id)
+            } else {
+                source.apollo_person_id.clone()
+            },
+            first_name: source.first_name.clone(),
+            last_name: source.last_name.clone(),
+            name: source.name.clone(),
+            title: source.title.clone(),
+            location: source.location.clone(),
+            timezone: source.timezone.clone(),
+            vantage: crate::response_design::effective_vantage(&source.title, &source.vantage),
+            primary: crate::response_design::effective_primary(&source.title, source.primary),
+            linkedin_url: source.linkedin_url.clone(),
+            linkedin_status: source.linkedin_status.clone(),
+            email: source.email.clone(),
+            email_status: source.email_status.clone(),
+            phone: source.phone.clone(),
+            status: source.status.clone(),
+            enriched_at: source.enriched_at.clone(),
+            ..Default::default()
+        };
+        db.upsert_person(&person)?;
+        filed += 1;
+        if filed >= limit {
+            break;
+        }
+    }
+    Ok(filed)
+}
+
+fn reusable_person_identity(person: &Person) -> String {
+    if !person.apollo_person_id.trim().is_empty() {
+        return format!("apollo:{}", person.apollo_person_id.trim());
+    }
+    if !person.email.trim().is_empty() {
+        return format!("email:{}", person.email.trim().to_ascii_lowercase());
+    }
+    if !person.linkedin_url.trim().is_empty() {
+        return format!(
+            "linkedin:{}",
+            person.linkedin_url.trim().to_ascii_lowercase()
+        );
+    }
+    let name = person.name.trim().to_ascii_lowercase();
+    let title = person.title.trim().to_ascii_lowercase();
+    if name.is_empty() || title.is_empty() {
+        String::new()
+    } else {
+        format!("name:{name}|{title}")
+    }
 }
 
 /// Fetch real people at an org, assign a vantage to each, and file them.
@@ -3435,7 +3672,16 @@ fn org_is_thin(o: &ApolloOrg) -> bool {
 /// Fill in a thin org's firmographics via Apollo organization enrichment (by
 /// domain). Falls back to the original record if it's already rich, has no
 /// domain, or enrichment fails/returns nothing — so sourcing never regresses.
-async fn hydrate_org(apollo: &Apollo, org: ApolloOrg) -> ApolloOrg {
+async fn hydrate_org(apollo: &Apollo, mut org: ApolloOrg) -> ApolloOrg {
+    if org
+        .technology_names
+        .iter()
+        .any(|name| name == PORTFOLIO_REUSE_MARKER)
+    {
+        org.technology_names
+            .retain(|name| name != PORTFOLIO_REUSE_MARKER);
+        return org;
+    }
     if !org_is_thin(&org) {
         return org;
     }
@@ -4009,11 +4255,13 @@ mod tests {
         clamp_employee_ranges, committee_role_for_title, committee_title_groups,
         company_identity_keys, credible_canonical_signal, enforce_play_qualification,
         enforce_refresh_qualification, may_revisit_owned_account, merge_prior_refresh_evidence,
-        preferred_contact_locations, qualification_skip_keys_for_run, reusable_workflow_contact,
-        reuse_lead_score, reuse_person_score, select_reuse_excluding, source_candidate_target, Icp,
-        LeadRefresh, OrgQual,
+        portfolio_orgs_for_exact_domains, preferred_contact_locations,
+        qualification_skip_keys_for_run, reusable_workflow_contact, reuse_lead_score,
+        reuse_person_score, reuse_portfolio_people, select_reuse_excluding,
+        source_candidate_target, Icp, LeadRefresh, OrgQual,
     };
     use crate::apollo::ApolloOrg;
+    use crate::db::{AccountPlayAssessment, Db, Lead, Person};
 
     #[test]
     fn committee_mapping_has_six_distinct_commercial_roles() {
@@ -4265,6 +4513,97 @@ mod tests {
     }
 
     #[test]
+    fn exact_domain_reuses_the_richest_canonical_portfolio_account() {
+        let leads = vec![
+            Lead {
+                brand: "gnk".into(),
+                apollo_org_id: "org-thin".into(),
+                name: "Thin profile".into(),
+                domain: "https://www.example.com/about".into(),
+                ..Default::default()
+            },
+            Lead {
+                brand: "outagehub".into(),
+                apollo_org_id: "org-rich".into(),
+                name: "Example Distribution".into(),
+                domain: "example.com".into(),
+                industry: "Warehousing".into(),
+                hq: "Mississauga, Ontario, Canada".into(),
+                headcount: 240,
+                ..Default::default()
+            },
+        ];
+        let orgs = portfolio_orgs_for_exact_domains(&leads, &["example.com".into()]);
+        assert_eq!(orgs.len(), 1);
+        assert_eq!(orgs[0].id, "org-rich");
+        assert_eq!(orgs[0].name, "Example Distribution");
+        assert_eq!(orgs[0].estimated_num_employees, 240);
+    }
+
+    #[test]
+    fn verified_people_are_reused_across_brand_opportunities() {
+        let path = std::env::temp_dir().join(format!(
+            "spruce-portfolio-contact-test-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let db = Db::open(&path).expect("open temp db");
+        let source_lead = db
+            .upsert_lead(&Lead {
+                brand: "outagehub".into(),
+                apollo_org_id: "org-shared".into(),
+                name: "Shared Factory".into(),
+                domain: "shared.example".into(),
+                ..Default::default()
+            })
+            .expect("source lead");
+        let target_lead = db
+            .upsert_lead(&Lead {
+                brand: "wapahki".into(),
+                apollo_org_id: "org-shared".into(),
+                name: "Shared Factory".into(),
+                domain: "shared.example".into(),
+                ..Default::default()
+            })
+            .expect("target lead");
+        db.upsert_person(&Person {
+            lead_id: source_lead,
+            brand: "outagehub".into(),
+            apollo_person_id: "person-1".into(),
+            name: "Pat Operator".into(),
+            title: "Plant Operations Manager".into(),
+            vantage: "process_owner".into(),
+            why_them: "Outage-specific rationale that must not cross brands".into(),
+            email: "pat@shared.example".into(),
+            email_status: "verified".into(),
+            status: "verified".into(),
+            ..Default::default()
+        })
+        .expect("source person");
+
+        assert_eq!(
+            reuse_portfolio_people(&db, "wapahki", &target_lead, "shared.example", 8)
+                .expect("reuse people"),
+            1
+        );
+        let people = db
+            .list_people(Some("wapahki"), None)
+            .expect("target people");
+        assert_eq!(people.len(), 1);
+        assert_eq!(people[0].email, "pat@shared.example");
+        assert_eq!(people[0].email_status, "verified");
+        assert!(people[0].why_them.is_empty());
+
+        drop(db);
+        for candidate in [
+            path.clone(),
+            std::path::PathBuf::from(format!("{}-wal", path.display())),
+            std::path::PathBuf::from(format!("{}-shm", path.display())),
+        ] {
+            let _ = std::fs::remove_file(candidate);
+        }
+    }
+
+    #[test]
     fn gnk_signals_require_operating_evidence_not_department_or_portal_presence() {
         assert!(!credible_canonical_signal(
             "gnk",
@@ -4311,7 +4650,6 @@ mod tests {
             "After a loss-of-power alarm, operators decide whether to dispatch maintenance or hold the response when a utility outage is reported."
         ));
     }
-    use crate::db::{AccountPlayAssessment, Db, Lead, Person};
     use crate::gtm::{default_plays, SignalCandidate};
     use crate::playbook::Playbooks;
 
