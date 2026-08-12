@@ -1273,12 +1273,7 @@ impl Db {
             );
         }
         let facility_id = if assessment.brand.eq_ignore_ascii_case("wapahki") {
-            observations
-                .iter()
-                .find(|observation| {
-                    observation.definition_key == "account.bounded_repetitive_task"
-                        && evidence_names_operating_site(&observation.evidence)
-                })
+            facility_observation_for_task(&observations)
                 .and_then(|observation| {
                     self.upsert_facility(&Facility {
                         market_account_id: account.id.clone(),
@@ -6615,18 +6610,43 @@ fn opportunity_title(task_or_decision: &str) -> String {
 
 fn evidence_names_operating_site(evidence: &str) -> bool {
     let text = evidence.to_ascii_lowercase();
-    [
-        " facility",
-        " plant",
-        " warehouse",
-        " distribution centre",
-        " distribution center",
-        " site",
-        " production",
-        " cold storage",
-    ]
-    .iter()
-    .any(|term| text.contains(term))
+    ONTARIO_SITE_NAMES
+        .iter()
+        .any(|place| text.contains(&place.to_ascii_lowercase()))
+        || [
+            " at the facility",
+            " at its facility",
+            " at their facility",
+            " facility in ",
+            " plant in ",
+            " warehouse in ",
+            " distribution centre in ",
+            " distribution center in ",
+            " operating site in ",
+        ]
+        .iter()
+        .any(|term| text.contains(term))
+}
+
+/// A Wapahki task belongs to a facility only when the task claim itself names
+/// the site, or another atomic claim from the exact same source page names it.
+/// A company HQ or locations page cannot silently donate a facility to an
+/// unrelated task page.
+fn facility_observation_for_task(observations: &[SignalObservation]) -> Option<&SignalObservation> {
+    let task = observations
+        .iter()
+        .find(|observation| observation.definition_key == "account.bounded_repetitive_task")?;
+    if evidence_names_operating_site(&task.evidence) {
+        return Some(task);
+    }
+    let task_url = task.source_url.trim().trim_end_matches('/');
+    if task_url.is_empty() {
+        return None;
+    }
+    observations.iter().find(|observation| {
+        observation.source_url.trim().trim_end_matches('/') == task_url
+            && evidence_names_operating_site(&observation.evidence)
+    })
 }
 
 fn facility_type_from_evidence(evidence: &str) -> &'static str {
@@ -6634,6 +6654,8 @@ fn facility_type_from_evidence(evidence: &str) -> &'static str {
     if text.contains("warehouse")
         || text.contains("distribution centre")
         || text.contains("distribution center")
+        || text.contains("distribution-centre")
+        || text.contains("distribution-center")
     {
         "warehouse_or_distribution_centre"
     } else if text.contains("cold storage") || text.contains("freezer") {
@@ -6644,29 +6666,8 @@ fn facility_type_from_evidence(evidence: &str) -> &'static str {
 }
 
 fn facility_label(lead: &Lead, evidence: &str) -> String {
-    const ONTARIO_CITIES: &[&str] = &[
-        "Brantford",
-        "Toronto",
-        "Mississauga",
-        "Brampton",
-        "Vaughan",
-        "Hamilton",
-        "London",
-        "Guelph",
-        "Kitchener",
-        "Waterloo",
-        "Cambridge",
-        "Windsor",
-        "Ottawa",
-        "Belleville",
-        "Kingston",
-        "Barrie",
-        "Markham",
-        "Oakville",
-        "Burlington",
-    ];
     let lower = evidence.to_ascii_lowercase();
-    if let Some(city) = ONTARIO_CITIES
+    if let Some(city) = ONTARIO_SITE_NAMES
         .iter()
         .find(|city| lower.contains(&city.to_ascii_lowercase()))
     {
@@ -6677,6 +6678,37 @@ fn facility_label(lead: &Lead, evidence: &str) -> String {
         format!("{} site documented in task source", lead.name.trim())
     }
 }
+
+const ONTARIO_SITE_NAMES: &[&str] = &[
+    "Barrie",
+    "Belleville",
+    "Brampton",
+    "Brantford",
+    "Burlington",
+    "Caledon",
+    "Cambridge",
+    "Etobicoke",
+    "Guelph",
+    "Halton Hills",
+    "Hamilton",
+    "King City",
+    "Kingston",
+    "Kitchener",
+    "Leamington",
+    "London",
+    "Markham",
+    "Mississauga",
+    "Newmarket",
+    "Oakville",
+    "Ottawa",
+    "Pickering",
+    "Richmond Hill",
+    "Toronto",
+    "Vars",
+    "Vaughan",
+    "Waterloo",
+    "Windsor",
+];
 
 fn choose_segment_id(brand: &str, context: &str, segments: &[MarketSegment]) -> String {
     let text = context.to_ascii_lowercase();
@@ -7516,9 +7548,10 @@ CREATE INDEX IF NOT EXISTS idx_jobs_claim ON jobs(status, next_run_at, priority)
 #[cfg(test)]
 mod tests {
     use super::{
-        AccountPlayAssessment, ApplicationBrief, ConversationMessage, CustomerDevelopmentRecord,
-        Db, GtmExperiment, GtmOutcome, Job, Lead, Mailbox, Meeting, Opportunity,
-        OpportunityContact, OpportunityTouch, Person, Sequence, Touch, CURRENT_COPY_POLICY_VERSION,
+        evidence_names_operating_site, facility_observation_for_task, AccountPlayAssessment,
+        ApplicationBrief, ConversationMessage, CustomerDevelopmentRecord, Db, GtmExperiment,
+        GtmOutcome, Job, Lead, Mailbox, Meeting, Opportunity, OpportunityContact, OpportunityTouch,
+        Person, Sequence, SignalObservation, Touch, CURRENT_COPY_POLICY_VERSION,
     };
     use chrono::{TimeZone, Utc};
     use uuid::Uuid;
@@ -7531,6 +7564,46 @@ mod tests {
         ] {
             let _ = std::fs::remove_file(candidate);
         }
+    }
+
+    #[test]
+    fn facility_link_requires_a_named_site_not_a_generic_warehouse_role() {
+        assert!(!evidence_names_operating_site(
+            "The Warehouse Selector role loads full cases onto pallets."
+        ));
+        assert!(evidence_names_operating_site(
+            "The Brantford role loads cartons into cases and palletizes finished goods."
+        ));
+    }
+
+    #[test]
+    fn task_can_use_a_site_claim_only_from_the_exact_same_source_page() {
+        let task = SignalObservation {
+            definition_key: "account.bounded_repetitive_task".into(),
+            source_url: "https://example.com/jobs/operator".into(),
+            evidence: "The operator palletizes finished cases.".into(),
+            ..Default::default()
+        };
+        let same_page_site = SignalObservation {
+            definition_key: "account.job_posting_workflow_evidence".into(),
+            source_url: "https://example.com/jobs/operator/".into(),
+            evidence: "The Newmarket role is based at the company's production plant.".into(),
+            ..Default::default()
+        };
+        let unrelated_site = SignalObservation {
+            definition_key: "account.fit_evidence".into(),
+            source_url: "https://example.com/locations".into(),
+            evidence: "The company has a facility in Toronto.".into(),
+            ..Default::default()
+        };
+        let linked = [task.clone(), same_page_site, unrelated_site.clone()];
+        assert_eq!(
+            facility_observation_for_task(&linked)
+                .expect("same-page facility")
+                .evidence,
+            "The Newmarket role is based at the company's production plant."
+        );
+        assert!(facility_observation_for_task(&[task, unrelated_site]).is_none());
     }
 
     #[test]
