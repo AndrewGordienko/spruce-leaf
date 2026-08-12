@@ -3395,7 +3395,7 @@ async fn request_copy_review_with_tier(
     let stage_contract = format!(
         "SCHEMA CONTRACT: first grade the entire sequence for coherence, relevance, repetition, and whether a sensible recipient has a reason to answer. Then return exactly one review object for every stage 1 through {expected_touches}, even when only a subset needs repair. A sequence passes only at 85+ with no unresolved sequence issues. For an unnamed stage that does not need editing, preserve it with empty revised fields."
     );
-    let sendability_contract = "INDEPENDENT SENDABILITY: Judge the words as a skeptical recipient, not as a checker of the writer's requested structure. No generation template, diagnostic-question shape, or factual correction is presumptively sendable. T1 needs a verified trigger, recognizable problem, plausible consequence, concrete seller contribution, and a role-relevant reason to answer through a natural conversation or email path. Compare the actual T1 ask with the private desired response and operating decision in review knowledge. Fail or repair copy that replaces a specific supported decision with a broad workflow-interview question such as `what takes the most time`, `what happens today`, or `how do you handle this`. Curiosity is not recipient value. Never require or invent collateral. When verified seller context explicitly permits Andrew to apply an existing fit screen to this exact sourced task and return a free first-pass blocker view, that is a concrete recipient benefit; preserve it during repair and judge whether the wording makes the no-site-visit, rule-out value clear. Do not demand a second give-back. Later touches must add evidence, a useful distinction, an honest objection answer, route, or close rather than paraphrase.";
+    let sendability_contract = "INDEPENDENT SENDABILITY: Judge the words as a skeptical recipient, not as a checker of the writer's requested structure. No generation template, diagnostic-question shape, or factual correction is presumptively sendable. T1 needs a verified trigger, recognizable problem, plausible consequence, concrete seller contribution, and a role-relevant reason to answer through a natural conversation or email path. In a one-touch discovery note, one direct operating answer by email is itself a complete response path; do not require a call before the missing term is confirmed. Compare the actual T1 ask with the private desired response and operating decision in review knowledge. Fail or repair copy that replaces a specific supported decision with a broad workflow-interview question such as `what takes the most time`, `what happens today`, or `how do you handle this`. Curiosity is not recipient value. Never require or invent collateral. When verified seller context explicitly permits Andrew to apply an existing fit screen to this exact sourced task and return a free first-pass blocker view, that is a concrete recipient benefit; preserve it during repair and judge whether the wording makes the no-site-visit, rule-out value clear. Do not demand a second give-back. Later touches must add evidence, a useful distinction, an honest objection answer, route, or close rather than paraphrase.";
     let user = format!(
         "{task}\n\n{stage_contract}\n{sendability_contract}\nCHANNEL: linkedin_request has no subject; linkedin_or_email must work as either a DM or a complete email fallback. A LinkedIn request must give a concrete operating reason to connect, not praise the recipient's remit, background, perspective, or work.\nINBOX TEST: grade T1's subject and first two lines before the rest. A subject that merely labels the category (`utility status`, `power alarms`, `claim evidence`, `decision trail`, `automation question`) fails even if relevant. Require a plain 3-9 word phrase naming the operating event, decision, object, or consequence that makes this exact email worth opening. No clickbait. Reject internal-memo prose such as `make this decision consequential`, `the distinction I have in mind`, and `the practical difference is`; Andrew must be able to say every line naturally aloud.\nEVIDENCE: the verified facts below are exhaustive. The hypothesis is not fact. Never invent an internal event, system, practice, consequence, or ownership claim.\n\nSIGNATURE: {signature}\nVERIFIED FACTS: {facts}\nHYPOTHESIS, NOT FACT: {hypothesis}\nRECIPIENT: {name} ({title}, {vantage})\nLIKELY ACCESS, INTERNAL ONLY: {can_observe}\nROLE RESPONSE CONTRACT (private; test role fit, reply cost, and face risk without inventing personality):\n{role_contract}\nDETERMINISTIC FINDINGS: {deterministic}\n\nCURRENT SEQUENCE:\n{sequence}\n\nRELEVANT REVIEW KNOWLEDGE:\n{knowledge}",
         task = task,
@@ -3964,13 +3964,14 @@ fn has_natural_response_path(body: &str) -> bool {
         .any(|marker| body.contains(marker))
         && ["send", "share"].iter().any(|marker| body.contains(marker))
         && body.contains('?');
-    // A single concrete operating question is already a natural reply path.
-    // Requiring an extra `reply by email` or call sentence made the writer add
-    // a second CTA, then the independent reviewer correctly rejected the
-    // resulting menu. Semantic QA still decides whether the question itself is
-    // worth answering.
-    let one_direct_question = body.matches('?').count() == 1;
-    exact_path || email_path || conversation_path || useful_asset_path || one_direct_question
+    // One concrete operating question, optionally followed by one short CTA
+    // question, is already a natural email-response path. Requiring the words
+    // `reply by email` or a call invitation contradicts the discovery contract
+    // and makes the writer stack a second channel onto a one-touch note.
+    // Forced menus are rejected separately, and semantic QA still decides
+    // whether the actual question gives this recipient a reason to answer.
+    let direct_question_path = (1..=2).contains(&body.matches('?').count());
+    exact_path || email_path || conversation_path || useful_asset_path || direct_question_path
 }
 
 fn mentions_outreach_asset(body: &str) -> bool {
@@ -5438,6 +5439,9 @@ mod tests {
             "You can reply here, or we could discuss it briefly if that is easier."
         ));
         assert!(has_natural_response_path("A brief reply is enough."));
+        assert!(has_natural_response_path(
+            "Does the denial move to appeal after the same review? Would a one-page case sketch be useful?"
+        ));
         for stage in 2..=7 {
             assert_eq!(touch_question_limit(stage), 1);
         }
