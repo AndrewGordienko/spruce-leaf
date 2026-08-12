@@ -64,7 +64,7 @@ use uuid::Uuid;
 // an evidence-linked opportunity. A company may belong to several portfolio
 // brands; copy is attributable to one facility/use case and one mapped buying
 // committee while only one cold thread is active at a time.
-pub const CURRENT_COPY_POLICY_VERSION: i64 = 30;
+pub const CURRENT_COPY_POLICY_VERSION: i64 = 31;
 
 /// A real company sourced from Apollo and (optionally) qualified against a brand
 /// thesis. Everything the model *guesses* stays in the inference/hypothesis

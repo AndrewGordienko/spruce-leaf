@@ -1455,7 +1455,7 @@ async fn plan_sequence(
         "operator_requested_outcome_internal_only": desired_outcome.unwrap_or("No narrower outcome supplied; choose the smallest useful cold response for this vantage and evidence state."),
     });
     let user = format!(
-        "Plan a {n}-touch no-reply sequence for this recipient. Hypotheses define the decision and mechanism but are not facts. Action-ready accounts may use the supported cadence. Discovery-ready accounts may use exactly one complete, hypothesis-led first email; they must not receive follow-ups before a reply. Every other state remains in research. First complete the private response_strategy: the exact response Andrew needs, why it could matter to this role, one concrete operating scene, the credibility basis, the smallest voluntary commitment, and what would trigger reactance. Honor an operator-requested outcome when it is earned by the evidence and this person's vantage; otherwise reduce it only as much as evidence or role fit requires and record that reduction in overall_strategy. When it is supported, preserve its exact operating decision in the T1 ask: do not replace it with a broad workflow-interview question such as `what takes the most time`, `what happens today`, or `how do you handle this`. A short discovery conversation plus an email-reply alternative is appropriate for a direct operator, process owner, or operational executive when research supports a concrete task, decision, or mechanism. Reserve routing-only treatment for routers or misaligned titles. Before selecting the thread, compare three distinct T1 approaches: problem-sniffing from the strongest source, a concise commercial point of view, and an existence-or-routing note. Prefer the one with the clearest recipient reason to answer and lowest evidence risk; do not blend them. State the selected approach and why in overall_strategy.\n\nACCOUNT BRIEF:\n{account}\n\nRECIPIENT:\n{recipient}\n\nPRIVATE GTM ACTION CONTEXT:\n{gtm_context}\n\nRELEVANT PLANNING KNOWLEDGE:\n{knowledge}\n\nT1 connects a verified trigger to one operating decision and one role-matched ask. T2 advances the mechanism. T3 is a human LinkedIn request. T4, when present, adds a sourced fact, useful distinction, objection answer, route, or close. Never invent collateral or a later stage merely to fill the plan. For each touch return stage, channel, objective, angle, and at most one ask. Never make LinkedIn say only that an email was sent. Cite only principle IDs that changed the plan.",
+        "Plan a {n}-touch no-reply sequence for this recipient. Hypotheses define the decision and mechanism but are not facts. Action-ready accounts may use the supported cadence. Discovery-ready accounts may use exactly one complete, hypothesis-led first email; they must not receive follow-ups before a reply. Every other state remains in research. First complete the private response_strategy: the exact response Andrew needs, why it could matter to this role, one concrete operating scene, the credibility basis, the smallest voluntary commitment, and what would trigger reactance. Honor an operator-requested outcome when it is earned by the evidence and this person's vantage; otherwise reduce it only as much as evidence or role fit requires and record that reduction in overall_strategy. When it is supported, preserve its exact operating decision in the T1 ask: do not replace it with a broad workflow-interview question such as `what takes the most time`, `what happens today`, or `how do you handle this`. For discovery-ready accounts, request one direct operating answer by email and do not add a call invitation before the missing term is confirmed. For action-ready direct operators, process owners, or operational executives, a short conversation with an email alternative may be appropriate. Reserve routing-only treatment for routers or misaligned titles. Before selecting the thread, compare three distinct T1 approaches: problem-sniffing from the strongest source, a concise commercial point of view, and an existence-or-routing note. Prefer the one with the clearest recipient reason to answer and lowest evidence risk; do not blend them. State the selected approach and why in overall_strategy.\n\nACCOUNT BRIEF:\n{account}\n\nRECIPIENT:\n{recipient}\n\nPRIVATE GTM ACTION CONTEXT:\n{gtm_context}\n\nRELEVANT PLANNING KNOWLEDGE:\n{knowledge}\n\nT1 connects a verified trigger to one operating decision and one role-matched ask. T2 advances the mechanism. T3 is a human LinkedIn request. T4, when present, adds a sourced fact, useful distinction, objection answer, route, or close. Never invent collateral or a later stage merely to fill the plan. For each touch return stage, channel, objective, angle, and at most one ask. Never make LinkedIn say only that an email was sent. Cite only principle IDs that changed the plan.",
         account = serde_json::to_string_pretty(&account).unwrap_or_default(),
         recipient = serde_json::to_string_pretty(&recipient).unwrap_or_default(),
         knowledge = knowledge.block,
@@ -1838,7 +1838,7 @@ Purpose and goal are private CRM notes, never substitutes for buyer-facing prose
 
 pub(crate) fn brand_trigger_contract(brand: &str, touches: usize) -> &'static str {
     if brand == "gnk" && touches == 1 {
-        "GNK PRECISE FIRST-TOUCH CONTRACT: Research must support one account-specific recurring decision OR direct mechanism/artifact evidence, plus a recipient close to it. T1 distinguishes sourced fact from hypothesis, names the recognizable workflow in ordinary language, frames the unproved consequence as one sharp question when necessary, explains one concrete way GnK could help, and offers a short conversation with an email answer as the easier path. Never reuse a universal records/reconstruction fork or make correction the only recipient value."
+        "GNK PRECISE FIRST-TOUCH CONTRACT: Research must support one account-specific recurring decision OR direct mechanism/artifact evidence, plus a recipient close to it. T1 distinguishes sourced fact from hypothesis, names the recognizable workflow in ordinary language, frames the unproved consequence as one sharp question when necessary, and explains one concrete way GnK could help. Honor the supplied copy decision state: discovery-ready copy asks for one direct operating answer by email and stops; action-ready copy may offer a short conversation with an email alternative. Never reuse a universal records/reconstruction fork or make correction the only recipient value."
     } else if brand == "gnk" {
         "GNK COMMERCIAL DISCOVERY CONTRACT: Multi-touch copy requires a specific recurring decision, believable consequence, mechanism evidence, and recipient close to the work. T1 names the problem, explains one concrete GnK contribution, and offers a short conversation with an email alternative. Follow-ups add evidence, consequence, a bounded test, or a useful route."
     } else if brand == "wapahki" && touches == 1 {
@@ -1848,7 +1848,7 @@ pub(crate) fn brand_trigger_contract(brand: &str, touches: usize) -> &'static st
     } else if brand == "outagehub" && touches == 2 {
         "OUTAGEHUB TWO-EMAIL EVIDENCE CONTRACT: This cadence is for distributed Canadian operators with one exact outage-time decision, a nearby operations recipient, and a completed location-specific historical utility match. T1 explains OutageHub's location-matched Canadian utility API, frames one evidence-safe consequence, and offers a natural short conversation or email path. T2 contributes the verified location and timestamp without claiming private site or asset status. Do not prescribe a universal dark-site/equipment-ticket binary."
     } else if brand == "outagehub" {
-        "OUTAGEHUB PRECISE FIRST-TOUCH CONTRACT: Target an operator with distributed Canadian locations and one evidenced outage-time diagnosis, dispatch, escalation, continuity, prioritization, or communication decision. T1 names the account-specific decision, explains in plain language that OutageHub supplies location-matched Canadian utility reports through an API, and offers a short conversation with an email answer as the easier path. A completed historical match may be mentioned with its exact boundary; it is not required for this first discovery touch. Never claim private site status or reuse a universal dark-site/ticket binary."
+        "OUTAGEHUB PRECISE FIRST-TOUCH CONTRACT: Target an operator with distributed Canadian locations and one evidenced outage-time diagnosis, dispatch, escalation, continuity, prioritization, or communication decision. T1 names the account-specific decision and explains in plain language that OutageHub supplies location-matched Canadian utility reports through an API. Honor the supplied copy decision state: discovery-ready copy asks for one direct operating answer by email and stops; action-ready copy may offer a short conversation with an email alternative. A completed historical match may be mentioned with its exact boundary; it is not required for this first discovery touch. Never claim private site status or reuse a universal dark-site/ticket binary."
     } else {
         ""
     }
@@ -3807,8 +3807,9 @@ fn copy_sentence_count(body: &str, signature: &str) -> usize {
     sentences + usize::from(has_text)
 }
 
-/// The first note often has two different jobs that are both naturally phrased
-/// as questions: test one operating decision, then ask for a short conversation.
+/// The first note can have two different jobs that are both naturally phrased
+/// as questions: test one operating decision, then offer a response path when
+/// the account is action-ready.
 /// Counting punctuation cannot distinguish those jobs, so reserve up to three
 /// marks for T1 and keep every follow-up to one. A short diagnostic with two alternatives
 /// plus a call-or-email CTA can naturally contain three marks (and appears in
@@ -4007,6 +4008,9 @@ fn names_historical_outage_result(body: &str) -> bool {
         "we found",
         "overlapped",
         "fell inside",
+        "fell within",
+        "was inside",
+        "was within",
         "reported at",
     ]
     .iter()
@@ -4455,10 +4459,7 @@ fn sequence_quality_issues(
                 );
             }
             if !has_natural_response_path(&touch.body) {
-                issues.push(
-                    "GnK stage 1 must offer a natural short-conversation or email response path"
-                        .into(),
-                );
+                issues.push("GnK stage 1 must offer one natural role-matched response path".into());
             }
             let hedge_moves = gnk_hedge_moves(&touch.body);
             if hedge_moves > 1 {
@@ -4493,8 +4494,7 @@ fn sequence_quality_issues(
             }
             if !has_natural_response_path(&touch.body) {
                 issues.push(
-                    "Wapahki stage 1 must offer a natural short-conversation or email response path"
-                        .into(),
+                    "Wapahki stage 1 must offer one natural role-matched response path".into(),
                 );
             }
         }
@@ -5228,6 +5228,9 @@ mod tests {
     fn outagehub_historical_followup_requires_a_completed_timed_result() {
         assert!(names_historical_outage_result(
             "I matched the charging site in Kingston to a utility outage area reported at 14:30 on 2026-07-14."
+        ));
+        assert!(names_historical_outage_result(
+            "A public ChargeLab-network station at 127 Church Street in Orono fell within Hydro One's reported outage area beginning March 8, 2026 at 05:30 UTC."
         ));
         assert!(!names_historical_outage_result(
             "I can prepare a historical comparison for one charging location using a utility report."
