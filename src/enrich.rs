@@ -7,7 +7,7 @@
 //! so it's a separate, explicit pass.
 
 use anyhow::Result;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::apollo::{Apollo, ApolloPerson};
@@ -75,7 +75,14 @@ pub async fn enrich_pending(
             .unwrap_or_default()
     };
 
-    let batch = select_enrichment_batch(people, limit, only_person_ids);
+    // Paid reveal credits should follow the active opportunity map, not the
+    // insertion order of every historical contact in the CRM. Build a
+    // round-robin order so each current easy/medium opportunity gets its best
+    // workflow-side committee member before we deepen any one account. Hard
+    // research opportunities and unmapped legacy people remain available as a
+    // fallback, but cannot consume the front of a normal enrichment batch.
+    let priority_order = current_opportunity_enrichment_order(db, brand)?;
+    let batch = select_enrichment_batch(people, limit, only_person_ids, &priority_order);
     let total = batch.len();
     report_enrich(
         progress.as_ref(),
@@ -167,15 +174,47 @@ pub async fn enrich_pending(
         // A returned match consumes one Apollo credit.
         summary.credits_spent += 1;
 
-        merge_enriched_identity(&mut p, &matched);
-        db.upsert_person(&p)?;
-
         let email = matched.email.trim().to_string();
         let phone = if matched.best_phone().is_empty() {
             p.phone.clone()
         } else {
             matched.best_phone()
         };
+        let lead = leads.iter().find(|lead| lead.id == p.lead_id);
+        if lead.is_none_or(|lead| !enrichment_matches_account(lead, &matched)) {
+            failed += 1;
+            db.set_person_email(&p.id, &email, "invalid", &phone)?;
+            db.set_person_status(&p.id, "held")?;
+            let matched_employer = matched
+                .organization
+                .as_ref()
+                .map(|organization| format!("{} ({})", organization.name, organization.domain()))
+                .unwrap_or_else(|| "unknown employer".into());
+            let expected = lead
+                .map(|lead| format!("{} ({})", lead.name, lead.domain))
+                .unwrap_or_else(|| "missing CRM account".into());
+            let detail = format!(
+                "identity mismatch: Apollo returned {matched_employer}; expected {expected}"
+            );
+            report_enrich(
+                progress.as_ref(),
+                "Revealing and verifying contacts",
+                format!(
+                    "{}/{total} processed · {} verified · {no_email} no email · {failed} errors\nLatest: {who} · {detail}",
+                    i + 1,
+                    summary.verified,
+                ),
+                "active",
+            );
+            if progress.is_none() {
+                eprintln!("  · [{}/{total}] {who} — held: {detail}", i + 1);
+            }
+            db.log_event(&p.brand, &p.id, "", "identity_mismatch", &detail)?;
+            continue;
+        }
+
+        merge_enriched_identity(&mut p, &matched);
+        db.upsert_person(&p)?;
 
         if email.is_empty() {
             no_email += 1;
@@ -283,16 +322,210 @@ fn merge_enriched_identity(person: &mut Person, matched: &ApolloPerson) {
     }
 }
 
+fn enrichment_matches_account(lead: &Lead, matched: &ApolloPerson) -> bool {
+    let expected_org_id = lead.apollo_org_id.trim();
+    let matched_org_id = if matched.organization_id.trim().is_empty() {
+        matched
+            .organization
+            .as_ref()
+            .map(|organization| organization.id.trim())
+            .unwrap_or("")
+    } else {
+        matched.organization_id.trim()
+    };
+    if !expected_org_id.is_empty()
+        && !matched_org_id.is_empty()
+        && expected_org_id == matched_org_id
+    {
+        return true;
+    }
+
+    let expected_domain = normalized_domain(&lead.domain);
+    let employer_domain = matched
+        .organization
+        .as_ref()
+        .map(|organization| normalized_domain(&organization.domain()))
+        .unwrap_or_default();
+    if domains_related(&expected_domain, &employer_domain) {
+        return true;
+    }
+
+    let email_domain = matched
+        .email
+        .rsplit_once('@')
+        .map(|(_, domain)| normalized_domain(domain))
+        .unwrap_or_default();
+    // Apollo occasionally omits organization data from a valid match. In that
+    // case a company-domain email is acceptable; a different employer/domain
+    // is held for explicit identity resolution.
+    matched_org_id.is_empty()
+        && employer_domain.is_empty()
+        && domains_related(&expected_domain, &email_domain)
+}
+
+fn normalized_domain(value: &str) -> String {
+    value
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_start_matches("www.")
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('.')
+        .to_ascii_lowercase()
+}
+
+fn domains_related(left: &str, right: &str) -> bool {
+    !left.is_empty()
+        && !right.is_empty()
+        && (left == right
+            || left.ends_with(&format!(".{right}"))
+            || right.ends_with(&format!(".{left}")))
+}
+
 fn select_enrichment_batch(
     people: Vec<Person>,
     limit: usize,
     only_person_ids: Option<&HashSet<String>>,
+    priority_order: &[String],
 ) -> Vec<Person> {
-    people
+    let mut eligible = people
         .into_iter()
-        .filter(|person| only_person_ids.is_none_or(|person_ids| person_ids.contains(&person.id)))
-        .take(limit)
-        .collect()
+        .enumerate()
+        .filter(|(_, person)| {
+            only_person_ids.is_none_or(|person_ids| person_ids.contains(&person.id))
+        })
+        .map(|(index, person)| (person.id.clone(), (index, person)))
+        .collect::<HashMap<_, _>>();
+    let mut selected = Vec::with_capacity(limit.min(eligible.len()));
+    for person_id in priority_order {
+        if selected.len() >= limit {
+            break;
+        }
+        if let Some((_, person)) = eligible.remove(person_id) {
+            selected.push(person);
+        }
+    }
+    if selected.len() < limit {
+        let mut fallback = eligible.into_values().collect::<Vec<_>>();
+        fallback.sort_by(|left, right| {
+            crate::response_design::contact_priority(
+                &right.1.title,
+                &right.1.vantage,
+                right.1.primary,
+            )
+            .cmp(&crate::response_design::contact_priority(
+                &left.1.title,
+                &left.1.vantage,
+                left.1.primary,
+            ))
+            .then_with(|| left.0.cmp(&right.0))
+        });
+        selected.extend(
+            fallback
+                .into_iter()
+                .map(|(_, person)| person)
+                .take(limit - selected.len()),
+        );
+    }
+    selected
+}
+
+fn current_opportunity_enrichment_order(db: &SharedDb, brand: Option<&str>) -> Result<Vec<String>> {
+    let brands = match brand {
+        Some(brand) => vec![brand.to_string()],
+        None => db
+            .list_leads(None)?
+            .into_iter()
+            .map(|lead| lead.brand)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect(),
+    };
+    let people = db
+        .list_people(brand, Some("new"))?
+        .into_iter()
+        .map(|person| (person.id.clone(), person))
+        .collect::<HashMap<_, _>>();
+    let mut opportunity_rosters = Vec::new();
+    for brand in brands {
+        let Some(play) = db.current_gtm_play(&brand)? else {
+            continue;
+        };
+        for opportunity in db
+            .list_sales_opportunities(Some(&brand), None)?
+            .into_iter()
+            .filter(|opportunity| opportunity.play_id == play.id)
+            .filter(|opportunity| opportunity.status != "rejected")
+        {
+            let tier = match opportunity.priority_tier.as_str() {
+                "easy" => 0,
+                "medium" => 1,
+                _ => 2,
+            };
+            let mut roster = db
+                .list_opportunity_stakeholders(Some(&opportunity.id), Some(&brand))?
+                .into_iter()
+                .filter_map(|stakeholder| {
+                    let person = people.get(&stakeholder.person_id)?;
+                    if stakeholder.status == "held" {
+                        return None;
+                    }
+                    Some((
+                        stakeholder.priority,
+                        crate::response_design::contact_priority(
+                            &person.title,
+                            &person.vantage,
+                            person.primary,
+                        ),
+                        person.name.clone(),
+                        person.id.clone(),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            roster.sort_by(|left, right| {
+                left.0
+                    .cmp(&right.0)
+                    .then_with(|| right.1.cmp(&left.1))
+                    .then_with(|| left.2.cmp(&right.2))
+            });
+            if !roster.is_empty() {
+                opportunity_rosters.push((tier, opportunity.fit_score, opportunity.title, roster));
+            }
+        }
+    }
+    opportunity_rosters.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| right.1.cmp(&left.1))
+            .then_with(|| left.2.cmp(&right.2))
+    });
+
+    let mut ordered = Vec::new();
+    let mut seen = HashSet::new();
+    let max_depth = opportunity_rosters
+        .iter()
+        .map(|(_, _, _, roster)| roster.len())
+        .max()
+        .unwrap_or(0);
+    // Finish easy and medium coverage before revealing contacts for hard
+    // opportunities that are not allowed to draft yet.
+    for allowed_tier in [1, 2] {
+        for depth in 0..max_depth {
+            for (tier, _, _, roster) in &opportunity_rosters {
+                if *tier > allowed_tier || (*tier <= 1 && allowed_tier == 2) {
+                    continue;
+                }
+                if let Some((_, _, _, person_id)) = roster.get(depth) {
+                    if seen.insert(person_id.clone()) {
+                        ordered.push(person_id.clone());
+                    }
+                }
+            }
+        }
+    }
+    Ok(ordered)
 }
 
 fn first_line(s: &str) -> String {
@@ -316,9 +549,9 @@ fn is_quota_error(msg: &str) -> bool {
 mod tests {
     use std::collections::HashSet;
 
-    use super::{merge_enriched_identity, select_enrichment_batch};
-    use crate::apollo::ApolloPerson;
-    use crate::db::Person;
+    use super::{enrichment_matches_account, merge_enriched_identity, select_enrichment_batch};
+    use crate::apollo::{ApolloOrg, ApolloPerson};
+    use crate::db::{Lead, Person};
 
     #[test]
     fn enrichment_respects_the_full_motion_working_set() {
@@ -341,13 +574,36 @@ mod tests {
             .map(str::to_string)
             .collect::<HashSet<_>>();
 
-        let batch = select_enrichment_batch(people, 3, Some(&selected));
+        let batch = select_enrichment_batch(people, 3, Some(&selected), &[]);
         assert_eq!(
             batch
                 .iter()
                 .map(|person| person.id.as_str())
                 .collect::<Vec<_>>(),
             vec!["a-1", "b-1", "c-1"]
+        );
+    }
+
+    #[test]
+    fn enrichment_follows_current_opportunity_order_before_fifo() {
+        let people = ["legacy", "second-current", "first-current"]
+            .into_iter()
+            .map(|id| Person {
+                id: id.into(),
+                name: id.into(),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let priority = vec!["first-current".into(), "second-current".into()];
+
+        let batch = select_enrichment_batch(people, 2, None, &priority);
+
+        assert_eq!(
+            batch
+                .iter()
+                .map(|person| person.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first-current", "second-current"]
         );
     }
 
@@ -377,5 +633,45 @@ mod tests {
         assert_eq!(person.name, "Sam Rivera");
         assert_eq!(person.location, "Brantford, Ontario, Canada");
         assert_eq!(person.vantage, "process_owner");
+    }
+
+    #[test]
+    fn enrichment_holds_a_person_who_moved_to_another_employer() {
+        let lead = Lead {
+            apollo_org_id: "redpath-org".into(),
+            name: "Redpath Sugar".into(),
+            domain: "redpathsugar.com".into(),
+            ..Default::default()
+        };
+        let matched = ApolloPerson {
+            organization_id: "disney-org".into(),
+            email: "david@disney.com".into(),
+            organization: Some(ApolloOrg {
+                id: "disney-org".into(),
+                name: "Disney".into(),
+                primary_domain: "disney.com".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert!(!enrichment_matches_account(&lead, &matched));
+    }
+
+    #[test]
+    fn enrichment_accepts_an_explicit_apollo_employer_identity_with_alias_email() {
+        let lead = Lead {
+            apollo_org_id: "company-org".into(),
+            name: "Company Canada".into(),
+            domain: "company.ca".into(),
+            ..Default::default()
+        };
+        let matched = ApolloPerson {
+            organization_id: "company-org".into(),
+            email: "owner@parent-company.com".into(),
+            ..Default::default()
+        };
+
+        assert!(enrichment_matches_account(&lead, &matched));
     }
 }
