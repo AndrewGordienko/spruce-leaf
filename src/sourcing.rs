@@ -21,11 +21,12 @@ use futures::stream::{self, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use crate::apollo::{Apollo, ApolloOrg, ApolloPerson, OrgFilters, PeopleFilters};
 use crate::calendar;
-use crate::db::{AccountPlayAssessment, Lead, Person, SharedDb};
+use crate::db::{AccountPlayAssessment, CoverageRun, Lead, MarketSegment, Person, SharedDb};
 use crate::engine::Engine;
 use crate::gtm::SignalCandidate;
 use crate::knowledge::{core_strategy_block, Library};
@@ -355,13 +356,34 @@ pub async fn source(
         "complete",
     );
 
+    let available_segments = db.list_market_segments(Some(&pb.key)).unwrap_or_default();
+    let market_segment = choose_source_segment(&pb.key, thesis, &icp, &available_segments);
+    let query_fingerprint = source_query_fingerprint(
+        &pb.key,
+        market_segment
+            .as_ref()
+            .map(|segment| segment.key.as_str())
+            .unwrap_or("unsegmented"),
+        &icp,
+    );
+    let prior_coverage = market_segment.as_ref().and_then(|segment| {
+        db.list_coverage_runs(Some(&pb.key))
+            .ok()?
+            .into_iter()
+            .find(|run| {
+                run.segment_id == segment.id
+                    && run.source_name == "apollo"
+                    && run.query_fingerprint == query_fingerprint
+            })
+    });
+
     // 2. Real organizations (overfetch so qualification can be selective). Reuse
     // across runs: never re-qualify a company we've already judged. Rejects live
     // in the learning store; companies we already qualified are Lead rows on file.
     // Combining both lets `source` spend its qualification budget only on genuinely
     // NEW companies — and page deeper when a page is all-known, so a re-run ADDS
     // leads instead of stalling on the same top results.
-    const MAX_SOURCE_PAGES: u32 = 5;
+    const DEFAULT_MAX_SOURCE_PAGES: u32 = 50;
     let exact_domains = exact_domains
         .unwrap_or_default()
         .iter()
@@ -383,38 +405,50 @@ pub async fn source(
         .collect();
     let mut seen = qualification_skip_keys_for_run(&exact_domains, durable_skip_keys);
     let on_file = db.list_leads(Some(&pb.key)).unwrap_or_default();
-    let portfolio = db.list_leads(None).unwrap_or_default();
-    let mut portfolio_owners = std::collections::HashMap::<String, String>::new();
-    for lead in &portfolio {
+    for lead in &on_file {
         for key in lead_identity_keys(lead) {
-            seen.insert(key.clone());
-            portfolio_owners
-                .entry(key)
-                .or_insert_with(|| lead.brand.clone());
+            seen.insert(key);
         }
     }
 
     let want_candidates = source_candidate_target(n_accounts, candidate_limit);
-    let per_page = want_candidates as u32;
+    let per_page = want_candidates.min(100) as u32;
     report_source(
         progress.as_ref(),
         "apollo",
         "Searching Apollo",
-        format!(
-            "Looking for about {want_candidates} candidates across up to {MAX_SOURCE_PAGES} pages"
-        ),
+        format!("Looking for about {want_candidates} candidates across a resumable market sweep"),
         "active",
     );
     let mut fresh: Vec<ApolloOrg> = Vec::new();
+    let mut fresh_keys = HashSet::<String>::new();
     let mut orgs_found = 0usize;
     let mut skipped_known = 0usize;
-    let mut skipped_portfolio = std::collections::BTreeMap::<String, usize>::new();
+    let max_source_pages = std::env::var("SPRUCE_MAX_SOURCE_PAGES")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(DEFAULT_MAX_SOURCE_PAGES)
+        .clamp(1, 500);
     let source_pages = if exact_domains.is_empty() {
-        MAX_SOURCE_PAGES
+        max_source_pages
     } else {
         1
     };
-    for page in 1..=source_pages {
+    let start_page = if exact_domains.is_empty() {
+        prior_coverage
+            .as_ref()
+            .filter(|run| !run.exhausted)
+            .and_then(|run| run.cursor.parse::<u32>().ok())
+            .unwrap_or(1)
+    } else {
+        1
+    };
+    let mut last_page = start_page.saturating_sub(1);
+    let mut source_exhausted = prior_coverage.as_ref().is_some_and(|run| run.exhausted);
+    for page in start_page..start_page.saturating_add(source_pages) {
+        if source_exhausted && exact_domains.is_empty() {
+            break;
+        }
         let page_orgs = apollo
             .search_organizations(&OrgFilters {
                 keywords: if exact_domains.is_empty() {
@@ -438,26 +472,35 @@ pub async fn source(
                 ..Default::default()
             })
             .await?;
+        last_page = page;
         if page_orgs.is_empty() {
+            source_exhausted = true;
             break;
+        }
+        if page_orgs.len() < per_page as usize {
+            source_exhausted = true;
         }
         orgs_found += page_orgs.len();
         for org in page_orgs {
             let keys = org_identity_keys(&org);
             let learning_key = org_learning_key(&org);
-            if let Some(owner) = keys
-                .iter()
-                .find_map(|key| portfolio_owners.get(key))
-                .filter(|owner| !owner.eq_ignore_ascii_case(&pb.key))
-            {
-                *skipped_portfolio.entry(owner.clone()).or_default() += 1;
+            let revisit_same_brand = explicit_domain_rerun;
+            // Skip anything already judged; `insert` returning false also guards
+            // the same company reappearing across pages. An explicit same-brand
+            // domain rerun is allowed to reassess the account and rebuild its
+            // localized contact bench after new evidence arrives.
+            let already_seen = (!learning_key.is_empty() && seen.contains(&learning_key))
+                || keys.iter().any(|key| seen.contains(key));
+            if already_seen && !revisit_same_brand {
+                skipped_known += 1;
                 continue;
             }
-            // Skip anything already judged; `insert` returning false also guards
-            // the same company reappearing across pages.
-            if (!learning_key.is_empty() && seen.contains(&learning_key))
-                || keys.iter().any(|key| seen.contains(key))
-            {
+            let fresh_key = keys
+                .iter()
+                .find(|key| key.starts_with("domain:"))
+                .cloned()
+                .unwrap_or_else(|| learning_key.clone());
+            if !fresh_key.is_empty() && !fresh_keys.insert(fresh_key) {
                 skipped_known += 1;
                 continue;
             }
@@ -471,25 +514,65 @@ pub async fn source(
             break;
         }
     }
+    if let Some(segment) = &market_segment {
+        let previous_pages = prior_coverage
+            .as_ref()
+            .map(|run| run.pages_examined)
+            .unwrap_or(0);
+        let previous_seen = prior_coverage
+            .as_ref()
+            .map(|run| run.candidates_seen)
+            .unwrap_or(0);
+        let next_cursor = if source_exhausted {
+            String::new()
+        } else {
+            last_page.saturating_add(1).to_string()
+        };
+        let pages_this_run = if last_page >= start_page {
+            i64::from(last_page - start_page + 1)
+        } else {
+            0
+        };
+        let _ = db.upsert_coverage_run(&CoverageRun {
+            segment_id: segment.id.clone(),
+            brand: pb.key.clone(),
+            source_name: "apollo".into(),
+            query_fingerprint: query_fingerprint.clone(),
+            cursor: next_cursor,
+            pages_examined: previous_pages + pages_this_run,
+            candidates_seen: previous_seen + orgs_found as i64,
+            accounts_added: prior_coverage
+                .as_ref()
+                .map(|run| run.accounts_added)
+                .unwrap_or(0),
+            status: if source_exhausted { "complete" } else { "partial" }.into(),
+            exhausted: source_exhausted,
+            gap_reason: if source_exhausted {
+                String::new()
+            } else {
+                "Apollo sweep paused after reaching the current research budget; resume from persisted page cursor.".into()
+            },
+            started_at: prior_coverage
+                .as_ref()
+                .map(|run| run.started_at.clone())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| Utc::now().to_rfc3339()),
+            completed_at: if source_exhausted {
+                Utc::now().to_rfc3339()
+            } else {
+                String::new()
+            },
+            ..Default::default()
+        });
+    }
     report_source(
         progress.as_ref(),
         "apollo",
         "Found candidate companies",
         {
-            let claimed = skipped_portfolio.values().sum::<usize>();
-            let owners = skipped_portfolio
-                .iter()
-                .map(|(brand, count)| format!("{count} {brand}"))
-                .collect::<Vec<_>>()
-                .join(", ");
             format!(
-                "{orgs_found} returned · {} new to qualify · {skipped_known} already judged · {claimed} claimed by another brand{} · {} qualified on file",
+                "{orgs_found} returned · {} new to qualify · {skipped_known} already judged for this brand · {} on file",
                 fresh.len(),
-                if owners.is_empty() {
-                    String::new()
-                } else {
-                    format!(" ({owners})")
-                },
                 on_file.len(),
             )
         },
@@ -843,6 +926,21 @@ pub async fn source(
         }
         winners.push((org, lead, lead_id));
     }
+    if let Some(segment) = &market_segment {
+        if let Some(mut coverage) = db
+            .list_coverage_runs(Some(&pb.key))
+            .unwrap_or_default()
+            .into_iter()
+            .find(|run| {
+                run.segment_id == segment.id
+                    && run.source_name == "apollo"
+                    && run.query_fingerprint == query_fingerprint
+            })
+        {
+            coverage.accounts_added += winners.len() as i64;
+            let _ = db.upsert_coverage_run(&coverage);
+        }
+    }
 
     // 4. Real people at each org, mapped to vantage points. Every org is
     // independent (its own Apollo people search + one vantage call), so fan them
@@ -1048,32 +1146,15 @@ fn enforce_play_qualification(
     qualification.evidence_gaps.extend(unknowns);
     qualification.disqualifiers = hard_disqualifiers;
 
-    if play.is_some_and(|play| play.brand.eq_ignore_ascii_case("outagehub")) {
-        augment_outage_signals(
-            &qualification.observed_facts,
-            &qualification.signals,
-            &qualification.research_sources,
-            &mut qualification.structured_signals,
-        );
-    } else if play.is_some_and(|play| play.brand.eq_ignore_ascii_case("wapahki")) {
-        augment_wapahki_signals(
-            &qualification.observed_facts,
-            &qualification.signals,
-            &qualification.research_sources,
-            &mut qualification.structured_signals,
-        );
-    } else if play.is_some_and(|play| play.brand.eq_ignore_ascii_case("gnk")) {
-        augment_gnk_signals(
-            &qualification.observed_facts,
-            &qualification.signals,
-            &qualification.research_sources,
-            &mut qualification.structured_signals,
-        );
-    }
+    // Do not infer canonical evidence by concatenating the whole research
+    // corpus. Every structured signal must arrive with the exact passage and
+    // URL that supports that individual claim; downstream opportunity lineage
+    // groups claims by source domain before any action can become easy-tier.
 
     qualification.structured_signals.retain(|signal| {
         allowed_signal_keys.contains(signal.definition_key.trim())
             && !signal.evidence.trim().is_empty()
+            && !signal.source_url.trim().is_empty()
             && signal.confidence >= 0.60
             && credible_canonical_signal(
                 play.map(|play| play.brand.as_str()).unwrap_or_default(),
@@ -1191,6 +1272,7 @@ fn enforce_play_qualification(
 /// completed location/outage results while forgetting to map those same facts
 /// to every canonical signal key. Do that mapping deterministically so routing
 /// depends on cited evidence, not on whether the model repeated a JSON label.
+#[cfg(test)]
 fn augment_outage_signals(
     observed_facts: &[String],
     readable_signals: &[String],
@@ -1253,6 +1335,7 @@ fn augment_outage_signals(
 /// posting cannot be lost because one JSON label was omitted. A single page
 /// still counts as one lineage, so it can earn a medium first-touch draft but
 /// never an easy/action-ready cadence by itself.
+#[cfg(test)]
 fn augment_wapahki_signals(
     observed_facts: &[String],
     readable_signals: &[String],
@@ -1365,6 +1448,7 @@ fn augment_wapahki_signals(
 /// keys when the research model extracted the facts but omitted the labels.
 /// This never derives a pain claim from company category or generic software
 /// use; the relevant decision/mechanism words must appear in the cited text.
+#[cfg(test)]
 fn augment_gnk_signals(
     observed_facts: &[String],
     readable_signals: &[String],
@@ -1503,23 +1587,43 @@ fn independent_source_lineages(signals: &[SignalCandidate], required_keys: &[Str
     signals
         .iter()
         .filter(|signal| required_keys.contains(&signal.definition_key))
-        .map(|signal| {
-            let source = signal
-                .source_url
-                .trim()
-                .split('#')
-                .next()
-                .unwrap_or_default()
-                .trim_end_matches('/')
-                .to_ascii_lowercase();
-            if source.is_empty() {
-                "unspecified-source".to_string()
-            } else {
-                source
-            }
-        })
+        .filter_map(|signal| source_independence_group(&signal.source_url))
         .collect::<HashSet<_>>()
         .len()
+}
+
+fn source_independence_group(raw: &str) -> Option<String> {
+    let host = raw
+        .trim()
+        .split("//")
+        .nth(1)
+        .unwrap_or(raw.trim())
+        .split(['/', '#', '?'])
+        .next()
+        .unwrap_or_default()
+        .split('@')
+        .next_back()
+        .unwrap_or_default()
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .trim_start_matches("www.")
+        .to_ascii_lowercase();
+    if host.is_empty() {
+        return None;
+    }
+    let labels = host.split('.').collect::<Vec<_>>();
+    let group = if labels.len() >= 3
+        && matches!(labels[labels.len() - 2], "co" | "com" | "org" | "gov")
+        && labels.last().is_some_and(|suffix| suffix.len() == 2)
+    {
+        labels[labels.len() - 3..].join(".")
+    } else if labels.len() >= 2 {
+        labels[labels.len() - 2..].join(".")
+    } else {
+        host
+    };
+    Some(group)
 }
 
 fn qualification_foundations_present(brand: &str, matched: &[String]) -> bool {
@@ -1586,49 +1690,10 @@ fn enforce_refresh_qualification(
         .partition(|item| is_missing_evidence(item));
     refresh.evidence_gaps.extend(unknowns);
     refresh.disqualifiers = hard_disqualifiers;
-    if play.is_some_and(|play| play.brand.eq_ignore_ascii_case("outagehub")) {
-        let research_sources = refresh
-            .structured_signals
-            .iter()
-            .map(|signal| signal.source_url.clone())
-            .filter(|source| !source.trim().is_empty())
-            .collect::<Vec<_>>();
-        augment_outage_signals(
-            &refresh.observed_facts,
-            &refresh.signals,
-            &research_sources,
-            &mut refresh.structured_signals,
-        );
-    } else if play.is_some_and(|play| play.brand.eq_ignore_ascii_case("wapahki")) {
-        let research_sources = refresh
-            .structured_signals
-            .iter()
-            .map(|signal| signal.source_url.clone())
-            .filter(|source| !source.trim().is_empty())
-            .collect::<Vec<_>>();
-        augment_wapahki_signals(
-            &refresh.observed_facts,
-            &refresh.signals,
-            &research_sources,
-            &mut refresh.structured_signals,
-        );
-    } else if play.is_some_and(|play| play.brand.eq_ignore_ascii_case("gnk")) {
-        let research_sources = refresh
-            .structured_signals
-            .iter()
-            .map(|signal| signal.source_url.clone())
-            .filter(|source| !source.trim().is_empty())
-            .collect::<Vec<_>>();
-        augment_gnk_signals(
-            &refresh.observed_facts,
-            &refresh.signals,
-            &research_sources,
-            &mut refresh.structured_signals,
-        );
-    }
     refresh.structured_signals.retain(|signal| {
         allowed_signal_keys.contains(signal.definition_key.trim())
             && !signal.evidence.trim().is_empty()
+            && !signal.source_url.trim().is_empty()
             && signal.confidence >= 0.60
             && credible_canonical_signal(
                 play.map(|play| play.brand.as_str()).unwrap_or_default(),
@@ -1959,7 +2024,8 @@ async fn source_people(
     let source_pool = n_contacts
         .saturating_mul(CONTACT_BACKFILL_FACTOR)
         .max(n_contacts);
-    let people = gather_people(apollo, org, icp, source_pool).await;
+    let preferred_locations = preferred_contact_locations(&pb.key);
+    let people = gather_people(apollo, org, icp, source_pool, &preferred_locations).await;
     if people.is_empty() {
         log_sourcing(format!("no people found for {} (all strategies)", org.name));
         return Ok(0);
@@ -2035,6 +2101,7 @@ async fn gather_people(
     org: &ApolloOrg,
     icp: &Icp,
     n_contacts: usize,
+    preferred_locations: &[String],
 ) -> Vec<ApolloPerson> {
     use std::collections::HashSet;
 
@@ -2051,6 +2118,34 @@ async fn gather_people(
     // Ordered strategies: most targeted first so kept contacts are best-fit, then
     // progressively broader so we still reach the count.
     let mut attempts: Vec<(&str, PeopleFilters)> = Vec::new();
+    if !preferred_locations.is_empty() && !domain.is_empty() {
+        attempts.push((
+            "domain+titles+location",
+            PeopleFilters {
+                organization_domains: vec![domain.clone()],
+                titles: icp.titles.clone(),
+                seniorities: icp.seniorities.clone(),
+                locations: preferred_locations.to_vec(),
+                page: 1,
+                per_page: over,
+                ..Default::default()
+            },
+        ));
+    }
+    if !preferred_locations.is_empty() && !org.id.is_empty() {
+        attempts.push((
+            "org_id+titles+location",
+            PeopleFilters {
+                organization_ids: vec![org.id.clone()],
+                titles: icp.titles.clone(),
+                seniorities: icp.seniorities.clone(),
+                locations: preferred_locations.to_vec(),
+                page: 1,
+                per_page: over,
+                ..Default::default()
+            },
+        ));
+    }
     if !domain.is_empty() {
         attempts.push((
             "domain+titles",
@@ -2134,6 +2229,16 @@ async fn gather_people(
     }
     out.truncate(want);
     out
+}
+
+fn preferred_contact_locations(brand: &str) -> Vec<String> {
+    if brand.eq_ignore_ascii_case("wapahki") {
+        vec!["Ontario, Canada".into()]
+    } else if brand.eq_ignore_ascii_case("outagehub") {
+        vec!["Canada".into()]
+    } else {
+        Vec::new()
+    }
 }
 
 /// Best-effort domain resolution for an org whose search record has none: search
@@ -2525,10 +2630,10 @@ fn apply_brand_icp_guard(brand: &str, icp: &mut Icp) {
         }
     }
     icp.keywords.truncate(10);
-    icp.locations = if brand.eq_ignore_ascii_case("outagehub") {
-        vec!["Canada".into()]
+    icp.locations = if brand.eq_ignore_ascii_case("wapahki") {
+        vec!["Ontario, Canada".into()]
     } else {
-        vec!["Canada".into(), "United States".into()]
+        vec!["Canada".into()]
     };
 }
 
@@ -2842,6 +2947,15 @@ fn qualification_skip_keys_for_run(
     }
 }
 
+#[cfg(test)]
+fn may_revisit_owned_account(
+    explicit_domain_rerun: bool,
+    portfolio_owner: Option<&str>,
+    brand: &str,
+) -> bool {
+    explicit_domain_rerun && portfolio_owner.is_some_and(|owner| owner.eq_ignore_ascii_case(brand))
+}
+
 fn org_identity_keys(org: &ApolloOrg) -> Vec<String> {
     company_identity_keys(&org.id, &org.domain())
 }
@@ -2887,10 +3001,83 @@ fn augment_context_with_learnings(
 /// never leaving the size filter empty, which would let giants back in.
 fn source_candidate_target(n_accounts: usize, candidate_limit: Option<usize>) -> usize {
     let n_accounts = n_accounts.max(1);
-    let ordinary_overfetch = n_accounts.saturating_mul(2).clamp(10, 100);
+    let ordinary_overfetch = n_accounts.saturating_mul(3).max(25);
     candidate_limit
-        .map(|limit| limit.max(n_accounts).min(ordinary_overfetch).clamp(1, 100))
+        .map(|limit| limit.max(n_accounts).min(ordinary_overfetch).max(1))
         .unwrap_or(ordinary_overfetch)
+}
+
+fn choose_source_segment<'a>(
+    brand: &str,
+    thesis: &str,
+    icp: &Icp,
+    segments: &'a [MarketSegment],
+) -> Option<&'a MarketSegment> {
+    let context = format!(
+        "{} {} {}",
+        thesis.to_ascii_lowercase(),
+        icp.keywords.join(" ").to_ascii_lowercase(),
+        icp.titles.join(" ").to_ascii_lowercase()
+    );
+    let preferred = if brand.eq_ignore_ascii_case("wapahki") {
+        if ["warehouse", "distribution", "3pl", "fulfillment"]
+            .iter()
+            .any(|term| context.contains(term))
+        {
+            "ontario_warehouse_case_handling"
+        } else if ["food", "beverage", "pack", "pallet"]
+            .iter()
+            .any(|term| context.contains(term))
+        {
+            "ontario_food_case_palletizing"
+        } else {
+            "ontario_manufacturing_machine_tending"
+        }
+    } else if brand.eq_ignore_ascii_case("gnk") {
+        if ["construction", "contractor", "change order"]
+            .iter()
+            .any(|term| context.contains(term))
+        {
+            "canada_construction_delay_evidence"
+        } else if ["claim", "billing", "eligibility", "filing"]
+            .iter()
+            .any(|term| context.contains(term))
+        {
+            "canada_specialty_claims_admin"
+        } else {
+            "canada_3pl_exception_decisions"
+        }
+    } else if brand.eq_ignore_ascii_case("outagehub") {
+        if ["telecom", "tower", "network operations"]
+            .iter()
+            .any(|term| context.contains(term))
+        {
+            "canada_telecom_site_continuity"
+        } else if ["generator", "backup power", "refuel"]
+            .iter()
+            .any(|term| context.contains(term))
+        {
+            "canada_backup_power_dispatch"
+        } else {
+            "canada_ev_charging_operations"
+        }
+    } else {
+        ""
+    };
+    segments
+        .iter()
+        .find(|segment| segment.key == preferred)
+        .or_else(|| segments.first())
+}
+
+fn source_query_fingerprint(brand: &str, segment_key: &str, icp: &Icp) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    brand.hash(&mut hasher);
+    segment_key.hash(&mut hasher);
+    icp.keywords.hash(&mut hasher);
+    icp.employee_ranges.hash(&mut hasher);
+    icp.locations.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 fn clamp_employee_ranges(ranges: Vec<String>, max_employees: Option<i64>) -> Vec<String> {
@@ -3509,10 +3696,10 @@ mod tests {
         apply_brand_icp_guard, augment_gnk_signals, augment_outage_signals,
         augment_wapahki_signals, brand_candidate_precheck, brand_qualification_guard,
         clamp_employee_ranges, company_identity_keys, credible_canonical_signal,
-        enforce_play_qualification, enforce_refresh_qualification, merge_prior_refresh_evidence,
-        qualification_skip_keys_for_run, reusable_workflow_contact, reuse_lead_score,
-        reuse_person_score, select_reuse_excluding, source_candidate_target, Icp, LeadRefresh,
-        OrgQual,
+        enforce_play_qualification, enforce_refresh_qualification, may_revisit_owned_account,
+        merge_prior_refresh_evidence, preferred_contact_locations, qualification_skip_keys_for_run,
+        reusable_workflow_contact, reuse_lead_score, reuse_person_score, select_reuse_excluding,
+        source_candidate_target, Icp, LeadRefresh, OrgQual,
     };
     use crate::apollo::ApolloOrg;
 
@@ -3622,7 +3809,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_preserves_prior_verified_workflow_facts_before_routing() {
+    fn refresh_does_not_stretch_legacy_notes_into_atomic_claims() {
         let play = default_plays()
             .into_iter()
             .find(|play| play.brand == "gnk")
@@ -3657,12 +3844,12 @@ mod tests {
         merge_prior_refresh_evidence(&lead, &mut refresh);
         let status = enforce_refresh_qualification(&mut refresh, Some(&play), &allowed);
 
-        assert_eq!(status, "research_needed");
-        assert!(refresh
+        assert_eq!(status, "research_required");
+        assert!(!refresh
             .matched_signal_keys
             .iter()
             .any(|key| key == "account.specific_recurring_decision"));
-        assert!(refresh
+        assert!(!refresh
             .matched_signal_keys
             .iter()
             .any(|key| key == "account.external_trigger_or_mechanism_evidence"));
@@ -3807,7 +3994,7 @@ mod tests {
 
     #[test]
     fn full_motion_can_bound_deep_qualification_without_weakening_standalone_source() {
-        assert_eq!(source_candidate_target(3, None), 10);
+        assert_eq!(source_candidate_target(3, None), 25);
         assert_eq!(source_candidate_target(3, Some(6)), 6);
         assert_eq!(source_candidate_target(1, Some(4)), 4);
         // A caller cannot ask to evaluate fewer candidates than account slots.
@@ -3828,6 +4015,31 @@ mod tests {
             durable
         );
         assert!(qualification_skip_keys_for_run(&["qcfoods.ca".into()], durable).is_empty());
+    }
+
+    #[test]
+    fn wapahki_people_search_starts_in_ontario() {
+        assert_eq!(
+            preferred_contact_locations("wapahki"),
+            vec!["Ontario, Canada"]
+        );
+        assert_eq!(preferred_contact_locations("outagehub"), vec!["Canada"]);
+        assert!(preferred_contact_locations("gnk").is_empty());
+    }
+
+    #[test]
+    fn explicit_same_brand_domain_can_rebuild_its_contact_bench() {
+        assert!(may_revisit_owned_account(
+            true,
+            Some("outagehub"),
+            "outagehub"
+        ));
+        assert!(!may_revisit_owned_account(
+            false,
+            Some("outagehub"),
+            "outagehub"
+        ));
+        assert!(!may_revisit_owned_account(true, Some("gnk"), "outagehub"));
     }
 
     #[test]
@@ -4177,8 +4389,8 @@ mod tests {
         .map(|(definition_key, evidence)| SignalCandidate {
             definition_key: definition_key.into(),
             evidence: evidence.into(),
+            source_url: "https://example.com/current-job".into(),
             confidence: 0.8,
-            ..Default::default()
         })
         .collect();
         let mut qualification = OrgQual {

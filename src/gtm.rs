@@ -9,7 +9,8 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::db::{
-    CustomerDevelopmentRecord, GtmExperiment, GtmPlay, Lead, Person, SharedDb, SignalDefinition,
+    CustomerDevelopmentRecord, EvidenceClaim, GtmExperiment, GtmPlay, Lead, MarketSegment,
+    OpportunityStakeholder, Person, SalesOpportunity, SharedDb, SignalDefinition,
     SignalObservation,
 };
 use crate::playbook::Playbook;
@@ -272,6 +273,9 @@ pub struct SignalCandidate {
 pub struct GtmActionContext {
     pub state: String,
     pub play: Option<GtmPlay>,
+    pub opportunity: Option<SalesOpportunity>,
+    pub evidence_claims: Vec<EvidenceClaim>,
+    pub stakeholders: Vec<OpportunityStakeholder>,
     pub observations: Vec<SignalObservation>,
     pub matched_signal_keys: Vec<String>,
     pub experiment: Option<GtmExperiment>,
@@ -292,11 +296,15 @@ impl GtmActionContext {
         self.action_ready() || (self.state == "discovery_ready" && touches == 1)
     }
 
-    /// Delivery is deliberately stricter than drafting. Medium-priority
-    /// accounts may produce one reviewable hypothesis-led draft, but they can
-    /// never become scheduled work until research promotes the account to
-    /// action-ready.
+    /// A human may approve one independently reviewed discovery touch. This is
+    /// the only delivery path for medium accounts; it cannot create follow-ups.
     pub fn delivery_ready_for(&self, touches: usize) -> bool {
+        (self.action_ready() && touches > 0) || (self.state == "discovery_ready" && touches == 1)
+    }
+
+    /// Automatic scheduling remains easy-tier only. Touch count may shorten a
+    /// cadence but never weaken evidence or commercial authorization.
+    pub fn automatic_delivery_ready_for(&self, touches: usize) -> bool {
         self.action_ready() && touches > 0
     }
 
@@ -307,15 +315,16 @@ impl GtmActionContext {
             return "GTM ACTION STATE: no active play. Draft only a diagnostic question; do not pitch a proof or integration.".into();
         };
         let evidence = self
-            .observations
+            .evidence_claims
             .iter()
-            .map(|observation| {
+            .map(|claim| {
                 format!(
-                    "- [{}; confidence {:.2}; {}] {}",
-                    observation.definition_key,
-                    observation.confidence,
-                    observation.status,
-                    observation.evidence
+                    "- [{}; confidence {:.2}; {}; {}] {}",
+                    claim.claim_type,
+                    claim.confidence,
+                    claim.status,
+                    claim.source_url,
+                    claim.source_excerpt
                 )
             })
             .collect::<Vec<_>>()
@@ -378,24 +387,46 @@ impl GtmActionContext {
     pub fn copy_prompt_block(&self) -> String {
         let mut seen = std::collections::HashSet::new();
         let evidence = self
-            .observations
+            .evidence_claims
             .iter()
-            .filter(|observation| {
-                matches!(observation.status.as_str(), "observed" | "verified")
-                    && seen.insert(observation.definition_key.clone())
+            .filter(|claim| {
+                matches!(claim.status.as_str(), "observed" | "verified")
+                    && seen.insert(claim.claim_type.clone())
             })
-            .take(4)
-            .map(|observation| format!("- {}", observation.evidence))
+            .take(6)
+            .map(|claim| {
+                format!(
+                    "- [{}; {}] {}",
+                    claim.claim_type, claim.source_url, claim.source_excerpt
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n");
+        let opportunity = self.opportunity.as_ref().map_or_else(
+            || "none — hold for research".to_string(),
+            |opportunity| {
+                format!(
+                    "{} | task/decision: {} | facility id: {} | tier: {}",
+                    opportunity.title,
+                    opportunity.task_or_decision,
+                    if opportunity.facility_id.is_empty() {
+                        "not linked"
+                    } else {
+                        &opportunity.facility_id
+                    },
+                    opportunity.priority_tier,
+                )
+            },
+        );
         let action = match self.state.as_str() {
             "action_ready" => "The account has enough sourced evidence for one narrow commercial note. Use only a supplied observation as the company-specific signal. Lead with a role-relevant implication and a credible point of view. A cold outcome may be a short working conversation, interest, correction, or referral; it is not yet a pilot or proof. Never invent collateral or claim an asset exists unless verified seller context explicitly supplies it.",
             "discovery_ready" => "This is a medium-priority account: research supports one concrete operating task, decision, or mechanism and this recipient is close to it, but one economic or workflow term remains unproved. Write one complete, useful first email only. State sourced account details as facts, present the exact missing term as one honest question, explain the seller's relevant contribution, and make a direct email answer the sole next step. Do not ask for a call before the missing term is confirmed. Never use a universal diagnostic template or schedule follow-ups before a reply.",
             _ => "The account does not yet have enough sourced evidence for a multi-touch sequence. Hold it for research or use one manual routing note; do not manufacture discovery questions or explain a proof, integration, pilot, or product.",
         };
         format!(
-            "COPY DECISION STATE: {state}\nPERMITTED ACTION: {action}\nSOURCE-BACKED OBSERVATIONS:\n{evidence}\nTreat everything else as a question, not account reality.",
+            "COPY DECISION STATE: {state}\nOPPORTUNITY: {opportunity}\nPERMITTED ACTION: {action}\nATOMIC SOURCE CLAIMS:\n{evidence}\nTreat everything else as a question, not account reality.",
             state = self.state,
+            opportunity = opportunity,
             evidence = if evidence.is_empty() {
                 "- none".to_string()
             } else {
@@ -548,27 +579,52 @@ fn delivery_block_reason_inner(
         let Some(sequence_id) = db.active_sequence_for_person(&person.id)? else {
             return Ok(Some("no active sequence is available for delivery".into()));
         };
-        let current_policy = db
-            .sequence_gtm_attribution(&sequence_id)?
-            .is_some_and(|sequence| {
-                sequence.status == "active"
-                    && sequence.copy_policy_version == crate::db::CURRENT_COPY_POLICY_VERSION
-            });
+        let sequence = db.sequence_gtm_attribution(&sequence_id)?;
+        let current_policy = sequence.as_ref().is_some_and(|sequence| {
+            sequence.status == "active"
+                && sequence.copy_policy_version == crate::db::CURRENT_COPY_POLICY_VERSION
+        });
         if !current_policy {
             return Ok(Some(
                 "sequence predates the current copy policy and must be regenerated".into(),
             ));
         }
+        let current_opportunity_id = context_opportunity_id(db, &playbook.key, &lead.id, person)?;
+        if sequence.as_ref().is_none_or(|sequence| {
+            sequence.sales_opportunity_id.trim().is_empty()
+                || sequence.sales_opportunity_id != current_opportunity_id
+        }) {
+            return Ok(Some(
+                "sequence is not attributed to the current facility/use-case opportunity".into(),
+            ));
+        }
         touch_count = db.list_touches_for_sequence(&sequence_id)?.len();
     }
     let context = prepare_action(db, &playbook.key, &lead.id, person)?;
-    if !context.delivery_ready_for(touch_count) {
+    let eligible = if require_current_active_sequence {
+        context.delivery_ready_for(touch_count)
+    } else {
+        context.automatic_delivery_ready_for(touch_count)
+    };
+    if !eligible {
         return Ok(Some(format!(
             "current GTM state '{}' is not eligible for a {}-touch sequence",
             context.state, touch_count
         )));
     }
     Ok(None)
+}
+
+fn context_opportunity_id(
+    db: &SharedDb,
+    brand: &str,
+    lead_id: &str,
+    person: &Person,
+) -> Result<String> {
+    Ok(prepare_action(db, brand, lead_id, person)?
+        .opportunity
+        .map(|opportunity| opportunity.id)
+        .unwrap_or_default())
 }
 
 /// Resolve the current versioned play, live evidence, and stable experiment arm
@@ -645,7 +701,7 @@ pub fn prepare_action(
     let has_source_backed_account_fact = db
         .get_lead(lead_id)?
         .is_some_and(|lead| !lead.observed_facts.is_empty());
-    let state = play.as_ref().map_or("no_play", |play| {
+    let legacy_state = play.as_ref().map_or("no_play", |play| {
         let matched = play
             .required_signal_keys
             .iter()
@@ -684,6 +740,76 @@ pub fn prepare_action(
         }
     });
 
+    let opportunity = match &play {
+        Some(play) => db.best_sales_opportunity(brand, lead_id, &play.id)?,
+        None => None,
+    };
+    let evidence_claims = match &opportunity {
+        Some(opportunity) => db.list_evidence_claims(Some(&opportunity.id), Some(brand))?,
+        None => Vec::new(),
+    };
+    let stakeholders = match &opportunity {
+        Some(opportunity) => {
+            db.list_opportunity_stakeholders(Some(&opportunity.id), Some(brand))?
+        }
+        None => Vec::new(),
+    };
+    let mut claim_keys = evidence_claims
+        .iter()
+        .filter(|claim| {
+            matches!(claim.status.as_str(), "observed" | "verified")
+                && !claim.source_url.trim().is_empty()
+                && !claim.source_excerpt.trim().is_empty()
+        })
+        .map(|claim| claim.claim_type.clone())
+        .collect::<Vec<_>>();
+    let independent_lineages = evidence_claims
+        .iter()
+        .filter(|claim| matches!(claim.status.as_str(), "observed" | "verified"))
+        .map(|claim| claim.independence_group.as_str())
+        .filter(|group| !group.trim().is_empty())
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    let person_is_mapped = stakeholders
+        .iter()
+        .any(|stakeholder| stakeholder.person_id == person.id && stakeholder.status != "held");
+    if person_is_mapped && has_reachable_channel && has_workflow_vantage {
+        claim_keys.push("account.reachable_workflow_owner".into());
+    }
+    claim_keys.sort();
+    claim_keys.dedup();
+    let opportunity_has_required_site = opportunity.as_ref().is_some_and(|opportunity| {
+        !brand.eq_ignore_ascii_case("wapahki") || !opportunity.facility_id.trim().is_empty()
+    });
+    let opportunity_state = opportunity
+        .as_ref()
+        .map_or("research_required", |opportunity| {
+            if !person_is_mapped || !opportunity_has_required_site {
+                "research_required"
+            } else if opportunity.evidence_status == "action_ready"
+                && mandatory_action_signals_present(brand, &claim_keys)
+                && independent_lineages >= 2
+            {
+                "action_ready"
+            } else if matches!(
+                opportunity.evidence_status.as_str(),
+                "action_ready" | "discovery_ready"
+            ) && mandatory_discovery_signals_present(brand, &claim_keys)
+            {
+                "discovery_ready"
+            } else {
+                "research_required"
+            }
+        });
+    let state = match (legacy_state, opportunity_state) {
+        ("action_ready", "action_ready") => "action_ready",
+        ("action_ready" | "discovery_ready", "action_ready" | "discovery_ready") => {
+            "discovery_ready"
+        }
+        ("no_play", _) => "no_play",
+        _ => "research_required",
+    };
+
     let mut experiment = None;
     let mut experiment_assignment_id = String::new();
     let mut experiment_arm = String::new();
@@ -702,8 +828,11 @@ pub fn prepare_action(
     Ok(GtmActionContext {
         state: state.into(),
         play,
+        opportunity,
+        evidence_claims,
+        stakeholders,
         observations,
-        matched_signal_keys,
+        matched_signal_keys: claim_keys,
         experiment,
         experiment_assignment_id,
         experiment_arm,
@@ -913,7 +1042,7 @@ pub fn default_plays() -> Vec<GtmPlay> {
         GtmPlay {
             brand: "outagehub".into(),
             key: "distributed_site_outage_decision".into(),
-            version: 12,
+            version: 13,
             name: "Distributed-site outage decision".into(),
             lifecycle: "testing".into(),
             motion: "internal_pipeline_to_forward_deployed_proof".into(),
@@ -922,7 +1051,7 @@ pub fn default_plays() -> Vec<GtmPlay> {
             required_signal_keys: vec!["account.fit_evidence".into(), "account.distributed_locations".into(), "account.outage_sensitive_decision".into(), "account.historical_location_outage_match".into()],
             minimum_signal_matches: 4,
             hypothesis: "During an ambiguous location or asset incident, location-matched public utility context may improve one evidenced diagnosis, dispatch, escalation, continuity, prioritization, or communication decision.".into(),
-            action_policy: "Work easy to hard. Easy accounts have a visible outage-time decision, reachable owner, and completed historical match. Medium accounts have the decision and owner but no completed match and may receive one honest first touch only. Explain OutageHub's API contribution and offer a short conversation or email answer; never claim private site status.".into(),
+            action_policy: "Select one bounded market segment, then work easy to hard at operator × site-network × outage-time-decision level. Easy opportunities have atomic source claims for the decision, a mapped committee, and completed historical proof. Medium opportunities may receive one independently reviewed, manually approved discovery touch; automation never schedules them. Explain OutageHub's API contribution and never claim private site status.".into(),
             proof_type: "historical_replay".into(),
             proof_description: "Match supplied or public operating locations to historical utility outage areas, recording the location, utility timestamp, and what an API response or webhook would have returned.".into(),
             success_metric: "Whether outside utility status is checked today and whether it changes the account-specific diagnosis, dispatch, escalation, continuity, prioritization, or communication decision.".into(),
@@ -933,7 +1062,7 @@ pub fn default_plays() -> Vec<GtmPlay> {
         GtmPlay {
             brand: "gnk".into(),
             key: "closed_case_reconstruction".into(),
-            version: 5,
+            version: 6,
             name: "Workflow-specific decision support".into(),
             lifecycle: "testing".into(),
             motion: "internal_pipeline_to_forward_deployed_proof".into(),
@@ -942,7 +1071,7 @@ pub fn default_plays() -> Vec<GtmPlay> {
             required_signal_keys: vec!["account.fit_evidence".into(), "account.specific_recurring_decision".into(), "account.believable_operating_consequence".into(), "account.external_trigger_or_mechanism_evidence".into()],
             minimum_signal_matches: 4,
             hypothesis: "A source-backed trigger creates a recurring exception decision whose inputs, coordination, or existing system boundary produces a meaningful operating consequence.".into(),
-            action_policy: "Work easy to hard. Easy accounts support the recurring event, decision, consequence, mechanism, and owner. Medium accounts support the decision or mechanism and owner but leave one term open; allow one hypothesis-led first email only. Explain one concrete GnK contribution and offer a short conversation or email response path.".into(),
+            action_policy: "Work one bounded problem segment at a time and qualify company × workflow opportunity, not company category. Easy opportunities carry atomic claims for the recurring event, decision, consequence, mechanism, and a mapped committee. Medium opportunities may receive one independently reviewed, manually approved discovery touch; automation never schedules them. Explain one concrete GnK contribution and an email-first response path.".into(),
             proof_type: "bounded_workflow_replay".into(),
             proof_description: "Apply the proposed workflow to a small historical sample and compare decision time, exception handling, and outcome quality with the current process.".into(),
             success_metric: "The account-specific consequence named in research: resolution time, leakage or recoveries, audit exposure, customer SLA, throughput, escalation, or constrained expert capacity.".into(),
@@ -953,7 +1082,7 @@ pub fn default_plays() -> Vec<GtmPlay> {
         GtmPlay {
             brand: "wapahki".into(),
             key: "task_exception_review".into(),
-            version: 6,
+            version: 7,
             name: "Task-and-exception feasibility review".into(),
             lifecycle: "testing".into(),
             motion: "internal_pipeline_to_forward_deployed_proof".into(),
@@ -962,7 +1091,7 @@ pub fn default_plays() -> Vec<GtmPlay> {
             required_signal_keys: vec!["account.fit_evidence".into(), "account.bounded_repetitive_task".into(), "account.manual_task_economic_pressure".into()],
             minimum_signal_matches: 3,
             hypothesis: "One recurring physical movement may be automatable enough to investigate, with the exact variation, rate, integration, and economics confirmed by the operator closest to the work.".into(),
-            action_policy: "Work easy to hard. Easy accounts have a source-supported task, economic pressure, and reachable owner. Medium accounts have a task and owner but unproved economics; allow one honest task-specific first email. Briefly give Andrew's University of Toronto and Automata context, explain Wapahki's contribution, and offer a short conversation or email answer. Never ask the recipient to find a use case from scratch.".into(),
+            action_policy: "Work company × facility × line/workcell × task, easy to hard. Easy opportunities have a facility-linked task, atomic source claims for task and economic pressure, and a mapped committee. Medium opportunities may receive one independently reviewed, manually approved task-specific first touch; automation never schedules them. Briefly give Andrew's University of Toronto and Automata context and never ask the recipient to find a use case from scratch.".into(),
             proof_type: "task_feasibility_review".into(),
             proof_description: "Review a task sketch, short video, or representative SKU/changeover set; model the normal motion, exceptions, rate, and technical boundaries.".into(),
             success_metric: "Required rate, intervention frequency, changeover burden, task coverage, and a clear technical/economic stop condition.".into(),
@@ -973,6 +1102,38 @@ pub fn default_plays() -> Vec<GtmPlay> {
     ]
 }
 
+pub fn default_market_segments() -> Vec<MarketSegment> {
+    [
+        ("wapahki", "ontario_food_case_palletizing", "Ontario food case packing and palletizing", "Ontario, Canada", "Repeatable case/tray packing, palletizing, depalletizing, or cold-chain handling at food plants and distribution centres", "company × facility × line/workcell × task"),
+        ("wapahki", "ontario_warehouse_case_handling", "Ontario warehouse case handling", "Ontario, Canada", "Manual case, tote, pallet, and outbound handling at warehouses, 3PLs, and distribution centres", "company × facility × zone × task"),
+        ("wapahki", "ontario_manufacturing_machine_tending", "Ontario manufacturing machine tending", "Ontario, Canada", "Repetitive loading, unloading, transfer, inspection, or kitting around production equipment", "company × facility × line/workcell × task"),
+        ("gnk", "canada_3pl_exception_decisions", "3PL exception and reconciliation decisions", "Canada", "Recurring shipment, deduction, claim, document, and SLA exceptions that require cross-system reconstruction", "company × workflow opportunity"),
+        ("gnk", "canada_construction_delay_evidence", "Construction delay-evidence reconstruction", "Canada", "Recurring delay, change-order, payment, and project-record decisions with evidence split across tools", "company × project workflow opportunity"),
+        ("gnk", "canada_specialty_claims_admin", "Specialty claims and case administration", "Canada", "Recurring eligibility, evidence, escalation, recovery, and filing decisions with narrow software gaps", "company × case workflow opportunity"),
+        ("outagehub", "canada_ev_charging_operations", "Canadian EV charging operations", "Canada", "Utility-outage attribution, SLA triage, driver communication, and dispatch across operated charging sites", "operator × operated site network × outage-time decision"),
+        ("outagehub", "canada_telecom_site_continuity", "Canadian telecom site continuity", "Canada", "Battery, generator, refuelling, crew, and restoration prioritization across distributed telecom assets", "operator × asset portfolio × outage-time decision"),
+        ("outagehub", "canada_backup_power_dispatch", "Canadian backup-power dispatch", "Canada", "Customer outage awareness, generator/refuelling triage, and service dispatch for backup-power providers", "provider × customer site portfolio × dispatch decision"),
+    ]
+    .into_iter()
+    .map(|(brand, key, name, geography, wedge, unit)| MarketSegment {
+        brand: brand.into(),
+        key: key.into(),
+        version: 1,
+        name: name.into(),
+        geography: geography.into(),
+        wedge: wedge.into(),
+        unit_of_analysis: unit.into(),
+        enumeration_sources: vec![
+            "official registries/directories".into(),
+            "company facility pages and job postings".into(),
+            "Apollo enrichment after enumeration".into(),
+        ],
+        status: "active".into(),
+        ..Default::default()
+    })
+    .collect()
+}
+
 pub fn seed_defaults(db: &SharedDb) -> Result<()> {
     for definition in default_signal_definitions() {
         db.insert_signal_definition_if_absent(&definition)?;
@@ -981,6 +1142,9 @@ pub fn seed_defaults(db: &SharedDb) -> Result<()> {
         let play_id = db.insert_gtm_play_if_absent(&play)?;
         db.retire_older_unproven_gtm_play_versions(&play.brand, &play.key, play.version)?;
         db.relabel_unassessed_qualified_leads(&play.brand, &play_id)?;
+    }
+    for segment in default_market_segments() {
+        db.upsert_market_segment(&segment)?;
     }
     db.backfill_legacy_signal_observations()?;
     db.backfill_sequence_gtm_attribution()?;
@@ -995,21 +1159,21 @@ mod tests {
         SignalCandidate,
     };
     use crate::db::{
-        AccountPlayAssessment, CustomerDevelopmentRecord, Db, Lead, Person, SharedDb,
-        SignalObservation,
+        AccountPlayAssessment, CustomerDevelopmentRecord, Db, EvidenceClaim, Lead, Person, SharedDb,
     };
     use std::sync::Arc;
     use uuid::Uuid;
 
     #[test]
-    fn discovery_can_be_drafted_once_but_never_delivered() {
+    fn discovery_requires_manual_approval_and_never_auto_schedules() {
         let discovery = GtmActionContext {
             state: "discovery_ready".into(),
             ..Default::default()
         };
         assert!(discovery.sequence_ready_for(1));
         assert!(!discovery.sequence_ready_for(2));
-        assert!(!discovery.delivery_ready_for(1));
+        assert!(discovery.delivery_ready_for(1));
+        assert!(!discovery.automatic_delivery_ready_for(1));
 
         let ready = GtmActionContext {
             state: "action_ready".into(),
@@ -1112,24 +1276,28 @@ mod tests {
                 SignalCandidate {
                     definition_key: "account.fit_evidence".into(),
                     evidence: "The company operates specialty claims.".into(),
+                    source_url: "https://example.com/claims".into(),
                     confidence: 0.9,
                     ..Default::default()
                 },
                 SignalCandidate {
                     definition_key: "account.specific_recurring_decision".into(),
                     evidence: "After every disputed rejection, claims decides whether to pursue recovery or write it off.".into(),
+                    source_url: "https://example.org/claims-guide".into(),
                     confidence: 0.9,
                     ..Default::default()
                 },
                 SignalCandidate {
                     definition_key: "account.believable_operating_consequence".into(),
                     evidence: "The review affects recoveries, settlement time, and senior reviewer capacity.".into(),
+                    source_url: "https://example.net/recovery".into(),
                     confidence: 0.9,
                     ..Default::default()
                 },
                 SignalCandidate {
                     definition_key: "account.external_trigger_or_mechanism_evidence".into(),
                     evidence: "A public claims guide requires policy, investigation, and prior-action records before escalation.".into(),
+                    source_url: "https://example.ca/escalation".into(),
                     confidence: 0.9,
                     ..Default::default()
                 },
@@ -1416,24 +1584,28 @@ mod tests {
                 SignalCandidate {
                     definition_key: "account.fit_evidence".into(),
                     evidence: "The company operates a Canadian EV charging network with public charging sites.".into(),
+                    source_url: "https://operator.example/network".into(),
                     confidence: 0.9,
                     ..Default::default()
                 },
                 SignalCandidate {
                     definition_key: "account.distributed_locations".into(),
                     evidence: "The operator runs multiple charging sites across Canada.".into(),
+                    source_url: "https://natural-resources.canada.ca/stations".into(),
                     confidence: 0.9,
                     ..Default::default()
                 },
                 SignalCandidate {
                     definition_key: "account.outage_sensitive_decision".into(),
                     evidence: "Service Operations checks utility status before dispatch or customer communication when a charging-site availability incident occurs.".into(),
+                    source_url: "https://operator.example/service-operations".into(),
                     confidence: 0.9,
                     ..Default::default()
                 },
                 SignalCandidate {
                     definition_key: "account.historical_location_outage_match".into(),
                     evidence: "On 2026-07-14 at 14:30, the charging site at 123 King Street overlapped a utility outage area in a utility report.".into(),
+                    source_url: "https://api.outagehub.ca/historical-match/123".into(),
                     confidence: 0.9,
                     ..Default::default()
                 },
@@ -1553,8 +1725,10 @@ mod tests {
     fn copy_context_exposes_evidence_but_not_internal_proof_machinery() {
         let context = GtmActionContext {
             state: "action_ready".into(),
-            observations: vec![SignalObservation {
-                evidence: "Official site names five production formats.".into(),
+            evidence_claims: vec![EvidenceClaim {
+                claim_type: "account.fit_evidence".into(),
+                source_url: "https://example.com/formats".into(),
+                source_excerpt: "Official site names five production formats.".into(),
                 status: "observed".into(),
                 ..Default::default()
             }],

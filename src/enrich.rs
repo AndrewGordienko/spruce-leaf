@@ -10,7 +10,7 @@ use anyhow::Result;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use crate::apollo::Apollo;
+use crate::apollo::{Apollo, ApolloPerson};
 use crate::db::{Lead, Person, SharedDb};
 use crate::verify;
 
@@ -88,7 +88,7 @@ pub async fn enrich_pending(
     }
     let mut no_email = 0usize;
     let mut failed = 0usize;
-    for (i, p) in batch.into_iter().enumerate() {
+    for (i, mut p) in batch.into_iter().enumerate() {
         summary.attempted += 1;
         let who = if p.name.trim().is_empty() {
             format!("person {}", i + 1)
@@ -166,6 +166,9 @@ pub async fn enrich_pending(
         };
         // A returned match consumes one Apollo credit.
         summary.credits_spent += 1;
+
+        merge_enriched_identity(&mut p, &matched);
+        db.upsert_person(&p)?;
 
         let email = matched.email.trim().to_string();
         let phone = if matched.best_phone().is_empty() {
@@ -253,6 +256,33 @@ pub async fn enrich_pending(
     Ok(summary)
 }
 
+/// Search results are intentionally masked, while the paid enrichment response
+/// can contain the full surname, profile URL, and location. Preserve the mapped
+/// workflow vantage but hydrate those identity fields so later selection can
+/// choose the local owner and the CRM does not display a half-name.
+fn merge_enriched_identity(person: &mut Person, matched: &ApolloPerson) {
+    if !matched.first_name.trim().is_empty() {
+        person.first_name = matched.first_name.trim().to_string();
+    }
+    if !matched.last_name.trim().is_empty() {
+        person.last_name = matched.last_name.trim().to_string();
+    }
+    let name = matched.full_name();
+    if !name.trim().is_empty() {
+        person.name = name.trim().to_string();
+    }
+    if !matched.title.trim().is_empty() {
+        person.title = matched.title.trim().to_string();
+    }
+    if !matched.linkedin_url.trim().is_empty() {
+        person.linkedin_url = matched.linkedin_url.trim().to_string();
+    }
+    let location = matched.location();
+    if !location.trim().is_empty() {
+        person.location = location;
+    }
+}
+
 fn select_enrichment_batch(
     people: Vec<Person>,
     limit: usize,
@@ -286,7 +316,8 @@ fn is_quota_error(msg: &str) -> bool {
 mod tests {
     use std::collections::HashSet;
 
-    use super::select_enrichment_batch;
+    use super::{merge_enriched_identity, select_enrichment_batch};
+    use crate::apollo::ApolloPerson;
     use crate::db::Person;
 
     #[test]
@@ -318,5 +349,33 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["a-1", "b-1", "c-1"]
         );
+    }
+
+    #[test]
+    fn enrichment_hydrates_identity_without_erasing_vantage() {
+        let mut person = Person {
+            first_name: "Sam".into(),
+            name: "Sam".into(),
+            title: "Production Manager".into(),
+            vantage: "process_owner".into(),
+            ..Default::default()
+        };
+        let matched = ApolloPerson {
+            first_name: "Sam".into(),
+            last_name: "Rivera".into(),
+            name: "Sam Rivera".into(),
+            title: "Production Manager".into(),
+            linkedin_url: "https://linkedin.com/in/sam-rivera".into(),
+            city: "Brantford".into(),
+            state: "Ontario".into(),
+            country: "Canada".into(),
+            ..Default::default()
+        };
+
+        merge_enriched_identity(&mut person, &matched);
+
+        assert_eq!(person.name, "Sam Rivera");
+        assert_eq!(person.location, "Brantford, Ontario, Canada");
+        assert_eq!(person.vantage, "process_owner");
     }
 }

@@ -60,7 +60,11 @@ use uuid::Uuid;
 // task signal plus an unrelated lifting condition still leaves the recipient
 // doing seller discovery. Those accounts remain medium until the consequence
 // is tied to the candidate task.
-pub const CURRENT_COPY_POLICY_VERSION: i64 = 29;
+// v30 changes the commercial unit from a brand-exclusive company hypothesis to
+// an evidence-linked opportunity. A company may belong to several portfolio
+// brands; copy is attributable to one facility/use case and one mapped buying
+// committee while only one cold thread is active at a time.
+pub const CURRENT_COPY_POLICY_VERSION: i64 = 30;
 
 /// A real company sourced from Apollo and (optionally) qualified against a brand
 /// thesis. Everything the model *guesses* stays in the inference/hypothesis
@@ -166,6 +170,9 @@ pub struct Sequence {
     pub experiment_arm: String,
     pub experiment_assignment_id: String,
     pub signal_observation_ids: Vec<String>,
+    /// The facility/use-case opportunity this copy was written for. Empty only
+    /// on legacy rows created before copy-policy v30.
+    pub sales_opportunity_id: String,
     /// research_required | discovery_ready | action_ready | no_play
     pub gtm_state: String,
     pub copy_policy_version: i64,
@@ -330,6 +337,159 @@ pub struct AccountPlayAssessment {
     pub proof_fit: String,
     pub evidence_gaps: Vec<String>,
     pub disqualifiers: Vec<String>,
+    pub source: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Canonical company identity shared by every Spruce Leaf brand. `Lead` remains
+/// a brand-specific working record during the migration, but it no longer owns
+/// the company or excludes another brand from pursuing a different use case.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MarketAccount {
+    pub id: String,
+    pub identity_key: String,
+    pub canonical_domain: String,
+    pub apollo_org_id: String,
+    pub name: String,
+    pub industry: String,
+    pub hq: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// A bounded, enumerable market wedge. Coverage belongs here rather than being
+/// inferred from how many rows a single Apollo run happened to return.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MarketSegment {
+    pub id: String,
+    pub brand: String,
+    pub key: String,
+    pub version: i64,
+    pub name: String,
+    pub geography: String,
+    pub wedge: String,
+    pub unit_of_analysis: String,
+    pub enumeration_sources: Vec<String>,
+    pub status: String,
+    pub estimated_total: i64,
+    pub accounts_discovered: i64,
+    pub accounts_with_opportunities: i64,
+    pub source_exhausted: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// One source cursor within one coverage run. A run is complete only when each
+/// declared source is exhausted or carries an explicit gap/reason.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CoverageRun {
+    pub id: String,
+    pub segment_id: String,
+    pub brand: String,
+    pub source_name: String,
+    pub query_fingerprint: String,
+    pub cursor: String,
+    pub pages_examined: i64,
+    pub candidates_seen: i64,
+    pub accounts_added: i64,
+    pub status: String,
+    pub exhausted: bool,
+    pub gap_reason: String,
+    pub started_at: String,
+    pub completed_at: String,
+    pub updated_at: String,
+}
+
+/// A physical operating site. A company can own many facilities and one
+/// facility can contain many separately qualified tasks.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Facility {
+    pub id: String,
+    pub market_account_id: String,
+    pub name: String,
+    pub facility_type: String,
+    pub address: String,
+    pub city: String,
+    pub region: String,
+    pub country: String,
+    pub source_url: String,
+    pub source_excerpt: String,
+    pub confidence: f64,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// The actual customer-sales object: one problem/task/decision at one account
+/// (and, when physical, one facility). Several opportunities may coexist at a
+/// company and may belong to different Spruce Leaf brands.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SalesOpportunity {
+    pub id: String,
+    pub brand: String,
+    pub market_account_id: String,
+    pub lead_id: String,
+    pub segment_id: String,
+    pub facility_id: String,
+    pub play_id: String,
+    pub kind: String,
+    pub title: String,
+    pub task_or_decision: String,
+    pub mechanism: String,
+    pub consequence: String,
+    pub system_concept: String,
+    pub proof_offer: String,
+    pub evidence_status: String,
+    pub priority_tier: String,
+    pub fit_score: i64,
+    pub status: String,
+    pub evidence_gaps: Vec<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// One atomic, auditable claim. `source_excerpt` is the exact supporting
+/// passage; `independence_group` prevents two pages on one company site from
+/// masquerading as two independent evidence sources.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EvidenceClaim {
+    pub id: String,
+    pub sales_opportunity_id: String,
+    pub brand: String,
+    pub lead_id: String,
+    pub facility_id: String,
+    pub claim_type: String,
+    pub claim_text: String,
+    pub source_url: String,
+    pub source_title: String,
+    pub source_excerpt: String,
+    pub source_locator: String,
+    pub source_domain: String,
+    pub lineage_key: String,
+    pub independence_group: String,
+    pub confidence: f64,
+    pub status: String,
+    pub observed_at: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// A buying-committee role around one opportunity. People are mapped before
+/// outreach; `active_thread` is unique per opportunity so committee coverage
+/// never becomes simultaneous cold blasting.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OpportunityStakeholder {
+    pub id: String,
+    pub sales_opportunity_id: String,
+    pub person_id: String,
+    pub role: String,
+    pub relationship_to_task: String,
+    pub can_observe: String,
+    pub can_decide: String,
+    pub priority: i64,
+    pub active_thread: bool,
+    pub status: String,
     pub source: String,
     pub created_at: String,
     pub updated_at: String,
@@ -764,7 +924,27 @@ impl Db {
         db.migrate()?;
         let db = Arc::new(db);
         crate::gtm::seed_defaults(&db)?;
+        db.backfill_market_opportunity_model()?;
         Ok(db)
+    }
+
+    fn backfill_market_opportunity_model(&self) -> Result<()> {
+        // Re-upserting uses the governed domain/Apollo identity hierarchy and
+        // creates one brand membership per existing legacy lead.
+        for lead in self.list_leads(None)? {
+            self.upsert_lead(&lead)?;
+        }
+        // Signals are already durable; assessments turn them into opportunity
+        // claims without upgrading any routing status.
+        for assessment in self.list_account_play_assessments(None)? {
+            self.materialize_sales_opportunity(&assessment)?;
+        }
+        // Contact rows then populate the full committee map. They remain
+        // inactive until the planner selects one cold thread.
+        for person in self.list_people(None, None)? {
+            self.upsert_person(&person)?;
+        }
+        Ok(())
     }
 
     fn migrate(&self) -> Result<()> {
@@ -787,6 +967,7 @@ impl Db {
             ("sequences", "copy_policy_version", "INTEGER DEFAULT 0"),
             ("sequences", "generation_backend", "TEXT DEFAULT ''"),
             ("sequences", "generation_model", "TEXT DEFAULT ''"),
+            ("sequences", "sales_opportunity_id", "TEXT DEFAULT ''"),
             ("touches", "recipient_timezone", "TEXT DEFAULT ''"),
             ("touches", "scheduled_rule", "TEXT DEFAULT ''"),
             ("touches", "schedule_reason", "TEXT DEFAULT ''"),
@@ -858,40 +1039,14 @@ impl Db {
 
     // --- Leads -------------------------------------------------------------
 
-    /// Insert or update a lead, keyed on (brand, apollo_org_id). Returns its id.
+    /// Insert or update a brand-specific lead, keyed on (brand, apollo_org_id).
+    /// The canonical company identity is shared through `market_accounts`; a
+    /// manufacturer can therefore be pursued by Wapahki and GnK for unrelated
+    /// opportunities without duplicating or excluding the company universe.
     pub fn upsert_lead(&self, lead: &Lead) -> Result<String> {
         let conn = self.conn.lock().unwrap();
         let now = now();
-        let canonical_domain = lead
-            .domain
-            .trim()
-            .trim_start_matches("https://")
-            .trim_start_matches("http://")
-            .trim_start_matches("www.")
-            .trim_end_matches('/')
-            .split('/')
-            .next()
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        let portfolio_owner: Option<String> = conn
-            .query_row(
-                "SELECT brand FROM leads
-                 WHERE brand<>?1 AND (
-                   (?2<>'' AND apollo_org_id=?2) OR
-                   (?3<>'' AND LOWER(RTRIM(REPLACE(REPLACE(REPLACE(domain,'https://',''),'http://',''),'www.',''), '/'))=?3)
-                 )
-                 ORDER BY created_at ASC LIMIT 1",
-                params![lead.brand, lead.apollo_org_id, canonical_domain],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if let Some(owner) = portfolio_owner {
-            anyhow::bail!(
-                "company '{}' is already assigned to {}; one company can belong to only one portfolio brand",
-                lead.name,
-                owner
-            );
-        }
+        let canonical_domain = canonical_domain(&lead.domain);
         let existing: Option<String> = conn
             .query_row(
                 "SELECT id FROM leads WHERE brand=?1 AND apollo_org_id=?2",
@@ -924,6 +1079,51 @@ impl Db {
             "UPDATE leads SET timezone=?2 WHERE id=?1",
             params![id, lead.timezone],
         )?;
+        let identity_key =
+            market_identity_key(&canonical_domain, &lead.apollo_org_id, &lead.name, &lead.hq);
+        let market_account_id: Option<String> = conn
+            .query_row(
+                "SELECT id FROM market_accounts WHERE identity_key=?1",
+                params![identity_key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let market_account_id = market_account_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+        conn.execute(
+            "INSERT INTO market_accounts
+             (id,identity_key,canonical_domain,apollo_org_id,name,industry,hq,created_at,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8)
+             ON CONFLICT(identity_key) DO UPDATE SET
+              canonical_domain=CASE WHEN excluded.canonical_domain<>'' THEN excluded.canonical_domain ELSE market_accounts.canonical_domain END,
+              apollo_org_id=CASE WHEN excluded.apollo_org_id<>'' THEN excluded.apollo_org_id ELSE market_accounts.apollo_org_id END,
+              name=excluded.name,industry=excluded.industry,hq=excluded.hq,updated_at=excluded.updated_at",
+            params![
+                market_account_id,
+                identity_key,
+                canonical_domain,
+                lead.apollo_org_id,
+                lead.name,
+                lead.industry,
+                lead.hq,
+                now,
+            ],
+        )?;
+        let membership_id = Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO brand_account_memberships
+             (id,market_account_id,brand,lead_id,status,priority_tier,created_at,updated_at)
+             VALUES (?1,?2,?3,?4,?5,'hard',?6,?6)
+             ON CONFLICT(market_account_id,brand) DO UPDATE SET
+              lead_id=excluded.lead_id,status=excluded.status,updated_at=excluded.updated_at",
+            params![
+                membership_id,
+                market_account_id,
+                lead.brand,
+                id,
+                status_or(&lead.status, "research"),
+                now
+            ],
+        )?;
         // `lead.signals` are internal research notes, not evidence observations.
         // Only source-qualified SignalCandidate rows may influence GTM readiness.
         Ok(id)
@@ -944,6 +1144,772 @@ impl Db {
             "SELECT * FROM leads WHERE (?1 IS NULL OR brand=?1) ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map(params![brand], |r| Ok(row_to_lead(r)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    // --- Market universe + customer opportunities -----------------------
+
+    pub fn market_account_for_lead(&self, lead_id: &str) -> Result<Option<MarketAccount>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT a.* FROM market_accounts a
+             JOIN brand_account_memberships m ON m.market_account_id=a.id
+             WHERE m.lead_id=?1 LIMIT 1",
+            params![lead_id],
+            |row| Ok(row_to_market_account(row)),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn list_market_accounts(&self, brand: Option<&str>) -> Result<Vec<MarketAccount>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT a.* FROM market_accounts a
+             LEFT JOIN brand_account_memberships m ON m.market_account_id=a.id
+             WHERE (?1 IS NULL OR m.brand=?1)
+             ORDER BY a.name",
+        )?;
+        let rows = stmt.query_map(params![brand], |row| Ok(row_to_market_account(row)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn upsert_market_segment(&self, segment: &MarketSegment) -> Result<String> {
+        if segment.brand.trim().is_empty() || segment.key.trim().is_empty() {
+            anyhow::bail!("market segment requires brand and key");
+        }
+        let conn = self.conn.lock().unwrap();
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT id FROM market_segments WHERE brand=?1 AND key=?2 AND version=?3",
+                params![segment.brand, segment.key, segment.version.max(1)],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let id = existing.unwrap_or_else(|| {
+            if segment.id.is_empty() {
+                Uuid::new_v4().to_string()
+            } else {
+                segment.id.clone()
+            }
+        });
+        let timestamp = now();
+        conn.execute(
+            "INSERT INTO market_segments
+             (id,brand,key,version,name,geography,wedge,unit_of_analysis,enumeration_sources,
+              status,estimated_total,accounts_discovered,accounts_with_opportunities,
+              source_exhausted,created_at,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?15)
+             ON CONFLICT(brand,key,version) DO UPDATE SET
+              name=excluded.name,geography=excluded.geography,wedge=excluded.wedge,
+              unit_of_analysis=excluded.unit_of_analysis,
+              enumeration_sources=excluded.enumeration_sources,status=excluded.status,
+              estimated_total=excluded.estimated_total,
+              accounts_discovered=excluded.accounts_discovered,
+              accounts_with_opportunities=excluded.accounts_with_opportunities,
+              source_exhausted=excluded.source_exhausted,updated_at=excluded.updated_at",
+            params![
+                id,
+                segment.brand,
+                segment.key,
+                segment.version.max(1),
+                segment.name,
+                segment.geography,
+                segment.wedge,
+                segment.unit_of_analysis,
+                js(&segment.enumeration_sources),
+                status_or(&segment.status, "active"),
+                segment.estimated_total.max(0),
+                segment.accounts_discovered.max(0),
+                segment.accounts_with_opportunities.max(0),
+                segment.source_exhausted,
+                timestamp,
+            ],
+        )?;
+        Ok(id)
+    }
+
+    /// Convert the legacy company-level assessment into the v30 commercial
+    /// object and copy only atomic, URL-backed observations into claim lineage.
+    /// This bridge keeps existing research useful while preventing unlinked
+    /// account prose from authorizing outreach.
+    fn materialize_sales_opportunity(&self, assessment: &AccountPlayAssessment) -> Result<String> {
+        let Some(lead) = self.get_lead(&assessment.lead_id)? else {
+            anyhow::bail!("assessment lead {} is missing", assessment.lead_id);
+        };
+        let Some(account) = self.market_account_for_lead(&assessment.lead_id)? else {
+            anyhow::bail!(
+                "assessment lead {} has no market identity",
+                assessment.lead_id
+            );
+        };
+        let observations = self
+            .list_active_signal_observations(
+                Some(&assessment.brand),
+                Some(&assessment.lead_id),
+                None,
+            )?
+            .into_iter()
+            .filter(|observation| {
+                observation.person_id.is_empty()
+                    && !observation.source_url.trim().is_empty()
+                    && !observation.evidence.trim().is_empty()
+                    && assessment
+                        .matched_signal_keys
+                        .contains(&observation.definition_key)
+            })
+            .collect::<Vec<_>>();
+        let task_or_decision = if !lead.hypothesis.trim().is_empty() {
+            lead.hypothesis.clone()
+        } else if !assessment.symptom.trim().is_empty() {
+            assessment.symptom.clone()
+        } else {
+            "Unresolved operating task or decision".into()
+        };
+        let mut gaps = assessment.evidence_gaps.clone();
+        if observations.is_empty() {
+            gaps.push(
+                "No atomic source-backed evidence claim is linked to this opportunity.".into(),
+            );
+        }
+        let facility_id = if assessment.brand.eq_ignore_ascii_case("wapahki") {
+            observations
+                .iter()
+                .find(|observation| {
+                    observation.definition_key == "account.bounded_repetitive_task"
+                        && evidence_names_operating_site(&observation.evidence)
+                })
+                .and_then(|observation| {
+                    self.upsert_facility(&Facility {
+                        market_account_id: account.id.clone(),
+                        name: facility_label(&lead, &observation.evidence),
+                        facility_type: facility_type_from_evidence(&observation.evidence).into(),
+                        region: if observation
+                            .evidence
+                            .to_ascii_lowercase()
+                            .contains("ontario")
+                        {
+                            "Ontario".into()
+                        } else {
+                            String::new()
+                        },
+                        country: "Canada".into(),
+                        source_url: observation.source_url.clone(),
+                        source_excerpt: observation.evidence.clone(),
+                        confidence: observation.confidence,
+                        status: "observed".into(),
+                        ..Default::default()
+                    })
+                    .ok()
+                })
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        if assessment.brand.eq_ignore_ascii_case("wapahki") && facility_id.is_empty() {
+            gaps.push(
+                "No exact operating facility is linked to the physical task evidence.".into(),
+            );
+        }
+        let evidence_status = match assessment.status.as_str() {
+            "qualified"
+                if !observations.is_empty()
+                    && (!assessment.brand.eq_ignore_ascii_case("wapahki")
+                        || !facility_id.is_empty()) =>
+            {
+                "action_ready"
+            }
+            "qualified" | "research_needed" if !observations.is_empty() => "discovery_ready",
+            _ => "research_required",
+        };
+        let priority_tier = match evidence_status {
+            "action_ready" => "easy",
+            "discovery_ready" => "medium",
+            _ => "hard",
+        };
+        let segment_id = choose_segment_id(
+            &assessment.brand,
+            &format!(
+                "{} {} {} {}",
+                lead.industry, task_or_decision, lead.mechanism, assessment.symptom
+            ),
+            &self.list_market_segments(Some(&assessment.brand))?,
+        );
+        let opportunity = SalesOpportunity {
+            brand: assessment.brand.clone(),
+            market_account_id: account.id,
+            lead_id: assessment.lead_id.clone(),
+            segment_id,
+            facility_id,
+            play_id: assessment.play_id.clone(),
+            kind: match assessment.brand.as_str() {
+                "wapahki" => "physical_task",
+                "outagehub" => "outage_decision",
+                _ => "software_workflow",
+            }
+            .into(),
+            title: opportunity_title(&task_or_decision),
+            task_or_decision,
+            mechanism: if !lead.mechanism.trim().is_empty() {
+                lead.mechanism.clone()
+            } else {
+                assessment.root_cause.clone()
+            },
+            consequence: lead.consequence_metric.clone(),
+            system_concept: lead.system_concept.clone(),
+            proof_offer: assessment.proof_fit.clone(),
+            evidence_status: evidence_status.into(),
+            priority_tier: priority_tier.into(),
+            fit_score: assessment.fit_score,
+            status: if evidence_status == "research_required" {
+                "research".into()
+            } else {
+                "mapped".into()
+            },
+            evidence_gaps: gaps,
+            ..Default::default()
+        };
+        let opportunity_id = self.upsert_sales_opportunity(&opportunity)?;
+        for observation in observations {
+            let _ = self.upsert_evidence_claim(&EvidenceClaim {
+                sales_opportunity_id: opportunity_id.clone(),
+                brand: assessment.brand.clone(),
+                lead_id: assessment.lead_id.clone(),
+                claim_type: observation.definition_key,
+                claim_text: observation.evidence.clone(),
+                source_url: observation.source_url,
+                source_excerpt: observation.evidence,
+                confidence: observation.confidence,
+                status: observation.status,
+                observed_at: observation.observed_at,
+                ..Default::default()
+            });
+        }
+        for person in self
+            .list_people(Some(&assessment.brand), None)?
+            .into_iter()
+            .filter(|person| person.lead_id == assessment.lead_id)
+        {
+            self.upsert_person(&person)?;
+        }
+        Ok(opportunity_id)
+    }
+
+    pub fn list_market_segments(&self, brand: Option<&str>) -> Result<Vec<MarketSegment>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT * FROM market_segments WHERE (?1 IS NULL OR brand=?1)
+             ORDER BY brand,status='active' DESC,name,version DESC",
+        )?;
+        let rows = stmt.query_map(params![brand], |row| Ok(row_to_market_segment(row)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn upsert_coverage_run(&self, run: &CoverageRun) -> Result<String> {
+        if run.segment_id.trim().is_empty()
+            || run.source_name.trim().is_empty()
+            || run.query_fingerprint.trim().is_empty()
+        {
+            anyhow::bail!("coverage run requires segment, source, and query fingerprint");
+        }
+        let conn = self.conn.lock().unwrap();
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT id FROM coverage_runs
+                 WHERE segment_id=?1 AND source_name=?2 AND query_fingerprint=?3",
+                params![run.segment_id, run.source_name, run.query_fingerprint],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let id = existing.unwrap_or_else(|| {
+            if run.id.is_empty() {
+                Uuid::new_v4().to_string()
+            } else {
+                run.id.clone()
+            }
+        });
+        let timestamp = now();
+        conn.execute(
+            "INSERT INTO coverage_runs
+             (id,segment_id,brand,source_name,query_fingerprint,cursor,pages_examined,
+              candidates_seen,accounts_added,status,exhausted,gap_reason,started_at,
+              completed_at,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+             ON CONFLICT(segment_id,source_name,query_fingerprint) DO UPDATE SET
+              cursor=excluded.cursor,pages_examined=excluded.pages_examined,
+              candidates_seen=excluded.candidates_seen,accounts_added=excluded.accounts_added,
+              status=excluded.status,exhausted=excluded.exhausted,
+              gap_reason=excluded.gap_reason,completed_at=excluded.completed_at,
+              updated_at=excluded.updated_at",
+            params![
+                id,
+                run.segment_id,
+                run.brand,
+                run.source_name,
+                run.query_fingerprint,
+                run.cursor,
+                run.pages_examined.max(0),
+                run.candidates_seen.max(0),
+                run.accounts_added.max(0),
+                status_or(&run.status, "running"),
+                run.exhausted,
+                run.gap_reason,
+                status_or(&run.started_at, &timestamp),
+                run.completed_at,
+                timestamp,
+            ],
+        )?;
+        conn.execute(
+            "UPDATE market_segments SET
+              accounts_discovered=COALESCE((SELECT SUM(candidates_seen) FROM coverage_runs WHERE segment_id=?1),0),
+              source_exhausted=CASE WHEN EXISTS(SELECT 1 FROM coverage_runs WHERE segment_id=?1)
+                 AND NOT EXISTS(SELECT 1 FROM coverage_runs WHERE segment_id=?1 AND exhausted=0)
+                 THEN 1 ELSE 0 END,
+              updated_at=?2 WHERE id=?1",
+            params![run.segment_id, timestamp],
+        )?;
+        Ok(id)
+    }
+
+    pub fn list_coverage_runs(&self, brand: Option<&str>) -> Result<Vec<CoverageRun>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT * FROM coverage_runs WHERE (?1 IS NULL OR brand=?1)
+             ORDER BY updated_at DESC",
+        )?;
+        let rows = stmt.query_map(params![brand], |row| Ok(row_to_coverage_run(row)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn upsert_facility(&self, facility: &Facility) -> Result<String> {
+        if facility.market_account_id.trim().is_empty()
+            || facility.name.trim().is_empty()
+            || facility.source_url.trim().is_empty()
+            || facility.source_excerpt.trim().is_empty()
+        {
+            anyhow::bail!("facility requires account, name, exact source URL, and excerpt");
+        }
+        let conn = self.conn.lock().unwrap();
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT id FROM facilities
+                 WHERE market_account_id=?1 AND name=?2 AND source_url=?3",
+                params![
+                    facility.market_account_id,
+                    facility.name,
+                    facility.source_url
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let id = existing.unwrap_or_else(|| {
+            if facility.id.is_empty() {
+                Uuid::new_v4().to_string()
+            } else {
+                facility.id.clone()
+            }
+        });
+        let timestamp = now();
+        conn.execute(
+            "INSERT INTO facilities
+             (id,market_account_id,name,facility_type,address,city,region,country,
+              source_url,source_excerpt,confidence,status,created_at,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?13)
+             ON CONFLICT(market_account_id,name,source_url) DO UPDATE SET
+              facility_type=excluded.facility_type,address=excluded.address,city=excluded.city,
+              region=excluded.region,country=excluded.country,
+              source_excerpt=excluded.source_excerpt,confidence=excluded.confidence,
+              status=excluded.status,updated_at=excluded.updated_at",
+            params![
+                id,
+                facility.market_account_id,
+                facility.name,
+                facility.facility_type,
+                facility.address,
+                facility.city,
+                facility.region,
+                facility.country,
+                facility.source_url,
+                facility.source_excerpt,
+                facility.confidence.clamp(0.0, 1.0),
+                status_or(&facility.status, "observed"),
+                timestamp,
+            ],
+        )?;
+        Ok(id)
+    }
+
+    pub fn list_facilities(&self, market_account_id: Option<&str>) -> Result<Vec<Facility>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT * FROM facilities WHERE (?1 IS NULL OR market_account_id=?1)
+             ORDER BY name",
+        )?;
+        let rows = stmt.query_map(params![market_account_id], |row| Ok(row_to_facility(row)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn upsert_sales_opportunity(&self, opportunity: &SalesOpportunity) -> Result<String> {
+        if opportunity.brand.trim().is_empty()
+            || opportunity.market_account_id.trim().is_empty()
+            || opportunity.lead_id.trim().is_empty()
+            || opportunity.play_id.trim().is_empty()
+            || opportunity.title.trim().is_empty()
+            || opportunity.task_or_decision.trim().is_empty()
+        {
+            anyhow::bail!(
+                "sales opportunity requires brand, account, lead, play, title, and task/decision"
+            );
+        }
+        let conn = self.conn.lock().unwrap();
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT id FROM sales_opportunities
+                 WHERE brand=?1 AND lead_id=?2 AND play_id=?3
+                 ORDER BY updated_at DESC LIMIT 1",
+                params![opportunity.brand, opportunity.lead_id, opportunity.play_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let existed = existing.is_some();
+        let id = existing.unwrap_or_else(|| {
+            if opportunity.id.is_empty() {
+                Uuid::new_v4().to_string()
+            } else {
+                opportunity.id.clone()
+            }
+        });
+        let timestamp = now();
+        if !existed {
+            conn.execute(
+                "INSERT INTO sales_opportunities
+             (id,brand,market_account_id,lead_id,segment_id,facility_id,play_id,kind,title,
+              task_or_decision,mechanism,consequence,system_concept,proof_offer,evidence_status,
+              priority_tier,fit_score,status,evidence_gaps,created_at,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?20)
+             ON CONFLICT(brand,lead_id,play_id,title) DO UPDATE SET
+              market_account_id=excluded.market_account_id,segment_id=excluded.segment_id,
+              facility_id=excluded.facility_id,kind=excluded.kind,
+              task_or_decision=excluded.task_or_decision,mechanism=excluded.mechanism,
+              consequence=excluded.consequence,system_concept=excluded.system_concept,
+              proof_offer=excluded.proof_offer,evidence_status=excluded.evidence_status,
+              priority_tier=excluded.priority_tier,fit_score=excluded.fit_score,
+              status=excluded.status,evidence_gaps=excluded.evidence_gaps,
+              updated_at=excluded.updated_at",
+                params![
+                    id,
+                    opportunity.brand,
+                    opportunity.market_account_id,
+                    opportunity.lead_id,
+                    opportunity.segment_id,
+                    opportunity.facility_id,
+                    opportunity.play_id,
+                    opportunity.kind,
+                    opportunity.title,
+                    opportunity.task_or_decision,
+                    opportunity.mechanism,
+                    opportunity.consequence,
+                    opportunity.system_concept,
+                    opportunity.proof_offer,
+                    status_or(&opportunity.evidence_status, "research_required"),
+                    status_or(&opportunity.priority_tier, "hard"),
+                    opportunity.fit_score.clamp(0, 100),
+                    status_or(&opportunity.status, "research"),
+                    js(&opportunity.evidence_gaps),
+                    timestamp,
+                ],
+            )?;
+        }
+        // The row may predate a changed title, in which case the SELECT path
+        // owns the stable id and must update that exact row.
+        conn.execute(
+            "UPDATE sales_opportunities SET
+              market_account_id=?2,segment_id=?3,facility_id=?4,kind=?5,title=?6,
+              task_or_decision=?7,mechanism=?8,consequence=?9,system_concept=?10,
+              proof_offer=?11,evidence_status=?12,priority_tier=?13,fit_score=?14,
+              status=?15,evidence_gaps=?16,updated_at=?17 WHERE id=?1",
+            params![
+                id,
+                opportunity.market_account_id,
+                opportunity.segment_id,
+                opportunity.facility_id,
+                opportunity.kind,
+                opportunity.title,
+                opportunity.task_or_decision,
+                opportunity.mechanism,
+                opportunity.consequence,
+                opportunity.system_concept,
+                opportunity.proof_offer,
+                status_or(&opportunity.evidence_status, "research_required"),
+                status_or(&opportunity.priority_tier, "hard"),
+                opportunity.fit_score.clamp(0, 100),
+                status_or(&opportunity.status, "research"),
+                js(&opportunity.evidence_gaps),
+                timestamp,
+            ],
+        )?;
+        conn.execute(
+            "UPDATE brand_account_memberships SET priority_tier=?3,status=?4,updated_at=?5
+             WHERE brand=?1 AND lead_id=?2",
+            params![
+                opportunity.brand,
+                opportunity.lead_id,
+                status_or(&opportunity.priority_tier, "hard"),
+                status_or(&opportunity.status, "research"),
+                timestamp,
+            ],
+        )?;
+        if !opportunity.segment_id.trim().is_empty() {
+            conn.execute(
+                "UPDATE market_segments SET
+                  accounts_with_opportunities=(SELECT COUNT(DISTINCT market_account_id)
+                    FROM sales_opportunities WHERE segment_id=?1 AND status<>'rejected'),
+                  updated_at=?2 WHERE id=?1",
+                params![opportunity.segment_id, timestamp],
+            )?;
+        }
+        Ok(id)
+    }
+
+    pub fn list_sales_opportunities(
+        &self,
+        brand: Option<&str>,
+        lead_id: Option<&str>,
+    ) -> Result<Vec<SalesOpportunity>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT * FROM sales_opportunities
+             WHERE (?1 IS NULL OR brand=?1) AND (?2 IS NULL OR lead_id=?2)
+             ORDER BY CASE priority_tier WHEN 'easy' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
+                      fit_score DESC,updated_at DESC",
+        )?;
+        let rows = stmt.query_map(params![brand, lead_id], |row| {
+            Ok(row_to_sales_opportunity(row))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn best_sales_opportunity(
+        &self,
+        brand: &str,
+        lead_id: &str,
+        play_id: &str,
+    ) -> Result<Option<SalesOpportunity>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT * FROM sales_opportunities
+             WHERE brand=?1 AND lead_id=?2 AND play_id=?3 AND status<>'rejected'
+             ORDER BY CASE priority_tier WHEN 'easy' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
+                      fit_score DESC,updated_at DESC LIMIT 1",
+            params![brand, lead_id, play_id],
+            |row| Ok(row_to_sales_opportunity(row)),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn upsert_evidence_claim(&self, claim: &EvidenceClaim) -> Result<String> {
+        if claim.sales_opportunity_id.trim().is_empty()
+            || claim.claim_type.trim().is_empty()
+            || claim.claim_text.trim().is_empty()
+            || claim.source_url.trim().is_empty()
+            || claim.source_excerpt.trim().is_empty()
+        {
+            anyhow::bail!(
+                "evidence claim requires opportunity, type, claim, exact source URL, and excerpt"
+            );
+        }
+        let domain = if claim.source_domain.trim().is_empty() {
+            source_domain(&claim.source_url)
+        } else {
+            claim.source_domain.trim().to_ascii_lowercase()
+        };
+        if domain.is_empty() {
+            anyhow::bail!("evidence claim source URL has no canonical domain");
+        }
+        let lineage_key = if claim.lineage_key.trim().is_empty() {
+            format!(
+                "{:016x}",
+                stable_hash(&format!(
+                    "{}|{}|{}|{}",
+                    claim.sales_opportunity_id,
+                    claim.claim_type,
+                    claim.source_url.trim().to_ascii_lowercase(),
+                    claim.source_excerpt.trim().to_ascii_lowercase()
+                ))
+            )
+        } else {
+            claim.lineage_key.clone()
+        };
+        let independence_group = if claim.independence_group.trim().is_empty() {
+            domain.clone()
+        } else {
+            claim.independence_group.trim().to_ascii_lowercase()
+        };
+        let conn = self.conn.lock().unwrap();
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT id FROM evidence_claims
+                 WHERE sales_opportunity_id=?1 AND lineage_key=?2",
+                params![claim.sales_opportunity_id, lineage_key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let id = existing.unwrap_or_else(|| {
+            if claim.id.is_empty() {
+                Uuid::new_v4().to_string()
+            } else {
+                claim.id.clone()
+            }
+        });
+        let timestamp = now();
+        conn.execute(
+            "INSERT INTO evidence_claims
+             (id,sales_opportunity_id,brand,lead_id,facility_id,claim_type,claim_text,
+              source_url,source_title,source_excerpt,source_locator,source_domain,lineage_key,
+              independence_group,confidence,status,observed_at,created_at,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?18)
+             ON CONFLICT(sales_opportunity_id,lineage_key) DO UPDATE SET
+              claim_text=excluded.claim_text,source_title=excluded.source_title,
+              source_excerpt=excluded.source_excerpt,source_locator=excluded.source_locator,
+              source_domain=excluded.source_domain,independence_group=excluded.independence_group,
+              confidence=excluded.confidence,status=excluded.status,
+              observed_at=excluded.observed_at,updated_at=excluded.updated_at",
+            params![
+                id,
+                claim.sales_opportunity_id,
+                claim.brand,
+                claim.lead_id,
+                claim.facility_id,
+                claim.claim_type,
+                claim.claim_text,
+                claim.source_url,
+                claim.source_title,
+                claim.source_excerpt,
+                claim.source_locator,
+                domain,
+                lineage_key,
+                independence_group,
+                claim.confidence.clamp(0.0, 1.0),
+                status_or(&claim.status, "observed"),
+                status_or(&claim.observed_at, &timestamp),
+                timestamp,
+            ],
+        )?;
+        Ok(id)
+    }
+
+    pub fn list_evidence_claims(
+        &self,
+        sales_opportunity_id: Option<&str>,
+        brand: Option<&str>,
+    ) -> Result<Vec<EvidenceClaim>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT * FROM evidence_claims
+             WHERE (?1 IS NULL OR sales_opportunity_id=?1) AND (?2 IS NULL OR brand=?2)
+             ORDER BY observed_at DESC",
+        )?;
+        let rows = stmt.query_map(params![sales_opportunity_id, brand], |row| {
+            Ok(row_to_evidence_claim(row))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    #[allow(dead_code)]
+    pub fn upsert_opportunity_stakeholder(
+        &self,
+        stakeholder: &OpportunityStakeholder,
+    ) -> Result<String> {
+        if stakeholder.sales_opportunity_id.trim().is_empty()
+            || stakeholder.person_id.trim().is_empty()
+            || stakeholder.role.trim().is_empty()
+        {
+            anyhow::bail!("opportunity stakeholder requires opportunity, person, and role");
+        }
+        let conn = self.conn.lock().unwrap();
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT id FROM opportunity_stakeholders
+                 WHERE sales_opportunity_id=?1 AND person_id=?2",
+                params![stakeholder.sales_opportunity_id, stakeholder.person_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let id = existing.unwrap_or_else(|| {
+            if stakeholder.id.is_empty() {
+                Uuid::new_v4().to_string()
+            } else {
+                stakeholder.id.clone()
+            }
+        });
+        let timestamp = now();
+        conn.execute(
+            "INSERT INTO opportunity_stakeholders
+             (id,sales_opportunity_id,person_id,role,relationship_to_task,can_observe,
+              can_decide,priority,active_thread,status,source,created_at,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,0,?9,?10,?11,?11)
+             ON CONFLICT(sales_opportunity_id,person_id) DO UPDATE SET
+              role=excluded.role,relationship_to_task=excluded.relationship_to_task,
+              can_observe=excluded.can_observe,can_decide=excluded.can_decide,
+              priority=excluded.priority,status=excluded.status,source=excluded.source,
+              updated_at=excluded.updated_at",
+            params![
+                id,
+                stakeholder.sales_opportunity_id,
+                stakeholder.person_id,
+                stakeholder.role,
+                stakeholder.relationship_to_task,
+                stakeholder.can_observe,
+                stakeholder.can_decide,
+                stakeholder.priority.max(0),
+                status_or(&stakeholder.status, "mapped"),
+                status_or(&stakeholder.source, "contact_research"),
+                timestamp,
+            ],
+        )?;
+        Ok(id)
+    }
+
+    pub fn activate_opportunity_stakeholder(
+        &self,
+        sales_opportunity_id: &str,
+        person_id: &str,
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE opportunity_stakeholders SET active_thread=0,updated_at=?2
+             WHERE sales_opportunity_id=?1",
+            params![sales_opportunity_id, now()],
+        )?;
+        let updated = tx.execute(
+            "UPDATE opportunity_stakeholders SET active_thread=1,status='active',updated_at=?3
+             WHERE sales_opportunity_id=?1 AND person_id=?2",
+            params![sales_opportunity_id, person_id, now()],
+        )?;
+        if updated == 0 {
+            anyhow::bail!("person is not mapped to this sales opportunity");
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn list_opportunity_stakeholders(
+        &self,
+        sales_opportunity_id: Option<&str>,
+        brand: Option<&str>,
+    ) -> Result<Vec<OpportunityStakeholder>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT s.* FROM opportunity_stakeholders s
+             JOIN sales_opportunities o ON o.id=s.sales_opportunity_id
+             WHERE (?1 IS NULL OR s.sales_opportunity_id=?1) AND (?2 IS NULL OR o.brand=?2)
+             ORDER BY s.active_thread DESC,s.priority,s.updated_at DESC",
+        )?;
+        let rows = stmt.query_map(params![sales_opportunity_id, brand], |row| {
+            Ok(row_to_opportunity_stakeholder(row))
+        })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -1008,6 +1974,43 @@ impl Db {
                     ..Default::default()
                 },
             );
+        }
+        // Map every sourced person onto the current opportunity committee. The
+        // outreach planner activates exactly one of these rows later; sourcing
+        // the committee is not authorization to contact the committee.
+        let opportunity_id: Option<String> = conn
+            .query_row(
+                "SELECT id FROM sales_opportunities
+                 WHERE brand=?1 AND lead_id=?2 AND status<>'rejected'
+                 ORDER BY CASE priority_tier WHEN 'easy' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
+                          fit_score DESC,updated_at DESC LIMIT 1",
+                params![p.brand, p.lead_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(opportunity_id) = opportunity_id {
+            let role = stakeholder_role(&p.title, &p.vantage);
+            conn.execute(
+                "INSERT INTO opportunity_stakeholders
+                 (id,sales_opportunity_id,person_id,role,relationship_to_task,can_observe,
+                  can_decide,priority,active_thread,status,source,created_at,updated_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,0,'mapped','contact_research',?9,?9)
+                 ON CONFLICT(sales_opportunity_id,person_id) DO UPDATE SET
+                  role=excluded.role,relationship_to_task=excluded.relationship_to_task,
+                  can_observe=excluded.can_observe,can_decide=excluded.can_decide,
+                  priority=excluded.priority,updated_at=excluded.updated_at",
+                params![
+                    Uuid::new_v4().to_string(),
+                    opportunity_id,
+                    id,
+                    role,
+                    p.why_them,
+                    p.can_observe,
+                    stakeholder_decision_scope(&role),
+                    stakeholder_priority(&role),
+                    now,
+                ],
+            )?;
         }
         Ok(id)
     }
@@ -1195,8 +2198,8 @@ impl Db {
             "INSERT INTO sequences (id,person_id,lead_id,brand,thesis,applied_principles,\
              play_id,play_version,experiment_id,experiment_arm,experiment_assignment_id,\
              signal_observation_ids,gtm_state,copy_policy_version,generation_backend,generation_model,\
-             status,current_stage,created_at) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+             sales_opportunity_id,status,current_stage,created_at) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
             params![
                 id,
                 s.person_id,
@@ -1214,6 +2217,7 @@ impl Db {
                 copy_policy_version,
                 s.generation_backend,
                 s.generation_model,
+                s.sales_opportunity_id,
                 status_or(&s.status, "active"),
                 s.current_stage,
                 now()
@@ -3477,7 +4481,12 @@ impl Db {
         }
         let mut recorded = 0usize;
         for candidate in candidates {
-            if candidate.definition_key.trim().is_empty() || candidate.evidence.trim().is_empty() {
+            if candidate.definition_key.trim().is_empty()
+                || candidate.evidence.trim().is_empty()
+                || candidate.source_url.trim().is_empty()
+            {
+                // Account qualification is allowed to retain an internal note,
+                // but it cannot become evidence without a resolvable source.
                 continue;
             }
             let observation = SignalObservation {
@@ -3776,6 +4785,8 @@ impl Db {
                 timestamp,
             ],
         )?;
+        drop(conn);
+        self.materialize_sales_opportunity(assessment)?;
         Ok(id)
     }
 
@@ -4612,6 +5623,148 @@ fn row_to_lead(r: &Row) -> Lead {
     }
 }
 
+fn row_to_market_account(r: &Row) -> MarketAccount {
+    MarketAccount {
+        id: g(r, "id"),
+        identity_key: g(r, "identity_key"),
+        canonical_domain: g(r, "canonical_domain"),
+        apollo_org_id: g(r, "apollo_org_id"),
+        name: g(r, "name"),
+        industry: g(r, "industry"),
+        hq: g(r, "hq"),
+        created_at: g(r, "created_at"),
+        updated_at: g(r, "updated_at"),
+    }
+}
+
+fn row_to_market_segment(r: &Row) -> MarketSegment {
+    MarketSegment {
+        id: g(r, "id"),
+        brand: g(r, "brand"),
+        key: g(r, "key"),
+        version: r.get("version").unwrap_or(1),
+        name: g(r, "name"),
+        geography: g(r, "geography"),
+        wedge: g(r, "wedge"),
+        unit_of_analysis: g(r, "unit_of_analysis"),
+        enumeration_sources: jd(&g(r, "enumeration_sources")),
+        status: g(r, "status"),
+        estimated_total: r.get("estimated_total").unwrap_or(0),
+        accounts_discovered: r.get("accounts_discovered").unwrap_or(0),
+        accounts_with_opportunities: r.get("accounts_with_opportunities").unwrap_or(0),
+        source_exhausted: r.get::<_, i64>("source_exhausted").unwrap_or(0) != 0,
+        created_at: g(r, "created_at"),
+        updated_at: g(r, "updated_at"),
+    }
+}
+
+fn row_to_coverage_run(r: &Row) -> CoverageRun {
+    CoverageRun {
+        id: g(r, "id"),
+        segment_id: g(r, "segment_id"),
+        brand: g(r, "brand"),
+        source_name: g(r, "source_name"),
+        query_fingerprint: g(r, "query_fingerprint"),
+        cursor: g(r, "cursor"),
+        pages_examined: r.get("pages_examined").unwrap_or(0),
+        candidates_seen: r.get("candidates_seen").unwrap_or(0),
+        accounts_added: r.get("accounts_added").unwrap_or(0),
+        status: g(r, "status"),
+        exhausted: r.get::<_, i64>("exhausted").unwrap_or(0) != 0,
+        gap_reason: g(r, "gap_reason"),
+        started_at: g(r, "started_at"),
+        completed_at: g(r, "completed_at"),
+        updated_at: g(r, "updated_at"),
+    }
+}
+
+fn row_to_facility(r: &Row) -> Facility {
+    Facility {
+        id: g(r, "id"),
+        market_account_id: g(r, "market_account_id"),
+        name: g(r, "name"),
+        facility_type: g(r, "facility_type"),
+        address: g(r, "address"),
+        city: g(r, "city"),
+        region: g(r, "region"),
+        country: g(r, "country"),
+        source_url: g(r, "source_url"),
+        source_excerpt: g(r, "source_excerpt"),
+        confidence: r.get("confidence").unwrap_or(0.0),
+        status: g(r, "status"),
+        created_at: g(r, "created_at"),
+        updated_at: g(r, "updated_at"),
+    }
+}
+
+fn row_to_sales_opportunity(r: &Row) -> SalesOpportunity {
+    SalesOpportunity {
+        id: g(r, "id"),
+        brand: g(r, "brand"),
+        market_account_id: g(r, "market_account_id"),
+        lead_id: g(r, "lead_id"),
+        segment_id: g(r, "segment_id"),
+        facility_id: g(r, "facility_id"),
+        play_id: g(r, "play_id"),
+        kind: g(r, "kind"),
+        title: g(r, "title"),
+        task_or_decision: g(r, "task_or_decision"),
+        mechanism: g(r, "mechanism"),
+        consequence: g(r, "consequence"),
+        system_concept: g(r, "system_concept"),
+        proof_offer: g(r, "proof_offer"),
+        evidence_status: g(r, "evidence_status"),
+        priority_tier: g(r, "priority_tier"),
+        fit_score: r.get("fit_score").unwrap_or(0),
+        status: g(r, "status"),
+        evidence_gaps: jd(&g(r, "evidence_gaps")),
+        created_at: g(r, "created_at"),
+        updated_at: g(r, "updated_at"),
+    }
+}
+
+fn row_to_evidence_claim(r: &Row) -> EvidenceClaim {
+    EvidenceClaim {
+        id: g(r, "id"),
+        sales_opportunity_id: g(r, "sales_opportunity_id"),
+        brand: g(r, "brand"),
+        lead_id: g(r, "lead_id"),
+        facility_id: g(r, "facility_id"),
+        claim_type: g(r, "claim_type"),
+        claim_text: g(r, "claim_text"),
+        source_url: g(r, "source_url"),
+        source_title: g(r, "source_title"),
+        source_excerpt: g(r, "source_excerpt"),
+        source_locator: g(r, "source_locator"),
+        source_domain: g(r, "source_domain"),
+        lineage_key: g(r, "lineage_key"),
+        independence_group: g(r, "independence_group"),
+        confidence: r.get("confidence").unwrap_or(0.0),
+        status: g(r, "status"),
+        observed_at: g(r, "observed_at"),
+        created_at: g(r, "created_at"),
+        updated_at: g(r, "updated_at"),
+    }
+}
+
+fn row_to_opportunity_stakeholder(r: &Row) -> OpportunityStakeholder {
+    OpportunityStakeholder {
+        id: g(r, "id"),
+        sales_opportunity_id: g(r, "sales_opportunity_id"),
+        person_id: g(r, "person_id"),
+        role: g(r, "role"),
+        relationship_to_task: g(r, "relationship_to_task"),
+        can_observe: g(r, "can_observe"),
+        can_decide: g(r, "can_decide"),
+        priority: r.get("priority").unwrap_or(100),
+        active_thread: r.get::<_, i64>("active_thread").unwrap_or(0) != 0,
+        status: g(r, "status"),
+        source: g(r, "source"),
+        created_at: g(r, "created_at"),
+        updated_at: g(r, "updated_at"),
+    }
+}
+
 fn row_to_person(r: &Row) -> Person {
     Person {
         id: g(r, "id"),
@@ -4659,6 +5812,7 @@ fn row_to_sequence(r: &Row) -> Sequence {
         copy_policy_version: r.get("copy_policy_version").unwrap_or(0),
         generation_backend: g(r, "generation_backend"),
         generation_model: g(r, "generation_model"),
+        sales_opportunity_id: g(r, "sales_opportunity_id"),
         status: g(r, "status"),
         current_stage: r.get("current_stage").unwrap_or(0),
         created_at: g(r, "created_at"),
@@ -5399,6 +6553,265 @@ fn status_or(s: &str, default: &str) -> String {
     }
 }
 
+fn canonical_domain(raw: &str) -> String {
+    raw.trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_start_matches("www.")
+        .trim_end_matches('/')
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('.')
+        .to_ascii_lowercase()
+}
+
+fn market_identity_key(domain: &str, apollo_org_id: &str, name: &str, hq: &str) -> String {
+    if !domain.trim().is_empty() {
+        format!("domain:{}", domain.trim().to_ascii_lowercase())
+    } else if !apollo_org_id.trim().is_empty() {
+        format!("apollo:{}", apollo_org_id.trim().to_ascii_lowercase())
+    } else {
+        format!(
+            "name:{:016x}",
+            stable_hash(&format!(
+                "{}|{}",
+                name.trim().to_ascii_lowercase(),
+                hq.trim().to_ascii_lowercase()
+            ))
+        )
+    }
+}
+
+fn opportunity_title(task_or_decision: &str) -> String {
+    let compact = task_or_decision
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if compact.chars().count() <= 120 {
+        compact
+    } else {
+        let mut title = compact.chars().take(117).collect::<String>();
+        title.push_str("...");
+        title
+    }
+}
+
+fn evidence_names_operating_site(evidence: &str) -> bool {
+    let text = evidence.to_ascii_lowercase();
+    [
+        " facility",
+        " plant",
+        " warehouse",
+        " distribution centre",
+        " distribution center",
+        " site",
+        " production",
+        " cold storage",
+    ]
+    .iter()
+    .any(|term| text.contains(term))
+}
+
+fn facility_type_from_evidence(evidence: &str) -> &'static str {
+    let text = evidence.to_ascii_lowercase();
+    if text.contains("warehouse")
+        || text.contains("distribution centre")
+        || text.contains("distribution center")
+    {
+        "warehouse_or_distribution_centre"
+    } else if text.contains("cold storage") || text.contains("freezer") {
+        "cold_storage"
+    } else {
+        "factory_or_production_site"
+    }
+}
+
+fn facility_label(lead: &Lead, evidence: &str) -> String {
+    const ONTARIO_CITIES: &[&str] = &[
+        "Brantford",
+        "Toronto",
+        "Mississauga",
+        "Brampton",
+        "Vaughan",
+        "Hamilton",
+        "London",
+        "Guelph",
+        "Kitchener",
+        "Waterloo",
+        "Cambridge",
+        "Windsor",
+        "Ottawa",
+        "Belleville",
+        "Kingston",
+        "Barrie",
+        "Markham",
+        "Oakville",
+        "Burlington",
+    ];
+    let lower = evidence.to_ascii_lowercase();
+    if let Some(city) = ONTARIO_CITIES
+        .iter()
+        .find(|city| lower.contains(&city.to_ascii_lowercase()))
+    {
+        format!("{} operating site", city)
+    } else if !lead.hq.trim().is_empty() && lower.contains(&lead.hq.trim().to_ascii_lowercase()) {
+        format!("{} operating site", lead.hq.trim())
+    } else {
+        format!("{} site documented in task source", lead.name.trim())
+    }
+}
+
+fn choose_segment_id(brand: &str, context: &str, segments: &[MarketSegment]) -> String {
+    let text = context.to_ascii_lowercase();
+    let preferred_key = if brand.eq_ignore_ascii_case("wapahki") {
+        if [
+            "warehouse",
+            "distribution",
+            "3pl",
+            "fulfillment",
+            "cold storage",
+        ]
+        .iter()
+        .any(|term| text.contains(term))
+        {
+            "ontario_warehouse_case_handling"
+        } else if ["food", "beverage", "pack", "case", "tray", "pallet"]
+            .iter()
+            .any(|term| text.contains(term))
+        {
+            "ontario_food_case_palletizing"
+        } else {
+            "ontario_manufacturing_machine_tending"
+        }
+    } else if brand.eq_ignore_ascii_case("gnk") {
+        if [
+            "construction",
+            "contractor",
+            "change order",
+            "project delay",
+        ]
+        .iter()
+        .any(|term| text.contains(term))
+        {
+            "canada_construction_delay_evidence"
+        } else if ["claim", "billing", "eligibility", "filing", "recovery"]
+            .iter()
+            .any(|term| text.contains(term))
+        {
+            "canada_specialty_claims_admin"
+        } else {
+            "canada_3pl_exception_decisions"
+        }
+    } else if brand.eq_ignore_ascii_case("outagehub") {
+        if ["telecom", "tower", "cell site", "network operations"]
+            .iter()
+            .any(|term| text.contains(term))
+        {
+            "canada_telecom_site_continuity"
+        } else if ["generator", "backup power", "refuelling", "refueling"]
+            .iter()
+            .any(|term| text.contains(term))
+        {
+            "canada_backup_power_dispatch"
+        } else {
+            "canada_ev_charging_operations"
+        }
+    } else {
+        ""
+    };
+    segments
+        .iter()
+        .find(|segment| segment.key == preferred_key)
+        .or_else(|| segments.first())
+        .map(|segment| segment.id.clone())
+        .unwrap_or_default()
+}
+
+fn stakeholder_role(title: &str, vantage: &str) -> String {
+    let text = format!(
+        " {} {} ",
+        title.trim().to_ascii_lowercase(),
+        vantage.trim().to_ascii_lowercase()
+    );
+    if text.contains(" procurement ") || text.contains(" purchasing ") {
+        "procurement_legal"
+    } else if text.contains(" safety ")
+        || text.contains(" sanitation ")
+        || text.contains(" quality ")
+    {
+        "constraint_owner"
+    } else if text.contains(" maintenance ")
+        || text.contains(" controls ")
+        || text.contains(" automation ")
+        || text.contains(" engineering ")
+        || text.contains(" technical ")
+        || text.contains(" it ")
+    {
+        "technical_evaluator"
+    } else if text.contains(" ceo ")
+        || text.contains(" founder ")
+        || text.contains(" president ")
+        || text.contains(" owner ")
+        || text.contains(" economic_buyer ")
+    {
+        "economic_buyer"
+    } else if text.contains(" supervisor ")
+        || text.contains(" lead ")
+        || text.contains(" operator ")
+        || text.contains(" coordinator ")
+    {
+        "problem_witness"
+    } else if text.contains(" manager ")
+        || text.contains(" director ")
+        || text.contains(" process_owner ")
+        || text.contains(" operational_executive ")
+    {
+        "process_owner"
+    } else {
+        "router"
+    }
+    .into()
+}
+
+fn stakeholder_priority(role: &str) -> i64 {
+    match role {
+        "problem_witness" => 10,
+        "process_owner" => 20,
+        "constraint_owner" => 30,
+        "technical_evaluator" => 40,
+        "economic_buyer" => 50,
+        "procurement_legal" => 60,
+        _ => 90,
+    }
+}
+
+fn stakeholder_decision_scope(role: &str) -> &'static str {
+    match role {
+        "problem_witness" => "Can confirm the task, current workflow, variation, and exceptions.",
+        "process_owner" => "Can sponsor workflow discovery and operational evaluation.",
+        "constraint_owner" => {
+            "Can validate safety, quality, sanitation, or compliance constraints."
+        }
+        "technical_evaluator" => {
+            "Can evaluate integration, feasibility, data, controls, or security."
+        }
+        "economic_buyer" => "Can validate economics, priority, budget, and executive sponsorship.",
+        "procurement_legal" => {
+            "Can route procurement, contracting, and legal review after sponsorship."
+        }
+        _ => "Can route the opportunity to the closest operating owner.",
+    }
+}
+
+fn source_domain(raw: &str) -> String {
+    canonical_domain(raw)
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .to_string()
+}
+
 fn normalize_linkedin_status(status: &str) -> &'static str {
     match status.trim().to_ascii_lowercase().as_str() {
         "requested" => "requested",
@@ -5479,6 +6892,7 @@ CREATE TABLE IF NOT EXISTS sequences (
     copy_policy_version INTEGER DEFAULT 0,
     generation_backend TEXT DEFAULT '',
     generation_model TEXT DEFAULT '',
+    sales_opportunity_id TEXT DEFAULT '',
     status TEXT DEFAULT 'active',
     current_stage INTEGER DEFAULT 0,
     created_at TEXT
@@ -5670,6 +7084,160 @@ CREATE TABLE IF NOT EXISTS account_play_assessments (
     FOREIGN KEY(lead_id) REFERENCES leads(id),
     FOREIGN KEY(play_id) REFERENCES gtm_plays(id)
 );
+CREATE TABLE IF NOT EXISTS market_accounts (
+    id TEXT PRIMARY KEY,
+    identity_key TEXT NOT NULL UNIQUE,
+    canonical_domain TEXT DEFAULT '',
+    apollo_org_id TEXT DEFAULT '',
+    name TEXT NOT NULL,
+    industry TEXT DEFAULT '',
+    hq TEXT DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS brand_account_memberships (
+    id TEXT PRIMARY KEY,
+    market_account_id TEXT NOT NULL,
+    brand TEXT NOT NULL,
+    lead_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'research',
+    priority_tier TEXT NOT NULL DEFAULT 'hard',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(market_account_id,brand),
+    UNIQUE(brand,lead_id),
+    FOREIGN KEY(market_account_id) REFERENCES market_accounts(id),
+    FOREIGN KEY(lead_id) REFERENCES leads(id)
+);
+CREATE TABLE IF NOT EXISTS market_segments (
+    id TEXT PRIMARY KEY,
+    brand TEXT NOT NULL,
+    key TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1,
+    name TEXT NOT NULL,
+    geography TEXT NOT NULL,
+    wedge TEXT NOT NULL,
+    unit_of_analysis TEXT NOT NULL,
+    enumeration_sources TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT 'active',
+    estimated_total INTEGER NOT NULL DEFAULT 0,
+    accounts_discovered INTEGER NOT NULL DEFAULT 0,
+    accounts_with_opportunities INTEGER NOT NULL DEFAULT 0,
+    source_exhausted INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(brand,key,version)
+);
+CREATE TABLE IF NOT EXISTS coverage_runs (
+    id TEXT PRIMARY KEY,
+    segment_id TEXT NOT NULL,
+    brand TEXT NOT NULL,
+    source_name TEXT NOT NULL,
+    query_fingerprint TEXT NOT NULL,
+    cursor TEXT DEFAULT '',
+    pages_examined INTEGER NOT NULL DEFAULT 0,
+    candidates_seen INTEGER NOT NULL DEFAULT 0,
+    accounts_added INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'running',
+    exhausted INTEGER NOT NULL DEFAULT 0,
+    gap_reason TEXT DEFAULT '',
+    started_at TEXT NOT NULL,
+    completed_at TEXT DEFAULT '',
+    updated_at TEXT NOT NULL,
+    UNIQUE(segment_id,source_name,query_fingerprint),
+    FOREIGN KEY(segment_id) REFERENCES market_segments(id)
+);
+CREATE TABLE IF NOT EXISTS facilities (
+    id TEXT PRIMARY KEY,
+    market_account_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    facility_type TEXT DEFAULT '',
+    address TEXT DEFAULT '',
+    city TEXT DEFAULT '',
+    region TEXT DEFAULT '',
+    country TEXT DEFAULT '',
+    source_url TEXT NOT NULL,
+    source_excerpt TEXT NOT NULL,
+    confidence REAL NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'observed',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(market_account_id,name,source_url),
+    FOREIGN KEY(market_account_id) REFERENCES market_accounts(id)
+);
+CREATE TABLE IF NOT EXISTS sales_opportunities (
+    id TEXT PRIMARY KEY,
+    brand TEXT NOT NULL,
+    market_account_id TEXT NOT NULL,
+    lead_id TEXT NOT NULL,
+    segment_id TEXT DEFAULT '',
+    facility_id TEXT DEFAULT '',
+    play_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    title TEXT NOT NULL,
+    task_or_decision TEXT NOT NULL,
+    mechanism TEXT DEFAULT '',
+    consequence TEXT DEFAULT '',
+    system_concept TEXT DEFAULT '',
+    proof_offer TEXT DEFAULT '',
+    evidence_status TEXT NOT NULL DEFAULT 'research_required',
+    priority_tier TEXT NOT NULL DEFAULT 'hard',
+    fit_score INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'research',
+    evidence_gaps TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(brand,lead_id,play_id,title),
+    FOREIGN KEY(market_account_id) REFERENCES market_accounts(id),
+    FOREIGN KEY(lead_id) REFERENCES leads(id)
+);
+CREATE TABLE IF NOT EXISTS evidence_claims (
+    id TEXT PRIMARY KEY,
+    sales_opportunity_id TEXT NOT NULL,
+    brand TEXT NOT NULL,
+    lead_id TEXT NOT NULL,
+    facility_id TEXT DEFAULT '',
+    claim_type TEXT NOT NULL,
+    claim_text TEXT NOT NULL,
+    source_url TEXT NOT NULL,
+    source_title TEXT DEFAULT '',
+    source_excerpt TEXT NOT NULL,
+    source_locator TEXT DEFAULT '',
+    source_domain TEXT DEFAULT '',
+    lineage_key TEXT NOT NULL,
+    independence_group TEXT NOT NULL,
+    confidence REAL NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'observed',
+    observed_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(sales_opportunity_id,lineage_key),
+    FOREIGN KEY(sales_opportunity_id) REFERENCES sales_opportunities(id)
+);
+CREATE TABLE IF NOT EXISTS opportunity_stakeholders (
+    id TEXT PRIMARY KEY,
+    sales_opportunity_id TEXT NOT NULL,
+    person_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    relationship_to_task TEXT DEFAULT '',
+    can_observe TEXT DEFAULT '',
+    can_decide TEXT DEFAULT '',
+    priority INTEGER NOT NULL DEFAULT 100,
+    active_thread INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'mapped',
+    source TEXT NOT NULL DEFAULT 'contact_research',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(sales_opportunity_id,person_id),
+    FOREIGN KEY(sales_opportunity_id) REFERENCES sales_opportunities(id),
+    FOREIGN KEY(person_id) REFERENCES people(id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_cold_thread_per_sales_opportunity
+ON opportunity_stakeholders(sales_opportunity_id) WHERE active_thread=1;
+CREATE INDEX IF NOT EXISTS idx_sales_opportunities_brand_priority
+ON sales_opportunities(brand,priority_tier,fit_score DESC);
+CREATE INDEX IF NOT EXISTS idx_evidence_claims_opportunity_type
+ON evidence_claims(sales_opportunity_id,claim_type);
 CREATE TABLE IF NOT EXISTS gtm_experiments (
     id TEXT PRIMARY KEY,
     brand TEXT NOT NULL,
@@ -5995,18 +7563,19 @@ mod tests {
     }
 
     #[test]
-    fn one_company_cannot_be_claimed_by_two_portfolio_brands() {
+    fn one_company_can_hold_distinct_opportunities_for_multiple_portfolio_brands() {
         let db = Db::open(":memory:").expect("open memory db");
-        db.upsert_lead(&Lead {
-            brand: "gnk".into(),
-            apollo_org_id: "portfolio-company".into(),
-            name: "Shared Company".into(),
-            domain: "https://www.shared.example/".into(),
-            ..Default::default()
-        })
-        .expect("claim company for gnk");
+        let gnk = db
+            .upsert_lead(&Lead {
+                brand: "gnk".into(),
+                apollo_org_id: "portfolio-company".into(),
+                name: "Shared Company".into(),
+                domain: "https://www.shared.example/".into(),
+                ..Default::default()
+            })
+            .expect("claim company for gnk");
 
-        let by_apollo = db
+        let outagehub = db
             .upsert_lead(&Lead {
                 brand: "outagehub".into(),
                 apollo_org_id: "portfolio-company".into(),
@@ -6014,10 +7583,9 @@ mod tests {
                 domain: "shared.example".into(),
                 ..Default::default()
             })
-            .expect_err("same Apollo organization must be rejected");
-        assert!(by_apollo.to_string().contains("already assigned to gnk"));
+            .expect("same company may have a distinct OutageHub opportunity");
 
-        let by_domain = db
+        let wapahki = db
             .upsert_lead(&Lead {
                 brand: "wapahki".into(),
                 apollo_org_id: "different-apollo-id".into(),
@@ -6025,8 +7593,13 @@ mod tests {
                 domain: "www.shared.example".into(),
                 ..Default::default()
             })
-            .expect_err("same canonical domain must be rejected");
-        assert!(by_domain.to_string().contains("already assigned to gnk"));
+            .expect("canonical domain resolves across brands");
+        let gnk_account = db.market_account_for_lead(&gnk).unwrap().unwrap();
+        let outage_account = db.market_account_for_lead(&outagehub).unwrap().unwrap();
+        let wapahki_account = db.market_account_for_lead(&wapahki).unwrap().unwrap();
+        assert_eq!(gnk_account.id, outage_account.id);
+        assert_eq!(gnk_account.id, wapahki_account.id);
+        assert_eq!(db.list_market_accounts(None).unwrap().len(), 1);
     }
 
     #[test]
@@ -7075,7 +8648,7 @@ mod tests {
             .current_gtm_play("outagehub")
             .expect("load current play")
             .expect("seeded outagehub play");
-        assert_eq!(play.version, 12);
+        assert_eq!(play.version, 13);
         assert_eq!(play.minimum_signal_matches, 4);
         assert!(play
             .required_signal_keys

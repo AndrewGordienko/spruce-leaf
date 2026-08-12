@@ -33,9 +33,11 @@ use uuid::Uuid;
 
 use crate::business::{BusinessProfile, Businesses};
 use crate::db::{
-    AccountPlayAssessment, ApplicationBrief, CustomerDevelopmentRecord, Event, GtmExperiment,
-    GtmOutcome, GtmPlay, Lead, Mailbox, Meeting, Opportunity, OpportunityContact, OpportunityTouch,
-    Person, ProofBrief, SharedDb, SignalDefinition, SignalObservation, Touch,
+    AccountPlayAssessment, ApplicationBrief, CoverageRun, CustomerDevelopmentRecord, Event,
+    EvidenceClaim, Facility, GtmExperiment, GtmOutcome, GtmPlay, Lead, Mailbox, MarketAccount,
+    MarketSegment, Meeting, Opportunity, OpportunityContact, OpportunityStakeholder,
+    OpportunityTouch, Person, ProofBrief, SalesOpportunity, SharedDb, SignalDefinition,
+    SignalObservation, Touch,
 };
 use crate::domain::Campaign;
 use crate::knowledge::{Library, SharedLibrary};
@@ -328,6 +330,14 @@ struct ExecutionDashboard {
 
 #[derive(Debug, Serialize)]
 struct GtmSnapshot {
+    market_accounts: Vec<MarketAccount>,
+    segments: Vec<MarketSegment>,
+    coverage_runs: Vec<CoverageRun>,
+    facilities: Vec<Facility>,
+    sales_opportunities: Vec<SalesOpportunity>,
+    evidence_claims: Vec<EvidenceClaim>,
+    opportunity_stakeholders: Vec<OpportunityStakeholder>,
+    people: Vec<Person>,
     definitions: Vec<SignalDefinition>,
     observations: Vec<SignalObservation>,
     plays: Vec<GtmPlay>,
@@ -366,7 +376,7 @@ struct ExecutionPerson {
 }
 
 fn complete_reviewed_sequence(touches: &[Touch]) -> bool {
-    matches!(touches.len(), 1 | 4 | 7)
+    matches!(touches.len(), 1 | 2 | 4 | 7)
         && (1..=touches.len() as i64).all(|stage| {
             touches.iter().any(|touch| {
                 touch.stage == stage
@@ -509,7 +519,27 @@ fn execution_dashboard(db: &SharedDb, brand: Option<&str>) -> Result<ExecutionDa
 
 fn gtm_snapshot(db: &SharedDb, brand: Option<&str>) -> Result<GtmSnapshot> {
     db.expire_signal_observations()?;
+    let market_accounts = db.list_market_accounts(brand)?;
+    let account_ids = market_accounts
+        .iter()
+        .map(|account| account.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let facilities = db
+        .list_facilities(None)?
+        .into_iter()
+        .filter(|facility| {
+            brand.is_none() || account_ids.contains(facility.market_account_id.as_str())
+        })
+        .collect();
     Ok(GtmSnapshot {
+        market_accounts,
+        segments: db.list_market_segments(brand)?,
+        coverage_runs: db.list_coverage_runs(brand)?,
+        facilities,
+        sales_opportunities: db.list_sales_opportunities(brand, None)?,
+        evidence_claims: db.list_evidence_claims(None, brand)?,
+        opportunity_stakeholders: db.list_opportunity_stakeholders(None, brand)?,
+        people: db.list_people(brand, None)?,
         definitions: db.list_signal_definitions(brand)?,
         observations: db.list_signal_observations(brand, 250)?,
         plays: db.list_gtm_plays(brand)?,
@@ -2629,25 +2659,23 @@ fn render_gtm_lab(
         .iter()
         .filter(|observation| matches!(observation.status.as_str(), "observed" | "verified"))
         .count();
-    let running = snapshot
-        .experiments
+    let mapped_opportunities = snapshot
+        .sales_opportunities
         .iter()
-        .filter(|experiment| experiment.status == "running")
-        .count();
-    let proof_ready = snapshot
-        .proofs
-        .iter()
-        .filter(|proof| matches!(proof.status.as_str(), "ready" | "approved" | "running"))
+        .filter(|opportunity| opportunity.status != "rejected")
         .count();
     render_subbar(
         &mut b,
         &format!("{brand_name} GTM Lab"),
         "Evidence → versioned play → controlled action → attributable outcome → bounded proof.",
         &[
+            (
+                snapshot.market_accounts.len().to_string(),
+                "universe accounts",
+            ),
+            (snapshot.segments.len().to_string(), "bounded segments"),
+            (mapped_opportunities.to_string(), "mapped opportunities"),
             (live_signals.to_string(), "live signals"),
-            (snapshot.plays.len().to_string(), "play versions"),
-            (running.to_string(), "experiments running"),
-            (proof_ready.to_string(), "proofs active"),
         ],
     );
     b.push_str(
@@ -2669,6 +2697,137 @@ fn render_gtm_lab(
         .iter()
         .map(|lead| (lead.id.as_str(), lead.name.as_str()))
         .collect::<std::collections::HashMap<_, _>>();
+
+    let market_names = snapshot
+        .market_accounts
+        .iter()
+        .map(|account| (account.id.as_str(), account.name.as_str()))
+        .collect::<std::collections::HashMap<_, _>>();
+    let facility_names = snapshot
+        .facilities
+        .iter()
+        .map(|facility| (facility.id.as_str(), facility.name.as_str()))
+        .collect::<std::collections::HashMap<_, _>>();
+    let person_names = snapshot
+        .people
+        .iter()
+        .map(|person| (person.id.as_str(), person.name.as_str()))
+        .collect::<std::collections::HashMap<_, _>>();
+    let opportunity_names = snapshot
+        .sales_opportunities
+        .iter()
+        .map(|opportunity| (opportunity.id.as_str(), opportunity.title.as_str()))
+        .collect::<std::collections::HashMap<_, _>>();
+
+    b.push_str("<section class=\"gtm-panel\"><div class=\"strategy-panel-head\"><h2>Market coverage ledger</h2><p>Coverage is measured per bounded segment and source cursor. Apollo enriches an enumerated market; it no longer defines the denominator.</p></div><div class=\"gtm-table-wrap\"><table class=\"gtm-table\"><thead><tr><th>Segment</th><th>Geography / unit</th><th>Coverage</th><th>Latest source cursor</th></tr></thead><tbody>");
+    for segment in &snapshot.segments {
+        let runs = snapshot
+            .coverage_runs
+            .iter()
+            .filter(|run| run.segment_id == segment.id)
+            .collect::<Vec<_>>();
+        let latest = runs.first().copied();
+        b.push_str(&format!(
+            "<tr><td><b>{}</b><small>{}</small></td><td>{}<small>{}</small></td><td>{} discovered / {} estimated<small>{} opportunity accounts · {}</small></td><td>{}<small>{} pages · {} candidates · {}</small></td></tr>",
+            esc(&segment.name),
+            esc(&segment.wedge),
+            esc(&segment.geography),
+            esc(&segment.unit_of_analysis),
+            segment.accounts_discovered,
+            if segment.estimated_total > 0 { segment.estimated_total.to_string() } else { "denominator pending".into() },
+            segment.accounts_with_opportunities,
+            if segment.source_exhausted { "sources exhausted" } else { "coverage open" },
+            latest.map(|run| esc(&run.source_name)).unwrap_or_else(|| "not started".into()),
+            latest.map(|run| run.pages_examined).unwrap_or(0),
+            latest.map(|run| run.candidates_seen).unwrap_or(0),
+            latest.map(|run| if run.exhausted { "exhausted".to_string() } else { format!("resume {}", run.cursor) }).unwrap_or_else(|| "no cursor".into()),
+        ));
+    }
+    if snapshot.segments.is_empty() {
+        b.push_str("<tr><td colspan=\"4\" class=\"empty\">No bounded market segments are configured.</td></tr>");
+    }
+    b.push_str("</tbody></table></div></section>");
+
+    b.push_str("<section class=\"gtm-panel\"><div class=\"strategy-panel-head\"><h2>Facility and workflow opportunities</h2><p>The sales object is a facility/task or workflow/decision with atomic evidence and a mapped committee—not a generic company hypothesis.</p></div><div class=\"gtm-card-grid\">");
+    for opportunity in &snapshot.sales_opportunities {
+        let account = market_names
+            .get(opportunity.market_account_id.as_str())
+            .copied()
+            .unwrap_or("Unknown account");
+        let facility = if opportunity.facility_id.is_empty() {
+            "No facility required or linked"
+        } else {
+            facility_names
+                .get(opportunity.facility_id.as_str())
+                .copied()
+                .unwrap_or("Unknown facility")
+        };
+        let claims = snapshot
+            .evidence_claims
+            .iter()
+            .filter(|claim| claim.sales_opportunity_id == opportunity.id)
+            .count();
+        let committee = snapshot
+            .opportunity_stakeholders
+            .iter()
+            .filter(|stakeholder| stakeholder.sales_opportunity_id == opportunity.id)
+            .collect::<Vec<_>>();
+        let active_person = committee
+            .iter()
+            .find(|stakeholder| stakeholder.active_thread)
+            .and_then(|stakeholder| person_names.get(stakeholder.person_id.as_str()).copied())
+            .unwrap_or("none");
+        b.push_str(&format!(
+            "<article class=\"gtm-card\"><div class=\"gtm-card-head\"><div><span class=\"strategy-kicker\">{} · {}</span><h3>{}</h3></div><span class=\"gtm-status {}\">{}</span></div><p><b>Account / facility:</b> {} · {}</p><p><b>Task or decision:</b> {}</p><p><b>Mechanism:</b> {}</p><p><b>Consequence:</b> {}</p><div class=\"gtm-proof-shape\"><b>Proof contribution</b><p>{}</p></div><p class=\"gtm-meta\">{} atomic claims · {} committee roles · active cold thread: {}<br>Gaps: {}</p></article>",
+            esc(&opportunity.brand),
+            esc(&opportunity.priority_tier),
+            esc(&opportunity.title),
+            esc(&opportunity.evidence_status),
+            esc(&opportunity.evidence_status),
+            esc(account),
+            esc(facility),
+            esc(&opportunity.task_or_decision),
+            esc(&opportunity.mechanism),
+            esc(&opportunity.consequence),
+            esc(&opportunity.proof_offer),
+            claims,
+            committee.len(),
+            esc(active_person),
+            esc(&opportunity.evidence_gaps.join("; ")),
+        ));
+    }
+    if snapshot.sales_opportunities.is_empty() {
+        b.push_str("<p class=\"empty\">No evidence-linked opportunities yet. Existing assessments backfill as research until exact claims and committee roles are present.</p>");
+    }
+    b.push_str("</div></section>");
+
+    b.push_str("<section class=\"gtm-panel\"><div class=\"strategy-panel-head\"><h2>Buying committees</h2><p>Map witnesses, process owners, constraint owners, technical evaluators, economic buyers, and procurement; activate one cold thread at a time.</p></div><div class=\"gtm-table-wrap\"><table class=\"gtm-table\"><thead><tr><th>Opportunity</th><th>Person</th><th>Role</th><th>Thread</th></tr></thead><tbody>");
+    for stakeholder in &snapshot.opportunity_stakeholders {
+        b.push_str(&format!(
+            "<tr><td><b>{}</b></td><td>{}</td><td>{}<small>{}</small></td><td>{}</td></tr>",
+            esc(opportunity_names
+                .get(stakeholder.sales_opportunity_id.as_str())
+                .copied()
+                .unwrap_or("Unknown opportunity")),
+            esc(person_names
+                .get(stakeholder.person_id.as_str())
+                .copied()
+                .unwrap_or("Unknown person")),
+            esc(&stakeholder.role),
+            esc(&stakeholder.relationship_to_task),
+            if stakeholder.active_thread {
+                "active cold thread"
+            } else {
+                "mapped / held"
+            },
+        ));
+    }
+    if snapshot.opportunity_stakeholders.is_empty() {
+        b.push_str(
+            "<tr><td colspan=\"4\" class=\"empty\">No committee roles mapped yet.</td></tr>",
+        );
+    }
+    b.push_str("</tbody></table></div></section>");
 
     if active.is_some_and(|meta| meta.key == "wapahki") {
         b.push_str("<section class=\"gtm-panel\"><div class=\"strategy-panel-head\"><h2>Customer-development stage gates</h2><p>The operating path is discovery → evidence → evaluation → design partnership → conditional intent → paid pilot → deployment. No rung advances merely because an email was sent or a meeting was booked.</p></div><div class=\"customer-dev-stage-grid\">");
@@ -4984,6 +5143,10 @@ mod tests {
         let html = render_gtm_lab(brand_meta("outagehub"), &counts, &snapshot);
 
         assert!(html.contains("Account root-cause ranking"));
+        assert!(html.contains("Market coverage ledger"));
+        assert!(html.contains("Facility and workflow opportunities"));
+        assert!(html.contains("Buying committees"));
+        assert!(html.contains("Canadian EV charging operations"));
         assert!(html.contains("Northern Cold Chain"));
         assert!(html.contains("Internal alarms cannot supply"));
         assert!(html.contains("88/100"));
@@ -5086,7 +5249,7 @@ mod tests {
                 .map(|(index, key)| crate::gtm::SignalCandidate {
                     definition_key: (*key).into(),
                     evidence: format!("Source-backed workflow evidence {index}"),
-                    source_url: format!("https://example.com/evidence/{index}"),
+                    source_url: format!("https://evidence-{index}.example/evidence/{index}"),
                     confidence: 0.9,
                 })
                 .collect::<Vec<_>>(),
@@ -5118,6 +5281,11 @@ mod tests {
             ..Default::default()
         })
         .expect("record current assessment");
+        let sales_opportunity_id = db
+            .best_sales_opportunity("gnk", &lead_id, &play.id)
+            .expect("opportunity query")
+            .expect("materialized sales opportunity")
+            .id;
         let sequence_id = db
             .create_sequence(&Sequence {
                 person_id: person_id.clone(),
@@ -5125,6 +5293,7 @@ mod tests {
                 brand: "gnk".into(),
                 play_id: play.id,
                 play_version: play.version,
+                sales_opportunity_id,
                 gtm_state: "action_ready".into(),
                 copy_policy_version: crate::db::CURRENT_COPY_POLICY_VERSION,
                 status: "active".into(),

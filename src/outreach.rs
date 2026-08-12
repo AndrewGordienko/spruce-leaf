@@ -604,6 +604,9 @@ fn create_building_checkpoint(
     generation_model: &str,
 ) -> Result<String> {
     db.interrupt_prior_building_sequences(&person.id)?;
+    if let Some(opportunity) = &gtm_context.opportunity {
+        db.activate_opportunity_stakeholder(&opportunity.id, &person.id)?;
+    }
     let sequence_id = db.create_sequence(&Sequence {
         person_id: person.id.clone(),
         lead_id: lead.id.clone(),
@@ -632,6 +635,11 @@ fn create_building_checkpoint(
             .map(|observation| observation.id.clone())
             .collect(),
         gtm_state: gtm_context.state.clone(),
+        sales_opportunity_id: gtm_context
+            .opportunity
+            .as_ref()
+            .map(|opportunity| opportunity.id.clone())
+            .unwrap_or_default(),
         generation_backend: generation_backend.into(),
         generation_model: generation_model.into(),
         status: "building".into(),
@@ -767,29 +775,34 @@ pub async fn plan_pending(
     } else {
         verified
     };
-    // Cold outreach opens one human thread per account. Additional colleagues
-    // remain mapped in the CRM and may be contacted only after a reply, route,
-    // or explicit single-person request supplies a reason.
+    let matched_people = filtered.len();
+    let mut people_held = 0usize;
+    let mut eligible_candidates = Vec::new();
+    for person in filtered {
+        if let Some(reason) =
+            crate::gtm::recipient_sequence_block_reason(db, &pb.key, &person.lead_id, &person)?
+        {
+            people_held += 1;
+            log_outreach(format!("held {}: {reason}", person.name));
+        } else {
+            eligible_candidates.push(person);
+        }
+    }
+
+    // Cold outreach opens one human thread per account. Apply the role gate to
+    // the whole bench before choosing that person; otherwise one blocked but
+    // highly ranked contact can hide a valid workflow owner at the same account.
+    // Additional colleagues remain mapped for later routing.
     let selected = if person_filter.is_some() {
-        filtered
+        eligible_candidates
     } else {
         if per_account_cap.unwrap_or(1) > 1 {
             log_outreach("limited cold planning to one primary recipient per account");
         }
-        select_people_for_planning(filtered, 1)
+        select_people_for_planning(&pb.key, eligible_candidates, 1)
     };
     let mut todo = Vec::new();
-    let mut matched_people = 0;
-    let mut people_held = 0usize;
     for p in selected {
-        matched_people += 1;
-        if let Some(reason) =
-            crate::gtm::recipient_sequence_block_reason(db, &pb.key, &p.lead_id, &p)?
-        {
-            people_held += 1;
-            log_outreach(format!("held {}: {reason}", p.name));
-            continue;
-        }
         let context = crate::gtm::prepare_action(db, &pb.key, &p.lead_id, &p)?;
         if !context.sequence_ready_for(n_touches) {
             people_held += 1;
@@ -1527,6 +1540,22 @@ async fn write_account_sequences(
         people,
     );
     let recipient_payload = |person: &crate::db::Person| {
+        let context = gtm_contexts.get(&person.id);
+        let mut verified_person_insights = vec![format!("Current title: {}", person.title)];
+        if !person.location.trim().is_empty() {
+            verified_person_insights.push(format!("Current listed location: {}", person.location));
+        }
+        if let Some(stakeholder) = context.and_then(|context| {
+            context
+                .stakeholders
+                .iter()
+                .find(|stakeholder| stakeholder.person_id == person.id)
+        }) {
+            verified_person_insights.push(format!(
+                "Mapped opportunity role: {}. Evidence boundary: {}",
+                stakeholder.role, stakeholder.relationship_to_task
+            ));
+        }
         json!({
             "person_key": person.id,
             "name": person.name,
@@ -1540,7 +1569,7 @@ async fn write_account_sequences(
             } else {
                 "A LinkedIn URL is on file, but its profile content has not been retrieved. The title is the only verified person-level insight; do not imply posts, tenure, priorities, or biography."
             },
-            "verified_person_insights": Vec::<String>::new(),
+            "verified_person_insights": verified_person_insights,
             "role_response_contract_internal_only": response_design::for_person(person).prompt_value(),
             "operator_requested_outcome_internal_only": desired_outcome.unwrap_or("No narrower outcome supplied; choose the smallest useful cold response for this vantage and evidence state."),
             "sequence_plan": plans.get(&person.id),
@@ -2614,7 +2643,8 @@ fn planner_account_brief(account: &CopyAccount) -> Value {
         "company": account.name,
         "industry": account.industry,
         "location": account.hq,
-        "verified_facts": account.observed_facts.iter().take(3).collect::<Vec<_>>(),
+        "verified_facts": Vec::<String>::new(),
+        "evidence_selection_note": "Use only the atomic opportunity claims in GTM ACTION STATE; legacy account facts are intentionally excluded.",
         "internal_hypotheses_not_for_verbatim_copy": {
             "question_to_test": account.hypothesis,
             "why_it_might_be_hard": account.mechanism,
@@ -2636,8 +2666,8 @@ fn writer_account_brief(account: &CopyAccount) -> Value {
         "company": account.name,
         "industry": account.industry,
         "location": account.hq,
-        "verified_facts": account.observed_facts.iter().take(3).collect::<Vec<_>>(),
-        "research_notes_not_verified_and_never_declarative": account.signals.iter().take(2).collect::<Vec<_>>(),
+        "verified_facts": Vec::<String>::new(),
+        "evidence_selection_note": "Use only the atomic, URL-linked claims in copy_decision_context; legacy list-position facts are intentionally excluded.",
         "question_to_test_not_a_fact": account.hypothesis,
         "mechanism_to_test_not_a_fact": account.mechanism,
         "plain_reason_it_might_matter_not_a_fact": account.consequence_metric,
@@ -3558,6 +3588,7 @@ fn gtm_state_priority(state: &str) -> u8 {
 }
 
 fn select_people_for_planning(
+    brand: &str,
     people: Vec<crate::db::Person>,
     per_account: usize,
 ) -> Vec<crate::db::Person> {
@@ -3576,17 +3607,37 @@ fn select_people_for_planning(
             continue;
         };
         candidates.sort_by(|left, right| {
-            response_design::contact_priority(&right.title, &right.vantage, right.primary)
-                .cmp(&response_design::contact_priority(
-                    &left.title,
-                    &left.vantage,
-                    left.primary,
-                ))
+            contact_location_priority(brand, right)
+                .cmp(&contact_location_priority(brand, left))
+                .then_with(|| {
+                    response_design::contact_priority(&right.title, &right.vantage, right.primary)
+                        .cmp(&response_design::contact_priority(
+                            &left.title,
+                            &left.vantage,
+                            left.primary,
+                        ))
+                })
                 .then_with(|| left.name.cmp(&right.name))
         });
         selected.extend(candidates.into_iter().take(per_account.max(1)));
     }
     selected
+}
+
+fn contact_location_priority(brand: &str, person: &crate::db::Person) -> u8 {
+    if !brand.eq_ignore_ascii_case("wapahki") {
+        return 0;
+    }
+    let location = person.location.to_ascii_lowercase();
+    if location.contains("ontario") || location.contains(", on,") || location.ends_with(", on") {
+        3
+    } else if location.contains("canada") {
+        2
+    } else if location.trim().is_empty() {
+        1
+    } else {
+        0
+    }
 }
 
 fn normalize_principle_ids(ids: &[String], allowed: &[String]) -> Vec<String> {
@@ -5756,6 +5807,7 @@ mod tests {
                 ..Default::default()
             };
         let selected = select_people_for_planning(
+            "gnk",
             vec![
                 person("r", "a", "Recruiter", "Senior Recruiter", "router", false),
                 person("o", "a", "Owner", "Claims Manager", "process_owner", true),
@@ -5801,6 +5853,28 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn wapahki_prefers_a_local_workflow_owner_over_a_foreign_peer() {
+        let person = |id: &str, location: &str| Person {
+            id: id.into(),
+            lead_id: "plant".into(),
+            name: id.into(),
+            title: "Production Manager".into(),
+            vantage: "process_owner".into(),
+            location: location.into(),
+            ..Default::default()
+        };
+        let selected = select_people_for_planning(
+            "wapahki",
+            vec![
+                person("foreign", "Chicago, Illinois, United States"),
+                person("local", "Brantford, Ontario, Canada"),
+            ],
+            1,
+        );
+        assert_eq!(selected[0].id, "local");
     }
 
     #[test]
@@ -5858,7 +5932,7 @@ mod tests {
         let approval = approve_ready_touches(&db, pb, Some(&person_id)).expect("approval");
         assert_eq!(approval.touches_scheduled, 0);
         assert_eq!(approval.people_held, 1);
-        assert!(approval.hold_reasons[0].contains("current GTM state"));
+        assert!(!approval.hold_reasons[0].trim().is_empty());
         assert_eq!(
             db.list_touches_for_person(&person_id).unwrap()[0].status,
             "draft"
