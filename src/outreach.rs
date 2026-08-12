@@ -698,7 +698,8 @@ fn checkpoint_sequence_copy(
             review_passes: review.map(|review| review.passes),
             review_issues: review
                 .map(|review| {
-                    let mut issues = vec![format!("sendability score: {}/100", review.score)];
+                    let mut issues =
+                        vec![format!("independent review score: {}/100", review.score)];
                     issues.extend(review.issues.clone());
                     issues
                 })
@@ -737,7 +738,7 @@ pub async fn plan_pending(
     progress_reporter: Option<PlanProgressReporter>,
 ) -> Result<PlanSummary> {
     let requested_touches = n_touches.max(1);
-    let n_touches = supported_touch_count(requested_touches);
+    let n_touches = supported_touch_count_for_brand(&pb.key, requested_touches);
     if n_touches != requested_touches {
         log_outreach(format!(
             "normalized eager sequence from {requested_touches} to {n_touches} supported touches"
@@ -751,21 +752,31 @@ pub async fn plan_pending(
     let system = pb.copy_system_prompt(shared);
 
     // Verified people to sequence. An explicit --person request targets that exact
-    // row. A bulk request honors the operator's per-account cardinality instead
-    // of silently collapsing five requested recipients into one "primary."
+    // row. Bulk cold outreach opens with one best-supported person per account.
     let mut verified = db.list_people(Some(&pb.key), Some("verified"))?;
     // The full motion scopes drafting to the people IT just sourced, so a run
     // doesn't re-draft the brand's entire accumulated backlog every time.
     if let Some(ids) = only_person_ids {
         verified.retain(|person| ids.contains(&person.id));
     }
-    let selected = if person_filter.is_some() || only_person_ids.is_some() {
+    let filtered = if person_filter.is_some() || only_person_ids.is_some() {
         verified
             .into_iter()
             .filter(|person| person_matches(person, person_filter))
             .collect::<Vec<_>>()
     } else {
-        select_people_for_planning(verified, per_account_cap.unwrap_or(1).max(1))
+        verified
+    };
+    // Cold outreach opens one human thread per account. Additional colleagues
+    // remain mapped in the CRM and may be contacted only after a reply, route,
+    // or explicit single-person request supplies a reason.
+    let selected = if person_filter.is_some() {
+        filtered
+    } else {
+        if per_account_cap.unwrap_or(1) > 1 {
+            log_outreach("limited cold planning to one primary recipient per account");
+        }
+        select_people_for_planning(filtered, 1)
     };
     let mut todo = Vec::new();
     let mut matched_people = 0;
@@ -807,9 +818,9 @@ pub async fn plan_pending(
                 }
                 continue;
             }
-            todo.push((p, Some(sequence_id)));
+            todo.push((p, Some(sequence_id), gtm_state_priority(&context.state)));
         } else {
-            todo.push((p, None));
+            todo.push((p, None, gtm_state_priority(&context.state)));
         }
     }
     if person_filter.is_some() && matched_people == 0 {
@@ -825,6 +836,15 @@ pub async fn plan_pending(
         });
     }
 
+    // When a bounded run or provider budget cannot cover everyone, consume
+    // easy/action-ready accounts before medium/discovery-ready accounts.
+    todo.sort_by(|left, right| {
+        left.2
+            .cmp(&right.2)
+            .then_with(|| left.0.lead_id.cmp(&right.0.lead_id))
+            .then_with(|| left.0.name.cmp(&right.0.name))
+    });
+
     // A full seven-touch sequence is already a large structured result. Keep
     // every writer call to one recipient: three recipients in one response
     // produced 21 touches and exhausted the provider's 12,288-token output
@@ -834,7 +854,7 @@ pub async fn plan_pending(
     let leads = db.list_leads(Some(&pb.key))?;
     let roster = todo
         .iter()
-        .map(|(person, _)| PlanProgressRecipient {
+        .map(|(person, _, _)| PlanProgressRecipient {
             key: person.id.clone(),
             name: person.name.clone(),
             account: leads
@@ -849,20 +869,27 @@ pub async fn plan_pending(
         todo.len()
     ));
     let progress = PlanProgress::new(progress_reporter, roster);
-    let mut grouped: HashMap<String, Vec<(crate::db::Person, Option<String>)>> = HashMap::new();
-    for (person, replaced_sequence) in todo {
+    let mut grouped: HashMap<String, (u8, Vec<(crate::db::Person, Option<String>)>)> =
+        HashMap::new();
+    for (person, replaced_sequence, priority) in todo {
         grouped
             .entry(person.lead_id.clone())
-            .or_default()
+            .or_insert_with(|| (priority, Vec::new()))
+            .1
             .push((person, replaced_sequence));
     }
     let mut groups = grouped.into_iter().collect::<Vec<_>>();
-    groups.sort_by(|left, right| left.0.cmp(&right.0));
+    groups.sort_by(|left, right| {
+        left.1
+             .0
+            .cmp(&right.1 .0)
+            .then_with(|| left.0.cmp(&right.0))
+    });
     // Fan each account out into bounded recipient chunks.
     type AccountRecipients = Vec<(crate::db::Person, Option<String>)>;
     let units: Vec<(String, AccountRecipients)> = groups
         .into_iter()
-        .flat_map(|(lead_id, people)| {
+        .flat_map(|(lead_id, (_, people))| {
             people
                 .chunks(max_recipients_per_call)
                 .map(|chunk| (lead_id.clone(), chunk.to_vec()))
@@ -1209,6 +1236,18 @@ pub fn supported_touch_count(requested: usize) -> usize {
     }
 }
 
+pub fn supported_touch_count_for_brand(brand: &str, requested: usize) -> usize {
+    if brand.eq_ignore_ascii_case("outagehub") {
+        if requested <= 1 {
+            1
+        } else {
+            2
+        }
+    } else {
+        supported_touch_count(requested)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn finalize_reviewed_draft(
     db: &SharedDb,
@@ -1226,10 +1265,14 @@ fn finalize_reviewed_draft(
     seq_id: &str,
 ) -> Result<FinalizedDraft> {
     let seq = &copy.sequence;
+    if let Some(reason) = cross_recipient_similarity_issue(db, pb, person, seq_id, seq)? {
+        return Err(anyhow!(reason));
+    }
     let now = Utc::now();
     let delivery_ready = auto_schedule
-        && gtm_context.sequence_ready_for(seq.touches.len())
-        && crate::gtm::delivery_block_reason(db, pb, lead, person)?.is_none();
+        && gtm_context.delivery_ready_for(seq.touches.len())
+        && crate::gtm::candidate_delivery_block_reason(db, pb, lead, person, seq.touches.len())?
+            .is_none();
     let mut touches_scheduled = 0usize;
     let mut touches_drafted = 0usize;
     for t in &seq.touches {
@@ -1254,7 +1297,7 @@ fn finalize_reviewed_draft(
                 }));
         let review_issues = review
             .map(|review| {
-                let mut issues = vec![format!("sendability score: {}/100", review.score)];
+                let mut issues = vec![format!("independent review score: {}/100", review.score)];
                 issues.extend(review.issues.clone());
                 issues
             })
@@ -1388,19 +1431,18 @@ async fn plan_sequence(
         desired_outcome,
     } = input;
     let account = planner_account_brief(account);
-    let discovery_only = gtm_context.contains("GTM ACTION STATE: discovery_ready");
     let effective_vantage = response_design::effective_vantage(&person.title, &person.vantage);
     let recipient = json!({
         "name": person.name,
         "first_name": person.first_name,
         "title": person.title,
         "vantage": effective_vantage,
-        "likely_access_internal_only": if discovery_only { "" } else { person.can_observe.as_str() },
+        "likely_access_internal_only": person.can_observe.as_str(),
         "role_response_contract_internal_only": response_design::for_person(person).prompt_value(),
         "operator_requested_outcome_internal_only": desired_outcome.unwrap_or("No narrower outcome supplied; choose the smallest useful cold response for this vantage and evidence state."),
     });
     let user = format!(
-        "Plan a {n}-touch no-reply sequence for this recipient. Hypotheses define the decision and mechanism but are not facts. First complete the private response_strategy: the exact response Andrew needs, why it could matter to this role, one concrete operating scene, the credibility basis, the smallest voluntary commitment, and what would trigger reactance. Honor an operator-requested outcome when it is earned by the evidence and this person's vantage; otherwise reduce it to the nearest honest step. Discovery-ready means the private problem remains a question, not that Andrew may ask only for routing: when the public workflow category is specific and the recipient is a credible operator, process owner, or operational executive, a short discovery conversation plus an email-reply alternative is an earned cold outcome. Reserve routing-only treatment for routers or misaligned titles. Before selecting the thread, compare three distinct T1 approaches: problem-sniffing from the strongest source, a concise commercial point of view, and an existence-or-routing note. Prefer the one with the clearest recipient reason to answer and lowest evidence risk; do not blend them. State the selected approach and why in overall_strategy.\n\nACCOUNT BRIEF:\n{account}\n\nRECIPIENT:\n{recipient}\n\nPRIVATE GTM ACTION CONTEXT:\n{gtm_context}\n\nRELEVANT PLANNING KNOWLEDGE:\n{knowledge}\n\nT1 connects a verified trigger to one operating decision and one role-matched ask. T2 advances the mechanism. T3 is a human LinkedIn request. T4, when present, adds a sourced fact, useful distinction, objection answer, route, or close. Never invent collateral or a later stage merely to fill the plan. For each touch return stage, channel, objective, angle, and at most one ask. Never make LinkedIn say only that an email was sent. If action state is research_required, do not plan. Cite only principle IDs that changed the plan.",
+        "Plan a {n}-touch no-reply sequence for this recipient. Hypotheses define the decision and mechanism but are not facts. Action-ready accounts may use the supported cadence. Discovery-ready accounts may use exactly one complete, hypothesis-led first email; they must not receive follow-ups before a reply. Every other state remains in research. First complete the private response_strategy: the exact response Andrew needs, why it could matter to this role, one concrete operating scene, the credibility basis, the smallest voluntary commitment, and what would trigger reactance. Honor an operator-requested outcome when it is earned by the evidence and this person's vantage; otherwise reduce it only as much as evidence or role fit requires and record that reduction in overall_strategy. When it is supported, preserve its exact operating decision in the T1 ask: do not replace it with a broad workflow-interview question such as `what takes the most time`, `what happens today`, or `how do you handle this`. A short discovery conversation plus an email-reply alternative is appropriate for a direct operator, process owner, or operational executive when research supports a concrete task, decision, or mechanism. Reserve routing-only treatment for routers or misaligned titles. Before selecting the thread, compare three distinct T1 approaches: problem-sniffing from the strongest source, a concise commercial point of view, and an existence-or-routing note. Prefer the one with the clearest recipient reason to answer and lowest evidence risk; do not blend them. State the selected approach and why in overall_strategy.\n\nACCOUNT BRIEF:\n{account}\n\nRECIPIENT:\n{recipient}\n\nPRIVATE GTM ACTION CONTEXT:\n{gtm_context}\n\nRELEVANT PLANNING KNOWLEDGE:\n{knowledge}\n\nT1 connects a verified trigger to one operating decision and one role-matched ask. T2 advances the mechanism. T3 is a human LinkedIn request. T4, when present, adds a sourced fact, useful distinction, objection answer, route, or close. Never invent collateral or a later stage merely to fill the plan. For each touch return stage, channel, objective, angle, and at most one ask. Never make LinkedIn say only that an email was sent. Cite only principle IDs that changed the plan.",
         account = serde_json::to_string_pretty(&account).unwrap_or_default(),
         recipient = serde_json::to_string_pretty(&recipient).unwrap_or_default(),
         knowledge = knowledge.block,
@@ -1485,17 +1527,14 @@ async fn write_account_sequences(
         people,
     );
     let recipient_payload = |person: &crate::db::Person| {
-        let discovery_only = gtm_contexts
-            .get(&person.id)
-            .is_some_and(|context| context.state == "discovery_ready");
         json!({
             "person_key": person.id,
             "name": person.name,
             "first_name": person.first_name,
             "title": person.title,
             "vantage": response_design::effective_vantage(&person.title, &person.vantage),
-            "likely_access_internal_only": if discovery_only { "" } else { person.can_observe.as_str() },
-            "why_this_person_internal_only": if discovery_only { "Selected from verified title and mapped operating vantage only; do not infer access to the private workflow." } else { person.why_them.as_str() },
+            "likely_access_internal_only": person.can_observe.as_str(),
+            "why_this_person_internal_only": person.why_them.as_str(),
             "person_research_status": if person.linkedin_url.trim().is_empty() {
                 "No person-level profile source is on file. Do not fake individual personalization; use the account signal and role-appropriate ask."
             } else {
@@ -1522,11 +1561,7 @@ async fn write_account_sequences(
     };
     let writer_knowledge = knowledge.writer.block.clone();
     let brand_trigger_contract = brand_trigger_contract(&pb.key, n);
-    let t1_contract = if n == 1 {
-        "ONE-TOUCH OVERRIDE: This is a research opener, not a miniature commercial cadence. This instruction overrides any generic requirement below to state a seller difference, ask for a call, or offer two response paths. For a discovery_ready recipient, do not choose hold_for_research merely because the private workflow, historical incident, manual step, consequence, or mechanism is unproven; testing one such bounded premise as a question is the purpose of this lane. Hold only when no supplied fact explains account relevance, the title cannot credibly answer, or the premise cannot be kept hypothesis-safe. Write one complete note inside the configured word band with one verified reason for choosing this person, one concrete operating moment, and exactly one factual question answerable in a sentence. The factual question must be the final copy sentence before Andrew's signature. A relevant, low-risk correction from the workflow owner is a sufficient reason to answer. Do not add a capability sentence, research explanation, routing request, or recipient-benefit justification after the question."
-    } else {
-        "MULTI-TOUCH T1 CONTRACT: State one concrete seller difference in plain language and give one easy response path after the operating moment is clear."
-    };
+    let t1_contract = "T1 CONTRACT: Write a complete founder note inside the configured word band. Explain why this person, name one recognizable problem and plausible consequence, state one concrete and evidence-safe seller contribution, and offer one natural response path. For a medium/discovery-ready account, the one direct operating answer is the sole CTA; do not add a call before the missing term is confirmed. A correction may be useful, but Andrew's desire for one is never the recipient's reason to answer. When the operator requested a supported operating decision or response, preserve it in T1; never broaden it into a generic workflow interview such as `what takes the most time`, `what happens today`, or `how do you handle this`. Hold rather than manufacture any missing account foundation.";
     let writer_instructions = format!(
         r#"Write one {n}-touch no-reply sequence for each recipient. {planning_contract}
 
@@ -1538,11 +1573,11 @@ Think through the buyer-safe brief and copy decision context. Return exactly one
 
 If previous_rejection_feedback_internal_only is nonempty, this is a whole-sequence rewrite after a failed review. Treat every saved finding as a hard defect to remove, reconsider the structure that produced it, and return genuinely revised copy. Do not quote or mention the feedback to the recipient.
 
-T1 must use the brand-specific word band. Write it as one natural note, not as a checklist. Use one verified fact to explain why this person received it, ask about one recognizable operating moment, state one concrete seller difference in plain language, and give one easy way to answer. Treat the mechanism as uncertainty, but do not narrate the research process or stack caveats. A complete founder note usually moves naturally from why this person, to the operating moment and bounded guess, to what Andrew is exploring, to one call-or-email response path; use that logic without copying a fixed template. Never dictate answer labels or turn the note into a multiple-choice research form; an easy answer is an ordinary sentence in the recipient's own language. Never manufacture specificity with a task, object, machine, customer, or process that is absent from verified facts. A short discovery conversation is a valid cold ask for a direct workflow owner when the hypothesis is precise. When operator_requested_outcome_internal_only asks for that conversation or a short email explanation and the evidence supports the workflow category, T1 must offer those two natural paths; do not silently replace them with a coded answer, routing request, or permission to send collateral. A router may only be asked to route.
+T1 must use the brand-specific word band. Write it as one natural note, not as a checklist. Use one verified fact to explain why this person received it, ask about one recognizable operating moment, state one concrete seller difference in plain language, and give one easy way to answer. Treat the mechanism as uncertainty, but do not narrate the research process or stack caveats. A complete founder note usually moves naturally from why this person, to the operating moment and bounded guess, to what Andrew is exploring, to one response path; use that logic without copying a fixed template. Never dictate answer labels or turn the note into a multiple-choice research form; an easy answer is an ordinary sentence in the recipient's own language. Never manufacture specificity with a task, object, machine, customer, or process that is absent from verified facts. A short discovery conversation is a valid cold ask for an action-ready direct workflow owner when the hypothesis is precise. For a discovery-ready recipient, ask for the one missing operating answer by email and stop; do not stack a call invitation onto it. A router may only be asked to route.
 
 Before returning T1, privately write five possible subjects and discard any that merely label the category, such as `utility status`, `power alarms`, `claim evidence`, `decision trail`, or `automation question`. Choose a 3-9 word subject that names the recognizable event, decision, object, or consequence in the email and gives this recipient an accurate reason to open. It should remain plain and forwardable, never clickbait. Then read the first two body lines aloud. Rewrite compressed phrases such as `make this decision consequential`, `the distinction I have in mind`, and `the practical difference is` into ordinary spoken English.
 
-For one touch use email/0. For two touches use email/0 and email/6. For four touches use email/0, email/3, linkedin_request/7, email/14. For seven touches use email/0, email/3, linkedin_request/5, email/9, linkedin_or_email/13, email/17, linkedin_or_email/21. Every email-capable touch must look like an email: `[First name],` on its own line without Hi, Hello, or Hey, a coherent message, and the exact signature on its own line. T1 uses one plain, specific 3-9 word operational subject; sentence case or title case is fine. Later email-capable touches preserve it with one re: prefix. A linkedin_request has no subject, greeting, signature, pitch, meeting ask, or prior-email reference; it must stay under 300 characters. It must name the operating question or shared topic that makes connecting useful. Empty compliments such as `substantial remit`, `valuable perspective`, `impressive background`, or `I respect your work` fail.
+For one touch use email/0. For two touches use email/0 and email/6. For four touches use email/0, email/3, linkedin_request/7, email/14. For seven touches use email/0, email/3, linkedin_request/5, email/9, linkedin_or_email/13, email/17, linkedin_or_email/21. Every email-capable touch must look like an email: `Hi [First name],` on its own line, a coherent message, and the exact signature on its own line. T1 uses one plain, specific 3-9 word operational subject; sentence case or title case is fine. Later email-capable touches preserve it with one re: prefix. A linkedin_request has no subject, greeting, signature, pitch, meeting ask, or prior-email reference; it must stay under 300 characters. It must name the operating question or shared topic that makes connecting useful. Empty compliments such as `substantial remit`, `valuable perspective`, `impressive background`, or `I respect your work` fail.
 
 Purpose and goal are private CRM notes, never substitutes for buyer-facing prose. Before returning, read the whole sequence as the recipient. Remove generic lessons, fragments, surveys, framework language, and repeated retreat lines. In four touches, at most one touch may mainly say Andrew may be wrong, invite a correction/referral, or close; in seven touches the maximum is three. Rewrite any excess around mechanism, useful contribution, and the hard buyer objection. Never reveal play labels, experiment arms, confidence scores, or internal hypotheses."#,
         n = n,
@@ -1772,23 +1807,19 @@ Purpose and goal are private CRM notes, never substitutes for buyer-facing prose
     })
 }
 
-fn brand_trigger_contract(brand: &str, touches: usize) -> &'static str {
+pub(crate) fn brand_trigger_contract(brand: &str, touches: usize) -> &'static str {
     if brand == "gnk" && touches == 1 {
-        "GNK ONE-TOUCH DISCOVERY CONTRACT: Write one diagnostic email only. Lead with one supplied, source-backed company or role fact and one recognizable decision moment. Ask exactly one five-second factual question about whether the named reviewer can see the supporting record immediately or whether another step is needed. Do not claim the workflow is manual, fragmented, recurring, expensive, or consequential unless the account evidence states that directly. Do not mention GnK, pitch software, ask for a meeting, request a referral, offer collateral, or promise a follow-up. The sole goal is a correction or factual reply."
+        "GNK PRECISE FIRST-TOUCH CONTRACT: Research must support one account-specific recurring decision OR direct mechanism/artifact evidence, plus a recipient close to it. T1 distinguishes sourced fact from hypothesis, names the recognizable workflow in ordinary language, frames the unproved consequence as one sharp question when necessary, explains one concrete way GnK could help, and offers a short conversation with an email answer as the easier path. Never reuse a universal records/reconstruction fork or make correction the only recipient value."
     } else if brand == "gnk" {
-        "GNK RECOGNITION-FIRST CONTRACT: Copy is allowed only when research supplies all four account-level foundations: a specific recurring decision, a believable operating or economic consequence, an external trigger or direct evidence of the mechanism, and a recipient genuinely close to the work. Company category, scale, geography, department pages, portals, or a generally plausible cross-system workflow are not enough. T1 names the recognizable event and the decision fork, then asks exactly one question that is quick to answer: can the reviewer immediately see what supports the current position, or must someone rebuild the account from named source-safe records? The email may explain one concrete GnK intervention only after the fork is clear. Do not ask the recipient to develop the opportunity, diagnose importance, parse internal labels, or accept a meeting. Avoid 'the distinction I mean', 'my hypothesis is', 'that is the narrow point', 'one practical boundary', 'I am not suggesting', and all research-process narration. Follow-ups must advance with a sourced consequence, operational example, bounded proof, adjacent question, or useful route; never restate or retract T1. If the premise would need an apology or retraction, hold the account instead."
+        "GNK COMMERCIAL DISCOVERY CONTRACT: Multi-touch copy requires a specific recurring decision, believable consequence, mechanism evidence, and recipient close to the work. T1 names the problem, explains one concrete GnK contribution, and offers a short conversation with an email alternative. Follow-ups add evidence, consequence, a bounded test, or a useful route."
     } else if brand == "wapahki" && touches == 1 {
-        "WAPAHKI ONE-TOUCH DISCOVERY CONTRACT: Write one 40–80 word plant-floor diagnostic email only. After the greeting, use exactly two body sentences: first, one supplied company fact; second, one factual question; then Andrew's signature. The question is the whole discovery ask and should normally be no more than 25 words: `At [generic final-packing station], is [the handoff] still staffed by hand because [one likely blocker] makes fixed equipment difficult?` Use that as a structural shape, never canned wording. Keep the hypothesized station, staffing consequence, and blocker entirely inside the question so none becomes an asserted company fact. Food manufacturing, co-packing, packaged products, or packaging capabilities support asking about generic final packing or pack-out; a tray, pouch, case, conveyor, machine, or exact movement still requires supplied evidence. Choose exactly one blocker such as sanitation, product shape, package variation, or reset time. Do not add an `or` alternative, line-speed clause, stoppage clause, second consequence, or second diagnostic. Product variety or private-label work never proves changeovers, manual work, or pressure. Do not ask the recipient to find a use case, classify variation, evaluate a robot, take a meeting, route the email, or review collateral. Do not mention Wapahki or pitch robotics."
+        "WAPAHKI PRECISE FIRST-TOUCH CONTRACT: Research must identify one physical candidate task or handoff and a recipient close to it. T1 is a natural founder/researcher note: why this operator, the sourced facility/task clue, one honestly framed consequence or economic question, Andrew's University of Toronto and Automata robotics context, one concrete Wapahki contribution, and one low-friction response path. When the verified seller context permits it, give the recipient a practical reason to answer by offering to apply Wapahki's existing one-page automation-fit screen to this exact task and return a first-pass view; never imply that assessment already exists. For a medium account, ask for the missing operating answer by email and stop. Arrive with the candidate task; never ask the recipient to search the operation for a use case."
     } else if brand == "wapahki" {
-        "WAPAHKI PLANT-FIRST CONTRACT: T1 must follow this response path: one source-supported physical station or handoff; one observed operating condition; one suspected consequence such as staffing, overtime, throughput, stoppage, utilization, short-run economics, ergonomics, safety, sanitation, or changeover cost; one likely reason ordinary automation struggles; and exactly one factual question answerable from memory. Arrive with the candidate task and invite correction. Never ask the recipient to inspect the plant, identify any use case, classify where variation enters, or evaluate Wapahki's task boundary. Product variety, owned brands, and private-label work do not prove changeovers, manual packing, low volume, staffing pressure, or failed automation. Wapahki, robotics, and Andrew's robotics biography are optional and must not appear before the plant moment and question. T2 adds the suspected economic reason or one new operating fact. T3 is a plant-specific human connection reason, not a miniature pitch. T4 names one plausible alternative owner or closes without repeating the repeatability-versus-format thesis. Do not explain the normal-case/exception architecture before the recipient confirms why the job remains manual."
-    } else if brand == "outagehub" && touches == 1 {
-        "OUTAGEHUB ONE-TOUCH DISCOVERY CONTRACT: Write one diagnostic email only. Use one supplied fact about the recipient's operated Canadian locations, charging footprint, or outage-sensitive role. Name the exact moment an entire site goes dark and ask exactly one factual question: does the team check local utility status before its next equipment ticket, dispatch, or customer-status step, or do internal systems settle the cause? Choose only one downstream step. That question must be the final sentence before Andrew's signature; nothing may follow it. Do not claim a historical match, manual reconciliation, avoidable dispatch, delay, or multi-site effect unless supplied evidence proves it. Do not mention OutageHub, pitch an API, ask for a meeting or referral, offer an example, narrate the research, or create a follow-up."
+        "WAPAHKI FOUNDER-RESEARCHER CONTRACT: Multi-touch copy requires one source-supported physical task, credible economic pressure, and a reachable owner. T1 is a natural founder/researcher note with Andrew's University of Toronto and Automata context, one Wapahki contribution, and a short call-or-email response path. Follow-ups advance the same task."
     } else if brand == "outagehub" && touches == 2 {
-        "OUTAGEHUB TWO-EMAIL EVIDENCE CONTRACT: This experiment targets operated Canadian EV-charging networks only. T1 names one exact incident moment: an entire charging site goes dark. State the useful job in operator language: determine whether the failure is upstream utility supply before opening an equipment/network ticket, dispatching a technician, or updating driver/customer status. Ask exactly one easy disqualifying question about whether Service Operations still checks the local utility map or whether telemetry settles the cause immediately. Do not ask the recipient to validate an invented multi-site prioritization theory. Do not use abstract phrases such as external context, operational action, reported interruption, reconcile records, classification path, or which response step takes the most time. T2 lands six days later and is allowed only when the account brief contains a real, location-specific historical match or measured example; provide the verified timestamp/location result and ask one short follow-on question. Never manufacture that asset or promise it before it exists. If no real historical example is present, hold the sequence rather than write filler. Two emails are the whole cadence; there is no LinkedIn touch, routing bump, disclaimer paragraph, or breakup email."
-    } else if brand == "outagehub" && touches >= 7 {
-        "OUTAGEHUB SEVEN-TOUCH CONTRACT: A stable sourced fact about the prospect's operated site/network footprint can be the trigger; a recent utility outage is not required and must never be invented. T1 is a complete founder note, normally 100-150 words: directly explain why this person was chosen, describe one recognizable outage-time decision and a restrained practical consequence of uncertainty, name OutageHub and the specific outside utility context it could add beyond alarms or site calls, then offer a short conversation or email reply. Do not compress those ideas into internal-memo phrases or expand them into a dossier. T2 sharpens the diagnostic with one new distinction. T3 is only a human, recipient-specific reason to connect: no product explainer, collateral, meeting ask, or prior-email reference. T4 contributes a useful comparison or supported work product; a historical example is optional and may name a prospect location, incident, or outage window only when that detail appears in verified facts or the recipient first supplies it. T5 answers the strongest objection, usually what this adds beyond alarms, telemetry, or site calls. T6 routes once. T7 closes without another pitch. State the public-versus-private data limitation at most once across the sequence. Do not repeat the same utility-data mechanism in more than two touches or offer the same artifact twice."
+        "OUTAGEHUB TWO-EMAIL EVIDENCE CONTRACT: This cadence is for distributed Canadian operators with one exact outage-time decision, a nearby operations recipient, and a completed location-specific historical utility match. T1 explains OutageHub's location-matched Canadian utility API, frames one evidence-safe consequence, and offers a natural short conversation or email path. T2 contributes the verified location and timestamp without claiming private site or asset status. Do not prescribe a universal dark-site/equipment-ticket binary."
     } else if brand == "outagehub" {
-        "OUTAGEHUB FOUR-TOUCH CONTRACT: A stable sourced fact about the prospect's operated site/network footprint can be the trigger; a recent utility outage is not required and must never be invented. T1 should read like a complete 100-150 word founder note: why this person, one recognizable outage-time decision, a restrained practical consequence, one plain OutageHub explanation, and a short conversation or email reply. Do not compress those ideas into internal-memo phrases or expand them into a dossier. T2 must add one new diagnostic distinction and may offer one supported work product. A historical comparison may name a prospect location, incident, or outage window only when that detail appears in verified facts or the recipient first supplies it. T3 is only a human, recipient-specific reason to connect: no product explainer, historical comparison, collateral, meeting ask, or prior-email reference. T4 routes or closes the same question without explaining public outage data again. State the public-versus-private data limitation at most once across the sequence. Do not repeat the same utility-data mechanism in more than two touches."
+        "OUTAGEHUB PRECISE FIRST-TOUCH CONTRACT: Target an operator with distributed Canadian locations and one evidenced outage-time diagnosis, dispatch, escalation, continuity, prioritization, or communication decision. T1 names the account-specific decision, explains in plain language that OutageHub supplies location-matched Canadian utility reports through an API, and offers a short conversation with an email answer as the easier path. A completed historical match may be mentioned with its exact boundary; it is not required for this first discovery touch. Never claim private site status or reuse a universal dark-site/ticket binary."
     } else {
         ""
     }
@@ -2261,6 +2292,11 @@ fn record_copy_research_attempt(
         "copy_policy_version": CURRENT_COPY_POLICY_VERSION,
         "round": round,
         "candidate_hash": format!("{:016x}", hasher.finish()),
+        "candidate": sequence.touches.iter().map(|touch| json!({
+            "stage": touch.stage,
+            "subject": touch.subject,
+            "body": touch.body,
+        })).collect::<Vec<_>>(),
         "status": status,
         "findings": findings,
     });
@@ -2274,7 +2310,8 @@ fn record_copy_research_attempt(
     for finding in findings {
         let (key, subject) = copy_research_rule(finding);
         let compact = finding.chars().take(600).collect::<String>();
-        let _ = db.record_learning(&pb.key, "copy_research_rule", &subject, &key, &compact);
+        let kind = format!("copy_research_rule_v{CURRENT_COPY_POLICY_VERSION}");
+        let _ = db.record_learning(&pb.key, &kind, &subject, &key, &compact);
     }
 }
 
@@ -3328,16 +3365,10 @@ async fn request_copy_review_with_tier(
     let stage_contract = format!(
         "SCHEMA CONTRACT: first grade the entire sequence for coherence, relevance, repetition, and whether a sensible recipient has a reason to answer. Then return exactly one review object for every stage 1 through {expected_touches}, even when only a subset needs repair. A sequence passes only at 85+ with no unresolved sequence issues. For an unnamed stage that does not need editing, preserve it with empty revised fields."
     );
-    let brand_contract = brand_trigger_contract(&pb.key, expected_touches);
-    let sendability_contract = if expected_touches == 1 {
-        "ONE-TOUCH SENDABILITY: This is a bounded research opener. This rule overrides any generic demand for a seller difference, capability sentence, collateral, or meeting ask. Pass when a verified account/role fact explains why this person was chosen and leads to exactly one concrete operating question that the recipient can answer quickly and without face risk. The operating moment may be the explicitly labeled hypothesis; it does not need to be public fact, but it must remain inside the question and must not become an asserted event, mechanism, or consequence. A relevant correction from the workflow owner is enough reason to answer. The factual question may be the final sentence; do not demand a second recipient-benefit closing. Reject generic moments, invented consequences, research-process narration, or a question that asks the recipient to discover the use case."
-    } else {
-        "SENDABILITY: Reject T1 if it is merely a diagnostic question plus a vague capability sentence. Require one verified trigger, one operating decision, one concrete seller difference, and a role-relevant reason to answer. Curiosity is not recipient value. Never require or invent collateral. T2 must advance the mechanism. Any later touch must add a sourced fact, useful distinction, honest objection answer, route, or close rather than paraphrase."
-    };
+    let sendability_contract = "INDEPENDENT SENDABILITY: Judge the words as a skeptical recipient, not as a checker of the writer's requested structure. No generation template, diagnostic-question shape, or factual correction is presumptively sendable. T1 needs a verified trigger, recognizable problem, plausible consequence, concrete seller contribution, and a role-relevant reason to answer through a natural conversation or email path. Compare the actual T1 ask with the private desired response and operating decision in review knowledge. Fail or repair copy that replaces a specific supported decision with a broad workflow-interview question such as `what takes the most time`, `what happens today`, or `how do you handle this`. Curiosity is not recipient value. Never require or invent collateral. When verified seller context explicitly permits Andrew to apply an existing fit screen to this exact sourced task and return a free first-pass blocker view, that is a concrete recipient benefit; preserve it during repair and judge whether the wording makes the no-site-visit, rule-out value clear. Do not demand a second give-back. Later touches must add evidence, a useful distinction, an honest objection answer, route, or close rather than paraphrase.";
     let user = format!(
-        "{task}\n\n{stage_contract}\n{brand_contract}\n{sendability_contract}\nCHANNEL: linkedin_request has no subject; linkedin_or_email must work as either a DM or a complete email fallback. A LinkedIn request must give a concrete operating reason to connect, not praise the recipient's remit, background, perspective, or work.\nINBOX TEST: grade T1's subject and first two lines before the rest. A subject that merely labels the category (`utility status`, `power alarms`, `claim evidence`, `decision trail`, `automation question`) fails even if relevant. Require a plain 3-9 word phrase naming the operating event, decision, object, or consequence that makes this exact email worth opening. No clickbait. Reject internal-memo prose such as `make this decision consequential`, `the distinction I have in mind`, and `the practical difference is`; Andrew must be able to say every line naturally aloud.\nEVIDENCE: the verified facts below are exhaustive. The hypothesis is not fact. Never invent an internal event, system, practice, consequence, or ownership claim.\n\nSIGNATURE: {signature}\nVERIFIED FACTS: {facts}\nHYPOTHESIS, NOT FACT: {hypothesis}\nRECIPIENT: {name} ({title}, {vantage})\nLIKELY ACCESS, INTERNAL ONLY: {can_observe}\nROLE RESPONSE CONTRACT (private; test role fit, reply cost, and face risk without inventing personality):\n{role_contract}\nDETERMINISTIC FINDINGS: {deterministic}\n\nCURRENT SEQUENCE:\n{sequence}\n\nRELEVANT REVIEW KNOWLEDGE:\n{knowledge}",
+        "{task}\n\n{stage_contract}\n{sendability_contract}\nCHANNEL: linkedin_request has no subject; linkedin_or_email must work as either a DM or a complete email fallback. A LinkedIn request must give a concrete operating reason to connect, not praise the recipient's remit, background, perspective, or work.\nINBOX TEST: grade T1's subject and first two lines before the rest. A subject that merely labels the category (`utility status`, `power alarms`, `claim evidence`, `decision trail`, `automation question`) fails even if relevant. Require a plain 3-9 word phrase naming the operating event, decision, object, or consequence that makes this exact email worth opening. No clickbait. Reject internal-memo prose such as `make this decision consequential`, `the distinction I have in mind`, and `the practical difference is`; Andrew must be able to say every line naturally aloud.\nEVIDENCE: the verified facts below are exhaustive. The hypothesis is not fact. Never invent an internal event, system, practice, consequence, or ownership claim.\n\nSIGNATURE: {signature}\nVERIFIED FACTS: {facts}\nHYPOTHESIS, NOT FACT: {hypothesis}\nRECIPIENT: {name} ({title}, {vantage})\nLIKELY ACCESS, INTERNAL ONLY: {can_observe}\nROLE RESPONSE CONTRACT (private; test role fit, reply cost, and face risk without inventing personality):\n{role_contract}\nDETERMINISTIC FINDINGS: {deterministic}\n\nCURRENT SEQUENCE:\n{sequence}\n\nRELEVANT REVIEW KNOWLEDGE:\n{knowledge}",
         task = task,
-        brand_contract = brand_contract,
         sendability_contract = sendability_contract,
         signature = pb.signature,
         facts = verified_facts,
@@ -3416,7 +3447,10 @@ fn business_copy_context(business: &BusinessProfile) -> String {
     serde_json::to_string_pretty(&json!({
         "business": business.name,
         "summary": business.summary,
-        "proven_seller_facts": business.known_facts.iter().take(5).collect::<Vec<_>>(),
+        // Keep the compact verified fact set in full. Wapahki's real one-page
+        // fit screen follows the founder/context facts; truncating at five made
+        // the reviewer incorrectly treat that give-back as invented.
+        "proven_seller_facts": business.known_facts.iter().take(12).collect::<Vec<_>>(),
         "first_party_market_discovery": discovery,
         "hard_constraints": business.constraints.iter().take(5).collect::<Vec<_>>(),
         "instruction": format!(
@@ -3481,7 +3515,8 @@ fn empirical_copy_context(db: &SharedDb, brand: &str) -> Result<String> {
 }
 
 fn copy_research_rule_context(db: &SharedDb, brand: &str) -> Result<String> {
-    let rules = db.recent_learnings(Some(brand), Some("copy_research_rule"), 20)?;
+    let kind = format!("copy_research_rule_v{CURRENT_COPY_POLICY_VERSION}");
+    let rules = db.recent_learnings(Some(brand), Some(&kind), 20)?;
     if rules.is_empty() {
         return Ok("OUTREACH RESEARCH RULES: no prior independent-review defects have been compiled for this copy policy yet.".into());
     }
@@ -3512,6 +3547,14 @@ fn person_matches(person: &crate::db::Person, filter: Option<&str>) -> bool {
     person.id.eq_ignore_ascii_case(filter)
         || person.email.eq_ignore_ascii_case(filter)
         || person.name.eq_ignore_ascii_case(filter)
+}
+
+fn gtm_state_priority(state: &str) -> u8 {
+    match state {
+        "action_ready" => 0,
+        "discovery_ready" => 1,
+        _ => 2,
+    }
 }
 
 fn select_people_for_planning(
@@ -3659,13 +3702,10 @@ fn touch_word_band(pb: &Playbook, touch: &CopyTouch) -> (usize, usize) {
         }
     } else if touch.channel.eq_ignore_ascii_case("email") {
         match touch.stage {
-            // The prompt targets the brand band exactly. QA keeps a small
-            // tolerance so a natural 69-word GnK note is not sent through two
-            // model repairs merely to add a filler word to a 70-word target.
-            1 => (
-                pb.min_words.saturating_sub(20),
-                pb.max_words.saturating_add(10),
-            ),
+            // T1 uses the configured band exactly. Silently relaxing the floor
+            // turned a 75-word commercial standard into a 55-word production
+            // standard and made incomplete notes look compliant.
+            1 => (pb.min_words, pb.max_words),
             // These are still emails, not caption-sized blurbs. T2 sharpens
             // the diagnostic, T4 contributes value, and T6 routes; each stays
             // shorter than T1 while retaining enough room to do its actual job.
@@ -3765,9 +3805,8 @@ fn gnk_hedge_moves(body: &str) -> usize {
 
 fn wapahki_names_operating_consequence(body: &str) -> bool {
     let body = body.to_ascii_lowercase();
-    [
+    let named_consequence = [
         "staffing",
-        "staffed by hand",
         "staffed manually",
         "needs people",
         "need people",
@@ -3788,7 +3827,6 @@ fn wapahki_names_operating_consequence(body: &str) -> bool {
         "ergonomic",
         "injur",
         "safety",
-        "sanitation",
         "payback",
         "capacity",
         "bottleneck",
@@ -3800,7 +3838,88 @@ fn wapahki_names_operating_consequence(body: &str) -> bool {
         "changeover cost",
     ]
     .iter()
+    .any(|marker| body.contains(marker));
+    let quantified_lifting = body.contains("lift")
+        && [" lb", "-lb", " pound"]
+            .iter()
+            .any(|marker| body.contains(marker));
+    let repetitive_lifting = ["regular lifting", "repetitive lifting", "heavy lifting"]
+        .iter()
+        .any(|marker| body.contains(marker));
+    named_consequence || quantified_lifting || repetitive_lifting
+}
+
+fn gnk_names_operating_consequence(body: &str) -> bool {
+    let body = body.to_ascii_lowercase();
+    [
+        "settlement",
+        "delay",
+        "recovery",
+        "recoveries",
+        "write-off",
+        "write off",
+        "audit",
+        "sla",
+        "escalation",
+        "senior time",
+        "reviewer capacity",
+        "leakage",
+        "burden",
+    ]
+    .iter()
     .any(|marker| body.contains(marker))
+}
+
+fn has_natural_response_path(body: &str) -> bool {
+    let body = body.to_ascii_lowercase();
+    let exact_path = [
+        "short conversation",
+        "brief conversation",
+        "quick conversation",
+        "minute call",
+        "short call",
+        "brief call",
+        "email reply",
+        "reply by email",
+        "replying by email",
+        "brief reply",
+        "reply is enough",
+        "tell me by email",
+        "answer by email",
+        "by email whether",
+        "email would be easier",
+        "short email",
+        "brief email",
+        "reply here",
+        "discuss it briefly",
+        "discuss briefly",
+        "open to a call",
+        "open to a conversation",
+    ]
+    .iter()
+    .any(|marker| body.contains(marker));
+    let email_path = body.contains("email")
+        && ["reply", "answer", "easier", "write back"]
+            .iter()
+            .any(|marker| body.contains(marker));
+    let conversation_path = ["call", "conversation", "chat"]
+        .iter()
+        .any(|marker| body.contains(marker))
+        && ["short", "brief", "quick", "minute", "open to"]
+            .iter()
+            .any(|marker| body.contains(marker));
+    let useful_asset_path = ["fit screen", "one-page"]
+        .iter()
+        .any(|marker| body.contains(marker))
+        && ["send", "share"].iter().any(|marker| body.contains(marker))
+        && body.contains('?');
+    // A single concrete operating question is already a natural reply path.
+    // Requiring an extra `reply by email` or call sentence made the writer add
+    // a second CTA, then the independent reviewer correctly rejected the
+    // resulting menu. Semantic QA still decides whether the question itself is
+    // worth answering.
+    let one_direct_question = body.matches('?').count() == 1;
+    exact_path || email_path || conversation_path || useful_asset_path || one_direct_question
 }
 
 fn mentions_outreach_asset(body: &str) -> bool {
@@ -3822,23 +3941,6 @@ fn mentions_outreach_asset(body: &str) -> bool {
         "benchmark",
         "case study",
         "assessment",
-    ]
-    .iter()
-    .any(|term| body.contains(term))
-}
-
-fn explains_outagehub_signal(body: &str) -> bool {
-    let body = body.to_ascii_lowercase();
-    [
-        "public utility",
-        "utility report",
-        "utility update",
-        "utility event",
-        "outage report",
-        "outage update",
-        "location-matched",
-        "matches canadian utility",
-        "match canadian utility",
     ]
     .iter()
     .any(|term| body.contains(term))
@@ -3896,29 +3998,6 @@ fn names_historical_outage_result(body: &str) -> bool {
     .iter()
     .any(|term| body.contains(term));
     result && place && outage && time && !hypothetical
-}
-
-fn states_outagehub_data_boundary(body: &str) -> bool {
-    let body = body.to_ascii_lowercase();
-    let limitation = [
-        "cannot",
-        "can't",
-        "does not",
-        "doesn't",
-        "would not",
-        "wouldn't",
-        "not confirm",
-        "not establish",
-        "not replace",
-        "only outside",
-        "only a reported",
-    ]
-    .iter()
-    .any(|term| body.contains(term));
-    let data = ["utility", "outage", "public report", "outagehub"]
-        .iter()
-        .any(|term| body.contains(term));
-    limitation && data
 }
 
 /// Correction and routing are legitimate outcomes, but the failed campaigns
@@ -4252,17 +4331,15 @@ fn sequence_quality_issues(
                     .map(str::trim)
                     .find(|line| !line.is_empty())
                     .unwrap_or("");
-                let greeting_words = greeting.split_whitespace().count();
                 let greeting_lower = greeting.to_ascii_lowercase();
-                if !greeting.ends_with(',')
-                    || !(1..=3).contains(&greeting_words)
+                let greeting_words = greeting.split_whitespace().count();
+                if !greeting_lower.starts_with("hi ")
+                    || !greeting.ends_with(',')
+                    || !(2..=4).contains(&greeting_words)
                     || greeting.contains('?')
-                    || greeting_lower.starts_with("hi ")
-                    || greeting_lower.starts_with("hello ")
-                    || greeting_lower.starts_with("hey ")
                 {
                     issues.push(format!(
-                        "stage {} must start with '[First name],' on its own line without Hi, Hello, or Hey",
+                        "stage {} must start with 'Hi [First name],' on its own line",
                         touch.stage
                     ));
                 }
@@ -4310,22 +4387,26 @@ fn sequence_quality_issues(
             });
         }
         if pb.key == "gnk" && touch.stage == 1 {
-            if question_count != 1 {
-                issues.push(format!(
-                    "GnK stage 1 must contain exactly one five-second operating question (found {question_count})"
-                ));
-            }
             let body = touch.body.to_ascii_lowercase();
-            if let Some(gnk_position) = body.find("gnk") {
-                if body
-                    .find('?')
-                    .is_none_or(|question_position| gnk_position < question_position)
-                {
-                    issues.push(
-                        "GnK stage 1 introduces the seller before the operating question; make the event and pain legible first"
-                            .into(),
-                    );
-                }
+            if !body.contains("gnk")
+                || !(body.contains("software") || body.contains("system") || body.contains("tool"))
+            {
+                issues.push(
+                    "GnK stage 1 must name GnK and one concrete software/system contribution"
+                        .into(),
+                );
+            }
+            if !gnk_names_operating_consequence(&touch.body) {
+                issues.push(
+                    "GnK stage 1 must connect the recurring decision to a believable operating or economic consequence"
+                        .into(),
+                );
+            }
+            if !has_natural_response_path(&touch.body) {
+                issues.push(
+                    "GnK stage 1 must offer a natural short-conversation or email response path"
+                        .into(),
+                );
             }
             let hedge_moves = gnk_hedge_moves(&touch.body);
             if hedge_moves > 1 {
@@ -4335,22 +4416,22 @@ fn sequence_quality_issues(
             }
         }
         if pb.key == "wapahki" && touch.stage == 1 {
-            if question_count != 1 {
-                issues.push(format!(
-                    "Wapahki stage 1 must contain exactly one factual plant-floor question (found {question_count})"
-                ));
-            }
             let body = touch.body.to_ascii_lowercase();
-            if let Some(wapahki_position) = body.find("wapahki") {
-                if body
-                    .find('?')
-                    .is_none_or(|question_position| wapahki_position < question_position)
-                {
-                    issues.push(
-                        "Wapahki stage 1 introduces the robotics thesis before the plant-floor question"
-                            .into(),
-                    );
-                }
+            let has_university_context = body.contains("university of toronto")
+                || body.contains("u of t")
+                || body.contains("uoft");
+            if !has_university_context || !body.contains("automata") {
+                issues.push(
+                    "Wapahki stage 1 must briefly give Andrew's University of Toronto and Automata robotics context"
+                        .into(),
+                );
+            }
+            if !(body.contains("wapahki") || body.contains("robotic") || body.contains("robotics"))
+            {
+                issues.push(
+                    "Wapahki stage 1 must state one honest robotics contribution rather than only ask for research"
+                        .into(),
+                );
             }
             if !wapahki_names_operating_consequence(&touch.body) {
                 issues.push(
@@ -4358,34 +4439,12 @@ fn sequence_quality_issues(
                         .into(),
                 );
             }
-            if let Some(question_end) = touch.body.rfind('?') {
-                let through_question = &touch.body[..=question_end];
-                let question_start = through_question[..question_end]
-                    .rfind(|character: char| matches!(character, '.' | '!' | '\n'))
-                    .map_or(0, |position| position + 1);
-                let question = through_question[question_start..].trim();
-                let question_words = question.split_whitespace().count();
-                if question_words > 30 {
-                    issues.push(format!(
-                        "Wapahki stage 1 question is {question_words} words (maximum 30); test one station, one staffing consequence, and one blocker only"
-                    ));
-                }
-                if question
-                    .split(|character: char| !character.is_alphabetic())
-                    .any(|word| word.eq_ignore_ascii_case("or"))
-                {
-                    issues.push(
-                        "Wapahki stage 1 uses an `or` alternative; ask one direct yes/no question without a fallback branch"
-                            .into(),
-                    );
-                }
+            if !has_natural_response_path(&touch.body) {
+                issues.push(
+                    "Wapahki stage 1 must offer a natural short-conversation or email response path"
+                        .into(),
+                );
             }
-        }
-        if pb.key == "outagehub" && expected_touches == 1 && touch.stage == 1 && question_count != 1
-        {
-            issues.push(format!(
-                "OutageHub one-touch discovery must contain exactly one factual outage-time question (found {question_count})"
-            ));
         }
         if channel == "linkedin_request" && touch.body.chars().count() > 300 {
             issues.push(format!(
@@ -4522,65 +4581,25 @@ fn sequence_quality_issues(
         ));
     }
 
-    if pb.key == "outagehub" && expected_touches == 2 {
+    if pb.key == "outagehub" && matches!(expected_touches, 1 | 2) {
         let first = sequence.touches.iter().find(|touch| touch.stage == 1);
-        if first.is_some_and(|touch| touch.body.matches('?').count() != 1) {
-            issues
-                .push("OutageHub stage 1 must ask exactly one easy site-diagnosis question".into());
+        if first.is_some_and(|touch| {
+            let body = touch.body.to_ascii_lowercase();
+            !body.contains("outagehub") || !body.contains("utility")
+        }) {
+            issues.push("OutageHub stage 1 must name its utility-location contribution".into());
         }
-        let second = sequence.touches.iter().find(|touch| touch.stage == 2);
-        if second.is_some_and(|touch| !names_historical_outage_result(&touch.body)) {
-            issues.push(
-                "OutageHub stage 2 must contribute a real location-specific historical result; hold the sequence when no verified example exists"
-                    .into(),
-            );
+        if expected_touches == 2 {
+            let second = sequence.touches.iter().find(|touch| touch.stage == 2);
+            if second.is_some_and(|touch| !names_historical_outage_result(&touch.body)) {
+                issues.push(
+                    "OutageHub stage 2 must contribute a real location-specific historical result; hold the sequence when no verified example exists"
+                        .into(),
+                );
+            }
         }
-    } else if pb.key == "outagehub" && expected_touches >= 4 {
-        let first = sequence.touches.iter().find(|touch| touch.stage == 1);
-        if first.is_some_and(|touch| !touch.body.to_ascii_lowercase().contains(&brand_name)) {
-            issues.push(
-                "stage 1 must name OutageHub once and state its concrete contribution in the first note"
-                    .into(),
-            );
-        }
-
-        let explainer_stages = sequence
-            .touches
-            .iter()
-            .filter(|touch| explains_outagehub_signal(&touch.body))
-            .map(|touch| touch.stage)
-            .collect::<Vec<_>>();
-        for stage in explainer_stages.iter().skip(2) {
-            issues.push(format!(
-                "stage {stage} repeats the OutageHub utility-data explanation across {} touches (maximum 2)",
-                explainer_stages.len()
-            ));
-        }
-
-        let boundary_stages = sequence
-            .touches
-            .iter()
-            .filter(|touch| states_outagehub_data_boundary(&touch.body))
-            .map(|touch| touch.stage)
-            .collect::<Vec<_>>();
-        for stage in boundary_stages.iter().skip(1) {
-            issues.push(format!(
-                "stage {stage} repeats the public-versus-private data caveat across {} touches (maximum 1)",
-                boundary_stages.len()
-            ));
-        }
-
-        if sequence
-            .touches
-            .iter()
-            .find(|touch| touch.channel.eq_ignore_ascii_case("linkedin_request"))
-            .is_some_and(|touch| mentions_outreach_asset(&touch.body))
-        {
-            issues.push(
-                "stage 3 LinkedIn request must give a human reason to connect without offering collateral or a historical comparison"
-                    .into(),
-            );
-        }
+    } else if pb.key == "outagehub" {
+        issues.push("OutageHub's evidence cadence requires exactly two emails".into());
     }
 
     if expected_touches == 7 {
@@ -4737,6 +4756,96 @@ fn word_set_similarity(left: &str, right: &str, signature: &str) -> (f64, usize)
     } else {
         (overlap as f64 / union as f64, overlap)
     }
+}
+
+fn primary_question(body: &str) -> String {
+    let Some(question_end) = body.find('?') else {
+        return String::new();
+    };
+    let through_question = &body[..=question_end];
+    let question_start = through_question[..question_end]
+        .rfind(|character: char| matches!(character, '.' | '!' | '\n'))
+        .map_or(0, |position| position + 1);
+    through_question[question_start..].trim().to_string()
+}
+
+pub(crate) fn cross_recipient_structural_similarity(
+    candidate: &CopySequence,
+    other: &CopySequence,
+    signature: &str,
+) -> Option<(f64, f64)> {
+    let candidate = candidate.touches.iter().find(|touch| touch.stage == 1)?;
+    let other = other.touches.iter().find(|touch| touch.stage == 1)?;
+    let (body_similarity, body_overlap) =
+        word_set_similarity(&candidate.body, &other.body, signature);
+    let candidate_question = primary_question(&candidate.body);
+    let other_question = primary_question(&other.body);
+    let (question_similarity, question_overlap) =
+        word_set_similarity(&candidate_question, &other_question, signature);
+    ((body_similarity >= 0.42 && body_overlap >= 10)
+        || (question_similarity >= 0.65 && question_overlap >= 6))
+        .then_some((body_similarity, question_similarity))
+}
+
+fn cross_recipient_similarity_issue(
+    db: &SharedDb,
+    pb: &Playbook,
+    person: &crate::db::Person,
+    current_sequence_id: &str,
+    sequence: &CopySequence,
+) -> Result<Option<String>> {
+    if !sequence.touches.iter().any(|touch| touch.stage == 1) {
+        return Ok(None);
+    }
+    for other in db.list_people(Some(&pb.key), None)? {
+        if other.id == person.id {
+            continue;
+        }
+        let Some(other_sequence_id) = db.active_sequence_for_person(&other.id)? else {
+            continue;
+        };
+        if other_sequence_id == current_sequence_id {
+            continue;
+        }
+        let current_policy = db
+            .sequence_gtm_attribution(&other_sequence_id)?
+            .is_some_and(|attribution| {
+                attribution.copy_policy_version == CURRENT_COPY_POLICY_VERSION
+            });
+        if !current_policy {
+            continue;
+        }
+        let Some(other_first) = db
+            .list_touches_for_sequence(&other_sequence_id)?
+            .into_iter()
+            .find(|touch| touch.stage == 1)
+        else {
+            continue;
+        };
+        let other_sequence = CopySequence {
+            touches: vec![CopyTouch {
+                stage: other_first.stage as u32,
+                day_offset: other_first.day_offset as u32,
+                channel: other_first.channel,
+                subject: other_first.subject,
+                body: other_first.body,
+                purpose: other_first.purpose,
+                goal: other_first.goal,
+            }],
+            applied_principles: Vec::new(),
+        };
+        if let Some((body_similarity, question_similarity)) =
+            cross_recipient_structural_similarity(sequence, &other_sequence, &pb.signature)
+        {
+            return Ok(Some(format!(
+                "cross-recipient structural duplication with {}: T1 body {:.0}% similar and main question {:.0}% similar; rewrite from this account's evidence",
+                other.name,
+                body_similarity * 100.0,
+                question_similarity * 100.0,
+            )));
+        }
+    }
+    Ok(None)
 }
 
 fn first_line(s: &str) -> String {
@@ -5019,14 +5128,15 @@ fn review_edit_schema(n: usize) -> Value {
 mod tests {
     use super::{
         affected_stages, apply_targeted_repairs, approve_ready_touches, brand_trigger_contract,
-        business_copy_context, copy_research_rule, copy_sentence_count, format_progress_status,
-        generic_subject_label, gnk_hedge_moves, has_forced_response_menu, is_email_capable_channel,
-        is_empty_linkedin_praise, is_retreat_or_route_touch, mentions_outreach_asset,
-        names_historical_outage_result, narrates_internal_copy_logic, normalize_dashes,
-        normalize_principle_ids, normalize_thread_subjects, provisional_channel,
+        business_copy_context, copy_research_rule, copy_sentence_count,
+        cross_recipient_similarity_issue, format_progress_status, generic_subject_label,
+        gnk_hedge_moves, has_forced_response_menu, has_natural_response_path,
+        is_email_capable_channel, is_empty_linkedin_praise, is_retreat_or_route_touch,
+        mentions_outreach_asset, names_historical_outage_result, narrates_internal_copy_logic,
+        normalize_dashes, normalize_principle_ids, normalize_thread_subjects, provisional_channel,
         provisional_day_offset, select_people_for_planning, sequence_quality_issues,
-        supported_touch_count, touch_question_limit, touch_word_band,
-        unsupported_account_task_noun_issues, wapahki_names_operating_consequence,
+        supported_touch_count, supported_touch_count_for_brand, touch_question_limit,
+        touch_word_band, unsupported_account_task_noun_issues, wapahki_names_operating_consequence,
         word_set_similarity, CopyAccount, CopySequence, CopyTouch, EditDoc, EditReview,
         PlanProgressRecipient, PlanProgressUpdate, TouchReview,
     };
@@ -5038,6 +5148,8 @@ mod tests {
         assert_eq!(supported_touch_count(4), 4);
         assert_eq!(supported_touch_count(2), 2);
         assert_eq!(supported_touch_count(1), 1);
+        assert_eq!(supported_touch_count_for_brand("outagehub", 1), 1);
+        assert_eq!(supported_touch_count_for_brand("outagehub", 7), 2);
     }
     use crate::business::Businesses;
     use crate::db::{Db, Lead, Person, Sequence, Touch, CURRENT_COPY_POLICY_VERSION};
@@ -5046,18 +5158,18 @@ mod tests {
     #[test]
     fn outagehub_two_email_contract_requires_completed_historical_evidence() {
         let contract = brand_trigger_contract("outagehub", 2);
-        assert!(contract.contains("EV-charging networks only"));
-        assert!(contract.contains("real, location-specific historical match"));
-        assert!(contract.contains("T2 lands six days later"));
-        assert!(contract.contains("there is no LinkedIn touch"));
+        assert!(contract.contains("distributed Canadian operators"));
+        assert!(contract.contains("completed location-specific historical utility match"));
+        assert!(contract.contains("T2 contributes the verified location and timestamp"));
+        assert!(contract.contains("OutageHub's location-matched Canadian utility API"));
         let gnk = brand_trigger_contract("gnk", 4);
         assert!(gnk.contains("specific recurring decision"));
-        assert!(gnk.contains("exactly one question"));
-        assert!(gnk.contains("never restate or retract T1"));
+        assert!(gnk.contains("concrete GnK contribution"));
+        assert!(gnk.contains("email alternative"));
         let wapahki = brand_trigger_contract("wapahki", 4);
-        assert!(wapahki.contains("physical station or handoff"));
-        assert!(wapahki.contains("suspected consequence"));
-        assert!(wapahki.contains("identify any use case"));
+        assert!(wapahki.contains("source-supported physical task"));
+        assert!(wapahki.contains("University of Toronto and Automata"));
+        assert!(wapahki.contains("Follow-ups advance the same task"));
     }
 
     #[test]
@@ -5099,6 +5211,9 @@ mod tests {
         ));
         assert!(wapahki_names_operating_consequence(
             "Sanitation changeovers erase the short-run payback."
+        ));
+        assert!(wapahki_names_operating_consequence(
+            "The role description calls for regular 35–40 lb lifting."
         ));
     }
 
@@ -5160,6 +5275,94 @@ mod tests {
     }
 
     #[test]
+    fn cross_recipient_gate_rejects_a_reused_question_skeleton() {
+        let db = Db::open(":memory:").expect("open db");
+        let playbooks = Playbooks::load("playbooks").expect("load playbooks");
+        let pb = playbooks.get("gnk").expect("gnk playbook");
+        let first_lead = db
+            .upsert_lead(&Lead {
+                brand: "gnk".into(),
+                apollo_org_id: "cross-sim-org-1".into(),
+                name: "First Account".into(),
+                ..Default::default()
+            })
+            .expect("first lead");
+        let first_person = db
+            .upsert_person(&Person {
+                lead_id: first_lead.clone(),
+                brand: "gnk".into(),
+                apollo_person_id: "cross-sim-person-1".into(),
+                name: "Priya".into(),
+                ..Default::default()
+            })
+            .expect("first person");
+        let first_sequence = db
+            .create_sequence(&Sequence {
+                person_id: first_person.clone(),
+                lead_id: first_lead.clone(),
+                brand: "gnk".into(),
+                copy_policy_version: CURRENT_COPY_POLICY_VERSION,
+                status: "active".into(),
+                ..Default::default()
+            })
+            .expect("first sequence");
+        db.insert_touch(&Touch {
+            sequence_id: first_sequence,
+            person_id: first_person,
+            lead_id: first_lead,
+            brand: "gnk".into(),
+            stage: 1,
+            body: "Hi Priya,\n\nYour operations guide describes disputed cases. When one is escalated, does the reviewer have the supporting evidence together before deciding whether to pursue recovery? GnK builds focused software around that decision. Would you be open to a short conversation, or would an email reply be easier?\n\nAndrew".into(),
+            status: "draft".into(),
+            ..Default::default()
+        })
+        .expect("first touch");
+        let second_lead = db
+            .upsert_lead(&Lead {
+                brand: "gnk".into(),
+                apollo_org_id: "cross-sim-org-2".into(),
+                name: "Second Account".into(),
+                ..Default::default()
+            })
+            .expect("second lead");
+        let second_person_id = db
+            .upsert_person(&Person {
+                lead_id: second_lead,
+                brand: "gnk".into(),
+                apollo_person_id: "cross-sim-person-2".into(),
+                name: "Morgan".into(),
+                ..Default::default()
+            })
+            .expect("second person");
+        let second_person = db
+            .get_person(&second_person_id)
+            .expect("person query")
+            .expect("second person");
+        let candidate = CopySequence {
+            touches: vec![CopyTouch {
+                stage: 1,
+                day_offset: 0,
+                channel: "email".into(),
+                subject: "Escalated case evidence".into(),
+                body: "Hi Morgan,\n\nYour services page describes disputed cases. When one is escalated, does the reviewer have the supporting evidence together before deciding whether to pursue recovery? GnK builds focused software around that decision. Would you be open to a short conversation, or would an email reply be easier?\n\nAndrew".into(),
+                purpose: String::new(),
+                goal: String::new(),
+            }],
+            applied_principles: Vec::new(),
+        };
+
+        let issue = cross_recipient_similarity_issue(
+            &db,
+            pb,
+            &second_person,
+            "candidate-sequence",
+            &candidate,
+        )
+        .expect("similarity check");
+        assert!(issue.is_some(), "reused structure should be blocked");
+    }
+
+    #[test]
     fn sentence_count_ignores_greeting_and_signature() {
         let body = "Maya,\n\nCases change shape between runs. Does that still keep the handoff manual?\n\nAndrew";
         assert_eq!(copy_sentence_count(body, "Andrew"), 2);
@@ -5168,6 +5371,22 @@ mod tests {
     #[test]
     fn first_email_allows_a_bounded_diagnostic_and_cta() {
         assert_eq!(touch_question_limit(1), 3);
+        assert!(has_natural_response_path(
+            "Could you tell me by email whether that comes up?"
+        ));
+        assert!(has_natural_response_path(
+            "If email is easier, reply with the handoff that still repeats."
+        ));
+        assert!(has_natural_response_path(
+            "Would a 15-minute chat be useful?"
+        ));
+        assert!(has_natural_response_path(
+            "I can send the one-page fit screen if that would be useful?"
+        ));
+        assert!(has_natural_response_path(
+            "You can reply here, or we could discuss it briefly if that is easier."
+        ));
+        assert!(has_natural_response_path("A brief reply is enough."));
         for stage in 2..=7 {
             assert_eq!(touch_question_limit(stage), 1);
         }
@@ -5190,7 +5409,7 @@ mod tests {
     }
 
     #[test]
-    fn gnk_first_touch_rejects_solution_first_copy_and_multiple_questions() {
+    fn gnk_first_touch_rejects_missing_consequence_and_stacked_caveats() {
         let playbooks = Playbooks::load("playbooks").expect("load playbooks");
         let pb = playbooks.get("gnk").expect("gnk playbook");
         let sequence = CopySequence {
@@ -5207,15 +5426,7 @@ mod tests {
         };
         let issues = sequence_quality_issues(pb, &playbooks.shared, &sequence, &[], 1, false);
         assert!(
-            issues
-                .iter()
-                .any(|issue| issue.contains("exactly one five-second")),
-            "issues were {issues:?}"
-        );
-        assert!(
-            issues
-                .iter()
-                .any(|issue| issue.contains("introduces the seller")),
+            issues.iter().any(|issue| issue.contains("consequence")),
             "issues were {issues:?}"
         );
         assert!(
@@ -5283,7 +5494,7 @@ mod tests {
         let playbooks = Playbooks::load("playbooks").expect("load playbooks");
         let pb = playbooks.get("gnk").expect("gnk playbook");
         for (stage, expected) in [
-            (1, (55, 140)),
+            (1, (75, 130)),
             (2, (35, 145)),
             (4, (35, 120)),
             (6, (25, 80)),
@@ -5593,7 +5804,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_approval_cannot_schedule_an_oversized_account() {
+    fn manual_approval_cannot_bypass_current_gtm_readiness() {
         let db = Db::open(":memory:").expect("open db");
         let playbooks = Playbooks::load("playbooks").expect("load playbooks");
         let pb = playbooks.get("gnk").expect("gnk playbook");
@@ -5647,7 +5858,7 @@ mod tests {
         let approval = approve_ready_touches(&db, pb, Some(&person_id)).expect("approval");
         assert_eq!(approval.touches_scheduled, 0);
         assert_eq!(approval.people_held, 1);
-        assert!(approval.hold_reasons[0].contains("account ceiling"));
+        assert!(approval.hold_reasons[0].contains("current GTM state"));
         assert_eq!(
             db.list_touches_for_person(&person_id).unwrap()[0].status,
             "draft"
@@ -6120,25 +6331,7 @@ mod tests {
         assert!(
             issues
                 .iter()
-                .any(|issue| issue.contains("stage 1 must name OutageHub")),
-            "issues were {issues:?}"
-        );
-        assert!(
-            issues
-                .iter()
-                .any(|issue| issue.contains("utility-data explanation")),
-            "issues were {issues:?}"
-        );
-        assert!(
-            issues
-                .iter()
-                .any(|issue| issue.contains("public-versus-private data caveat")),
-            "issues were {issues:?}"
-        );
-        assert!(
-            issues.iter().any(|issue| {
-                issue.contains("LinkedIn request") && issue.contains("historical comparison")
-            }),
+                .any(|issue| issue.contains("exactly two emails")),
             "issues were {issues:?}"
         );
     }

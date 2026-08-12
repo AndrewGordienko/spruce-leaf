@@ -238,7 +238,8 @@ pub fn sourcing_play_block(play: Option<&GtmPlay>) -> String {
     };
     format!(
         "ACTIVE VERSIONED GTM PLAY (selection policy, not marketing copy)\n\
-         Name: {} v{}\nTarget ICP: {}\nHypothesis: {}\nRequired signal catalog keys: {} (minimum {} matches)\n\
+         Name: {} v{}\nTarget ICP: {}\nHypothesis: {}\nRequired signal catalog keys: {} (minimum {} distinct catalog keys, not repeated examples)\n\
+         A single completed historical location/event result satisfies the historical-match key when its evidence boundary is met; never demand four locations because the play requires four different keys. Missing evidence is a research gap, not a hard disqualifier.\n\
          Action policy: {}\nProof we can actually deliver: {}\nSuccess metric: {}\nKill condition: {}\n\
          Use this play to choose, qualify, and RANK accounts. Reject superficial industry/technology matches and enforce the declared minimum rather than silently making every catalog key mandatory. When the action policy explicitly says the exact decision may be tested, a source-backed operating footprint can earn a cautious discovery note while the decision and root cause remain questions. Otherwise require source-backed evidence of the decision and current mechanism. Always require a credible path to the bounded proof.",
         play.name,
@@ -283,11 +284,20 @@ impl GtmActionContext {
         self.state == "action_ready"
     }
 
-    /// Fully qualified accounts may enter a cadence. A source-backed account
-    /// with a reachable workflow contact may receive exactly one diagnostic
-    /// note; a lack of problem proof can never silently create follow-ups.
+    /// Easy-priority accounts may use the full supported cadence. A
+    /// medium-priority account may use one honest, hypothesis-led first touch;
+    /// it cannot silently become a follow-up campaign before the problem is
+    /// confirmed. Hard-priority research never reaches copy.
     pub fn sequence_ready_for(&self, touches: usize) -> bool {
-        self.action_ready() || (touches == 1 && self.state == "discovery_ready")
+        self.action_ready() || (self.state == "discovery_ready" && touches == 1)
+    }
+
+    /// Delivery is deliberately stricter than drafting. Medium-priority
+    /// accounts may produce one reviewable hypothesis-led draft, but they can
+    /// never become scheduled work until research promotes the account to
+    /// action-ready.
+    pub fn delivery_ready_for(&self, touches: usize) -> bool {
+        self.action_ready() && touches > 0
     }
 
     /// Private context for the planner/writer. This is decision infrastructure,
@@ -380,7 +390,7 @@ impl GtmActionContext {
             .join("\n");
         let action = match self.state.as_str() {
             "action_ready" => "The account has enough sourced evidence for one narrow commercial note. Use only a supplied observation as the company-specific signal. Lead with a role-relevant implication and a credible point of view. A cold outcome may be a short working conversation, interest, correction, or referral; it is not yet a pilot or proof. Never invent collateral or claim an asset exists unless verified seller context explicitly supplies it.",
-            "discovery_ready" => "The company fit and this recipient's operating vantage are sourced, but the internal workflow problem is not public evidence. Write exactly one source-safe first email. Name one supplied company fact or recognizable operating moment and ask one five-second factual question. Do not ask for a meeting, pitch the seller, offer collateral, or create a follow-up. Never claim that work is manual, expensive, recurring, fragmented, cross-system, or painful. Never propose a proof, pilot, integration, or product evaluation.",
+            "discovery_ready" => "This is a medium-priority account: research supports one concrete operating task, decision, or mechanism and this recipient is close to it, but one economic or workflow term remains unproved. Write one complete, useful first email only. State sourced account details as facts, present the exact missing term as one honest question, explain the seller's relevant contribution, and make a direct email answer the sole next step. Do not ask for a call before the missing term is confirmed. Never use a universal diagnostic template or schedule follow-ups before a reply.",
             _ => "The account does not yet have enough sourced evidence for a multi-touch sequence. Hold it for research or use one manual routing note; do not manufacture discovery questions or explain a proof, integration, pilot, or product.",
         };
         format!(
@@ -429,6 +439,14 @@ pub fn recipient_sequence_block_reason(
     lead_id: &str,
     person: &Person,
 ) -> Result<Option<String>> {
+    if brand.eq_ignore_ascii_case("outagehub")
+        && !outagehub_workflow_contact(&person.title, &person.vantage)
+    {
+        return Ok(Some(
+            "OutageHub requires a Service/Customer Operations, technical-support, NOC, reliability, maintenance, facilities, field-service, or charging-network operations contact"
+                .into(),
+        ));
+    }
     if crate::response_design::is_route_only_contact(&person.title, &person.vantage) {
         return Ok(Some(
             "recipient is route-only; hold for one bounded manual routing request".into(),
@@ -444,6 +462,37 @@ pub fn recipient_sequence_block_reason(
     Ok(None)
 }
 
+fn outagehub_workflow_contact(title: &str, vantage: &str) -> bool {
+    let title = format!(" {} ", title.trim().to_ascii_lowercase());
+    let function_is_close = [
+        " service operations ",
+        " service operation ",
+        " network operations ",
+        " network operation ",
+        " noc ",
+        " reliability ",
+        " maintenance ",
+        " facilities ",
+        " facility ",
+        " field service ",
+        " customer operations ",
+        " support operations ",
+        " technical support ",
+        " charging operations ",
+        " charging operation ",
+        " charging network ",
+        " charger operations ",
+        " charger operation ",
+    ]
+    .iter()
+    .any(|term| title.contains(term));
+    let vantage_is_close = matches!(
+        vantage.trim().to_ascii_lowercase().as_str(),
+        "operator" | "process_owner" | "operational_executive"
+    );
+    function_is_close && vantage_is_close
+}
+
 /// Final cold-email delivery boundary shared by approval and the cadence
 /// engine. Re-evaluating immediately before SMTP keeps stale scheduled rows,
 /// old play versions, and oversized legacy accounts from bypassing policy.
@@ -452,6 +501,30 @@ pub fn delivery_block_reason(
     playbook: &Playbook,
     lead: &Lead,
     person: &Person,
+) -> Result<Option<String>> {
+    delivery_block_reason_inner(db, playbook, lead, person, true, None)
+}
+
+/// Eligibility check for a newly reviewed `building` sequence. The candidate
+/// has not been promoted yet, so an older active sequence must not prevent its
+/// replacement; promotion and every delivery query enforce the current policy.
+pub(crate) fn candidate_delivery_block_reason(
+    db: &SharedDb,
+    playbook: &Playbook,
+    lead: &Lead,
+    person: &Person,
+    touches: usize,
+) -> Result<Option<String>> {
+    delivery_block_reason_inner(db, playbook, lead, person, false, Some(touches))
+}
+
+fn delivery_block_reason_inner(
+    db: &SharedDb,
+    playbook: &Playbook,
+    lead: &Lead,
+    person: &Person,
+    require_current_active_sequence: bool,
+    candidate_touches: Option<usize>,
 ) -> Result<Option<String>> {
     if playbook
         .max_employees
@@ -466,27 +539,33 @@ pub fn delivery_block_reason(
     if let Some(reason) = recipient_sequence_block_reason(db, &playbook.key, &lead.id, person)? {
         return Ok(Some(reason));
     }
-    let context = prepare_action(db, &playbook.key, &lead.id, person)?;
-    let one_touch_discovery = if context.state == "discovery_ready" {
-        match db.active_sequence_for_person(&person.id)? {
-            Some(sequence_id) => {
-                let current = db
-                    .sequence_gtm_attribution(&sequence_id)?
-                    .is_some_and(|sequence| {
-                        sequence.copy_policy_version == crate::db::CURRENT_COPY_POLICY_VERSION
-                            && sequence.gtm_state == "discovery_ready"
-                    });
-                current && db.list_touches_for_sequence(&sequence_id)?.len() == 1
-            }
-            None => false,
+    // A live send must belong to the current policy. During initial
+    // finalization the only row is still a `building` checkpoint, so absence of
+    // an active sequence is valid here; every scheduling/due-work query also
+    // filters by CURRENT_COPY_POLICY_VERSION.
+    let mut touch_count = candidate_touches.unwrap_or_default();
+    if require_current_active_sequence {
+        let Some(sequence_id) = db.active_sequence_for_person(&person.id)? else {
+            return Ok(Some("no active sequence is available for delivery".into()));
+        };
+        let current_policy = db
+            .sequence_gtm_attribution(&sequence_id)?
+            .is_some_and(|sequence| {
+                sequence.status == "active"
+                    && sequence.copy_policy_version == crate::db::CURRENT_COPY_POLICY_VERSION
+            });
+        if !current_policy {
+            return Ok(Some(
+                "sequence predates the current copy policy and must be regenerated".into(),
+            ));
         }
-    } else {
-        false
-    };
-    if !context.action_ready() && !one_touch_discovery {
+        touch_count = db.list_touches_for_sequence(&sequence_id)?.len();
+    }
+    let context = prepare_action(db, &playbook.key, &lead.id, person)?;
+    if !context.delivery_ready_for(touch_count) {
         return Ok(Some(format!(
-            "current GTM state '{}' is not eligible for delivery",
-            context.state
+            "current GTM state '{}' is not eligible for a {}-touch sequence",
+            context.state, touch_count
         )));
     }
     Ok(None)
@@ -585,12 +664,20 @@ pub fn prepare_action(
         let assessment_allows_action = assessment
             .as_ref()
             .is_some_and(|assessment| assessment.status == "qualified");
+        let assessment_allows_discovery = assessment.as_ref().is_some_and(|assessment| {
+            matches!(assessment.status.as_str(), "qualified" | "research_needed")
+        });
         if assessment_allows_action
             && matched >= play.minimum_signal_matches.max(1) as usize
             && mandatory_action_signals_present(brand, &matched_signal_keys)
         {
             "action_ready"
-        } else if has_source_backed_account_fact && has_reachable_channel && has_workflow_vantage {
+        } else if assessment_allows_discovery
+            && has_source_backed_account_fact
+            && has_reachable_channel
+            && has_workflow_vantage
+            && mandatory_discovery_signals_present(brand, &matched_signal_keys)
+        {
             "discovery_ready"
         } else {
             "research_required"
@@ -627,8 +714,8 @@ fn mandatory_action_signals_present(brand: &str, matched: &[String]) -> bool {
     let required: &[&str] = if brand.eq_ignore_ascii_case("outagehub") {
         &[
             "account.fit_evidence",
-            "account.operated_ev_charging_network",
             "account.distributed_locations",
+            "account.outage_sensitive_decision",
             "account.historical_location_outage_match",
             "account.reachable_workflow_owner",
         ]
@@ -640,12 +727,36 @@ fn mandatory_action_signals_present(brand: &str, matched: &[String]) -> bool {
             "account.external_trigger_or_mechanism_evidence",
             "account.reachable_workflow_owner",
         ]
+    } else if brand.eq_ignore_ascii_case("wapahki") {
+        &[
+            "account.fit_evidence",
+            "account.bounded_repetitive_task",
+            "account.manual_task_economic_pressure",
+            "account.reachable_workflow_owner",
+        ]
     } else {
         return true;
     };
     required
         .iter()
         .all(|required| matched.iter().any(|key| key == required))
+}
+
+fn mandatory_discovery_signals_present(brand: &str, matched: &[String]) -> bool {
+    let has = |key: &str| matched.iter().any(|matched| matched == key);
+    if !has("account.fit_evidence") || !has("account.reachable_workflow_owner") {
+        return false;
+    }
+    if brand.eq_ignore_ascii_case("wapahki") {
+        has("account.bounded_repetitive_task")
+    } else if brand.eq_ignore_ascii_case("gnk") {
+        has("account.specific_recurring_decision")
+            || has("account.external_trigger_or_mechanism_evidence")
+    } else if brand.eq_ignore_ascii_case("outagehub") {
+        has("account.distributed_locations") && has("account.outage_sensitive_decision")
+    } else {
+        true
+    }
 }
 
 /// Last-mile evidence guard. Qualification applies a richer version of this
@@ -801,40 +912,40 @@ pub fn default_plays() -> Vec<GtmPlay> {
     vec![
         GtmPlay {
             brand: "outagehub".into(),
-            key: "historical_outage_replay".into(),
-            version: 8,
-            name: "EV charging historical outage check".into(),
+            key: "distributed_site_outage_decision".into(),
+            version: 12,
+            name: "Distributed-site outage decision".into(),
             lifecycle: "testing".into(),
             motion: "internal_pipeline_to_forward_deployed_proof".into(),
-            target_icp: "Operators of Canadian EV-charging networks with a source-backed site footprint and an account-specific historical match between one public charging location and a reported utility outage area. Exclude equipment sellers, installers, utilities, consultants, and every non-charging vertical from this experiment.".into(),
+            target_icp: "Canadian operators with distributed, outage-sensitive locations or assets: charging, telecom, cold storage, data centres, multi-site facilities, service dispatch, backup power, and adjacent infrastructure. Prioritize visible decisions and reachable owners; do not require one vertical.".into(),
             target_vantages: vec!["process_owner".into(), "operator".into(), "technical_evaluator".into()],
-            required_signal_keys: vec!["account.fit_evidence".into(), "account.operated_ev_charging_network".into(), "account.distributed_locations".into(), "account.historical_location_outage_match".into()],
+            required_signal_keys: vec!["account.fit_evidence".into(), "account.distributed_locations".into(), "account.outage_sensitive_decision".into(), "account.historical_location_outage_match".into()],
             minimum_signal_matches: 4,
-            hypothesis: "When an entire charging site goes dark, Service Operations may still check the local utility map before opening an equipment/network ticket, dispatching someone, or updating status.".into(),
-            action_policy: "Run a ten-person founder-led EV experiment only after preparing an account-specific historical timestamp/location result. Send two emails: T1 asks one easy disqualifying site-diagnosis question; T2 six days later contributes the verified historical result. No LinkedIn, routing bump, product-disclaimer paragraph, or breakup email.".into(),
+            hypothesis: "During an ambiguous location or asset incident, location-matched public utility context may improve one evidenced diagnosis, dispatch, escalation, continuity, prioritization, or communication decision.".into(),
+            action_policy: "Work easy to hard. Easy accounts have a visible outage-time decision, reachable owner, and completed historical match. Medium accounts have the decision and owner but no completed match and may receive one honest first touch only. Explain OutageHub's API contribution and offer a short conversation or email answer; never claim private site status.".into(),
             proof_type: "historical_replay".into(),
-            proof_description: "Match public charging locations to historical utility outage areas, recording the location, utility timestamp, and what a feed or webhook would have returned.".into(),
-            success_metric: "Whether utility status is checked manually today and whether the verified historical signal could change diagnosis, dispatch, or customer status.".into(),
-            kill_condition: "Telemetry already settles upstream utility cause immediately, Service Operations never checks utility status, or no verified location-specific historical match exists.".into(),
+            proof_description: "Match supplied or public operating locations to historical utility outage areas, recording the location, utility timestamp, and what an API response or webhook would have returned.".into(),
+            success_metric: "Whether outside utility status is checked today and whether it changes the account-specific diagnosis, dispatch, escalation, continuity, prioritization, or communication decision.".into(),
+            kill_condition: "Private telemetry already settles the relevant utility question quickly enough, the operation has no location-specific outage decision, or no reachable person can observe it.".into(),
             source_refs: vec!["playbooks/outagehub.toml".into(), "youtube:wNnU2BJILPA@509".into()],
             ..Default::default()
         },
         GtmPlay {
             brand: "gnk".into(),
             key: "closed_case_reconstruction".into(),
-            version: 3,
-            name: "Recurring decision reconstruction".into(),
+            version: 5,
+            name: "Workflow-specific decision support".into(),
             lifecycle: "testing".into(),
             motion: "internal_pipeline_to_forward_deployed_proof".into(),
-            target_icp: "Reachable mid-market workflow owners where public evidence supports one specific recurring decision, a believable consequence, and either an external trigger or direct evidence of the mechanism. Company category and generic workflow plausibility do not qualify.".into(),
+            target_icp: "Organizations with a source-backed recurring decision, exception, coordination burden, or workflow-specific software gap. Cover industries broadly; rank visible consequences and reachable owners first, then investigate medium and hard accounts.".into(),
             target_vantages: vec!["process_owner".into(), "operator".into(), "operational_executive".into(), "router".into()],
             required_signal_keys: vec!["account.fit_evidence".into(), "account.specific_recurring_decision".into(), "account.believable_operating_consequence".into(), "account.external_trigger_or_mechanism_evidence".into()],
             minimum_signal_matches: 4,
-            hypothesis: "A source-backed trigger creates a recurring decision whose supporting position is not immediately visible, forcing someone to reconstruct it from separate records with a meaningful operating consequence.".into(),
-            action_policy: "Open on the exact event and decision fork. Ask whether the reviewer can immediately see what supports the current position or whether someone rebuilds it from the named records. Do not ask the recipient to diagnose importance or evaluate GnK. Each follow-up must add evidence, consequence, a bounded test, or a useful route; hold rather than retract the premise.".into(),
-            proof_type: "closed_case_reconstruction".into(),
-            proof_description: "Reconstruct a small sample of closed cases using the proposed decision or evidence workflow and compare it with the current process.".into(),
-            success_metric: "Settlement or resolution time, leakage or recoveries, audit exposure, customer SLA, and senior reviewer capacity affected by reconstruction.".into(),
+            hypothesis: "A source-backed trigger creates a recurring exception decision whose inputs, coordination, or existing system boundary produces a meaningful operating consequence.".into(),
+            action_policy: "Work easy to hard. Easy accounts support the recurring event, decision, consequence, mechanism, and owner. Medium accounts support the decision or mechanism and owner but leave one term open; allow one hypothesis-led first email only. Explain one concrete GnK contribution and offer a short conversation or email response path.".into(),
+            proof_type: "bounded_workflow_replay".into(),
+            proof_description: "Apply the proposed workflow to a small historical sample and compare decision time, exception handling, and outcome quality with the current process.".into(),
+            success_metric: "The account-specific consequence named in research: resolution time, leakage or recoveries, audit exposure, customer SLA, throughput, escalation, or constrained expert capacity.".into(),
             kill_condition: "The decision is not recurring or consequential, no source-backed trigger or mechanism exists, the position is immediately visible, or the recipient is not close enough to answer.".into(),
             source_refs: vec!["playbooks/gnk.toml".into(), "youtube:wNnU2BJILPA@509".into()],
             ..Default::default()
@@ -842,16 +953,16 @@ pub fn default_plays() -> Vec<GtmPlay> {
         GtmPlay {
             brand: "wapahki".into(),
             key: "task_exception_review".into(),
-            version: 4,
+            version: 6,
             name: "Task-and-exception feasibility review".into(),
             lifecycle: "testing".into(),
             motion: "internal_pipeline_to_forward_deployed_proof".into(),
-            target_icp: "Food manufacturers where first-party evidence identifies one physical station or handoff and a credible economic reason that the work remaining manual matters. Product variety alone is insufficient.".into(),
+            target_icp: "Factories, product manufacturers, warehouses, distribution centres, and fulfillment operations, starting in Ontario then Canada. Rank one physical task and the nearest operator; prioritize sourced economic pressure but retain task-specific medium accounts.".into(),
             target_vantages: vec!["process_owner".into(), "operator".into(), "technical_evaluator".into(), "router".into()],
-            required_signal_keys: vec!["account.fit_evidence".into(), "account.bounded_repetitive_task".into(), "account.format_variability".into(), "account.exception_heavy_manual_work".into(), "account.manual_task_economic_pressure".into()],
+            required_signal_keys: vec!["account.fit_evidence".into(), "account.bounded_repetitive_task".into(), "account.manual_task_economic_pressure".into()],
             minimum_signal_matches: 3,
-            hypothesis: "The normal motion is repeatable enough for a flexible cell while people can retain a bounded set of exceptions that make fixed automation uneconomic.".into(),
-            action_policy: "Cold outreach starts from one source-supported station or handoff, one suspected economic consequence, and one likely blocker to ordinary automation. Ask one factual question the recipient can answer from memory; never ask them to identify a use case or evaluate Wapahki's architecture. After a human reply, read the account's customer-development record and ask for only its next missing commitment. Never infer validation from a send, compliment, or meeting; never ask a non-responsive cold prospect for a pilot or LOI.".into(),
+            hypothesis: "One recurring physical movement may be automatable enough to investigate, with the exact variation, rate, integration, and economics confirmed by the operator closest to the work.".into(),
+            action_policy: "Work easy to hard. Easy accounts have a source-supported task, economic pressure, and reachable owner. Medium accounts have a task and owner but unproved economics; allow one honest task-specific first email. Briefly give Andrew's University of Toronto and Automata context, explain Wapahki's contribution, and offer a short conversation or email answer. Never ask the recipient to find a use case from scratch.".into(),
             proof_type: "task_feasibility_review".into(),
             proof_description: "Review a task sketch, short video, or representative SKU/changeover set; model the normal motion, exceptions, rate, and technical boundaries.".into(),
             success_metric: "Required rate, intervention frequency, changeover burden, task coverage, and a clear technical/economic stop condition.".into(),
@@ -867,8 +978,9 @@ pub fn seed_defaults(db: &SharedDb) -> Result<()> {
         db.insert_signal_definition_if_absent(&definition)?;
     }
     for play in default_plays() {
-        db.insert_gtm_play_if_absent(&play)?;
+        let play_id = db.insert_gtm_play_if_absent(&play)?;
         db.retire_older_unproven_gtm_play_versions(&play.brand, &play.key, play.version)?;
+        db.relabel_unassessed_qualified_leads(&play.brand, &play_id)?;
     }
     db.backfill_legacy_signal_observations()?;
     db.backfill_sequence_gtm_attribution()?;
@@ -879,7 +991,8 @@ pub fn seed_defaults(db: &SharedDb) -> Result<()> {
 mod tests {
     use super::{
         customer_development_missing, customer_development_stage, default_signal_definitions,
-        prepare_action, seed_defaults, GtmActionContext, SignalCandidate,
+        outagehub_workflow_contact, prepare_action, seed_defaults, GtmActionContext,
+        SignalCandidate,
     };
     use crate::db::{
         AccountPlayAssessment, CustomerDevelopmentRecord, Db, Lead, Person, SharedDb,
@@ -887,6 +1000,24 @@ mod tests {
     };
     use std::sync::Arc;
     use uuid::Uuid;
+
+    #[test]
+    fn discovery_can_be_drafted_once_but_never_delivered() {
+        let discovery = GtmActionContext {
+            state: "discovery_ready".into(),
+            ..Default::default()
+        };
+        assert!(discovery.sequence_ready_for(1));
+        assert!(!discovery.sequence_ready_for(2));
+        assert!(!discovery.delivery_ready_for(1));
+
+        let ready = GtmActionContext {
+            state: "action_ready".into(),
+            ..Default::default()
+        };
+        assert!(ready.sequence_ready_for(1));
+        assert!(ready.delivery_ready_for(1));
+    }
 
     fn remove_temp_db(path: &std::path::Path) {
         for candidate in [
@@ -896,6 +1027,30 @@ mod tests {
         ] {
             let _ = std::fs::remove_file(candidate);
         }
+    }
+
+    #[test]
+    fn outagehub_requires_functional_proximity_not_generic_operational_altitude() {
+        assert!(outagehub_workflow_contact(
+            "Director of Charging Network Operations",
+            "operational_executive"
+        ));
+        assert!(outagehub_workflow_contact(
+            "Maintenance Manager",
+            "process_owner"
+        ));
+        assert!(outagehub_workflow_contact(
+            "Senior Manager, Customer Operations",
+            "process_owner"
+        ));
+        assert!(!outagehub_workflow_contact(
+            "Director of Customer Success",
+            "process_owner"
+        ));
+        assert!(!outagehub_workflow_contact(
+            "Operational Excellence EPMO",
+            "operational_executive"
+        ));
     }
 
     fn qualify_current_play(db: &SharedDb, brand: &str, lead_id: &str, keys: &[&str]) {
@@ -1248,6 +1403,7 @@ mod tests {
                 brand: "outagehub".into(),
                 apollo_person_id: "person-maintenance-owner".into(),
                 name: "Morgan Engineer".into(),
+                title: "Director, Network Operations".into(),
                 vantage: "process_owner".into(),
                 email_status: "verified".into(),
                 ..Default::default()
@@ -1270,8 +1426,8 @@ mod tests {
                     ..Default::default()
                 },
                 SignalCandidate {
-                    definition_key: "account.operated_ev_charging_network".into(),
-                    evidence: "The company operates an EV charging network with charging sites in Ontario.".into(),
+                    definition_key: "account.outage_sensitive_decision".into(),
+                    evidence: "Service Operations checks utility status before dispatch or customer communication when a charging-site availability incident occurs.".into(),
                     confidence: 0.9,
                     ..Default::default()
                 },
@@ -1293,7 +1449,7 @@ mod tests {
             &[
                 "account.fit_evidence",
                 "account.distributed_locations",
-                "account.operated_ev_charging_network",
+                "account.outage_sensitive_decision",
                 "account.historical_location_outage_match",
             ],
         );

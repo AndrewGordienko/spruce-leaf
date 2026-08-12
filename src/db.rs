@@ -34,10 +34,33 @@ use uuid::Uuid;
 // recurring decision + consequence + trigger/mechanism, and changes OutageHub
 // cold outreach to an evidence-first two-email EV-operator experiment. Older
 // copy did not receive those checks and must never remain sendable.
-// v19 adds a tightly bounded one-touch discovery lane. Accounts without the
-// evidence required for a cadence may receive one source-safe factual question,
-// but still cannot enter a follow-up sequence until the workflow is proven.
-pub const CURRENT_COPY_POLICY_VERSION: i64 = 19;
+// v22 turns account readiness into an easy/medium/hard queue. Easy accounts may
+// use the supported cadence; medium accounts may receive one complete,
+// hypothesis-led first email when a concrete task/decision and relevant person
+// are supported; hard accounts stay in research. This is not v19's generic
+// one-question lane: every T1 must explain seller value, a role-specific reason
+// to engage, and an answerable response path, then pass independent QA. The
+// mechanical gate checks factual contribution, not subjective CTA wording.
+// v23 recognizes quantified or explicitly repetitive lifting as a concrete
+// Wapahki operating consequence; v22 could reject an evidence-backed ergonomic
+// wedge merely because the writer did not use the literal word "ergonomic".
+// v24 recognizes semantically equivalent email-first/call response paths rather
+// than requiring one exact CTA phrase. Independent review still decides whether
+// the recipient has enough value and context to justify that response.
+// v25 also recognizes an answerable offer to send the real one-page fit screen
+// as a response path, preventing semantic edits toward recipient value from
+// oscillating against the mechanical CTA vocabulary.
+// v26 recognizes natural reply-here/discuss-briefly phrasing observed in the
+// independent editor's output; the prior literal marker list rejected it.
+// v27 removes the contradictory Wapahki call + email + asset CTA stack. An
+// unconfirmed workflow now gets one email-first response path; calls are earned.
+// v28 keeps the verified fit-screen fact in reviewer context and recognizes
+// natural brief-reply wording that v27's literal response detector missed.
+// v29 restores the higher easy-tier fit floor after live review showed that a
+// task signal plus an unrelated lifting condition still leaves the recipient
+// doing seller discovery. Those accounts remain medium until the consequence
+// is tied to the candidate task.
+pub const CURRENT_COPY_POLICY_VERSION: i64 = 29;
 
 /// A real company sourced from Apollo and (optionally) qualified against a brand
 /// thesis. Everything the model *guesses* stays in the inference/hypothesis
@@ -296,7 +319,7 @@ pub struct AccountPlayAssessment {
     pub brand: String,
     pub play_id: String,
     pub play_version: i64,
-    /// qualified | research_needed | rejected
+    /// qualified | research_needed | research_required | rejected
     pub status: String,
     pub fit_score: i64,
     pub matched_signal_keys: Vec<String>,
@@ -807,6 +830,28 @@ impl Db {
                    AND fresh.observed_at>=old.observed_at
                )",
             params![now()],
+        )?;
+        // A copy-policy cutover is an execution stop, not merely a dashboard
+        // filter. Preserve stale rows for audit while pausing any active
+        // sequence that still has unsent scheduled work.
+        conn.execute(
+            "UPDATE sequences SET status='paused'
+             WHERE status='active' AND copy_policy_version<?1
+               AND EXISTS (
+                 SELECT 1 FROM touches t
+                 WHERE t.sequence_id=sequences.id AND t.status='scheduled'
+               )",
+            params![CURRENT_COPY_POLICY_VERSION],
+        )?;
+        conn.execute(
+            "UPDATE touches SET status='cancelled',
+                    error='Cancelled by copy-policy cutover; regenerate from current evidence.'
+             WHERE status='scheduled' AND EXISTS (
+               SELECT 1 FROM sequences s
+               WHERE s.id=touches.sequence_id AND s.status='paused'
+                 AND s.copy_policy_version<?1
+             )",
+            params![CURRENT_COPY_POLICY_VERSION],
         )?;
         Ok(())
     }
@@ -3320,14 +3365,13 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<std::collections::HashSet<_>>>()?)
     }
 
-    /// Qualification skips that are safe to treat as durable deduplication.
-    /// Before the discovery-lane gate existed, two-signal accounts were stored
-    /// as rejects solely because they missed the old three-signal floor. Those
-    /// legacy rows must be reconsidered once; newly classified skips carry an
-    /// explicit `hard_reject:` / `insufficient_fit:` prefix and remain durable.
+    /// Qualification skips that are safe to treat as durable deduplication for
+    /// the caller's current research/qualification policy. A crawler, evidence,
+    /// or gate change must use a new tag so old misses are reconsidered once.
     pub fn durable_qualification_skip_keys(
         &self,
         brand: &str,
+        policy_tag: &str,
     ) -> Result<std::collections::HashSet<String>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -3338,12 +3382,10 @@ impl Db {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
         let mut keys = std::collections::HashSet::new();
+        let prefix = format!("{} ", policy_tag.trim());
         for row in rows {
             let (key, detail) = row?;
-            let legacy_two_signal_reject = !detail.starts_with("hard_reject:")
-                && !detail.starts_with("insufficient_fit:")
-                && detail.starts_with("only 2 canonical play signal(s) matched");
-            if !legacy_two_signal_reject {
+            if detail.starts_with(&prefix) {
                 keys.insert(key);
             }
         }
@@ -3735,6 +3777,23 @@ impl Db {
             ],
         )?;
         Ok(id)
+    }
+
+    pub fn relabel_unassessed_qualified_leads(
+        &self,
+        brand: &str,
+        current_play_id: &str,
+    ) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute(
+            "UPDATE leads SET status='research_needed',updated_at=?3
+             WHERE brand=?1 AND status='qualified'
+               AND NOT EXISTS (
+                 SELECT 1 FROM account_play_assessments a
+                 WHERE a.lead_id=leads.id AND a.play_id=?2 AND a.status='qualified'
+               )",
+            params![brand, current_play_id, now()],
+        )?)
     }
 
     pub fn list_account_play_assessments(
@@ -5891,6 +5950,51 @@ mod tests {
     }
 
     #[test]
+    fn reopening_database_pauses_scheduled_sequences_from_an_old_copy_policy() {
+        let path = std::env::temp_dir().join(format!(
+            "spruce-copy-cutover-test-{}.sqlite",
+            Uuid::new_v4()
+        ));
+        let db = Db::open(&path).expect("open temp db");
+        let sequence_id = db
+            .create_sequence(&Sequence {
+                id: "stale-policy-sequence".into(),
+                person_id: "stale-policy-person".into(),
+                lead_id: "stale-policy-lead".into(),
+                brand: "gnk".into(),
+                copy_policy_version: CURRENT_COPY_POLICY_VERSION - 1,
+                status: "active".into(),
+                ..Default::default()
+            })
+            .expect("create stale sequence");
+        db.insert_touch(&Touch {
+            id: "stale-policy-touch".into(),
+            sequence_id: sequence_id.clone(),
+            person_id: "stale-policy-person".into(),
+            lead_id: "stale-policy-lead".into(),
+            brand: "gnk".into(),
+            stage: 1,
+            status: "scheduled".into(),
+            ..Default::default()
+        })
+        .expect("create scheduled touch");
+        drop(db);
+
+        let reopened = Db::open(&path).expect("reopen temp db");
+        let sequence = reopened
+            .sequence_gtm_attribution(&sequence_id)
+            .expect("sequence query")
+            .expect("stale sequence");
+        assert_eq!(sequence.status, "paused");
+        let touches = reopened
+            .list_touches_for_sequence(&sequence_id)
+            .expect("touch query");
+        assert_eq!(touches[0].status, "cancelled");
+        drop(reopened);
+        remove_temp_db(&path);
+    }
+
+    #[test]
     fn one_company_cannot_be_claimed_by_two_portfolio_brands() {
         let db = Db::open(":memory:").expect("open memory db");
         db.upsert_lead(&Lead {
@@ -6930,7 +7034,7 @@ mod tests {
             "qualification_skip",
             "Current Hard Reject",
             "current-hard-reject",
-            "hard_reject: only 2 canonical play signal(s) matched; affirmative blocker",
+            "qv2 hard_reject: only 2 canonical play signal(s) matched; affirmative blocker",
         )
         .unwrap();
 
@@ -6948,8 +7052,9 @@ mod tests {
         // Known-reject keys are per-brand and drive the re-research skip.
         let keys = db.learning_keys("gnk", "qualification_skip").unwrap();
         assert!(keys.contains("acme-id") && keys.contains("beta-id"));
-        let durable = db.durable_qualification_skip_keys("gnk").unwrap();
+        let durable = db.durable_qualification_skip_keys("gnk", "qv2").unwrap();
         assert!(!durable.contains("legacy-two-signal"));
+        assert!(!durable.contains("acme-id"));
         assert!(durable.contains("current-hard-reject"));
         assert_eq!(
             db.learning_keys("outagehub", "qualification_skip")
@@ -6970,7 +7075,7 @@ mod tests {
             .current_gtm_play("outagehub")
             .expect("load current play")
             .expect("seeded outagehub play");
-        assert_eq!(play.version, 8);
+        assert_eq!(play.version, 12);
         assert_eq!(play.minimum_signal_matches, 4);
         assert!(play
             .required_signal_keys

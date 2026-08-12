@@ -371,7 +371,20 @@ fn seller_facts(case: &EvalCase, playbook: &Playbook) -> Vec<String> {
 
 fn system_prompt(playbook: &Playbook, shared: &Shared, arm: Arm) -> String {
     let core = "Write one cold first email as Andrew to the supplied recipient. Return a subject and body only. The subject must be a plain 3-9 word operating phrase that creates an honest, specific reason to open; privately consider several subjects before choosing. The body must begin `Hi [recipient first name],` on its own line, end with the exact required signature on its own line, and form a complete founder note in ordinary spoken English: why this person, one recognizable operating moment, a bounded guess about the difficulty, the seller's relevant difference, and one role-appropriate response path. Use the verified account and seller facts as separate exhaustive evidence boundaries. The hypothesis is a question, never a fact. Do not invent private workflows, systems, objects, incidents, ownership, impact, seller capabilities, or collateral. Make replying worthwhile and easy without a scripted answer menu, pressure, hype, or internal strategy language. Read the subject and first two lines as an inbox recipient before returning the structured result.";
-    let mut production = format!("{core}\n\n{}", playbook.copy_system_prompt(shared));
+    let production_touch_count = if playbook.key.eq_ignore_ascii_case("outagehub") {
+        2
+    } else {
+        1
+    };
+    let production_brand_contract = if arm == Arm::NoBrandDoctrine {
+        ""
+    } else {
+        crate::outreach::brand_trigger_contract(&playbook.key, production_touch_count)
+    };
+    let mut production = format!(
+        "{core}\n\n{production_brand_contract}\n\n{}",
+        playbook.copy_system_prompt(shared)
+    );
     match arm {
         Arm::Full | Arm::NoRoleContract => production,
         Arm::NoPsychology => {
@@ -541,10 +554,12 @@ mod tests {
             system_prompt(playbook, &playbooks.shared, Arm::ExpandedPsychology);
 
         assert!(full.contains("PRIVATE RESPONSE-DESIGN DOCTRINE"));
+        assert!(full.contains("OUTAGEHUB TWO-EMAIL EVIDENCE CONTRACT"));
         assert_eq!(full, no_role);
         assert!(!no_psych.contains("PRIVATE RESPONSE-DESIGN DOCTRINE"));
         assert!(!no_persona.contains("EDITABLE PERSONA EXCERPT"));
         assert!(!no_brand.contains("OutageHub BUYER-FACING CONSTRAINTS"));
+        assert!(!no_brand.contains("OUTAGEHUB TWO-EMAIL EVIDENCE CONTRACT"));
         assert!(compact_writer.split_whitespace().count() < full.split_whitespace().count());
         assert!(expanded_psychology.split_whitespace().count() > full.split_whitespace().count());
     }

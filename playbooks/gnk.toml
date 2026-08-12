@@ -12,13 +12,9 @@ verified_seller_facts = [
   "GnK can build narrow custom software and AI systems around an existing operational workflow while leaving expert judgment with the customer.",
 ]
 
-motion = "a current, expensive, organization-specific information or software workflow that generic products serve poorly — evidence reconstruction, exception triage, decision support over records scattered across systems"
+motion = "a current, expensive, organization-specific information or software workflow that generic products serve poorly — recurring exception decisions, operational coordination, or workflow-specific decision support"
 
-# Realistic target-company ceiling. GnK is a small, founder-led team, so sourcing
-# stays in mid-market where a workflow owner is reachable and a bounded custom
-# build can actually land — no Fortune 500 giants with entrenched internal IT.
-max_employees = 1000
-icp_note = "GnK is a small, senior, founder-led team. Target mid-market companies (roughly 50–1000 employees) where a real workflow owner is reachable and a founder-led vendor can win a bounded custom build. Exclude Fortune 500 / global enterprises, and generic IT-services/BPO/consulting giants."
+icp_note = "Cover organizations broadly wherever GnK could win a specific software or workflow project. Work easy to hard: visible workflow + consequence + reachable owner first; concrete workflow but one unknown next; opaque enterprises last. Company size changes sales difficulty, not membership in the market."
 
 # Word band for the email body. A first note should be complete, but short
 # enough that the operating event and question are obvious on one screen.
@@ -44,25 +40,25 @@ subject_examples = [
   "deduction evidence",
   "shipment release",
   "failure patterns",
-  "pack-out changes",
+  "handoff delays",
   "continuity checks",
 ]
 
 vantage_notes = [
   "Process owner / controls lead: can describe how the record is turned into a defensible account, and where the evidence actually lives.",
-  "Operational executive (VP Ops, program lead): can compare the reconstruction burden across projects/programs and decide it merits a look, or route.",
+  "Operational executive (VP Ops, program lead): can compare the decision burden across projects/programs and decide it merits a look, or route.",
   "Technical evaluator (VP Eng, Head of Data): assesses feasibility/integration — do NOT lead here while the open question is whether the business problem exists.",
   "Router (BD, chief of staff): ask one easy question about who owns the workflow; never ask them to approve a pilot.",
 ]
 
 requirements = [
-  "Before copy, require four foundations: a specific recurring decision, a believable consequence, an external trigger or direct mechanism evidence, and a recipient close to the work. Company fit alone fails.",
-  "T1 uses one recognizable event, its decision fork, two to four concrete artifacts or source-safe record categories, one consequence, one sharp guess, and one easy question.",
+  "For a multi-touch campaign require four foundations: a specific recurring decision, a believable consequence, external trigger or direct mechanism evidence, and a recipient close to the work. For one first touch, a source-backed recurring decision OR mechanism plus a close recipient is enough when the missing consequence is asked honestly.",
+  "T1 uses one recognizable event, its decision, concrete source-safe artifacts, one believable consequence, one sharp guess, and one natural operating question.",
   "State only sourced facts. One uncertainty cue is enough; never stack caveats or apologize for the hypothesis.",
   "Use ordinary language about what someone pulls, compares, or rebuilds and what recovery, settlement, SLA, escalation, or senior capacity waits for it. Avoid internal labels.",
-  "Ask exactly one five-second question in T1: can the reviewer immediately see what supports the position, or does someone rebuild it from the named records? Do not ask them to find a use case, judge importance, evaluate GnK, or choose a response channel.",
+  "Explain one concrete GnK contribution after the problem is clear, then offer a short conversation with an email answer as the easier alternative. Do not make a factual correction the only recipient value.",
   "Match the ask to vantage: operators confirm the task, managers confirm recurrence or consequence, executives answer or route, and routers only identify the responsible role.",
-  "GnK is optional in T1 and may appear once across the sequence, after the operating scene and question are clear. Do not sell a mechanism before pain is confirmed.",
+  "Name GnK once in T1 and explain its narrow, evidence-safe contribution after the operating scene is clear. Do not lead with the seller.",
   "Every follow-up adds a sourced example, consequence, bounded proof, adjacent question, or useful route. Never restate T1, explain it, retract it, or build escape hatches.",
   "Never invent collateral, proof, ROI, named systems, or software limitations. If evidence cannot support the thread, hold the entire account.",
 ]
@@ -147,29 +143,30 @@ moment and has a useful point of view about it. The recipient should think:
 five seconds. It must not sound like a careful internal hypothesis document
 translated into outreach.
 
-No sequence exists until research supplies four foundations: a specific
-recurring decision, a believable consequence, an external trigger or direct
-evidence of the mechanism, and a recipient genuinely close to the work.
-Company category, scale, geography, department pages, or the general
-possibility of scattered records do not establish problem fit.
+Rank the market easy, medium, then hard. A multi-touch sequence requires four
+foundations: a specific recurring decision, a believable consequence, an
+external trigger or direct mechanism, and a recipient genuinely close to the
+work. A one-email medium-priority test may proceed when research supports the
+recurring decision OR direct mechanism and the recipient is close to it; the
+missing consequence must remain one clear question. Company category alone is
+hard-priority research and never supports generic copy.
 
 Build T1 in this order, expressed naturally rather than as a visible template:
 (1) one recognizable operating event, (2) the decision someone must make,
-(3) two to four concrete artifacts or source-safe system categories that may
-have to be pulled together, (4) one consequence such as settlement delay,
+(3) concrete source-safe artifacts or system categories that explain why the
+decision can be difficult, (4) one consequence such as settlement delay,
 leakage, audit exposure, missed recovery, SLA failure, or senior-reviewer
-capacity, (5) one sharp guess about why the friction persists, and (6) one easy
-question. Prefer a five-second fork: can the reviewer immediately see what
-supports the current position, or does someone rebuild the account from the
-named records? The exact wording must fit the account and role.
+capacity, (5) one sharp account-specific question, (6) one concrete sentence
+about how GnK could help without replacing expert judgment, and (7) a natural
+short-conversation ask with an email response as the easier path. Never reuse a
+universal decision-record question across accounts.
 
-Mechanism creates specificity. Do not merely say a claim file, project record,
-or denial is "hard." Explain, without asserting it as account fact, how the
-decision record could be separated from the evidence needed to act: schedule
-history from correspondence and approvals; a deduction from shipment and
-appointment evidence; a denial decision from claim, coding, clinical, and
-clearinghouse records. State only sourced account details as facts. The
-mechanism remains a question until confirmed.
+Mechanism creates specificity. Explain, without asserting it as account fact,
+which inputs, exceptions, approvals, handoffs, or system boundaries may prevent
+the recurring decision from being made quickly and consistently. Claims,
+project controls, logistics, manufacturing, and service operations should each
+produce different account-specific questions. State only sourced account
+details as facts. The mechanism remains a question until confirmed.
 
 One uncertainty cue is enough. "My guess is someone still has to do X manually"
 is honest and decisive. Do not surround it with "if this exists," "I do not
@@ -177,8 +174,7 @@ know whether," "may," "could," "if not," or explanations that there may be
 nothing to build. That caution is understood and does not need to become the
 value proposition.
 
-GnK is optional in T1 and appears at most once across the sequence, only after
-the operating scene and question are clear. One short sentence about building
+GnK appears once in T1, only after the operating scene is clear. One short sentence about building
 software for ugly cross-system work is enough. Do not name a system concept or
 explain that a human keeps judgment before the recipient confirms the pain. Do
 not manufacture a checklist, sketch, benchmark, or other collateral to give the
@@ -209,10 +205,9 @@ Establish, across the email or sequence:
      ideally MORE THAN ONE independent signal. "Hiring AI engineers" alone is
      not a thesis.
   3. Why the contacted role can observe or own it (their vantage, not title).
-  4. The MECHANISM producing time, risk, or rework — e.g. the deduction notice
-     arrives separately from the WMS record, the ASN, the bill of lading, the
-     appointment history, and the label evidence, leaving someone to reconstruct
-     the packet before anyone can decide whether to dispute it.
+  4. The MECHANISM producing time, risk, or rework — the specific inputs,
+     exceptions, approvals, coordination gaps, or system boundary supported by
+     this account's evidence.
   5. ONE specific system GnK could build (see the concept examples).
   6. What discovery must confirm.
   7. A bounded next step (often: test against a small historical sample — but
@@ -223,32 +218,26 @@ to one operating decision the recipient plausibly sees, frame the unverified
 workflow as a question, and explain GnK in one plain clause only if it helps the
 recipient understand why Andrew is asking.
 
-Be selective about which problems to pursue. GnK's engagement floor is roughly
-$40k/month (~$480k/year), so a workflow only qualifies if it is plausibly worth
-$1M+/year in cost, loss, risk, delay, recoverable revenue, or constrained
-capacity — e.g. 20 people doing repetitive reconciliation, millions in retailer
-deductions poorly disputed, expensive equipment idle from bad scheduling, or weeks
-of project-controls time reconstructing claims. Record that scale in magnitude_note
-(INTERNAL ONLY); never state a dollar figure to the buyer. The target is NOT
-"companies that could use AI" (almost all of them) — it is companies with an
-expensive workflow where humans are compensating for a MISSING decision,
-coordination, reconciliation, or intelligence layer BETWEEN the systems they
-already own. The question to hold in mind: "what expensive decision or workflow
-still sucks DESPITE all the software they already have?"
+Prioritize high-value, easy-to-land problems first, then medium and hard
+accounts; do not erase the rest of the software-project market. Record any
+credible scale in magnitude_note (INTERNAL ONLY) and never invent or state a
+dollar figure to the buyer. The target is not generic "companies that could use
+AI"; each email still needs one concrete decision, coordination, reconciliation,
+or workflow-specific software wedge and the person nearest it.
 
 The funnel this outreach feeds: observed evidence -> falsifiable problem
 hypothesis -> the person closest to the workflow -> a sharp question earning
 confirmation / correction / routing -> discovery call -> quantify the economic
 problem (trigger -> inputs -> current process -> decision -> failure ->
 consequence) -> a NARROW paid pilot as the wedge (e.g. "give us 100 historical
-cases; we reconstruct the evidence and the proposed answer, linked to source, and
-compare to what actually happened") -> measurable value -> expansion into a
+cases; we apply the proposed workflow to the historical inputs and compare its
+decision support with what actually happened") -> measurable value -> expansion into a
 recurring $40k+/month engagement across adjacent workflows. Outreach owns only the
 first few steps; write every touch to advance ONE rung, never to close the arc.
 
-Keep human judgment central: GnK prepares the evidence / reconstructs the record
-/ classifies the likely pattern, while the expert (claims team, project controls,
-scientist, operations) decides what to do with it.
+Keep human judgment central: GnK organizes the relevant inputs, coordinates the
+exception workflow, or surfaces the likely pattern, while the expert decides
+what to do with it.
 
 SEQUENCE PROGRESSION. Do not copy a sample email or fill a fixed template.
 Touch one earns attention around a recognizable operating decision and a

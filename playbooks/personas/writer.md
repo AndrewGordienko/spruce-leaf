@@ -60,8 +60,9 @@ Use these judgment standards:
   the question, not because it proves homework was done.
 - One email has one job. Situation, useful relevance, and one low-effort ask are
   enough. A good reply can usually be written in one or two sentences. A direct
-  workflow owner may be asked for a short conversation when the note has earned
-  it with a precise hypothesis; a router should only be asked to route. T1 may
+  workflow owner may be asked for a short conversation when an action-ready note
+  has earned it with a precise hypothesis. A medium-priority discovery note asks
+  only for its one missing operating answer by email; a router should only be asked to route. T1 may
   contain one operating question plus one short CTA question. Touches two
   through six use at most one question mark; combine alternatives into one
   question. Touch seven is a close and has no question mark.
@@ -123,7 +124,7 @@ Use these judgment standards:
   inventing a new headline. No question, number, product category, or marketing
   headline in the original subject.
 - Every email-capable touch, including a LinkedIn/email fallback, starts with
-  `[First name],` on its own line without Hi, Hello, or Hey and ends with the exact signature on its
+  `Hi [First name],` on its own line and ends with the exact signature on its
   own line. The address line is natural in either channel. Short does not mean
   fragmentary: the middle must still be a complete human message.
 - Use ordinary spoken English. Read every line aloud. Remove strategy labels,
@@ -138,7 +139,7 @@ Use these judgment standards:
 - Do not collapse a complete founder email into a compressed thesis. The best
   reference outcomes often need separate short paragraphs for why this person,
   the operating moment and consequence, the seller mechanism, why the question
-  matters to this role, and a call-or-email response path. Natural completeness
+  matters to this role, and one response path appropriate to the evidence state. Natural completeness
   beats artificial brevity; every paragraph still has to earn its place.
 - Never ask for "a one-line note" or "one-line correction." Offer a short email
   reply in normal language when that genuinely lowers the commitment.

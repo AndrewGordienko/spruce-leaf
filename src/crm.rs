@@ -393,9 +393,14 @@ fn ready_execution_person(db: &SharedDb, person: &Person) -> Result<Option<Execu
     if !complete_reviewed_sequence(&touches) {
         return Ok(None);
     }
-    if person.brand == "outagehub"
-        && !crate::gtm::prepare_action(db, &person.brand, &person.lead_id, person)?
-            .sequence_ready_for(touches.len())
+    let Some(lead) = db.get_lead(&person.lead_id)? else {
+        return Ok(None);
+    };
+    let playbooks = crate::playbook::Playbooks::load("playbooks")?;
+    let playbook = playbooks.get(&person.brand)?;
+    if !crate::gtm::prepare_action(db, &person.brand, &person.lead_id, person)?
+        .sequence_ready_for(touches.len())
+        || crate::gtm::delivery_block_reason(db, playbook, &lead, person)?.is_some()
     {
         // Pipeline is execution state, not an archive. If a newer GTM play or
         // account assessment says the account is no longer ready, retain the
@@ -1415,7 +1420,7 @@ fn render_html(
     };
     let stats = if let Some(dashboard) = execution {
         vec![
-            (account_count.to_string(), "ready companies"),
+            (account_count.to_string(), "reviewed + GTM-ready companies"),
             (dashboard.mapped_contacts.to_string(), "mapped contacts"),
             (contact_count.to_string(), "reviewed sequences"),
             (scheduled_count.to_string(), "scheduled touches"),
@@ -4768,7 +4773,7 @@ mod tests {
     use crate::business::Businesses;
     use crate::db::{
         AccountPlayAssessment, CustomerDevelopmentRecord, Db, Lead, Mailbox, Person, Reply,
-        Sequence, Touch,
+        Sequence, SignalObservation, Touch,
     };
     use crate::playbook::Playbooks;
     use axum::http::{HeaderMap, HeaderValue};
@@ -4982,7 +4987,7 @@ mod tests {
         assert!(html.contains("Northern Cold Chain"));
         assert!(html.contains("Internal alarms cannot supply"));
         assert!(html.contains("88/100"));
-        assert!(html.contains("Match public charging locations"));
+        assert!(html.contains("Match supplied or public operating locations"));
         assert!(html.contains("Forward-deployed proof briefs"));
     }
 
@@ -5053,6 +5058,7 @@ mod tests {
                 apollo_person_id: "person-1".into(),
                 name: "Alex Rivera".into(),
                 title: "Operations Director".into(),
+                vantage: "process_owner".into(),
                 linkedin_url: "https://www.linkedin.com/in/alex-rivera".into(),
                 linkedin_status: "requested".into(),
                 email: "alex@example.com".into(),
@@ -5061,11 +5067,65 @@ mod tests {
                 ..Default::default()
             })
             .expect("insert person");
+        let play = db
+            .current_gtm_play("gnk")
+            .expect("current play query")
+            .expect("current GnK play");
+        let signal_keys = [
+            "account.fit_evidence",
+            "account.specific_recurring_decision",
+            "account.believable_operating_consequence",
+            "account.external_trigger_or_mechanism_evidence",
+        ];
+        db.record_signal_candidates(
+            "gnk",
+            &lead_id,
+            &signal_keys
+                .iter()
+                .enumerate()
+                .map(|(index, key)| crate::gtm::SignalCandidate {
+                    definition_key: (*key).into(),
+                    evidence: format!("Source-backed workflow evidence {index}"),
+                    source_url: format!("https://example.com/evidence/{index}"),
+                    confidence: 0.9,
+                })
+                .collect::<Vec<_>>(),
+            "test",
+        )
+        .expect("record account signals");
+        db.record_signal_observation(&SignalObservation {
+            brand: "gnk".into(),
+            definition_key: "contact.workflow_vantage".into(),
+            lead_id: lead_id.clone(),
+            person_id: person_id.clone(),
+            evidence: "Operations Director is close to the recurring decision.".into(),
+            confidence: 0.9,
+            status: "observed".into(),
+            ..Default::default()
+        })
+        .expect("record contact vantage");
+        db.upsert_account_play_assessment(&AccountPlayAssessment {
+            lead_id: lead_id.clone(),
+            brand: "gnk".into(),
+            play_id: play.id.clone(),
+            play_version: play.version,
+            status: "qualified".into(),
+            fit_score: 85,
+            matched_signal_keys: signal_keys.iter().map(|key| (*key).into()).collect(),
+            root_cause: "A current workflow boundary creates a recurring decision burden.".into(),
+            proof_fit: "A bounded historical workflow replay can test it.".into(),
+            source: "test".into(),
+            ..Default::default()
+        })
+        .expect("record current assessment");
         let sequence_id = db
             .create_sequence(&Sequence {
                 person_id: person_id.clone(),
                 lead_id: lead_id.clone(),
                 brand: "gnk".into(),
+                play_id: play.id,
+                play_version: play.version,
+                gtm_state: "action_ready".into(),
                 copy_policy_version: crate::db::CURRENT_COPY_POLICY_VERSION,
                 status: "active".into(),
                 ..Default::default()

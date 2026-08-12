@@ -292,13 +292,18 @@ async fn execute(
                 accounts,
                 contacts,
                 None,
+                None,
                 concurrency,
                 None,
             )
             .await?;
             Ok(format!(
-                "{} Apollo orgs, {} qualified leads, {} people",
-                s.orgs_found, s.leads_qualified, s.people_added
+                "{} Apollo orgs, {} easy, {} medium, {} hard-research leads, {} people",
+                s.orgs_found,
+                s.leads_qualified,
+                s.leads_research_needed,
+                s.leads_research_required,
+                s.people_added
             ))
         }
         kind::ENRICH => {

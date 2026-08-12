@@ -911,6 +911,7 @@ impl Agent {
             Ok(p) => p,
             Err(e) => return format!("Can't run: {e:#}"),
         };
+        let touches = outreach::supported_touch_count_for_brand(&self.brand, touches);
 
         // Live progress tree: header chip + per-account spinners/checkmarks and a
         // running tokens/cost/elapsed footer, painted by its own render thread.
@@ -998,6 +999,7 @@ impl Agent {
             thesis,
             accounts,
             contacts,
+            None,
             candidate_limit,
             self.concurrency.max(1),
             Some(progress),
@@ -1017,13 +1019,20 @@ impl Agent {
         {
             Ok(s) => {
                 // Surface the freshly-filed leads/people in the live CRM.
-                if s.leads_qualified > 0 || s.people_added > 0 {
+                if s.leads_qualified + s.leads_research_needed + s.leads_research_required > 0
+                    || s.people_added > 0
+                {
                     open_browser(&self.crm_url());
                     ui::activity("Opened CRM dashboard", self.crm_url());
                 }
                 format!(
-                    "Sourced {} real organizations into {} viable lead record(s) and {} people, now filed in the CRM at {}. Fully qualified and research-needed accounts remain visibly distinct. Next, ask me to enrich their emails.",
-                    s.orgs_found, s.leads_qualified, s.people_added, self.crm_url()
+                    "Sourced {} real organizations into {} easy, {} medium, and {} hard-research lead record(s), plus {} people, now filed in the CRM at {}. Only easy and precise medium accounts can reach copy. Next, ask me to enrich their emails.",
+                    s.orgs_found,
+                    s.leads_qualified,
+                    s.leads_research_needed,
+                    s.leads_research_required,
+                    s.people_added,
+                    self.crm_url()
                 )
             }
             Err(e) => e,
@@ -1081,11 +1090,9 @@ impl Agent {
     }
 
     /// Write sequences for verified people, returning the summary. `replace`
-    /// re-drafts existing (unsent) sequences to improve them. Bulk motions honor
-    /// the requested per-account recipient count; primary status affects order,
-    /// not whether explicitly requested recipients are silently discarded.
-    /// A scoped request may reveal only its selected, not-yet-verified people so
-    /// the requested account × contact cardinality does not silently collapse.
+    /// re-drafts existing (unsent) sequences to improve them. Bulk motions map
+    /// the requested contacts but open cold outreach with only the strongest
+    /// person at each account. An explicit single-person request remains exact.
     /// No account or people search occurs here; real send volume remains bounded
     /// by send-time account limits.
     async fn do_plan(&self, options: PlanOptions<'_>) -> Result<outreach::PlanSummary, String> {
@@ -1100,7 +1107,7 @@ impl Agent {
             show_holds,
         } = options;
         let requested_touches = touches.max(1);
-        let touches = outreach::supported_touch_count(requested_touches);
+        let touches = outreach::supported_touch_count_for_brand(&self.brand, requested_touches);
         if touches != requested_touches {
             ui::activity(
                 "Normalized eager sequence",
@@ -1593,7 +1600,8 @@ impl Agent {
         } = options;
         let accounts = accounts.max(1);
         let contacts = contacts.max(1);
-        let effective_touches = outreach::supported_touch_count(touches);
+        let outreach_contacts = 1usize;
+        let effective_touches = outreach::supported_touch_count_for_brand(&self.brand, touches);
         let max_source_passes = std::env::var("SPRUCE_FULL_MOTION_SOURCE_PASSES")
             .ok()
             .and_then(|value| value.trim().parse::<usize>().ok())
@@ -1701,6 +1709,8 @@ impl Agent {
                         source_total.orgs_found += pass.orgs_found;
                         source_total.candidates_new += pass.candidates_new;
                         source_total.leads_qualified += pass.leads_qualified;
+                        source_total.leads_research_needed += pass.leads_research_needed;
+                        source_total.leads_research_required += pass.leads_research_required;
                         source_total.people_added += pass.people_added;
                         if pass.candidates_new == 0 {
                             consecutive_empty_source_passes += 1;
@@ -1781,7 +1791,7 @@ impl Agent {
                                 .unwrap_or(false)
                         })
                         .count();
-                    let already_done = ready_people >= contacts;
+                    let already_done = ready_people >= outreach_contacts;
                     if already_done {
                         fulfilled.insert(lead_id.clone());
                     }
@@ -1867,7 +1877,7 @@ impl Agent {
                     auto: false,
                     replace: replace_drafts,
                     only_person_ids: Some(&plan_person_ids),
-                    per_account_cap: Some(contacts),
+                    per_account_cap: Some(outreach_contacts),
                     person_filter: None,
                     desired_outcome,
                     show_holds: false,
@@ -1896,7 +1906,7 @@ impl Agent {
                     .db
                     .lead_current_reviewed_sequence_count(lead_id, effective_touches)
                     .unwrap_or(0)
-                    >= contacts
+                    >= outreach_contacts
                 {
                     fulfilled.insert(lead_id.clone());
                 }
@@ -1945,7 +1955,7 @@ impl Agent {
                         auto: false,
                         replace: true,
                         only_person_ids: Some(&retry_people),
-                        per_account_cap: Some(contacts),
+                        per_account_cap: Some(outreach_contacts),
                         person_filter: None,
                         desired_outcome,
                         show_holds: false,
@@ -1964,7 +1974,7 @@ impl Agent {
                                 .db
                                 .lead_current_reviewed_sequence_count(lead_id, effective_touches)
                                 .unwrap_or(0)
-                                >= contacts
+                                >= outreach_contacts
                             {
                                 fulfilled.insert(lead_id.clone());
                             }
@@ -2003,17 +2013,19 @@ impl Agent {
             "Apollo skipped; on-file inventory filled the motion".to_string()
         } else {
             format!(
-                "Apollo ran {source_passes} adaptive pass(es): {} organizations seen, {} new candidates assessed, {} qualified accounts, {} people added",
+                "Apollo ran {source_passes} adaptive pass(es): {} organizations seen, {} new candidates assessed, {} easy, {} medium, {} hard-research accounts, {} people added",
                 source_total.orgs_found,
                 source_total.candidates_new,
                 source_total.leads_qualified,
+                source_total.leads_research_needed,
+                source_total.leads_research_required,
                 source_total.people_added,
             )
         };
 
         if fulfilled.len() >= accounts {
             return format!(
-                "Full motion filled {filled}/{accounts} account slots with {contacts} current reviewed {effective_touches}-touch sequence(s) per account. {planned} recipient sequence(s) were newly written; {drafted} touches remain drafts and {scheduled} were scheduled. {apollo_note}. Refreshed {refreshed_total} account(s) and processed {people_selected_total} recipient selection(s), including {verified_total} verified result(s). Nothing was sent. CRM: {url}.",
+                "Full motion filled {filled}/{accounts} account slots with one current reviewed {effective_touches}-touch sequence per account; {contacts} contact(s) per account may still be mapped for later routing. {planned} recipient sequence(s) were newly written; {drafted} touches remain drafts and {scheduled} were scheduled. {apollo_note}. Refreshed {refreshed_total} account(s) and processed {people_selected_total} recipient selection(s), including {verified_total} verified result(s). Nothing was sent. CRM: {url}.",
                 filled = fulfilled.len(),
                 planned = people_planned_total,
                 drafted = touches_drafted_total,
@@ -2023,7 +2035,7 @@ impl Agent {
         }
 
         format!(
-            "Full motion persisted through {rounds} replacement round(s) and filled {filled}/{accounts} account slots at the requested {contacts}-recipient coverage before hitting a real execution boundary: {reason}. A partially drafted account does not count as filled. {apollo_note}. It rejected {rejected} copy attempt(s), held {held} weak recipient/account attempt(s), and left {stopped} unfinished after the boundary; none of those counted as completed output. Nothing was sent. CRM: {url}.",
+            "Full motion persisted through {rounds} replacement round(s) and filled {filled}/{accounts} account slots at one cold recipient per account before hitting a real execution boundary: {reason}. Additional mapped contacts remain for later routing. A partially drafted account does not count as filled. {apollo_note}. It rejected {rejected} copy attempt(s), held {held} weak recipient/account attempt(s), and left {stopped} unfinished after the boundary; none of those counted as completed output. Nothing was sent. CRM: {url}.",
             rounds = motion_rounds,
             filled = fulfilled.len(),
             reason = terminal_reason.unwrap_or_else(|| "unknown execution boundary".to_string()),
@@ -2689,7 +2701,7 @@ Actions (each is a step's `action`):\n\
 - run_campaign: hypothetical research-only campaign; no Apollo.\n\
 - source_leads: ONLY finds and qualifies Apollo accounts+people, then stops — it writes NO emails. Use only when the request is purely to find companies/people and contains no request to write, draft, sequence, or perform outreach. set thesis/accounts/contacts (defaults 10/3).\n\
 - research_account: re-read and reassess ONE existing CRM account against the current GTM play without Apollo. Put its exact name/domain/id in query and the research focus in thesis. Use this before targeted regeneration when a promising old account has stale, weak, or retired-play evidence.\n\
-- run_full_motion: end-to-end motion for a brand (never sends). The requested account count AND contacts-per-account count are a FULFILLMENT CONTRACT: persist through adaptive sourcing passes, contact shortfalls, weak hypotheses, and rejected copy; save misses as targeting corrections, retry rejected copy with its feedback, and replace an account that still lacks the requested number of current reviewed recipient sequences. Stop short only at a real provider/model-budget/search-exhaustion safety boundary and report filled/requested exactly. REUSE-FIRST: if the CRM already has enough accounts/people for that brand, it SKIPS Apollo, refreshes why those companies fit, and writes missing, rejected, or stale sequences. Current-policy reviewed drafts are preserved unless the operator explicitly asks to rewrite/redraft/refine/replace them. set thesis/accounts/contacts/touches (defaults 5/5/7). set force_new=true ONLY when they explicitly ask for new/fresh/more companies not already on file.\n\
+- run_full_motion: end-to-end motion for a brand (never sends). The requested account count is the outreach FULFILLMENT CONTRACT; contacts-per-account controls contact mapping, while cold copy opens with exactly one carefully ranked person per account. Persist through adaptive sourcing passes, contact shortfalls, weak hypotheses, and rejected copy; save misses as targeting corrections, retry rejected copy with its feedback, and replace an account that still lacks one current reviewed recipient sequence. Stop short only at a real provider/model-budget/search-exhaustion safety boundary and report filled/requested exactly. REUSE-FIRST: if the CRM already has enough accounts/people for that brand, it SKIPS Apollo, refreshes why those companies fit, and writes missing, rejected, or stale sequences. Current-policy reviewed drafts are preserved unless the operator explicitly asks to rewrite/redraft/refine/replace them. set thesis/accounts/contacts/touches (defaults 5/5/7). set force_new=true ONLY when they explicitly ask for new/fresh/more companies not already on file.\n\
 - enrich_people: reveal/verify sourced emails; phone only when explicit.\n\
 - plan_outreach: draft sequences for contacts ALREADY found (no account/people search). When the operator says 'I need X from person Y,' put Y's exact name/email/id in person and X in outcome. Do not reinterpret X as buyer-facing wording; the response planner will reduce it when it is not yet earned. A scoped request may reveal only those selected contacts whose email is still missing, because an email sequence must not silently shrink; skip that reveal when the operator says no Apollo/no enrichment/verified only. IMPORTANT SCOPE: 'first N people' with NO company/account count means N people TOTAL in CRM order: set limit=N and OMIT accounts/contacts. 'first N people in the first company' means accounts=1, contacts=N. 'N people for each of M companies' means accounts=M, contacts=N. contacts is always PER selected company, never a bare total. Preserve current-policy reviewed drafts on ordinary retries; safely replace unsent drafts only when the operator explicitly says rewrite/redraft/refine/replace. auto only when explicit.\n\
 - approve_outreach: only after explicit approval — this is what actually schedules drafts to send.\n\
