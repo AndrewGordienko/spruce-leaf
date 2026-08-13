@@ -112,6 +112,7 @@ pub struct FundingOutreachOptions<'a> {
 
 pub struct SponsorshipOutreachOptions<'a> {
     pub opportunity_id: &'a str,
+    pub contact_id: Option<&'a str>,
     pub touches: usize,
     pub refresh: bool,
 }
@@ -308,7 +309,11 @@ struct SponsorshipReview {
     #[serde(default)]
     revised_subject: String,
     #[serde(default)]
-    revised_body: String,
+    revised_company_connection: String,
+    #[serde(default)]
+    revised_collaboration_sentence: String,
+    #[serde(default)]
+    revised_question: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2418,6 +2423,7 @@ pub async fn plan_sponsorship_outreach(
 ) -> Result<FundingPlanSummary> {
     let SponsorshipOutreachOptions {
         opportunity_id,
+        contact_id,
         touches,
         refresh,
     } = options;
@@ -2450,20 +2456,32 @@ pub async fn plan_sponsorship_outreach(
                 && sponsorship_contact_is_direct(contact)
         })
         .collect::<Vec<_>>();
-    let selected = (*verified_direct_contacts
-        .iter()
-        .max_by_key(|contact| {
-            (
-                contact.primary,
-                sponsorship_contact_score(&contact.title, route).unwrap_or_default(),
-            )
-        })
-        .ok_or_else(|| {
-            anyhow!(
-                "no verified direct sponsorship email; use Apollo to find a named person near executive, sponsorship, partnerships, community, innovation, marketing, or corporate-affairs budget routing"
-            )
-        })?)
-    .clone();
+    let selected = if let Some(contact_id) = contact_id {
+        (*verified_direct_contacts
+            .iter()
+            .find(|contact| contact.id == contact_id)
+            .ok_or_else(|| {
+                anyhow!(
+                    "requested sponsorship contact is not a verified direct email on this opportunity"
+                )
+            })?)
+        .clone()
+    } else {
+        (*verified_direct_contacts
+            .iter()
+            .max_by_key(|contact| {
+                (
+                    contact.primary,
+                    sponsorship_contact_score(&contact.title, route).unwrap_or_default(),
+                )
+            })
+            .ok_or_else(|| {
+                anyhow!(
+                    "no verified direct sponsorship email; use Apollo to find a named person near executive, sponsorship, partnerships, community, innovation, marketing, or corporate-affairs budget routing"
+                )
+            })?)
+        .clone()
+    };
     let mut existing = Vec::new();
     for contact in &all_contacts {
         existing.extend(db.list_opportunity_touches(&contact.id)?);
@@ -2558,11 +2576,18 @@ pub async fn plan_sponsorship_outreach(
             }
             if repair_attempt < 2
                 && !review.revised_subject.trim().is_empty()
-                && !review.revised_body.trim().is_empty()
+                && !review.revised_company_connection.trim().is_empty()
+                && !review.revised_question.trim().is_empty()
                 && sequence.touches.len() == 1
             {
                 sequence.touches[0].subject = review.revised_subject;
-                sequence.touches[0].body = review.revised_body;
+                sequence.touches[0].body = assemble_sponsorship_body(
+                    &selected,
+                    &opportunity.funder,
+                    &review.revised_company_connection,
+                    &review.revised_collaboration_sentence,
+                    &review.revised_question,
+                )?;
                 repaired = true;
             }
             break;
@@ -2773,28 +2798,13 @@ async fn write_sponsorship_sequence(
             sponsorship_personalization_schema(),
         )
         .await?;
-    let first_name = contact
-        .name
-        .split_whitespace()
-        .next()
-        .unwrap_or_default()
-        .trim_matches(|character: char| !character.is_alphanumeric());
-    if first_name.is_empty() {
-        bail!("verified sponsorship contact is missing a usable first name");
-    }
-    let sponsor_name = sponsorship_display_name(&opportunity.funder);
-    let mut offer_paragraph = format!(
-        "{SPONSORSHIP_ASK_SENTENCE} In return, {sponsor_name} would receive founding-sponsor recognition, API access and quarterly coverage briefings."
-    );
-    if !personalization.collaboration_sentence.trim().is_empty() {
-        offer_paragraph.push(' ');
-        offer_paragraph.push_str(personalization.collaboration_sentence.trim());
-    }
-    let body = format!(
-        "Hi {first_name},\n\n{SPONSORSHIP_FOUNDER_PARAGRAPH}\n\n{SPONSORSHIP_PROGRESS_PARAGRAPH}\n\n{}\n\n{offer_paragraph}\n\n{}\n\n{SPONSORSHIP_SIGNATURE}",
-        personalization.company_connection.trim(),
-        personalization.question.trim(),
-    );
+    let body = assemble_sponsorship_body(
+        contact,
+        &opportunity.funder,
+        &personalization.company_connection,
+        &personalization.collaboration_sentence,
+        &personalization.question,
+    )?;
     Ok(FundingSequence {
         touches: vec![FundingCopyTouch {
             stage: 1,
@@ -2808,6 +2818,37 @@ async fn write_sponsorship_sequence(
                 .into(),
         }],
     })
+}
+
+fn assemble_sponsorship_body(
+    contact: &OpportunityContact,
+    company: &str,
+    company_connection: &str,
+    collaboration_sentence: &str,
+    question: &str,
+) -> Result<String> {
+    let first_name = contact
+        .name
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .trim_matches(|character: char| !character.is_alphanumeric());
+    if first_name.is_empty() {
+        bail!("verified sponsorship contact is missing a usable first name");
+    }
+    let sponsor_name = sponsorship_display_name(company);
+    let mut offer_paragraph = format!(
+        "{SPONSORSHIP_ASK_SENTENCE} In return, {sponsor_name} would receive founding-sponsor recognition, API access and quarterly coverage briefings."
+    );
+    if !collaboration_sentence.trim().is_empty() {
+        offer_paragraph.push(' ');
+        offer_paragraph.push_str(collaboration_sentence.trim());
+    }
+    Ok(format!(
+        "Hi {first_name},\n\n{SPONSORSHIP_FOUNDER_PARAGRAPH}\n\n{SPONSORSHIP_PROGRESS_PARAGRAPH}\n\n{}\n\n{offer_paragraph}\n\n{}\n\n{SPONSORSHIP_SIGNATURE}",
+        company_connection.trim(),
+        question.trim(),
+    ))
 }
 
 fn sponsorship_display_name(company: &str) -> String {
@@ -2872,7 +2913,7 @@ async fn review_sponsorship_sequence(
             "The note closely follows Andrew's approved founder template without sounding like a grant application.",
             "The closing is exactly Thanks, Andrew Gordienko, Founder, OutageHub, and https://outagehub.ca."
         ],
-        "repair_rule": "If and only if one concise revision can make a single-touch sequence pass without adding unsupported facts, return the complete revised subject and body. Otherwise leave both empty.",
+        "repair_rule": "The founder story, progress paragraph, fixed $10,000 sentence, benefits sentence, greeting, and signature are locked and cannot be rewritten. If and only if the variable fields can be repaired without unsupported facts, return revised_subject, revised_company_connection, revised_collaboration_sentence, and revised_question. The connection is one source-bound paragraph; collaboration may be empty; question must contain exactly one question mark. Otherwise leave every revised field empty.",
         "issue_rule": "The issues array is reserved for material defects that make the email not ready unchanged. Never put stylistic observations, optional improvements, or a concern you explicitly consider non-blocking in issues. If passes is true, issues must be empty.",
     });
     engine
@@ -3503,13 +3544,16 @@ fn sponsorship_personalization_schema() -> Value {
 fn sponsorship_review_schema() -> Value {
     json!({
         "type":"object","additionalProperties":false,
-        "required":["passes","score","issues","revised_subject","revised_body"],
+        "required":["passes","score","issues","revised_subject","revised_company_connection",
+            "revised_collaboration_sentence","revised_question"],
         "properties":{
             "passes":{"type":"boolean"},
             "score":{"type":"integer","minimum":0,"maximum":100},
             "issues":string_array("Material sendability defects only."),
             "revised_subject":{"type":"string"},
-            "revised_body":{"type":"string"}
+            "revised_company_connection":{"type":"string"},
+            "revised_collaboration_sentence":{"type":"string"},
+            "revised_question":{"type":"string"}
         }
     })
 }

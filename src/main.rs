@@ -445,6 +445,9 @@ enum Command {
     /// Draft one or two independently reviewed sponsorship emails. Always manual.
     PlanSponsorshipOutreach {
         opportunity: String,
+        /// Exact mapped contact to use. Prevents title seniority from displacing the intended sponsor-side owner.
+        #[arg(long)]
+        contact: Option<String>,
         #[arg(long, default_value_t = 1, value_parser = positive_usize)]
         touches: usize,
         /// Replace existing unsent draft/blocked sponsorship copy after a policy or evidence repair.
@@ -1618,6 +1621,7 @@ fn main() -> Result<()> {
 
         Command::PlanSponsorshipOutreach {
             opportunity: opportunity_id,
+            contact,
             touches,
             refresh,
         } => {
@@ -1634,6 +1638,7 @@ fn main() -> Result<()> {
                 &playbooks.shared,
                 opportunity::SponsorshipOutreachOptions {
                     opportunity_id: &opportunity_id,
+                    contact_id: contact.as_deref(),
                     touches,
                     refresh,
                 },
