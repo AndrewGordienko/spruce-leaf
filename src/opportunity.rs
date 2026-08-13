@@ -2347,11 +2347,18 @@ fn sponsorship_copy_issues(
         if !(lower.contains("impact report") || lower.contains("annual report")) {
             issues.push("sponsorship touch 1 must name eventual impact-report inclusion".into());
         }
-        if !(lower.contains("someone else")
+        let requests_budget_owner_routing = (lower.contains("someone else")
             && (lower.contains("point me")
                 || lower.contains("route")
                 || lower.contains("introduc")))
-        {
+            || ((lower.contains("route me")
+                || lower.contains("point me")
+                || lower.contains("introduce me"))
+                && (lower.contains("person who owns")
+                    || lower.contains("person responsible")
+                    || lower.contains("right person")
+                    || lower.contains("budget owner")));
+        if !requests_budget_owner_routing {
             issues.push(
                 "sponsorship touch 1 must request routing if someone else owns the budget".into(),
             );
@@ -3080,6 +3087,17 @@ mod tests {
         assert!(sponsorship_copy_issues(
             "OutageHub infrastructure sponsorship",
             body,
+            1,
+            "commercial_sponsor"
+        )
+        .is_empty());
+        let natural_routing = body.replace(
+            "or, if someone else owns that area, would you point me toward them",
+            "or could you route me to the person who owns it",
+        );
+        assert!(sponsorship_copy_issues(
+            "OutageHub infrastructure sponsorship",
+            &natural_routing,
             1,
             "commercial_sponsor"
         )
