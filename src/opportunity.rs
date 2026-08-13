@@ -1383,6 +1383,8 @@ async fn import_one_sponsorship_candidate(
         "grid",
         "resilien",
         "emergency",
+        "communication",
+        "flood",
         "critical infrastructure",
         "utility",
         "telecom",
@@ -1503,6 +1505,7 @@ async fn import_one_sponsorship_candidate(
             "hello",
             "contact",
             "sales",
+            "businesssales",
             "service",
             "support",
             "marketing",
@@ -1723,6 +1726,7 @@ fn sponsorship_recipient_kind(name: &str, industry: &str, domain: &str) -> &'sta
         "hosting",
         "data center",
         "data centre",
+        "data-centre",
         "infrastructure as a service",
     ]
     .iter()
