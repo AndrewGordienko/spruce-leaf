@@ -34,10 +34,10 @@ use uuid::Uuid;
 // recurring decision + consequence + trigger/mechanism, and changes OutageHub
 // cold outreach to an evidence-first two-email EV-operator experiment. Older
 // copy did not receive those checks and must never remain sendable.
-// v22 turns account readiness into an easy/medium/hard queue. Easy accounts may
-// use the supported cadence; medium accounts may receive one complete,
+// v22 turns account readiness into an action/discovery/research queue.
+// Action-ready accounts may use the supported cadence; discovery-ready accounts may receive one complete,
 // hypothesis-led first email when a concrete task/decision and relevant person
-// are supported; hard accounts stay in research. This is not v19's generic
+// are supported; research-required accounts stay in research. This is not v19's generic
 // one-question lane: every T1 must explain seller value, a role-specific reason
 // to engage, and an answerable response path, then pass independent QA. The
 // mechanical gate checks factual contribution, not subjective CTA wording.
@@ -56,9 +56,9 @@ use uuid::Uuid;
 // unconfirmed workflow now gets one email-first response path; calls are earned.
 // v28 keeps the verified fit-screen fact in reviewer context and recognizes
 // natural brief-reply wording that v27's literal response detector missed.
-// v29 restores the higher easy-tier fit floor after live review showed that a
+// v29 restores the higher action-ready fit floor after live review showed that a
 // task signal plus an unrelated lifting condition still leaves the recipient
-// doing seller discovery. Those accounts remain medium until the consequence
+// doing seller discovery. Those accounts remain discovery-ready until the consequence
 // is tied to the candidate task.
 // v30 changes the commercial unit from a brand-exclusive company hypothesis to
 // an evidence-linked opportunity. A company may belong to several portfolio

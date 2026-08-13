@@ -288,21 +288,21 @@ impl GtmActionContext {
         self.state == "action_ready"
     }
 
-    /// Easy-priority accounts may use the full supported cadence. A
-    /// medium-priority account may use one honest, hypothesis-led first touch;
+    /// Action-ready accounts may use the full supported cadence. A
+    /// discovery-ready account may use one honest, hypothesis-led first touch;
     /// it cannot silently become a follow-up campaign before the problem is
-    /// confirmed. Hard-priority research never reaches copy.
+    /// confirmed. Research-required inventory never reaches copy.
     pub fn sequence_ready_for(&self, touches: usize) -> bool {
         self.action_ready() || (self.state == "discovery_ready" && touches == 1)
     }
 
     /// A human may approve one independently reviewed discovery touch. This is
-    /// the only delivery path for medium accounts; it cannot create follow-ups.
+    /// the only delivery path for discovery-ready accounts; it cannot create follow-ups.
     pub fn delivery_ready_for(&self, touches: usize) -> bool {
         (self.action_ready() && touches > 0) || (self.state == "discovery_ready" && touches == 1)
     }
 
-    /// Automatic scheduling remains easy-tier only. Touch count may shorten a
+    /// Automatic scheduling remains action-ready only. Touch count may shorten a
     /// cadence but never weaken evidence or commercial authorization.
     pub fn automatic_delivery_ready_for(&self, touches: usize) -> bool {
         self.action_ready() && touches > 0
@@ -420,7 +420,7 @@ impl GtmActionContext {
         );
         let action = match self.state.as_str() {
             "action_ready" => "The account has enough sourced evidence for one narrow commercial note. Use only a supplied observation as the company-specific signal. Lead with a role-relevant implication and a credible point of view. A cold outcome may be a short working conversation, interest, correction, or referral; it is not yet a pilot or proof. Never invent collateral or claim an asset exists unless verified seller context explicitly supplies it.",
-            "discovery_ready" => "This is a medium-priority account: research supports one concrete operating task, decision, or mechanism and this recipient is close to it, but one economic or workflow term remains unproved. Write one complete, useful first email only. State sourced account details as facts, present the exact missing term as one honest question, explain the seller's relevant contribution, and make a direct email answer the sole next step. Do not ask for a call before the missing term is confirmed. Never use a universal diagnostic template or schedule follow-ups before a reply.",
+            "discovery_ready" => "This opportunity is discovery-ready, not action-ready: research supports one concrete operating task, decision, or mechanism and this recipient is close to it, but one economic or workflow term remains unproved. Write one complete, useful first email only. State sourced account details as facts, present the exact missing term as one honest question, explain the seller's relevant contribution, and make a direct email answer the sole next step. Do not ask for a call before the missing term is confirmed. Never use a universal diagnostic template or schedule follow-ups before a reply.",
             _ => "The account does not yet have enough sourced evidence for a multi-touch sequence. Hold it for research or use one manual routing note; do not manufacture discovery questions or explain a proof, integration, pilot, or product.",
         };
         format!(
@@ -1056,7 +1056,7 @@ pub fn default_plays() -> Vec<GtmPlay> {
             required_signal_keys: vec!["account.fit_evidence".into(), "account.distributed_locations".into(), "account.outage_sensitive_decision".into(), "account.historical_location_outage_match".into()],
             minimum_signal_matches: 4,
             hypothesis: "During an ambiguous location or asset incident, location-matched public utility context may improve one evidenced diagnosis, dispatch, escalation, continuity, prioritization, or communication decision.".into(),
-            action_policy: "Select one bounded market segment, then work easy to hard at operator × site-network × outage-time-decision level. Easy opportunities have atomic source claims for the decision, a mapped committee, and completed historical proof. Medium opportunities may receive one independently reviewed, manually approved discovery touch; automation never schedules them. Explain OutageHub's API contribution and never claim private site status.".into(),
+            action_policy: "Select one bounded market segment, then assess operator × site-network × outage-time-decision evidence separately from commercial lane. Action-ready opportunities have atomic source claims for the decision, a mapped committee, and completed historical proof. Discovery-ready opportunities may receive one independently reviewed, manually approved discovery touch; automation never schedules them. Explain OutageHub's API contribution and never claim private site status.".into(),
             proof_type: "historical_replay".into(),
             proof_description: "Match supplied or public operating locations to historical utility outage areas, recording the location, utility timestamp, and what an API response or webhook would have returned.".into(),
             success_metric: "Whether outside utility status is checked today and whether it changes the account-specific diagnosis, dispatch, escalation, continuity, prioritization, or communication decision.".into(),
@@ -1071,7 +1071,7 @@ pub fn default_plays() -> Vec<GtmPlay> {
             name: "Workflow-specific decision support".into(),
             lifecycle: "testing".into(),
             motion: "internal_pipeline_to_forward_deployed_proof".into(),
-            target_icp: "Organizations with a source-backed recurring decision, exception, coordination burden, or workflow-specific software gap. Cover industries broadly; rank visible consequences and reachable owners first, then investigate medium and hard accounts.".into(),
+            target_icp: "Organizations with a source-backed recurring decision, exception, coordination burden, or workflow-specific software gap. Cover industries broadly; rank visible consequences and reachable owners first, then investigate discovery-ready and research-required accounts.".into(),
             target_vantages: vec!["process_owner".into(), "operator".into(), "operational_executive".into(), "router".into()],
             required_signal_keys: vec!["account.fit_evidence".into(), "account.specific_recurring_decision".into(), "account.believable_operating_consequence".into(), "account.external_trigger_or_mechanism_evidence".into()],
             minimum_signal_matches: 4,
@@ -1091,12 +1091,12 @@ pub fn default_plays() -> Vec<GtmPlay> {
             name: "Task-and-exception feasibility review".into(),
             lifecycle: "testing".into(),
             motion: "internal_pipeline_to_forward_deployed_proof".into(),
-            target_icp: "Factories, product manufacturers, warehouses, distribution centres, and fulfillment operations, starting in Ontario then Canada. Rank one physical task and the nearest operator; prioritize sourced economic pressure but retain task-specific medium accounts.".into(),
+            target_icp: "Factories, product manufacturers, warehouses, distribution centres, and fulfillment operations, starting in Ontario then Canada. Rank one physical task and the nearest operator; prioritize sourced economic pressure but retain task-specific discovery-ready accounts.".into(),
             target_vantages: vec!["process_owner".into(), "operator".into(), "technical_evaluator".into(), "router".into()],
             required_signal_keys: vec!["account.fit_evidence".into(), "account.bounded_repetitive_task".into(), "account.manual_task_economic_pressure".into()],
             minimum_signal_matches: 3,
             hypothesis: "One recurring physical movement may be automatable enough to investigate, with the exact variation, rate, integration, and economics confirmed by the operator closest to the work.".into(),
-            action_policy: "Work company × facility × line/workcell × task, easy to hard. Easy opportunities have a facility-linked task, atomic source claims for task and economic pressure, and a mapped committee. Medium opportunities may receive one independently reviewed, manually approved task-specific first touch; automation never schedules them. Briefly give Andrew's University of Toronto and Automata context and never ask the recipient to find a use case from scratch.".into(),
+            action_policy: "Work company × facility × line/workcell × task, keeping evidence readiness separate from commercial lane. Action-ready opportunities have a facility-linked task, atomic source claims for task and economic pressure, and a mapped committee. Discovery-ready opportunities may receive one independently reviewed, manually approved task-specific first touch; automation never schedules them. Briefly give Andrew's University of Toronto and Automata context and never ask the recipient to find a use case from scratch.".into(),
             proof_type: "task_feasibility_review".into(),
             proof_description: "Review a task sketch, short video, or representative SKU/changeover set; model the normal motion, exceptions, rate, and technical boundaries.".into(),
             success_metric: "Required rate, intervention frequency, changeover burden, task coverage, and a clear technical/economic stop condition.".into(),

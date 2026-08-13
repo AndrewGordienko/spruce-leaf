@@ -77,9 +77,9 @@ pub async fn enrich_pending(
 
     // Paid reveal credits should follow the active opportunity map, not the
     // insertion order of every historical contact in the CRM. Build a
-    // round-robin order so each current easy/medium opportunity gets its best
-    // workflow-side committee member before we deepen any one account. Hard
-    // research opportunities and unmapped legacy people remain available as a
+    // round-robin order so each current action/discovery-ready opportunity gets
+    // its best workflow-side committee member before we deepen any one account.
+    // Research-required opportunities and unmapped legacy people remain available as a
     // fallback, but cannot consume the front of a normal enrichment batch.
     let priority_order = current_opportunity_enrichment_order(db, brand)?;
     let batch = select_enrichment_batch(people, limit, only_person_ids, &priority_order);
@@ -509,7 +509,7 @@ fn current_opportunity_enrichment_order(db: &SharedDb, brand: Option<&str>) -> R
         .map(|(_, _, _, roster)| roster.len())
         .max()
         .unwrap_or(0);
-    // Finish easy and medium coverage before revealing contacts for hard
+    // Finish action/discovery-ready coverage before revealing contacts for research-required
     // opportunities that are not allowed to draft yet.
     for allowed_tier in [1, 2] {
         for depth in 0..max_depth {

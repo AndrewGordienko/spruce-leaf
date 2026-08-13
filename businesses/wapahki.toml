@@ -23,7 +23,7 @@ unknowns = [
 ]
 
 goals = [
-  "Build toward selling robotic arms and cells across every plausible Ontario factory and warehouse, then expand across Canada; prioritize easy tasks first, then medium and hard deployments.",
+  "Build toward selling robotic arms and cells across every plausible Ontario factory and warehouse, then expand across Canada; prioritize lower-delivery-risk cash-now tasks before core proofs and strategic deployments.",
   "Find recurring physical tasks repetitive enough for a robot but too variable for conventional automation to handle economically, and capture WHY existing automation breaks down (the market opportunity).",
   "Prefer partial-automation wedges where a stable high-volume core can be automated while people retain fragile, irregular, safety-critical, or otherwise non-deterministic exceptions.",
   "Quantify one bounded task's economics (operators, shifts, wage burden, throughput, changeover, payback) until it can be drawn, modeled, priced, and reproduced in the lab.",

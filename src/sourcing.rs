@@ -178,7 +178,8 @@ struct OrgQual {
     /// True only for fully qualified accounts. Research-needed inventory is
     /// preserved with this false and an explicit routing_status.
     qualified: bool,
-    /// qualified (easy) | research_needed (medium) | research_required (hard)
+    /// qualified/action_ready | research_needed/discovery_ready |
+    /// research_required
     /// | rejected. Computed locally after the model
     /// returns so missing public evidence is not confused with negative evidence.
     #[serde(skip)]
@@ -788,7 +789,7 @@ pub async fn source(
             Ok(value) if value.routing_status == "research_required" => {
                 research_required += 1;
                 format!(
-                    "Latest: hard-priority research {} · fit {}/100",
+                    "Latest: research-required {} · fit {}/100",
                     org.name, value.play_fit_score
                 )
             }
@@ -838,7 +839,7 @@ pub async fn source(
             "qualification",
             "Qualifying root-cause fit",
             format!(
-                "{reviewed}/{qualification_total} reviewed · {qualified} easy · {research_needed} medium · {research_required} hard research · {skipped} rejected · {errors} errors\n{latest}"
+                "{reviewed}/{qualification_total} reviewed · {qualified} action-ready · {research_needed} discovery-ready · {research_required} research-required · {skipped} rejected · {errors} errors\n{latest}"
             ),
             "active",
         );
@@ -932,10 +933,10 @@ pub async fn source(
         if selected_medium + selected_hard == 0 {
             "Ranked qualified companies"
         } else {
-            "Ranked easy, medium, and hard-priority companies"
+            "Ranked action-ready, discovery-ready, and research-required companies"
         },
         format!(
-            "{reviewed}/{qualification_total} reviewed · {qualified} easy · {research_needed} medium · {research_required} hard research\nSelected {selected_count}: {selected_qualified} easy · {selected_medium} medium · {selected_hard} hard"
+            "{reviewed}/{qualification_total} reviewed · {qualified} action-ready · {research_needed} discovery-ready · {research_required} research-required\nSelected {selected_count}: {selected_qualified} action-ready · {selected_medium} discovery-ready · {selected_hard} research-required"
         ),
         if selected_count > 0 { "complete" } else { "warning" },
     );
@@ -1272,7 +1273,7 @@ fn enforce_play_qualification(
     // Do not infer canonical evidence by concatenating the whole research
     // corpus. Every structured signal must arrive with the exact passage and
     // URL that supports that individual claim; downstream opportunity lineage
-    // groups claims by source domain before any action can become easy-tier.
+    // groups claims by source domain before any action can become action-ready.
 
     qualification.structured_signals.retain(|signal| {
         allowed_signal_keys.contains(signal.definition_key.trim())
@@ -1319,7 +1320,7 @@ fn enforce_play_qualification(
         && !qualification.proof_fit.trim().is_empty()
         // A full signal set is necessary but not sufficient when the task and
         // consequence may come from separate facts. Preserve the higher fit
-        // floor so weakly connected foundations remain medium-priority.
+        // floor so weakly connected foundations remain discovery-ready.
         && qualification.play_fit_score >= 65
         && qualification.disqualifiers.is_empty();
     let has_account_fit = matched.iter().any(|key| key == "account.fit_evidence");
@@ -1368,7 +1369,7 @@ fn enforce_play_qualification(
         }
         if qualification.play_fit_score < 45 {
             reasons.push(format!(
-                "play-fit score {}/100 is below the 45 medium-priority floor",
+                "play-fit score {}/100 is below the 45 discovery-ready floor",
                 qualification.play_fit_score.clamp(0, 100)
             ));
         }
@@ -1456,8 +1457,8 @@ fn augment_outage_signals(
 /// task more clearly than the extraction model labels it. Map only explicit
 /// task and burden language to Wapahki's canonical keys so a readable live job
 /// posting cannot be lost because one JSON label was omitted. A single page
-/// still counts as one lineage, so it can earn a medium first-touch draft but
-/// never an easy/action-ready cadence by itself.
+/// still counts as one lineage, so it can earn a discovery-ready first-touch
+/// draft but never an action-ready cadence by itself.
 #[cfg(test)]
 fn augment_wapahki_signals(
     observed_facts: &[String],
@@ -1875,7 +1876,7 @@ fn enforce_refresh_qualification(
         "research_needed".into()
     } else if hard_research_candidate {
         refresh.evidence_gaps.push(
-            "Hard-priority account: identify the exact task or decision and its closest owner before outreach."
+            "Research-required account: identify the exact task or decision and its closest owner before outreach."
                 .into(),
         );
         "research_required".into()
@@ -2895,11 +2896,11 @@ async fn qualify_org(
 
 fn brand_qualification_guard(brand: &str) -> &'static str {
     if brand.eq_ignore_ascii_case("outagehub") {
-        "OUTAGEHUB ACCOUNT GUARD: Keep the market broad but the problem narrow. A company can fit when it operates, monitors, supports, or dispatches across Canadian locations and a source-backed outage-time decision could use outside utility status or restoration context. EV charging is one segment, not the whole ICP. Require a distributed footprint and one concrete decision such as diagnosis, dispatch, escalation, continuity, transfer, prioritization, or customer communication. A completed historical location/polygon match makes the account easy-priority; without one, a well-evidenced decision and reachable owner may remain medium-priority for one honest discovery email. Sellers with no operated/monitored footprint are poor fits. Never claim a private site was down."
+        "OUTAGEHUB ACCOUNT GUARD: Keep the market broad but the problem narrow. A company can fit when it operates, monitors, supports, or dispatches across Canadian locations and a source-backed outage-time decision could use outside utility status or restoration context. EV charging is one segment, not the whole ICP. Require a distributed footprint and one concrete decision such as diagnosis, dispatch, escalation, continuity, transfer, prioritization, or customer communication. A completed historical location/polygon match can make the opportunity action-ready; without one, a well-evidenced decision and reachable owner may remain discovery-ready for one honest discovery email. Sellers with no operated/monitored footprint are poor fits. Never claim a private site was down."
     } else if brand.eq_ignore_ascii_case("wapahki") {
-        "WAPAHKI ACCOUNT GUARD: Cover product manufacturers, factories, warehouses, distribution centres, and fulfillment operations, starting in Ontario and expanding across Canada. Rank one source-supported physical candidate task: a package or product form, station, handoff, line, machine, physical job duty, receiving/picking/packing/palletizing flow, equipment project, facility expansion, or plant document. A current company-attributed job mirror supports only what it directly states. A task plus source-backed staffing, throughput, stoppage, utilization, changeover, sanitation, ergonomics, or safety pressure is easy-priority. A task without proven economics is medium-priority and may receive one honest, task-specific discovery email to the nearest operator; frame the consequence as a question. Company category alone is hard-priority research, not permission for a generic robotics note."
+        "WAPAHKI ACCOUNT GUARD: Cover product manufacturers, factories, warehouses, distribution centres, and fulfillment operations, starting in Ontario and expanding across Canada. Rank one source-supported physical candidate task: a package or product form, station, handoff, line, machine, physical job duty, receiving/picking/packing/palletizing flow, equipment project, facility expansion, or plant document. A current company-attributed job mirror supports only what it directly states. A task plus source-backed staffing, throughput, stoppage, utilization, changeover, sanitation, ergonomics, or safety pressure can be action-ready. A task without proven economics is discovery-ready and may receive one honest, task-specific discovery email to the nearest operator; frame the consequence as a question. Company category alone is research-required, not permission for a generic robotics note."
     } else if brand.eq_ignore_ascii_case("gnk") {
-        "GNK ACCOUNT GUARD: Cover organizations broadly, but rank a specific software/workflow wedge and the person nearest it. An account is easy-priority when public evidence supports one recurring event and decision, a believable consequence, and the trigger, artifacts, systems, or handoff. It is medium-priority when evidence supports the recurring decision OR the account-specific mechanism but not the full consequence; permit only one honest discovery email that states facts as facts and frames the missing term as a question. Generic company fit with no concrete workflow remains hard-priority research. Never turn software usage or company scale alone into a pain claim."
+        "GNK ACCOUNT GUARD: Cover organizations broadly, but rank a specific software/workflow wedge and the person nearest it. An opportunity is action-ready when public evidence supports one recurring event and decision, a believable consequence, and the trigger, artifacts, systems, or handoff. It is discovery-ready when evidence supports the recurring decision OR the account-specific mechanism but not the full consequence; permit only one honest discovery email that states facts as facts and frames the missing term as a question. Generic company fit with no concrete workflow remains research-required. Never turn software usage or company scale alone into a pain claim."
     } else {
         ""
     }
@@ -3085,8 +3086,8 @@ fn compact_list(values: &[String], limit: usize) -> String {
 
 /// The model chooses the current campaign wedge. These coverage terms keep the
 /// long-term market visible without collapsing every sourcing pass into one
-/// narrow vertical. Qualification and evidence strength determine easy,
-/// medium, and hard priority after discovery.
+/// narrow vertical. Qualification and evidence strength determine action-ready,
+/// discovery-ready, and research-required status after discovery.
 fn apply_brand_icp_guard(brand: &str, thesis: &str, segment_key: Option<&str>, icp: &mut Icp) {
     let thesis = thesis.to_ascii_lowercase();
     let segment_key = segment_key.unwrap_or_default().to_ascii_lowercase();
@@ -4593,7 +4594,7 @@ mod tests {
         let guard = brand_qualification_guard("wapahki");
         assert!(guard.contains("Company category alone"));
         assert!(guard.contains("physical candidate task"));
-        assert!(guard.contains("medium-priority"));
+        assert!(guard.contains("discovery-ready"));
         assert!(guard.contains("economic"));
     }
 

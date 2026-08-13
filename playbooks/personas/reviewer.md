@@ -85,7 +85,7 @@ Score the final wording on:
 - recipient-to-sender balance;
 - whether the single ask is answerable in one or two sentences, or is a
   justified short-conversation ask matched to a direct workflow owner;
-- whether a medium-priority discovery note stops at its one missing operating
+- whether a discovery-ready note stops at its one missing operating
   answer instead of stacking a premature call invitation onto that reply;
 - no more than one operating question plus one short CTA question in touch one,
   no more than one question mark in touches two through six, and none in the

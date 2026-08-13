@@ -78,11 +78,12 @@ forbidden = [
 ]
 
 copy_doctrine = """
-Cover the market broadly, but make every email narrow. Rank accounts easy,
-medium, then hard. Easy accounts expose a specific outage-time decision, a
-reachable owner, and a completed location/polygon match. Medium accounts expose
-the decision and owner but lack a match; they may receive one complete first
-email only. Hard accounts remain in research.
+Cover the market broadly, but make every email narrow. Keep evidence readiness
+separate from cash-now, core, and strategic commercial lanes. Action-ready
+opportunities expose a specific outage-time decision, a reachable owner, and a
+completed location/polygon match. Discovery-ready opportunities expose the
+decision and owner but lack a match; they may receive one complete first email
+only. Research-required opportunities remain in research.
 
 T1 is 60–95 words and contains one account-specific operating question about
 diagnosis, dispatch, escalation, continuity, prioritization, or communication.

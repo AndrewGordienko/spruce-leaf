@@ -1020,7 +1020,7 @@ impl Agent {
                     ui::activity("Opened CRM dashboard", self.crm_url());
                 }
                 format!(
-                    "Sourced {} real organizations into {} easy, {} medium, and {} hard-research lead record(s), plus {} people, now filed in the CRM at {}. Only easy and precise medium accounts can reach copy. Next, ask me to enrich their emails.",
+                    "Sourced {} real organizations into {} action-ready, {} discovery-ready, and {} research-required lead record(s), plus {} people, now filed in the CRM at {}. Only action-ready and precise discovery-ready accounts can reach copy. Next, ask me to enrich their emails.",
                     s.orgs_found,
                     s.leads_qualified,
                     s.leads_research_needed,
@@ -2008,7 +2008,7 @@ impl Agent {
             "Apollo skipped; on-file inventory filled the motion".to_string()
         } else {
             format!(
-                "Apollo ran {source_passes} adaptive pass(es): {} organizations seen, {} new candidates assessed, {} easy, {} medium, {} hard-research accounts, {} people added",
+                "Apollo ran {source_passes} adaptive pass(es): {} organizations seen, {} new candidates assessed, {} action-ready, {} discovery-ready, {} research-required accounts, {} people added",
                 source_total.orgs_found,
                 source_total.candidates_new,
                 source_total.leads_qualified,

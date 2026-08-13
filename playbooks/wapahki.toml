@@ -54,7 +54,7 @@ requirements = [
   "T1 is a complete founder/researcher note, not a two-sentence diagnostic template. Explain why this operator, the supported plant moment, one plausible consequence, and one honest automation hypothesis.",
   "Arrive with one concrete candidate task for the recipient to correct. Never ask them to inspect the plant, identify any suitable use case, translate the operation into a robotics taxonomy, or evaluate Wapahki's task boundary.",
   "Use a source-supported object, station, handoff, package, product, machine, line, warehouse flow, job posting, expansion, or equipment fact. Category alone does not prove the exact task.",
-  "Easy-priority accounts also show why the task matters: staffing or vacancies, overtime, throughput, line stoppage, utilization, short-run economics, ergonomics, safety, sanitation burden, or changeover cost. A one-email medium-priority test may ask about the suspected consequence honestly when the task and recipient are specific.",
+  "Action-ready accounts also show why the task matters: staffing or vacancies, overtime, throughput, line stoppage, utilization, short-run economics, ergonomics, safety, sanitation burden, or changeover cost. A one-email discovery-ready test may ask about the suspected consequence honestly when the task and recipient are specific.",
   "Test why an obviously repetitive job may remain manual: sanitation, irregular products, misfeeds, rate, integration, capital payback, or changeover burden. Mention only the one blocker that sharpens this account-specific question.",
   "Ask one natural account-specific operating question. The playbook supplies no fallback task, staffing claim, or automation blocker; every detail must come from account evidence.",
   "After the plant moment is legible, briefly state Andrew's University of Toronto and Automata robotics context and one honest Wapahki contribution.",
@@ -107,12 +107,14 @@ answerable from memory. Arrive with the candidate task and invite correction.
 Do not ask the recipient to classify where variation enters, decide whether a
 motion fits a bounded exception envelope, or identify any suitable task.
 
-Rank factories and warehouses easy, medium, then hard. Every first touch needs a
+Keep evidence readiness separate from cash-now, core, and strategic commercial
+lanes. Every first touch needs a
 source-supported package, product, station, line, machine, warehouse flow, job,
 facility, expansion, or other physical operating clue and a recipient close to
-the task. Easy accounts also have a credible economic-pressure signal and may
-support a cadence. Medium accounts may receive one task-specific email that
-asks whether the suspected consequence exists. Hard accounts remain in research.
+the task. Action-ready opportunities also have a credible economic-pressure
+signal and may support a cadence. Discovery-ready opportunities may receive one
+task-specific email that asks whether the suspected consequence exists.
+Research-required opportunities remain in research.
 Never promote category or product variety into a factual manual-work claim.
 
 Describe Wapahki only after the production moment and consequence are clear, if

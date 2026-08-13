@@ -61,7 +61,7 @@ Use these judgment standards:
 - One email has one job. Situation, useful relevance, and one low-effort ask are
   enough. A good reply can usually be written in one or two sentences. A direct
   workflow owner may be asked for a short conversation when an action-ready note
-  has earned it with a precise hypothesis. A medium-priority discovery note asks
+  has earned it with a precise hypothesis. A discovery-ready note asks
   only for its one missing operating answer by email; a router should only be asked to route. T1 may
   contain one operating question plus one short CTA question. Touches two
   through six use at most one question mark; combine alternatives into one

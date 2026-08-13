@@ -301,7 +301,7 @@ async fn execute(
             )
             .await?;
             Ok(format!(
-                "{} Apollo orgs, {} easy, {} medium, {} hard-research leads, {} people",
+                "{} Apollo orgs, {} action-ready, {} discovery-ready, {} research-required leads, {} people",
                 s.orgs_found,
                 s.leads_qualified,
                 s.leads_research_needed,

@@ -847,7 +847,7 @@ pub async fn plan_pending(
     }
 
     // When a bounded run or provider budget cannot cover everyone, consume
-    // easy/action-ready accounts before medium/discovery-ready accounts.
+    // action-ready accounts before discovery-ready accounts.
     todo.sort_by(|left, right| {
         left.2
             .cmp(&right.2)
@@ -1587,7 +1587,7 @@ async fn write_account_sequences(
     };
     let writer_knowledge = knowledge.writer.block.clone();
     let brand_trigger_contract = brand_trigger_contract(&pb.key, n);
-    let t1_contract = "T1 CONTRACT: Write a complete founder note inside the configured word band. Explain why this person, name one recognizable problem and plausible consequence, state one concrete and evidence-safe seller contribution, and offer one natural response path. For a medium/discovery-ready account, the one direct operating answer is the sole CTA; do not add a call before the missing term is confirmed. A correction may be useful, but Andrew's desire for one is never the recipient's reason to answer. When the operator requested a supported operating decision or response, preserve it in T1; never broaden it into a generic workflow interview such as `what takes the most time`, `what happens today`, or `how do you handle this`. Hold rather than manufacture any missing account foundation.";
+    let t1_contract = "T1 CONTRACT: Write a complete founder note inside the configured word band. Explain why this person, name one recognizable problem and plausible consequence, state one concrete and evidence-safe seller contribution, and offer one natural response path. For a discovery-ready account, the one direct operating answer is the sole CTA; do not add a call before the missing term is confirmed. A correction may be useful, but Andrew's desire for one is never the recipient's reason to answer. When the operator requested a supported operating decision or response, preserve it in T1; never broaden it into a generic workflow interview such as `what takes the most time`, `what happens today`, or `how do you handle this`. Hold rather than manufacture any missing account foundation.";
     let writer_instructions = format!(
         r#"Write one {n}-touch no-reply sequence for each recipient. {planning_contract}
 

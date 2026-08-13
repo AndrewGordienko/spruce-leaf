@@ -619,7 +619,7 @@ fn main() -> Result<()> {
                 None,
             ))?;
             println!(
-                "\u{2713} {} orgs \u{2192} {} easy, {} medium, {} hard-research leads; {} people.\n  next: spruce-leaf --brand {} enrich",
+                "\u{2713} {} orgs \u{2192} {} action-ready, {} discovery-ready, {} research-required leads; {} people.\n  next: spruce-leaf --brand {} enrich",
                 s.orgs_found,
                 s.leads_qualified,
                 s.leads_research_needed,
