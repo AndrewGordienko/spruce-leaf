@@ -1833,7 +1833,7 @@ pub(crate) fn brand_trigger_contract(brand: &str, touches: usize) -> &'static st
     } else if brand == "wapahki" && touches == 1 {
         "WAPAHKI PRECISE FIRST-TOUCH CONTRACT: Research must identify one physical candidate task or handoff and a recipient close to it. T1 is a natural founder/researcher note: why this operator, the sourced facility/task clue, one honestly framed consequence or economic question, Andrew's University of Toronto and Automata robotics context, one concrete Wapahki contribution, and one low-friction response path. When the verified seller context permits it, give the recipient a practical reason to answer by offering to apply Wapahki's existing one-page automation-fit screen to this exact task and return a first-pass view; never imply that assessment already exists. For a medium account, ask for the missing operating answer by email and stop. Arrive with the candidate task; never ask the recipient to search the operation for a use case."
     } else if brand == "wapahki" {
-        "WAPAHKI FOUNDER-RESEARCHER CONTRACT: Multi-touch copy requires one source-supported physical task, credible economic pressure, and a reachable owner. T1 is a natural founder/researcher note with Andrew's University of Toronto and Automata context, one Wapahki contribution, and a short call-or-email response path. Follow-ups advance the same task."
+        "WAPAHKI FOUNDER-RESEARCHER CONTRACT: Multi-touch copy requires one source-supported physical task, credible economic pressure, and a reachable owner. T1 is a natural founder/researcher note with Andrew's University of Toronto and Automata context, one Wapahki contribution, and a short call-or-email response path. Name the supported operating stake plainly as staffing or labour pressure, throughput, capacity, stoppage, downtime, safety, ergonomics, or payback; do not leave the consequence implicit. Follow-ups advance the same task. Across all seven touches, never sharpen a supported category such as packing or handling into an unverified object such as a bottle, tray, carton, pallet, or conveyor."
     } else if brand == "outagehub" && touches == 2 {
         "OUTAGEHUB TWO-EMAIL EVIDENCE CONTRACT: This cadence is for distributed Canadian operators with one exact outage-time decision, a nearby operations recipient, and a completed location-specific historical utility match. T1 explains OutageHub's location-matched Canadian utility API, frames one evidence-safe consequence, and offers a natural short conversation or email path. T2 contributes the verified location and timestamp without claiming private site or asset status. Do not prescribe a universal dark-site/equipment-ticket binary."
     } else if brand == "outagehub" && touches == 1 {
@@ -2225,7 +2225,26 @@ pub(crate) async fn review_and_edit_sequence_lean(
         .await?;
         qa_calls += 1;
         validate_editor_stages(&repair, sequence)?;
-        apply_targeted_repairs(sequence, &repair, &unresolved, expected_touches)?;
+        if let Err(error) = apply_targeted_repairs(sequence, &repair, &unresolved, expected_touches)
+        {
+            // A structured editor occasionally returns all requested stage rows
+            // but leaves one required rewrite blank. The mutation helper
+            // validates every affected row before changing the sequence, so it
+            // is safe to feed this exact omission into the next bounded repair
+            // round instead of rejecting an otherwise repairable recipient.
+            last_findings = vec![error.to_string()];
+            research_round += 1;
+            record_copy_research_attempt(
+                research_db,
+                pb,
+                research_person_id,
+                sequence,
+                research_round,
+                "incomplete_repair",
+                &last_findings,
+            );
+            continue;
+        }
         scrub_ai_punctuation(sequence);
         enforce_email_signatures(sequence, &pb.signature);
 
@@ -2292,7 +2311,14 @@ pub(crate) async fn review_and_edit_sequence_lean(
             .await?;
             qa_calls += 1;
             validate_editor_stages(&cleanup, sequence)?;
-            apply_targeted_repairs(sequence, &cleanup, &deterministic, expected_touches)?;
+            if let Err(error) =
+                apply_targeted_repairs(sequence, &cleanup, &deterministic, expected_touches)
+            {
+                deterministic.push(error.to_string());
+                deterministic.sort();
+                deterministic.dedup();
+                continue;
+            }
             scrub_ai_punctuation(sequence);
             enforce_email_signatures(sequence, &pb.signature);
         }
@@ -3887,6 +3913,10 @@ fn wapahki_names_operating_consequence(body: &str) -> bool {
     let body = body.to_ascii_lowercase();
     let named_consequence = [
         "staffing",
+        "labor",
+        "labour",
+        "manual work",
+        "manual handling",
         "staffed manually",
         "needs people",
         "need people",
