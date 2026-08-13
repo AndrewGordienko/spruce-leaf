@@ -1399,117 +1399,135 @@ async fn import_one_sponsorship_candidate(
         bail!("relevance excerpt does not establish why OutageHub matters");
     }
 
-    let (contact, contact_key, contact_source, apollo_person_id) =
-        if !row.contact.existing_person_id.trim().is_empty() {
-            let person = db
-                .get_person(&row.contact.existing_person_id)?
-                .ok_or_else(|| anyhow!("existing CRM person was not found"))?;
-            if person.email_status != "verified" || person.email.trim().is_empty() {
-                bail!("existing CRM person does not have a verified email");
-            }
-            let person_lead = db
-                .get_lead(&person.lead_id)?
-                .ok_or_else(|| anyhow!("existing CRM person's account was not found"))?;
-            if normalize_domain(&person_lead.domain) != domain {
-                bail!("existing CRM person belongs to a different company domain");
-            }
-            if sponsorship_contact_score(&person.title, route).is_none() {
-                bail!("existing CRM person's title does not match the recipient route");
-            }
-            (
-                SponsorshipResearchContact {
-                    name: person.name.clone(),
-                    title: person.title.clone(),
-                    email: person.email.clone(),
-                    location: person.location.clone(),
-                    linkedin_url: person.linkedin_url.clone(),
-                    ..Default::default()
-                },
-                format!("person:{}", person.id),
-                "existing_crm".to_string(),
-                person.apollo_person_id,
-            )
+    let (contact, contact_key, contact_source, apollo_person_id) = if !row
+        .contact
+        .existing_person_id
+        .trim()
+        .is_empty()
+    {
+        let person = db
+            .get_person(&row.contact.existing_person_id)?
+            .ok_or_else(|| anyhow!("existing CRM person was not found"))?;
+        if person.email_status != "verified" || person.email.trim().is_empty() {
+            bail!("existing CRM person does not have a verified email");
+        }
+        let person_lead = db
+            .get_lead(&person.lead_id)?
+            .ok_or_else(|| anyhow!("existing CRM person's account was not found"))?;
+        if normalize_domain(&person_lead.domain) != domain {
+            bail!("existing CRM person belongs to a different company domain");
+        }
+        if sponsorship_contact_score(&person.title, route).is_none() {
+            bail!("existing CRM person's title does not match the recipient route");
+        }
+        (
+            SponsorshipResearchContact {
+                name: person.name.clone(),
+                title: person.title.clone(),
+                email: person.email.clone(),
+                location: person.location.clone(),
+                linkedin_url: person.linkedin_url.clone(),
+                ..Default::default()
+            },
+            format!("person:{}", person.id),
+            "existing_crm".to_string(),
+            person.apollo_person_id,
+        )
+    } else {
+        if row.contact.name.trim().is_empty()
+            || row.contact.title.trim().is_empty()
+            || row.contact.email.trim().is_empty()
+            || row.contact.email_source_url.trim().is_empty()
+        {
+            bail!("new contact requires name, title, email, and email_source_url");
+        }
+        if sponsorship_contact_score(&row.contact.title, route).is_none() {
+            bail!("new contact title does not match the recipient route");
+        }
+        let email_source_is_first_party =
+            host_matches_allowed_domain(&row.contact.email_source_url, &domain);
+        let email_page = read_cached(research, page_cache, &row.contact.email_source_url).await?;
+        if !email_page
+            .to_ascii_lowercase()
+            .contains(&row.contact.email.trim().to_ascii_lowercase())
+        {
+            bail!("contact source does not publish the exact email");
+        }
+        let person_source_url = if row.contact.person_source_url.trim().is_empty() {
+            row.contact.email_source_url.as_str()
         } else {
-            if row.contact.name.trim().is_empty()
-                || row.contact.title.trim().is_empty()
-                || row.contact.email.trim().is_empty()
-                || row.contact.email_source_url.trim().is_empty()
-            {
-                bail!("new contact requires name, title, email, and first-party email_source_url");
-            }
-            if sponsorship_contact_score(&row.contact.title, route).is_none() {
-                bail!("new contact title does not match the recipient route");
-            }
-            if !host_matches_allowed_domain(&row.contact.email_source_url, &domain) {
-                bail!("contact email source must be on {domain} or its subdomain");
-            }
-            let email_page =
-                read_cached(research, page_cache, &row.contact.email_source_url).await?;
-            if !email_page
-                .to_ascii_lowercase()
-                .contains(&row.contact.email.trim().to_ascii_lowercase())
-            {
-                bail!("first-party contact page does not publish the exact email");
-            }
-            let person_source_url = if row.contact.person_source_url.trim().is_empty() {
-                row.contact.email_source_url.as_str()
-            } else {
-                row.contact.person_source_url.as_str()
-            };
-            let person_page = read_cached(research, page_cache, person_source_url).await?;
-            if !normalized_contains(&person_page, &row.contact.name)
-                || !normalized_contains(&person_page, &row.contact.title)
-            {
-                bail!("person source does not publish the exact name and title");
-            }
-            if !host_matches_allowed_domain(person_source_url, &domain)
-                && !normalized_contains(&person_page, &row.organization)
-                && !normalized_contains(&person_page, &domain)
-            {
-                bail!("third-party person source must explicitly identify the organization");
-            }
-            if !crate::verify::syntax_ok(&row.contact.email)
-                || !crate::verify::has_mx(row.contact.email.split('@').nth(1).unwrap_or_default())
-                    .await
-            {
-                bail!("published contact email fails syntax or mail-domain verification");
-            }
-            let mailbox = row
-                .contact
-                .email
-                .split('@')
-                .next()
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            let is_routed = [
-                "info",
-                "hello",
-                "contact",
-                "sales",
-                "service",
-                "support",
-                "marketing",
-                "partnerships",
-                "community",
-                "office",
-                "admin",
-            ]
-            .contains(&mailbox.as_str());
-            (
-                row.contact.clone(),
-                format!(
-                    "first-party:{}",
-                    row.contact.email.trim().to_ascii_lowercase()
-                ),
-                if is_routed {
-                    "first_party_published_routed"
-                } else {
-                    "first_party_published_direct"
-                }
-                .to_string(),
-                String::new(),
-            )
+            row.contact.person_source_url.as_str()
         };
+        let person_page = read_cached(research, page_cache, person_source_url).await?;
+        if !normalized_contains(&person_page, &row.contact.name)
+            || !normalized_contains(&person_page, &row.contact.title)
+        {
+            bail!("person source does not publish the exact name and title");
+        }
+        if !host_matches_allowed_domain(person_source_url, &domain)
+            && !normalized_contains(&person_page, &row.organization)
+            && !normalized_contains(&person_page, &domain)
+        {
+            bail!("third-party person source must explicitly identify the organization");
+        }
+        if !email_source_is_first_party
+            && (!normalized_contains(&email_page, &row.organization)
+                || !normalized_contains(&email_page, &row.contact.name)
+                || !normalized_contains(&email_page, &row.contact.title))
+        {
+            bail!(
+                    "third-party email source must publish the organization, exact person, title, and email together"
+                );
+        }
+        if !crate::verify::syntax_ok(&row.contact.email)
+            || !crate::verify::has_mx(row.contact.email.split('@').nth(1).unwrap_or_default()).await
+        {
+            bail!("published contact email fails syntax or mail-domain verification");
+        }
+        let contact_email_domain =
+            normalize_domain(row.contact.email.split('@').nth(1).unwrap_or_default());
+        if contact_email_domain != domain {
+            bail!("published contact email must use the organization's domain");
+        }
+        let mailbox = row
+            .contact
+            .email
+            .split('@')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let is_routed = [
+            "info",
+            "hello",
+            "contact",
+            "sales",
+            "service",
+            "support",
+            "marketing",
+            "partnerships",
+            "community",
+            "office",
+            "admin",
+            "executiveassistant",
+        ]
+        .contains(&mailbox.as_str());
+        (
+            row.contact.clone(),
+            format!(
+                "published:{}",
+                row.contact.email.trim().to_ascii_lowercase()
+            ),
+            if is_routed {
+                "first_party_published_routed"
+            } else if email_source_is_first_party {
+                "first_party_published_direct"
+            } else {
+                "third_party_published_direct"
+            }
+            .to_string(),
+            String::new(),
+        )
+    };
 
     let canonical_url = format!("https://{domain}");
     let fingerprint = opportunity_fingerprint(
@@ -1570,10 +1588,10 @@ async fn import_one_sponsorship_candidate(
                 row.contact.person_source_url.clone()
             },
         ],
-        fit_score: if contact_source == "first_party_published_routed" {
-            80
-        } else {
-            92
+        fit_score: match contact_source.as_str() {
+            "first_party_published_routed" => 80,
+            "third_party_published_direct" => 88,
+            _ => 92,
         },
         fit_status: "strong_fit".into(),
         fit_reasons: vec![
