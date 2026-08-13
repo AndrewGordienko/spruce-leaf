@@ -1845,7 +1845,7 @@ pub(crate) fn brand_trigger_contract(brand: &str, touches: usize) -> &'static st
     } else if brand == "outagehub" && touches == 2 {
         "OUTAGEHUB TWO-EMAIL EVIDENCE CONTRACT: This cadence is for distributed Canadian operators with one exact outage-time decision, a nearby operations recipient, and a completed location-specific historical utility match. T1 explains OutageHub's location-matched Canadian utility API, frames one evidence-safe consequence, and offers a natural short conversation or email path. T2 contributes the verified location and timestamp without claiming private site or asset status. Do not prescribe a universal dark-site/equipment-ticket binary."
     } else if brand == "outagehub" {
-        "OUTAGEHUB PRECISE FIRST-TOUCH CONTRACT: Target an operator with distributed Canadian locations and one evidenced outage-time diagnosis, dispatch, escalation, continuity, prioritization, or communication decision. T1 names the account-specific decision and explains in plain language that OutageHub supplies location-matched Canadian utility reports through an API. Honor the supplied copy decision state: discovery-ready copy asks for one direct operating answer by email and stops; action-ready copy may offer a short conversation with an email alternative. A completed historical match may be mentioned with its exact boundary; it is not required for this first discovery touch. Never claim private site status or reuse a universal dark-site/ticket binary."
+        "OUTAGEHUB PRECISE FIRST-TOUCH CONTRACT: Target an operator with distributed Canadian locations and one evidenced outage-time diagnosis, dispatch, escalation, continuity, prioritization, or communication decision. T1 names the account-specific decision and explains in plain language that OutageHub supplies location-matched Canadian utility reports through an API. Honor the supplied copy decision state: discovery-ready copy asks for one direct operating answer by email and stops; action-ready copy may offer a short conversation with an email alternative. A completed historical match may be mentioned only with its full date including year or exact timestamp and its outside-context boundary; it is not required for this first discovery touch. Never make a historical match sound current, claim private site status, or reuse a universal dark-site/ticket binary."
     } else {
         ""
     }
@@ -2044,7 +2044,10 @@ pub(crate) async fn review_and_edit_sequence_lean(
     let max_qa_calls = std::env::var("SPRUCE_COPY_RESEARCH_MAX_QA_CALLS")
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
-        .unwrap_or(8)
+        // A source-attribution or length repair can consume the eighth call
+        // immediately before its first clean audit. Ten leaves room for the
+        // independent confirmation audit without weakening convergence.
+        .unwrap_or(10)
         .clamp(4, 16);
     let mut qa_calls = 0usize;
     let mut research_round = 0usize;
@@ -4044,7 +4047,7 @@ fn mentions_outreach_asset(body: &str) -> bool {
     .any(|term| body.contains(term))
 }
 
-fn names_historical_outage_result(body: &str) -> bool {
+fn mentions_historical_outage_result(body: &str) -> bool {
     let body = body.to_ascii_lowercase();
     let result = [
         "i matched",
@@ -4057,6 +4060,8 @@ fn names_historical_outage_result(body: &str) -> bool {
         "was inside",
         "was within",
         "reported at",
+        "included the",
+        "included a",
     ]
     .iter()
     .any(|term| body.contains(term));
@@ -4064,27 +4069,6 @@ fn names_historical_outage_result(body: &str) -> bool {
         .iter()
         .any(|term| body.contains(term));
     let outage = ["utility outage", "utility report", "outage area"]
-        .iter()
-        .any(|term| body.contains(term));
-    let time = body.chars().any(|character| character.is_ascii_digit())
-        && [
-            "timestamp",
-            "2024",
-            "2025",
-            "2026",
-            "january",
-            "february",
-            "march",
-            "april",
-            "may",
-            "june",
-            "july",
-            "august",
-            "september",
-            "october",
-            "november",
-            "december",
-        ]
         .iter()
         .any(|term| body.contains(term));
     let hypothetical = [
@@ -4098,7 +4082,15 @@ fn names_historical_outage_result(body: &str) -> bool {
     ]
     .iter()
     .any(|term| body.contains(term));
-    result && place && outage && time && !hypothetical
+    result && place && outage && !hypothetical
+}
+
+fn names_historical_outage_result(body: &str) -> bool {
+    let body_lower = body.to_ascii_lowercase();
+    let time = body_lower
+        .split(|character: char| !character.is_ascii_digit())
+        .any(|number| number.len() == 4 && number.starts_with("20"));
+    mentions_historical_outage_result(body) && time
 }
 
 /// Correction and routing are legitimate outcomes, but the failed campaigns
@@ -4173,6 +4165,26 @@ fn has_forced_response_menu(body: &str) -> bool {
         "between-run",
         "fixed or manual",
         "fixed, flexible",
+    ]
+    .iter()
+    .any(|marker| body.contains(marker))
+}
+
+fn has_stacked_operating_questions(body: &str) -> bool {
+    let body = body.to_ascii_lowercase();
+    [
+        ", and which ",
+        ", and what ",
+        ", and where ",
+        ", and who ",
+        ", and when ",
+        ", and how ",
+        ", and does ",
+        ", and do ",
+        ", and is ",
+        ", and are ",
+        ", and would ",
+        ", and could ",
     ]
     .iter()
     .any(|marker| body.contains(marker))
@@ -4452,6 +4464,9 @@ fn source_attribution_issues(
         " page ",
         " guide ",
         " release ",
+        " reported ",
+        " says ",
+        " states ",
         " lists ",
         " describes ",
         " requires ",
@@ -4484,6 +4499,9 @@ fn source_attribution_issues(
             let attributed = attribution_markers
                 .iter()
                 .any(|marker| normalized.contains(marker));
+            if field == "body" && !attributed {
+                continue;
+            }
             if primary_score < 2 && !(field == "subject" && primary_score > 0) && !attributed {
                 continue;
             }
@@ -4606,9 +4624,18 @@ fn unsupported_subject_number_issues(
         })
         .filter(|evidence| !evidence.trim().is_empty())
         .unwrap_or_else(|| account.observed_facts.join(" "));
+    let normalize_number = |number: &str| {
+        let normalized = number.trim_start_matches('0');
+        if normalized.is_empty() {
+            "0".to_string()
+        } else {
+            normalized.to_string()
+        }
+    };
     let evidence_numbers = evidence
         .split(|character: char| !character.is_ascii_digit())
         .filter(|number| !number.is_empty())
+        .map(&normalize_number)
         .collect::<HashSet<_>>();
     let mut issues = Vec::new();
     for touch in &sequence.touches {
@@ -4617,7 +4644,8 @@ fn unsupported_subject_number_issues(
             .split(|character: char| !character.is_ascii_digit())
             .filter(|number| !number.is_empty())
         {
-            if !evidence_numbers.contains(number) {
+            let normalized = normalize_number(number);
+            if !evidence_numbers.contains(&normalized) {
                 issues.push(format!(
                     "stage {} subject contains unsupported number `{number}`; use only an exact quantity present in active evidence",
                     touch.stage
@@ -4894,6 +4922,12 @@ fn sequence_quality_issues(
                 touch.stage
             ));
         }
+        if has_stacked_operating_questions(&touch.body) {
+            issues.push(format!(
+                "stage {} stacks a second operating question after `, and`; ask one decision-sized question, while a simple correction-or-route alternative may remain",
+                touch.stage
+            ));
+        }
         if narrates_internal_copy_logic(&touch.body) {
             issues.push(format!(
                 "stage {} narrates the outreach logic instead of speaking naturally to the recipient",
@@ -5032,6 +5066,14 @@ fn sequence_quality_issues(
                         .into(),
                 );
             }
+        } else if first.is_some_and(|touch| {
+            mentions_historical_outage_result(&touch.body)
+                && !names_historical_outage_result(&touch.body)
+        }) {
+            issues.push(
+                "OutageHub stage 1 mentions a historical location/outage match without a full date including year or exact timestamp; make the event reproducible and preserve the outside-context boundary"
+                    .into(),
+            );
         }
     } else if pb.key == "outagehub" {
         issues.push("OutageHub's evidence cadence requires exactly two emails".into());
@@ -5566,9 +5608,10 @@ mod tests {
         business_copy_context, copy_research_rule, copy_sentence_count,
         cross_recipient_similarity_issue, format_progress_status, generic_subject_label,
         gnk_hedge_moves, has_forced_response_menu, has_natural_response_path,
-        is_email_capable_channel, is_empty_linkedin_praise, is_retreat_or_route_touch,
-        mentions_outreach_asset, names_historical_outage_result, narrates_internal_copy_logic,
-        normalize_dashes, normalize_principle_ids, normalize_thread_subjects, provisional_channel,
+        has_stacked_operating_questions, is_email_capable_channel, is_empty_linkedin_praise,
+        is_retreat_or_route_touch, mentions_historical_outage_result, mentions_outreach_asset,
+        names_historical_outage_result, narrates_internal_copy_logic, normalize_dashes,
+        normalize_principle_ids, normalize_thread_subjects, provisional_channel,
         provisional_day_offset, select_people_for_planning, sequence_quality_issues,
         source_attribution_issues, supported_touch_count, supported_touch_count_for_brand,
         touch_question_limit, touch_word_band, unconfirmed_subject_claim_issues,
@@ -5625,6 +5668,15 @@ mod tests {
         ));
         assert!(!names_historical_outage_result(
             "I found a charging site inside a utility outage area."
+        ));
+        assert!(mentions_historical_outage_result(
+            "Hydro One reported an outage area that included the CHARGELAB-network station in Orono."
+        ));
+        assert!(!names_historical_outage_result(
+            "Hydro One reported an outage area that included the CHARGELAB-network station in Orono."
+        ));
+        assert!(!names_historical_outage_result(
+            "On March 8, Hydro One reported an outage area that included the CHARGELAB-network station in Orono."
         ));
     }
 
@@ -6072,6 +6124,12 @@ mod tests {
         assert!(narrates_internal_copy_logic(
             "A company-attributed posting describes palletizing."
         ));
+        assert!(has_stacked_operating_questions(
+            "Does that check recur, and which step delays the escalation or customer update?"
+        ));
+        assert!(!has_stacked_operating_questions(
+            "Is that portion manual, or is there a better group to ask?"
+        ));
     }
 
     #[test]
@@ -6207,7 +6265,7 @@ mod tests {
                 day_offset: 0,
                 channel: "email".into(),
                 subject: "Cambridge line-end handling".into(),
-                body: "Hi Anil,\n\nNew World Friction says it manufactures private-label brake pads in Cambridge. Your Packaging Line End Operator posting separately lists packaging, labeling, and palletizing finished products.\n\nAndrew".into(),
+                body: "Hi Anil,\n\nNew World Friction says it manufactures private-label brake pads in Cambridge. Your Packaging Line End Operator posting separately lists packaging, labeling, and palletizing finished products. That is product context, not proof of line-end status.\n\nAndrew".into(),
                 purpose: String::new(),
                 goal: String::new(),
             }],
@@ -6266,7 +6324,7 @@ mod tests {
             name: "New World Friction".into(),
             industry: "manufacturing".into(),
             hq: "Cambridge, Ontario".into(),
-            observed_facts: vec!["The role handles materials up to 50 lb.".into()],
+            observed_facts: vec!["The role handles materials up to 50 lb on 2026-03-08.".into()],
             inferences: Vec::new(),
             hypothesis: String::new(),
             mechanism: String::new(),
@@ -6294,6 +6352,12 @@ mod tests {
             &account,
             None,
             &sequence("50-lb line-end work")
+        )
+        .is_empty());
+        assert!(unsupported_subject_number_issues(
+            &account,
+            None,
+            &sequence("March 8 line-end work")
         )
         .is_empty());
         assert!(!unsupported_subject_number_issues(
