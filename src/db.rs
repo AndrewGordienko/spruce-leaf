@@ -5055,6 +5055,24 @@ impl Db {
         Ok(())
     }
 
+    /// Record that a reviewed sponsorship email was sent outside Spruce Leaf.
+    /// This is bookkeeping only: it never queues or delivers a message.
+    pub fn mark_sponsorship_touch_manually_sent(&self, id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "UPDATE opportunity_touches
+             SET status='sent',sent_at=?2,mailbox_id='',message_id='',
+                 error='manually recorded; delivery occurred outside Spruce Leaf'
+             WHERE id=?1 AND status='draft' AND review_passes=1
+               AND EXISTS (
+                 SELECT 1 FROM opportunities o
+                 WHERE o.id=opportunity_touches.opportunity_id AND o.kind='sponsorship'
+               )",
+            params![id, now()],
+        )?;
+        Ok(changed == 1)
+    }
+
     pub fn previous_opportunity_message_id(&self, contact_id: &str, stage: i64) -> Result<String> {
         let conn = self.conn.lock().unwrap();
         Ok(conn
@@ -11099,6 +11117,58 @@ mod tests {
         assert!(!db
             .claim_opportunity_touch_for_send(&draft_id)
             .expect("attempt sponsorship delivery claim"));
+    }
+
+    #[test]
+    fn reviewed_sponsorship_can_be_recorded_as_manually_sent_without_delivery() {
+        let db = Db::open(":memory:").expect("open memory db");
+        let opportunity_id = db
+            .upsert_opportunity(&Opportunity {
+                brand: "outagehub".into(),
+                kind: "sponsorship".into(),
+                fingerprint: "manual-sponsorship-record".into(),
+                canonical_url: "https://example.org/manual-sponsor".into(),
+                ..Default::default()
+            })
+            .expect("insert sponsorship opportunity");
+        let contact_id = db
+            .upsert_opportunity_contact(&OpportunityContact {
+                opportunity_id: opportunity_id.clone(),
+                brand: "outagehub".into(),
+                contact_key: "person@example.org".into(),
+                ..Default::default()
+            })
+            .expect("insert sponsorship contact");
+        let touch_id = db
+            .insert_opportunity_touch(&OpportunityTouch {
+                opportunity_id,
+                contact_id: contact_id.clone(),
+                brand: "outagehub".into(),
+                status: "draft".into(),
+                review_passes: Some(true),
+                ..Default::default()
+            })
+            .expect("insert sponsorship draft");
+
+        assert!(db
+            .mark_sponsorship_touch_manually_sent(&touch_id)
+            .expect("record manual send"));
+        assert!(!db
+            .mark_sponsorship_touch_manually_sent(&touch_id)
+            .expect("manual send is idempotent"));
+        let touch = db
+            .list_opportunity_touches(&contact_id)
+            .expect("read sponsorship touch")
+            .pop()
+            .expect("sponsorship touch exists");
+        assert_eq!(touch.status, "sent");
+        assert!(!touch.sent_at.is_empty());
+        assert!(touch.message_id.is_empty());
+        assert!(touch.error.contains("outside Spruce Leaf"));
+        assert!(db
+            .due_opportunity_touches(10)
+            .expect("delivery queue remains empty")
+            .is_empty());
     }
 
     #[test]

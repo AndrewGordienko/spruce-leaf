@@ -77,6 +77,7 @@ pub struct SponsorshipCampaignAudit {
     pub ready: usize,
     pub blocked: usize,
     pub scheduled_or_sent: usize,
+    pub manually_sent: usize,
     pub direct_mailboxes: usize,
     pub routed_mailboxes: usize,
     pub issues: Vec<String>,
@@ -85,7 +86,7 @@ pub struct SponsorshipCampaignAudit {
 impl SponsorshipCampaignAudit {
     pub fn passes(&self) -> bool {
         self.organizations == self.target
-            && self.ready == self.target
+            && self.ready + self.manually_sent == self.target
             && self.blocked == 0
             && self.scheduled_or_sent == 0
             && self.issues.is_empty()
@@ -2155,7 +2156,11 @@ pub fn audit_sponsorship_campaign(
                 .or_default()
                 .push(opportunity.funder.clone());
             for touch in touches {
-                if matches!(touch.status.as_str(), "scheduled" | "sending" | "sent") {
+                if touch.status == "sent"
+                    && touch.error == "manually recorded; delivery occurred outside Spruce Leaf"
+                {
+                    audit.manually_sent += 1;
+                } else if matches!(touch.status.as_str(), "scheduled" | "sending" | "sent") {
                     audit.scheduled_or_sent += 1;
                 }
                 for issue in sponsorship_recipient_route_issues(
@@ -2185,6 +2190,8 @@ pub fn audit_sponsorship_campaign(
                 audit.ready += 1;
             }
             "blocked" => audit.blocked += 1,
+            "sent" if touch.error == "manually recorded; delivery occurred outside Spruce Leaf" => {
+            }
             "scheduled" | "sending" | "sent" => {}
             status => audit.issues.push(format!(
                 "{} has non-ready sponsorship status `{status}`",

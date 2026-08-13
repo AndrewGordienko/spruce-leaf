@@ -580,6 +580,10 @@ pub fn router(
             "/opportunities/approve/:contact",
             post(approve_opportunity_outreach),
         )
+        .route(
+            "/opportunities/sponsorship/touch/:touch/sent",
+            post(mark_sponsorship_touch_sent),
+        )
         .layer(middleware::from_fn(local_write_guard))
         .with_state(state)
 }
@@ -1616,6 +1620,14 @@ async fn approve_opportunity_outreach(
     redirect_back(&headers, brand.as_deref())
 }
 
+async fn mark_sponsorship_touch_sent(
+    State(state): State<WebState>,
+    Path(touch_id): Path<String>,
+) -> impl IntoResponse {
+    let _ = state.db.mark_sponsorship_touch_manually_sent(&touch_id);
+    Redirect::to("/b/outagehub/sponsorship")
+}
+
 /// Return the user to the brand CRM they acted from. Prefers the entity's own
 /// brand; otherwise honours the `Referer` (every action is posted from a
 /// `/b/:brand` page), falling back to the portfolio.
@@ -1870,7 +1882,20 @@ fn render_sponsorship_page(
             .filter(|entry| entry.opportunity.kind == "sponsorship")
             .flat_map(|entry| &entry.contacts)
             .flat_map(|entry| &entry.touches)
-            .filter(|touch| matches!(touch.status.as_str(), "scheduled" | "sending" | "sent"))
+            .filter(|touch| matches!(touch.status.as_str(), "scheduled" | "sending"))
+            .count()
+    });
+    let manually_sent = dashboard.map_or(0, |dashboard| {
+        dashboard
+            .opportunities
+            .iter()
+            .filter(|entry| entry.opportunity.kind == "sponsorship")
+            .flat_map(|entry| &entry.contacts)
+            .flat_map(|entry| &entry.touches)
+            .filter(|touch| {
+                touch.status == "sent"
+                    && touch.error == "manually recorded; delivery occurred outside Spruce Leaf"
+            })
             .count()
     });
     render_subbar(
@@ -1881,18 +1906,20 @@ fn render_sponsorship_page(
             ((ready + blocked).to_string(), "researched companies"),
             (ready.to_string(), "ready drafts"),
             (blocked.to_string(), "blocked drafts"),
-            (scheduled.to_string(), "scheduled or sent"),
+            (manually_sent.to_string(), "manually sent"),
+            (scheduled.to_string(), "in delivery queue"),
         ],
     );
     b.push_str("<main class=\"sheet-scroll\" id=\"sponsorship-drafts\">");
     if let Some(audit) = audit {
         b.push_str(&format!(
-            "<section class=\"campaign-audit {}\"><b>Campaign QA: {}</b><span>{}/{} organizations · {} ready · {} blocked · {} direct mailboxes · {} routed inboxes · {} scheduled/sending/sent</span>{}</section>",
+            "<section class=\"campaign-audit {}\"><b>Campaign QA: {}</b><span>{}/{} organizations · {} ready · {} manually sent · {} blocked · {} direct mailboxes · {} routed inboxes · {} automatic delivery rows</span>{}</section>",
             if audit.passes() { "pass" } else { "hold" },
             if audit.passes() { "PASS" } else { "HOLD" },
             audit.organizations,
             audit.target,
             audit.ready,
+            audit.manually_sent,
             audit.blocked,
             audit.direct_mailboxes,
             audit.routed_mailboxes,
@@ -1952,9 +1979,34 @@ fn render_sponsorship_table(b: &mut String, opportunities: &[ExecutionOpportunit
     b.push_str("<table class=\"crm-sheet sponsorship-sheet\"><colgroup><col class=\"c-company\"><col class=\"c-sponsor-evidence\"><col class=\"c-person\"><col class=\"c-sponsor-subject\"><col class=\"c-sponsor-email\"><col class=\"c-sponsor-qa\"></colgroup><thead><tr><th class=\"pin\">Company</th><th>Verified relevance + budget route</th><th>Recipient</th><th>Subject</th><th>Full email</th><th>QA / delivery state</th></tr></thead><tbody>");
     for (opportunity, contact, touch) in rows {
         let ready = touch.status == "draft" && touch.review_passes == Some(true);
-        let state = if ready { "ready" } else { "blocked" };
+        let manually_sent = touch.status == "sent"
+            && touch.error == "manually recorded; delivery occurred outside Spruce Leaf";
+        let state = if ready {
+            "ready"
+        } else if manually_sent {
+            "sent"
+        } else {
+            "blocked"
+        };
+        let delivery_control = if ready {
+            format!(
+                "<form method=\"post\" action=\"/opportunities/sponsorship/touch/{}/sent\"><button class=\"quiet\" type=\"submit\">Mark sent</button></form><small>This records a manual send; Spruce Leaf will not deliver it.</small>",
+                esc(&touch.id)
+            )
+        } else if manually_sent {
+            format!(
+                "<small>Manually sent outside Spruce Leaf{}</small>",
+                if touch.sent_at.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · {}", esc(&touch.sent_at))
+                }
+            )
+        } else {
+            "<small>Delivery: technically blocked from scheduling and sending</small>".into()
+        };
         b.push_str(&format!(
-            "<tr class=\"sponsor-row {state}\"><td class=\"company pin\"><span class=\"brand-tag outagehub\">OutageHub</span><strong>{company}</strong><small>CAD $10,000 founding sponsorship</small><a href=\"{url}\" rel=\"noreferrer\">Primary source ↗</a></td><td class=\"sponsor-evidence\"><ul>{evidence}</ul></td><td class=\"person\"><strong>{name}</strong><small>{title}</small><a class=\"email\" href=\"mailto:{email}\">{email}</a><span class=\"person-status verified\">{email_status}</span><span class=\"person-status\">{route}</span><p>{why}</p></td><td class=\"sponsor-subject\"><span class=\"subject\">{subject}</span></td><td class=\"sponsor-message\"><div class=\"message\">{body}</div></td><td class=\"sponsor-state\"><span class=\"touch-tag\">{state}</span>{qa}<small>Delivery: technically blocked from scheduling and sending</small></td></tr>",
+            "<tr class=\"sponsor-row {state}\"><td class=\"company pin\"><span class=\"brand-tag outagehub\">OutageHub</span><strong>{company}</strong><small>CAD $10,000 founding sponsorship</small><a href=\"{url}\" rel=\"noreferrer\">Primary source ↗</a></td><td class=\"sponsor-evidence\"><ul>{evidence}</ul></td><td class=\"person\"><strong>{name}</strong><small>{title}</small><a class=\"email\" href=\"mailto:{email}\">{email}</a><span class=\"person-status verified\">{email_status}</span><span class=\"person-status\">{route}</span><p>{why}</p></td><td class=\"sponsor-subject\"><span class=\"subject\">{subject}</span></td><td class=\"sponsor-message\"><div class=\"message\">{body}</div></td><td class=\"sponsor-state\"><span class=\"touch-tag\">{state}</span>{qa}{delivery_control}</td></tr>",
             state = state,
             company = esc(&opportunity.funder),
             name = esc(&contact.name),
@@ -1983,6 +2035,7 @@ fn render_sponsorship_table(b: &mut String, opportunities: &[ExecutionOpportunit
                     esc(&touch.review_issues.join(" · "))
                 )
             },
+            delivery_control = delivery_control,
         ));
     }
     b.push_str("</tbody></table>");
@@ -5047,6 +5100,7 @@ body { color: var(--ink); background: var(--paper); font: 13px/1.45 var(--font);
 .sponsorship-sheet tr.blocked td { background: #fffafa; }
 .sponsorship-sheet tr.blocked td.company.pin { border-left: 4px solid var(--red); }
 .sponsorship-sheet tr.ready td.company.pin { border-left: 4px solid var(--green); }
+.sponsorship-sheet tr.sent td.company.pin { border-left: 4px solid var(--blue); }
 .sponsor-evidence ul { margin: 0; padding-left: 16px; color: var(--muted); font-size: 10.5px; line-height: 1.45; }
 .sponsor-evidence li + li { margin-top: 5px; }
 .sponsor-subject .subject { display: block; font-size: 12px; line-height: 1.45; }
@@ -5717,7 +5771,8 @@ mod tests {
         assert!(html.contains("Canadian Resilience Co."));
         assert!(html.contains("maya@example.org"));
         assert!(html.contains("A complete manual-review sponsorship email."));
-        assert!(html.contains("technically blocked from scheduling and sending"));
+        assert!(html.contains("Mark sent"));
+        assert!(html.contains("This records a manual send; Spruce Leaf will not deliver it."));
         assert!(!html.contains("<details"));
         assert!(!html.contains("/opportunities/approve/"));
     }
