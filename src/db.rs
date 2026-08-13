@@ -3627,6 +3627,24 @@ impl Db {
         Ok(())
     }
 
+    /// True when a lower-numbered stage in the same sequence is still pending.
+    /// Deterministic delivery guard: a later touch must never send before its
+    /// opener, whatever its stored due_at claims.
+    pub fn sequence_has_pending_earlier_stage(
+        &self,
+        sequence_id: &str,
+        stage: i64,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let pending: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM touches WHERE sequence_id=?1 AND stage<?2
+               AND status IN ('draft','scheduled','writing','reviewing','blocked')",
+            params![sequence_id, stage],
+            |row| row.get(0),
+        )?;
+        Ok(pending > 0)
+    }
+
     pub fn apply_touch_schedule(&self, updates: &[TouchScheduleUpdate]) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
@@ -6318,6 +6336,34 @@ impl Db {
         drop(conn);
         self.materialize_sales_opportunity(assessment)?;
         Ok(id)
+    }
+
+    /// Rebuild the commercial opportunity after contact research has changed.
+    ///
+    /// Account qualification is persisted before the people-search fan-out, so
+    /// the first materialization cannot yet create contact-to-facility claims
+    /// for newly discovered people. Replaying the current assessment here keeps
+    /// stakeholder lineage in the same sourcing transaction instead of relying
+    /// on a future assessment run to repair it.
+    pub fn refresh_sales_opportunity_contacts(
+        &self,
+        brand: &str,
+        lead_id: &str,
+        play_id: &str,
+    ) -> Result<()> {
+        let assessment = self
+            .list_account_play_assessments(Some(brand))?
+            .into_iter()
+            .find(|assessment| {
+                assessment.lead_id == lead_id && assessment.play_id == play_id
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "cannot refresh contact lineage: no assessment for lead {lead_id} and play {play_id}"
+                )
+            })?;
+        self.materialize_sales_opportunity(&assessment)?;
+        Ok(())
     }
 
     pub fn relabel_unassessed_qualified_leads(

@@ -177,13 +177,23 @@ pub fn rebalance_approved_sales(
         };
         let mut anchor = plan.anchor;
         let mut plan_updates = Vec::<TouchScheduleUpdate>::new();
+        let mut scheduled_due = BTreeMap::<i64, DateTime<Utc>>::new();
+        let mut previous_slot: Option<DateTime<Utc>> = None;
         for touch in &plan.touches {
             let is_opener = touch.stage == 1 && !plan.active;
-            let eligible = if is_opener {
+            // Later stages anchor to the opener's ACTUAL slot and can never
+            // land before an earlier stage: capacity pressure delays the whole
+            // tail rather than reordering it.
+            let mut eligible = if is_opener {
                 now
             } else {
                 anchor.unwrap_or(now) + chrono::Duration::days(touch.day_offset.max(0))
             };
+            if let Some(previous) = previous_slot {
+                if eligible <= previous {
+                    eligible = previous + chrono::Duration::hours(1);
+                }
+            }
             let context = TimingContext {
                 industry: &plan.lead.industry,
                 title: &plan.person.title,
@@ -213,6 +223,8 @@ pub fn rebalance_approved_sales(
                 anchor = Some(slot.at);
                 admitted_people += 1;
             }
+            previous_slot = Some(slot.at);
+            scheduled_due.insert(touch.stage, slot.at);
             if plan.active && touch.stage > 1 {
                 protected_followups += 1;
             }
@@ -226,6 +238,14 @@ pub fn rebalance_approved_sales(
                 schedule_reason: format!("portfolio scheduler: {priority}; {}", slot.rationale),
             });
         }
+        chronology_updates_for_manual_stages(
+            db,
+            &plan.sequence_id,
+            anchor,
+            now,
+            &scheduled_due,
+            &mut plan_updates,
+        )?;
         updates.extend(plan_updates);
     }
 
@@ -338,6 +358,56 @@ pub fn align_sequence_touch_order(
         });
     }
     db.apply_touch_schedule(&updates)
+}
+
+/// Manual/draft stages (for example a linkedin_request between two emails) are
+/// not capacity-scheduled, but their displayed dates must stay chronological
+/// with the rescheduled email stages. T3 and T5 rendered before T1 was exactly
+/// the CRM failure this repairs: the email stages moved with the opener while
+/// draft stages kept their finalization-time dates.
+fn chronology_updates_for_manual_stages(
+    db: &SharedDb,
+    sequence_id: &str,
+    anchor: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    scheduled_due: &BTreeMap<i64, DateTime<Utc>>,
+    plan_updates: &mut Vec<TouchScheduleUpdate>,
+) -> Result<()> {
+    let mut history = db.list_touches_for_sequence(sequence_id)?;
+    history.sort_by_key(|touch| touch.stage);
+    let mut previous: Option<DateTime<Utc>> = None;
+    for touch in &history {
+        if let Some(due) = scheduled_due.get(&touch.stage) {
+            previous = Some(*due);
+            continue;
+        }
+        match touch.status.as_str() {
+            "sent" => {
+                if let Some(sent_at) = parse_utc(&touch.sent_at) {
+                    previous = Some(sent_at);
+                }
+            }
+            "draft" => {
+                let mut due =
+                    anchor.unwrap_or(now) + chrono::Duration::days(touch.day_offset.max(0));
+                if let Some(previous) = previous {
+                    if due <= previous {
+                        due = previous + chrono::Duration::hours(4);
+                    }
+                }
+                plan_updates.push(TouchScheduleUpdate {
+                    id: touch.id.clone(),
+                    due_at: due.to_rfc3339(),
+                    recipient_timezone: touch.recipient_timezone.clone(),
+                    scheduled_rule: "sequence_chronology".into(),
+                    schedule_reason: "kept chronological with the rescheduled opener; manual stage timing is provisional until approval".into(),
+                });
+                previous = Some(due);
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn plan_eligible(plan: &SequencePlan, now: DateTime<Utc>) -> DateTime<Utc> {

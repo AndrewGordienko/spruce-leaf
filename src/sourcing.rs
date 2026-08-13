@@ -1098,16 +1098,19 @@ pub async fn source(
                 .await
                 .map(|added| reused + added),
             };
-            (org.name, result)
+            (org.name, lead_id, result)
         }))
         .buffer_unordered(concurrency.max(4));
     let mut companies_mapped = 0usize;
     let mut contact_errors = 0usize;
     let mut contact_shortfalls = 0usize;
-    while let Some((name, result)) = people_counts.next().await {
+    while let Some((name, lead_id, result)) = people_counts.next().await {
         companies_mapped += 1;
         match result {
             Ok(added) => {
+                if let Some(play) = active_play.as_ref() {
+                    db.refresh_sales_opportunity_contacts(&pb.key, &lead_id, &play.id)?;
+                }
                 summary.people_added += added;
                 if added < n_contacts {
                     contact_shortfalls += 1;

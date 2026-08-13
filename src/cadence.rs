@@ -127,6 +127,32 @@ pub async fn tick(
             continue;
         }
 
+        // Deterministic chronology guard: whatever the stored due_at says, a
+        // later stage never delivers while an earlier stage in its sequence is
+        // still pending. Mis-dated tails wait for their opener instead of
+        // silently leap-frogging it.
+        if touch.stage > 1
+            && db.sequence_has_pending_earlier_stage(&touch.sequence_id, touch.stage)?
+        {
+            let reason = "chronology guard: an earlier stage in this sequence has not been sent";
+            if !cfg.dry_run {
+                db.set_touch_status(&touch.id, "blocked", "", "", reason)?;
+                db.log_event(
+                    &touch.brand,
+                    &person.id,
+                    &touch.id,
+                    "delivery_blocked",
+                    reason,
+                )?;
+            } else {
+                eprintln!(
+                    "  · would block [{}] stage {} to {} — {}",
+                    touch.brand, touch.stage, person.email, reason
+                );
+            }
+            continue;
+        }
+
         // Conditional touches become a manual LinkedIn task when the operator
         // has marked the connection accepted. Unknown/requested/not-connected
         // safely fall back to the reviewed email version.

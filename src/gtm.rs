@@ -2127,10 +2127,8 @@ mod tests {
 
     #[test]
     fn fabricated_source_urls_are_rejected_at_the_observation_boundary() {
-        let path = std::env::temp_dir().join(format!(
-            "spruce-source-url-test-{}.sqlite",
-            Uuid::new_v4()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("spruce-source-url-test-{}.sqlite", Uuid::new_v4()));
         let db = Arc::new(Db::open(&path).expect("open temp db"));
         seed_defaults(&db).expect("seed GTM defaults");
         let lead_id = db
@@ -2153,7 +2151,10 @@ mod tests {
         let message = fabricated
             .expect_err("prose masquerading as a source URL must be rejected")
             .to_string();
-        assert!(message.contains("non-URL source"), "unexpected error: {message}");
+        assert!(
+            message.contains("non-URL source"),
+            "unexpected error: {message}"
+        );
         db.record_signal_observation(&crate::db::SignalObservation {
             definition_key: "account.bounded_repetitive_task".into(),
             brand: "wapahki".into(),
@@ -2277,10 +2278,8 @@ mod tests {
 
     #[test]
     fn evidence_downgrade_quarantines_open_drafts() {
-        let path = std::env::temp_dir().join(format!(
-            "spruce-quarantine-test-{}.sqlite",
-            Uuid::new_v4()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("spruce-quarantine-test-{}.sqlite", Uuid::new_v4()));
         let db = Arc::new(Db::open(&path).expect("open temp db"));
         let sequence_id = db
             .create_sequence(&crate::db::Sequence {

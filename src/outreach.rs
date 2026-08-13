@@ -476,6 +476,12 @@ fn locked_must_reject_reason(
     ))
     .unwrap_or_default()
     .into_iter()
+    .chain(
+        serde_json::from_str::<Vec<MustRejectFixture>>(include_str!(
+            "../tests/fixtures/wapahki_must_reject_2026-08-13.json"
+        ))
+        .unwrap_or_default(),
+    )
     .find(|fixture| {
         account.name.eq_ignore_ascii_case(&fixture.account)
             && (fixture.recipient_title_contains.is_empty()
@@ -6220,6 +6226,79 @@ mod tests {
             };
             assert!(locked_must_reject_reason(&account, &contact, Some(&context)).is_some());
         }
+    }
+
+    /// Real drafted-and-caught Wapahki failures stay caught: corporate
+    /// revenue/finance recipients on a facility task, research-required
+    /// premises, and an opportunity that hedges between two candidate tasks.
+    #[test]
+    fn observed_wapahki_failures_are_locked_as_must_reject() {
+        let cases = [
+            (
+                "Haven Greens",
+                "Chief Revenue Officer",
+                "Packing trays into cases and stacking cases on pallets in King City",
+            ),
+            (
+                "Haven Greens",
+                "Vice President Finance",
+                "Packing trays into cases and stacking cases on pallets in King City",
+            ),
+            (
+                "New World Friction",
+                "General Manager",
+                "Packaging, labeling, and palletizing finished brake pads",
+            ),
+            (
+                "Redpath Sugar Ltd",
+                "Packaging Team Manager",
+                "Emptying scrap sugar bags and moving reject-sugar buggies",
+            ),
+            (
+                "TreeHouse Foods",
+                "Production Supervisor",
+                "At the Brantford operation, either loading cartons into cases or palletizing finished goods may remain manual",
+            ),
+        ];
+        for (account_name, title, task) in cases {
+            let account = super::copy_account(&Lead {
+                name: account_name.into(),
+                ..Default::default()
+            });
+            let contact = super::copy_contact(&Person {
+                title: title.into(),
+                ..Default::default()
+            });
+            let context = GtmActionContext {
+                opportunity: Some(SalesOpportunity {
+                    task_or_decision: task.into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            assert!(
+                locked_must_reject_reason(&account, &contact, Some(&context)).is_some(),
+                "expected locked rejection for {account_name} / {title}"
+            );
+        }
+        // A production supervisor with a single, unhedged supported task is
+        // not caught by the lock; the live evidence gates decide that case.
+        let account = super::copy_account(&Lead {
+            name: "TreeHouse Foods".into(),
+            ..Default::default()
+        });
+        let contact = super::copy_contact(&Person {
+            title: "Production Supervisor".into(),
+            ..Default::default()
+        });
+        let context = GtmActionContext {
+            opportunity: Some(SalesOpportunity {
+                task_or_decision: "Loading cartons into cases on the Brantford line".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(locked_must_reject_reason(&account, &contact, Some(&context)).is_none());
     }
 
     #[test]
