@@ -2355,6 +2355,7 @@ fn sponsorship_copy_issues(
                 || lower.contains("point me")
                 || lower.contains("introduce me"))
                 && (lower.contains("person who owns")
+                    || lower.contains("whoever owns")
                     || lower.contains("person responsible")
                     || lower.contains("right person")
                     || lower.contains("budget owner")));
@@ -3098,6 +3099,14 @@ mod tests {
         assert!(sponsorship_copy_issues(
             "OutageHub infrastructure sponsorship",
             &natural_routing,
+            1,
+            "commercial_sponsor"
+        )
+        .is_empty());
+        let whoever_routing = natural_routing.replace("the person who", "whoever");
+        assert!(sponsorship_copy_issues(
+            "OutageHub infrastructure sponsorship",
+            &whoever_routing,
             1,
             "commercial_sponsor"
         )

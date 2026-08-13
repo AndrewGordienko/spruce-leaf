@@ -457,7 +457,7 @@ pub fn lint(text: &str, forbidden: &[&str], min: usize, max: usize) -> Lint {
     let lower = text.to_lowercase();
     let forbidden_hits = forbidden
         .iter()
-        .filter(|p| lower.contains(&p.to_lowercase()))
+        .filter(|p| contains_forbidden_phrase(&lower, p))
         .map(|p| p.to_string())
         .collect();
 
@@ -469,6 +469,20 @@ pub fn lint(text: &str, forbidden: &[&str], min: usize, max: usize) -> Lint {
         word_count,
         length_ok,
         signature_ok: true,
+    }
+}
+
+fn contains_forbidden_phrase(lower_text: &str, phrase: &str) -> bool {
+    let lower_phrase = phrase.to_lowercase();
+    if lower_phrase
+        .chars()
+        .all(|character| character.is_alphanumeric())
+    {
+        lower_text
+            .split(|character: char| !character.is_alphanumeric())
+            .any(|word| word == lower_phrase)
+    } else {
+        lower_text.contains(&lower_phrase)
     }
 }
 
@@ -551,7 +565,20 @@ fn is_conventional_closing(line: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{enforce_signature, has_exact_signature, Playbooks};
+    use super::{enforce_signature, has_exact_signature, lint, Playbooks};
+
+    #[test]
+    fn single_word_forbidden_terms_do_not_match_inside_company_names() {
+        let result = lint(
+            "CES Transformers builds electrical equipment.",
+            &["transform"],
+            0,
+            0,
+        );
+        assert!(result.forbidden_hits.is_empty());
+        let result = lint("We transform operations.", &["transform"], 0, 0);
+        assert_eq!(result.forbidden_hits, vec!["transform"]);
+    }
 
     #[test]
     fn appends_the_configured_signature_when_missing() {
