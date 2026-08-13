@@ -118,6 +118,10 @@ pub struct SponsorshipOutreachOptions<'a> {
 
 const SPONSORSHIP_SIGNATURE: &str =
     "Thanks,\n\nAndrew Gordienko\nFounder, OutageHub\nhttps://outagehub.ca";
+const SPONSORSHIP_FOUNDER_PARAGRAPH: &str = "I’m Andrew, a U of T student. Over the past year, a few friends and I built OutageHub, a live platform that brings public outage reports from Canadian utilities into one map and API. The goal is to make Canada safer by reducing blind spots created by fragmented utility reporting.";
+const SPONSORSHIP_PROGRESS_PARAGRAPH: &str = "Up to this point, my friends and I have funded development ourselves. Along the way, conversations with federal and regional government representatives, Electricity Canada, news organizations and others have helped us refine the platform. We are now actively working to close our first customers and are looking for some short-term support to keep the service online while we do.";
+const SPONSORSHIP_ASK_SENTENCE: &str =
+    "A $10,000 founding sponsorship would provide runway for servers and continued development.";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SponsorshipResearchImport {
@@ -281,6 +285,18 @@ struct FundingCopyTouch {
     purpose: String,
     #[serde(default)]
     goal: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SponsorshipPersonalization {
+    #[serde(default)]
+    subject: String,
+    #[serde(default)]
+    company_connection: String,
+    #[serde(default)]
+    collaboration_sentence: String,
+    #[serde(default)]
+    question: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2741,23 +2757,78 @@ async fn write_sponsorship_sequence(
         "recipient_mailbox_is_direct": sponsorship_contact_is_direct(contact),
         "subjects_already_used_for_other_companies": existing_subjects,
     });
+    if n != 1 {
+        bail!("the approved sponsorship campaign currently supports one first touch at a time");
+    }
     let user = format!(
-        "Write {n} founder-led founding-sponsorship email touch(es), never more than two. Only a named person with a verified direct mailbox reaches this step, so touch 1 must begin `Hi [verified first name],`. Follow this approved campaign skeleton closely:\n\nParagraph 1: `I’m Andrew, a U of T student. Over the past year, a few friends and I built OutageHub, a live platform that brings public outage reports from Canadian utilities into one map and API. The goal is to make Canada safer by reducing blind spots created by fragmented utility reporting.`\n\nParagraph 2: `Up to this point, my friends and I have funded development ourselves. Along the way, conversations with federal and regional government representatives, Electricity Canada, news organizations and others have helped us refine the platform. We are now actively working to close our first customers and are looking for some short-term support to keep the service online while we do.` These are conversations, never endorsements.\n\nParagraph 3: Give one concise, natural connection supported exactly by target_company_evidence_is_exhaustive. This must explain why this company is a plausible sponsor; do not invent a budget or person-level fact.\n\nParagraph 4: `A $10,000 founding sponsorship would provide runway for servers and continued development. In return, [Company] would receive founding-sponsor recognition, API access and quarterly coverage briefings.` Add one natural sentence offering to explore a specific collaboration only when supported by the evidence.\n\nParagraph 5: Ask exactly one natural question. Usually ask whether the person would be open to a short conversation. If the evidence names a sponsorship form or equally concrete route, ask whether discussing it or using that route is the best next step.\n\nEnd exactly with:\n{signature}\n\nUse a truthful company-linked 3–9 word subject that is not in subjects_already_used_for_other_companies. Use {min}–{max} words per body. Never use a shared mailbox, route to another person, ask for credits instead of the paid sponsorship, invent how many months the money funds, a cost breakdown, live metric, endorsement, partnership, current customer, SLA, private site status, or complete Canadian coverage. Every target-company claim must appear in the exhaustive evidence. Return only the requested structure.\n\nBUSINESS-SPONSORSHIP DOCTRINE:\n{doctrine}\n\nCONTEXT:\n{context}\n\n{core}",
-        min = sponsorship.min_words,
-        max = sponsorship.max_words,
-        signature = SPONSORSHIP_SIGNATURE,
-        doctrine = sponsorship.doctrine,
+        "Supply only the variable fields for Andrew's locked sponsorship template. Do not rewrite the template.\n\n- subject: a truthful company-linked 3–9 word subject not already used.\n- company_connection: one concise sentence, supported exactly by the exhaustive company evidence, explaining why this company is a plausible OutageHub sponsor. Do not mention the recipient personally or presume a budget.\n- collaboration_sentence: either one short evidence-supported sentence beginning `I’d also be happy to explore` or an empty string.\n- question: exactly one natural question. Usually ask whether the person is open to a short conversation. Only mention a form when the evidence explicitly names one.\n\nNever invent a metric, endorsement, partnership, current customer, SLA, private-site status, complete Canadian coverage, budget ownership, or cost period.\n\nCONTEXT:\n{context}\n\n{core}",
         context = serde_json::to_string_pretty(&context).unwrap_or_default(),
         core = core_strategy_block("sequence"),
     );
-    engine
-        .structured_bulk::<FundingSequence>(
-            "opportunity.sponsorship_outreach",
-            "You write evidence-bound founder sponsorship outreach. The recipient must see a bounded commercial deliverable and a reason to answer; never invent budget ownership or sell influence over independent findings.",
+    let personalization = engine
+        .structured_bulk::<SponsorshipPersonalization>(
+            "opportunity.sponsorship_personalization",
+            "You select a source-bound company connection and natural response path for a locked founder-written sponsorship template. Return no prose outside the schema.",
             &user,
-            funding_sequence_schema(n),
+            sponsorship_personalization_schema(),
         )
-        .await
+        .await?;
+    let first_name = contact
+        .name
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .trim_matches(|character: char| !character.is_alphanumeric());
+    if first_name.is_empty() {
+        bail!("verified sponsorship contact is missing a usable first name");
+    }
+    let sponsor_name = sponsorship_display_name(&opportunity.funder);
+    let mut offer_paragraph = format!(
+        "{SPONSORSHIP_ASK_SENTENCE} In return, {sponsor_name} would receive founding-sponsor recognition, API access and quarterly coverage briefings."
+    );
+    if !personalization.collaboration_sentence.trim().is_empty() {
+        offer_paragraph.push(' ');
+        offer_paragraph.push_str(personalization.collaboration_sentence.trim());
+    }
+    let body = format!(
+        "Hi {first_name},\n\n{SPONSORSHIP_FOUNDER_PARAGRAPH}\n\n{SPONSORSHIP_PROGRESS_PARAGRAPH}\n\n{}\n\n{offer_paragraph}\n\n{}\n\n{SPONSORSHIP_SIGNATURE}",
+        personalization.company_connection.trim(),
+        personalization.question.trim(),
+    );
+    Ok(FundingSequence {
+        touches: vec![FundingCopyTouch {
+            stage: 1,
+            day_offset: 0,
+            subject: personalization.subject.trim().to_string(),
+            body,
+            purpose:
+                "Ask one named budget owner or router about the CAD $10,000 founding sponsorship."
+                    .into(),
+            goal: "Secure a short sponsorship discussion or the evidenced concrete next step."
+                .into(),
+        }],
+    })
+}
+
+fn sponsorship_display_name(company: &str) -> String {
+    let mut name = company.trim().to_string();
+    for suffix in [
+        " Cooperative Limited",
+        " Communications Corporation",
+        " Consulting Group",
+        " Corporation",
+        " Limited",
+        " Ltd.",
+        " Ltd",
+        " Inc.",
+        " Inc",
+    ] {
+        if name.ends_with(suffix) {
+            name.truncate(name.len() - suffix.len());
+            break;
+        }
+    }
+    name
 }
 
 async fn review_sponsorship_sequence(
@@ -2833,6 +2904,21 @@ fn sponsorship_copy_issues(
         issues.push("copy must not offer sponsor control over independent findings".into());
     }
     if stage == 1 {
+        if !body.contains(SPONSORSHIP_FOUNDER_PARAGRAPH) {
+            issues.push(
+                "sponsorship touch 1 must preserve the approved founder paragraph verbatim".into(),
+            );
+        }
+        if !body.contains(SPONSORSHIP_PROGRESS_PARAGRAPH) {
+            issues.push(
+                "sponsorship touch 1 must preserve the approved progress paragraph verbatim".into(),
+            );
+        }
+        if !body.contains(SPONSORSHIP_ASK_SENTENCE) {
+            issues.push(
+                "sponsorship touch 1 must preserve the approved CAD $10,000 ask verbatim".into(),
+            );
+        }
         if body.matches('?').count() != 1 {
             issues.push("sponsorship touch 1 must ask exactly one question".into());
         }
@@ -3401,6 +3487,19 @@ fn funding_sequence_schema(n: usize) -> Value {
     })
 }
 
+fn sponsorship_personalization_schema() -> Value {
+    json!({
+        "type":"object","additionalProperties":false,
+        "required":["subject","company_connection","collaboration_sentence","question"],
+        "properties":{
+            "subject":{"type":"string"},
+            "company_connection":{"type":"string"},
+            "collaboration_sentence":{"type":"string"},
+            "question":{"type":"string"}
+        }
+    })
+}
+
 fn sponsorship_review_schema() -> Value {
     json!({
         "type":"object","additionalProperties":false,
@@ -3584,7 +3683,7 @@ mod tests {
 
     #[test]
     fn sponsorship_copy_gate_enforces_founder_story_and_recipient_route() {
-        let body = "Hi Maya,\n\nI’m Andrew, a U of T student. Over the past year, a few friends and I built OutageHub, a live platform that brings public outage reports from Canadian utilities into one map and API. The goal is to make Canada safer by reducing blind spots created by fragmented utility reporting.\n\nUp to this point, my friends and I have funded development ourselves. Along the way, conversations with federal and regional government representatives, Electricity Canada, news organizations and others have helped us refine the platform. We are actively working to close our first customers.\n\nYour company publishes a sponsorship programme connected to Canadian infrastructure.\n\nA $10,000 founding sponsorship would provide runway for servers and continued development. In return, your company would receive founding-sponsor recognition, API access and quarterly coverage briefings.\n\nWould you be open to a short conversation about it?\n\nThanks,\n\nAndrew Gordienko\nFounder, OutageHub\nhttps://outagehub.ca";
+        let body = "Hi Maya,\n\nI’m Andrew, a U of T student. Over the past year, a few friends and I built OutageHub, a live platform that brings public outage reports from Canadian utilities into one map and API. The goal is to make Canada safer by reducing blind spots created by fragmented utility reporting.\n\nUp to this point, my friends and I have funded development ourselves. Along the way, conversations with federal and regional government representatives, Electricity Canada, news organizations and others have helped us refine the platform. We are now actively working to close our first customers and are looking for some short-term support to keep the service online while we do.\n\nYour company publishes a sponsorship programme connected to Canadian infrastructure.\n\nA $10,000 founding sponsorship would provide runway for servers and continued development. In return, your company would receive founding-sponsor recognition, API access and quarterly coverage briefings.\n\nWould you be open to a short conversation about it?\n\nThanks,\n\nAndrew Gordienko\nFounder, OutageHub\nhttps://outagehub.ca";
         assert!(sponsorship_copy_issues(
             "OutageHub infrastructure sponsorship",
             body,
