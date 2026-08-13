@@ -4963,6 +4963,7 @@ impl Db {
              JOIN opportunities o ON o.id=t.opportunity_id
              JOIN opportunity_contacts c ON c.id=t.contact_id
              WHERE t.status='scheduled' AND t.due_at<=?1
+               AND o.kind!='sponsorship'
                AND o.pipeline_status NOT IN ('submitted','won','lost','expired')
                AND c.status NOT IN ('replied','unsubscribed','bounced','suppressed')
                AND NOT EXISTS (
@@ -4981,7 +4982,11 @@ impl Db {
         let conn = self.conn.lock().unwrap();
         Ok(conn.execute(
             "UPDATE opportunity_touches SET status='sending',error='' \
-             WHERE id=?1 AND status='scheduled'",
+             WHERE id=?1 AND status='scheduled'
+               AND NOT EXISTS (
+                 SELECT 1 FROM opportunities o
+                 WHERE o.id=opportunity_touches.opportunity_id AND o.kind='sponsorship'
+               )",
             params![id],
         )? == 1)
     }
@@ -4995,7 +5000,11 @@ impl Db {
         let n = conn.execute(
             "UPDATE opportunity_touches SET status='scheduled' WHERE status='draft'
              AND review_passes=1
-             AND (?1 IS NULL OR brand=?1) AND (?2 IS NULL OR contact_id=?2)",
+             AND (?1 IS NULL OR brand=?1) AND (?2 IS NULL OR contact_id=?2)
+             AND NOT EXISTS (
+               SELECT 1 FROM opportunities o
+               WHERE o.id=opportunity_touches.opportunity_id AND o.kind='sponsorship'
+             )",
             params![brand, contact_id],
         )?;
         Ok(n)
@@ -11017,6 +11026,56 @@ mod tests {
         drop(opportunity);
         drop(db);
         remove_temp_db(&path);
+    }
+
+    #[test]
+    fn sponsorship_drafts_cannot_enter_the_delivery_queue() {
+        let db = Db::open(":memory:").expect("open memory db");
+        let opportunity_id = db
+            .upsert_opportunity(&Opportunity {
+                brand: "outagehub".into(),
+                kind: "sponsorship".into(),
+                fingerprint: "manual-sponsorship".into(),
+                title: "Founding sponsorship".into(),
+                canonical_url: "https://example.org/sponsor".into(),
+                ..Default::default()
+            })
+            .expect("insert sponsorship opportunity");
+        let contact_id = db
+            .upsert_opportunity_contact(&OpportunityContact {
+                opportunity_id: opportunity_id.clone(),
+                brand: "outagehub".into(),
+                contact_key: "sponsor@example.org".into(),
+                email: "sponsor@example.org".into(),
+                ..Default::default()
+            })
+            .expect("insert sponsorship contact");
+        let draft_id = db
+            .insert_opportunity_touch(&OpportunityTouch {
+                opportunity_id: opportunity_id.clone(),
+                contact_id: contact_id.clone(),
+                brand: "outagehub".into(),
+                stage: 1,
+                status: "draft".into(),
+                review_passes: Some(true),
+                ..Default::default()
+            })
+            .expect("insert sponsorship draft");
+        assert_eq!(
+            db.approve_opportunity_touches(Some("outagehub"), Some(&contact_id))
+                .expect("attempt sponsorship approval"),
+            0
+        );
+
+        db.set_opportunity_touch_status(&draft_id, "scheduled", "", "", "")
+            .expect("simulate legacy scheduled sponsorship");
+        assert!(db
+            .due_opportunity_touches(10)
+            .expect("query opportunity delivery queue")
+            .is_empty());
+        assert!(!db
+            .claim_opportunity_touch_for_send(&draft_id)
+            .expect("attempt sponsorship delivery claim"));
     }
 
     #[test]

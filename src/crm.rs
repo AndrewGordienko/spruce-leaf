@@ -223,6 +223,7 @@ pub fn open(path: impl AsRef<FsPath>) -> Result<SharedStore> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Surface {
     Pipeline,
+    Sponsorship,
     Strategy,
     Gtm,
 }
@@ -488,15 +489,38 @@ fn brand_tab_counts(db: &SharedDb) -> Vec<(&'static BrandMeta, usize)> {
     BRANDS
         .iter()
         .map(|meta| {
-            let contacts = db.list_people(Some(meta.key), None).map_or(0, |people| {
+            let execution_contacts = db.list_people(Some(meta.key), None).map_or(0, |people| {
                 people
                     .iter()
                     .filter(|person| ready_execution_person(db, person).ok().flatten().is_some())
                     .count()
             });
-            (meta, contacts)
+            let sponsorship_contacts = reviewable_sponsorship_contacts(db, meta.key);
+            (meta, execution_contacts + sponsorship_contacts)
         })
         .collect()
+}
+
+fn reviewable_sponsorship_contacts(db: &SharedDb, brand: &str) -> usize {
+    db.list_opportunities(Some(brand), None)
+        .map_or(0, |opportunities| {
+            opportunities
+                .iter()
+                .filter(|opportunity| opportunity.kind == "sponsorship")
+                .flat_map(|opportunity| {
+                    db.list_opportunity_contacts(&opportunity.id)
+                        .unwrap_or_default()
+                })
+                .filter(|contact| {
+                    db.list_opportunity_touches(&contact.id)
+                        .is_ok_and(|touches| {
+                            touches.iter().any(|touch| {
+                                touch.status == "draft" && touch.review_passes == Some(true)
+                            })
+                        })
+                })
+                .count()
+        })
 }
 
 pub fn router(
@@ -517,6 +541,7 @@ pub fn router(
         .route("/", get(hub))
         .route("/favicon.svg", get(favicon))
         .route("/b/:brand", get(brand_index))
+        .route("/b/outagehub/sponsorship", get(outagehub_sponsorship_index))
         .route("/strategy", get(strategy_hub))
         .route("/strategy/:brand", get(strategy_brand))
         .route("/gtm", get(gtm_hub))
@@ -726,6 +751,12 @@ async fn brand_index(
         profile,
     ))
     .into_response()
+}
+
+async fn outagehub_sponsorship_index(State(state): State<WebState>) -> Html<String> {
+    let counts = brand_tab_counts(&state.db);
+    let execution = execution_dashboard(&state.db, Some("outagehub")).ok();
+    Html(render_sponsorship_page(execution.as_ref(), &counts))
 }
 
 /// Portfolio strategy board: what each business is trying to do and the shared
@@ -1796,6 +1827,130 @@ fn render_outcome_strip(b: &mut String, dashboard: &ExecutionDashboard, brand: O
     ));
 }
 
+fn reviewable_sponsorship_draft_count(dashboard: &ExecutionDashboard) -> usize {
+    dashboard
+        .opportunities
+        .iter()
+        .filter(|entry| entry.opportunity.kind == "sponsorship")
+        .flat_map(|entry| &entry.contacts)
+        .flat_map(|entry| &entry.touches)
+        .filter(|touch| touch.status == "draft" && touch.review_passes == Some(true))
+        .count()
+}
+
+fn render_sponsorship_page(
+    dashboard: Option<&ExecutionDashboard>,
+    counts: &[(&'static BrandMeta, usize)],
+) -> String {
+    let mut b = page_head("OutageHub Sponsorship · Sales CRM");
+    render_topbar(&mut b, Some("outagehub"), Surface::Sponsorship, counts);
+    let ready = dashboard
+        .map(reviewable_sponsorship_draft_count)
+        .unwrap_or(0);
+    let blocked = dashboard.map_or(0, |dashboard| {
+        dashboard
+            .opportunities
+            .iter()
+            .filter(|entry| entry.opportunity.kind == "sponsorship")
+            .flat_map(|entry| &entry.contacts)
+            .flat_map(|entry| &entry.touches)
+            .filter(|touch| touch.status == "blocked")
+            .count()
+    });
+    let scheduled = dashboard.map_or(0, |dashboard| {
+        dashboard
+            .opportunities
+            .iter()
+            .filter(|entry| entry.opportunity.kind == "sponsorship")
+            .flat_map(|entry| &entry.contacts)
+            .flat_map(|entry| &entry.touches)
+            .filter(|touch| matches!(touch.status.as_str(), "scheduled" | "sending" | "sent"))
+            .count()
+    });
+    render_subbar(
+        &mut b,
+        "OutageHub Sponsorship",
+        "One paid CAD $10,000 founding sponsor. Every email is shown in full for manual review and is excluded from the delivery queue.",
+        &[
+            ((ready + blocked).to_string(), "researched companies"),
+            (ready.to_string(), "ready drafts"),
+            (blocked.to_string(), "blocked drafts"),
+            (scheduled.to_string(), "scheduled or sent"),
+        ],
+    );
+    b.push_str("<main class=\"sheet-scroll\" id=\"sponsorship-drafts\">");
+    if let Some(dashboard) = dashboard {
+        render_sponsorship_table(&mut b, &dashboard.opportunities);
+    } else {
+        b.push_str("<div class=\"empty-sheet\"><strong>Sponsorship CRM unavailable</strong><span>Refresh after the local execution database reconnects.</span></div>");
+    }
+    b.push_str(
+        "</main><script>(()=>{let busy=false;setInterval(async()=>{if(busy||document.hidden)return;busy=true;try{const response=await fetch(location.href,{cache:'no-store'});if(!response.ok)return;const incoming=new DOMParser().parseFromString(await response.text(),'text/html');const current=document.querySelector('.sheet-scroll');const next=incoming.querySelector('.sheet-scroll');if(current&&next&&current.innerHTML!==next.innerHTML){const left=current.scrollLeft,top=current.scrollTop;current.innerHTML=next.innerHTML;current.scrollLeft=left;current.scrollTop=top}const stats=document.querySelector('.subbar-stats');const nextStats=incoming.querySelector('.subbar-stats');if(stats&&nextStats&&stats.innerHTML!==nextStats.innerHTML)stats.innerHTML=nextStats.innerHTML}catch(_){ }finally{busy=false}},3000)})();</script></div></body></html>",
+    );
+    b
+}
+
+fn render_sponsorship_table(b: &mut String, opportunities: &[ExecutionOpportunity]) {
+    let mut rows = opportunities
+        .iter()
+        .filter(|entry| entry.opportunity.kind == "sponsorship")
+        .flat_map(|entry| {
+            entry.contacts.iter().flat_map(move |contact| {
+                contact
+                    .touches
+                    .iter()
+                    .map(move |touch| (&entry.opportunity, &contact.contact, touch))
+            })
+        })
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        b.push_str("<div class=\"empty-sheet\"><strong>No sponsorship drafts yet</strong><span>Verified sponsor research will appear here after generation and review.</span></div>");
+        return;
+    }
+    rows.sort_by(|left, right| {
+        let status_rank = |status: &str| match status {
+            "draft" => 0,
+            "blocked" => 1,
+            _ => 2,
+        };
+        status_rank(&left.2.status)
+            .cmp(&status_rank(&right.2.status))
+            .then_with(|| left.0.funder.cmp(&right.0.funder))
+    });
+    b.push_str("<table class=\"crm-sheet sponsorship-sheet\"><colgroup><col class=\"c-company\"><col class=\"c-sponsor-evidence\"><col class=\"c-person\"><col class=\"c-sponsor-subject\"><col class=\"c-sponsor-email\"><col class=\"c-sponsor-qa\"></colgroup><thead><tr><th class=\"pin\">Company</th><th>Verified relevance + budget route</th><th>Recipient</th><th>Subject</th><th>Full email</th><th>QA / delivery state</th></tr></thead><tbody>");
+    for (opportunity, contact, touch) in rows {
+        let ready = touch.status == "draft" && touch.review_passes == Some(true);
+        let state = if ready { "ready" } else { "blocked" };
+        b.push_str(&format!(
+            "<tr class=\"sponsor-row {state}\"><td class=\"company pin\"><span class=\"brand-tag outagehub\">OutageHub</span><strong>{company}</strong><small>CAD $10,000 founding sponsorship</small><a href=\"{url}\" rel=\"noreferrer\">Primary source ↗</a></td><td class=\"sponsor-evidence\"><ul>{evidence}</ul></td><td class=\"person\"><strong>{name}</strong><small>{title}</small><a class=\"email\" href=\"mailto:{email}\">{email}</a><span class=\"person-status verified\">{email_status}</span><p>{why}</p></td><td class=\"sponsor-subject\"><span class=\"subject\">{subject}</span></td><td class=\"sponsor-message\"><div class=\"message\">{body}</div></td><td class=\"sponsor-state\"><span class=\"touch-tag\">{state}</span>{qa}<small>Delivery: technically blocked from scheduling and sending</small></td></tr>",
+            state = state,
+            company = esc(&opportunity.funder),
+            name = esc(&contact.name),
+            title = esc(&contact.title),
+            email = esc(&contact.email),
+            email_status = esc(&contact.email_status),
+            why = esc(&contact.why_them),
+            evidence = opportunity
+                .evidence
+                .iter()
+                .map(|item| format!("<li>{}</li>", esc(item)))
+                .collect::<String>(),
+            url = esc(&opportunity.canonical_url),
+            subject = esc(&touch.subject),
+            body = esc_multiline(&touch.body),
+            qa = if touch.review_issues.is_empty() {
+                "<p class=\"sponsor-qa ok\">Passed deterministic QA and both semantic audits. Manual review still required.</p>".to_string()
+            } else {
+                format!(
+                    "<p class=\"sponsor-qa fail\"><b>Held:</b> {}</p>",
+                    esc(&touch.review_issues.join(" · "))
+                )
+            },
+        ));
+    }
+    b.push_str("</tbody></table>");
+}
+
 fn render_customer_development(b: &mut String, dashboard: &ExecutionDashboard) {
     let stage_for_opportunity = |sales_opportunity_id: &str| {
         dashboard
@@ -2002,8 +2157,7 @@ fn render_topbar(
     b.push_str(&format!(
         "<a class=\"surface-tab{}\" href=\"{}\">Pipeline</a>\
          <a class=\"surface-tab{}\" href=\"{}\">Strategy</a>\
-         <a class=\"surface-tab{}\" href=\"{}\">GTM Lab</a></nav>\
-         <nav class=\"biz-tabs\">",
+         <a class=\"surface-tab{}\" href=\"{}\">GTM Lab</a>",
         if surface == Surface::Pipeline {
             " active"
         } else {
@@ -2023,10 +2177,22 @@ fn render_topbar(
         },
         esc(&gtm_href),
     ));
+    if active == Some("outagehub") || surface == Surface::Sponsorship {
+        b.push_str(&format!(
+            "<a class=\"surface-tab{}\" href=\"/b/outagehub/sponsorship\">OutageHub Sponsorship</a>",
+            if surface == Surface::Sponsorship {
+                " active"
+            } else {
+                ""
+            },
+        ));
+    }
+    b.push_str("</nav><nav class=\"biz-tabs\">");
     let all_total: usize = counts.iter().map(|(_, contacts)| contacts).sum();
     let all_href = match surface {
         Surface::Strategy => "/strategy",
         Surface::Gtm => "/gtm",
+        Surface::Sponsorship => "/",
         Surface::Pipeline => "/",
     };
     b.push_str(&format!(
@@ -2039,6 +2205,7 @@ fn render_topbar(
         let href = match surface {
             Surface::Strategy => format!("/strategy/{}", meta.key),
             Surface::Gtm => format!("/gtm/{}", meta.key),
+            Surface::Sponsorship => format!("/b/{}", meta.key),
             Surface::Pipeline => format!("/b/{}", meta.key),
         };
         b.push_str(&format!(
@@ -2126,7 +2293,7 @@ fn render_hub(
     b.push_str("<section class=\"calendar-brand-strip\">");
     for (meta, contacts) in counts {
         b.push_str(&format!(
-            "<a class=\"calendar-brand-summary {brand}\" href=\"/b/{brand}\"><span class=\"brand-chip {brand}\">{name}</span><span><b>30/day</b><small>{contacts} ready sequence{suffix}</small></span><i>Open pipeline →</i></a>",
+            "<a class=\"calendar-brand-summary {brand}\" href=\"/b/{brand}\"><span class=\"brand-chip {brand}\">{name}</span><span><b>30/day</b><small>{contacts} reviewable contact{suffix}</small></span><i>Open pipeline →</i></a>",
             brand = meta.key,
             name = esc(meta.name),
             suffix = if *contacts == 1 { "" } else { "s" },
@@ -4833,6 +5000,21 @@ body { color: var(--ink); background: var(--paper); font: 13px/1.45 var(--font);
 .sheet-scroll { flex: 1 1 auto; min-height: 0; overflow: auto; }
 .crm-sheet { border-collapse: separate; border-spacing: 0; table-layout: fixed; width: max-content; min-width: 100%; }
 .c-company { width: 210px; }.c-context { width: 360px; }.c-person { width: 220px; }.c-why { width: 280px; }.c-touch { width: 300px; }
+.c-sponsor-evidence { width: 360px; }.c-sponsor-subject { width: 230px; }.c-sponsor-email { width: 560px; }.c-sponsor-qa { width: 300px; }
+.sponsorship-sheet td { height: auto; min-height: 120px; }
+.sponsorship-sheet tr.blocked td { background: #fffafa; }
+.sponsorship-sheet tr.blocked td.company.pin { border-left: 4px solid var(--red); }
+.sponsorship-sheet tr.ready td.company.pin { border-left: 4px solid var(--green); }
+.sponsor-evidence ul { margin: 0; padding-left: 16px; color: var(--muted); font-size: 10.5px; line-height: 1.45; }
+.sponsor-evidence li + li { margin-top: 5px; }
+.sponsor-subject .subject { display: block; font-size: 12px; line-height: 1.45; }
+.sponsor-message .message { color: var(--ink); white-space: normal; font-size: 11.5px; line-height: 1.55; overflow-wrap: anywhere; }
+.sponsor-state .touch-tag { margin-bottom: 7px; }
+.sponsor-state .sponsor-qa { margin: 0 0 8px; padding: 7px; border-radius: 6px; font-size: 10.5px; line-height: 1.4; }
+.sponsor-state .sponsor-qa.ok { color: var(--green); background: var(--green-tint); }
+.sponsor-state .sponsor-qa.fail { color: var(--red); background: var(--red-tint); }
+.sponsor-state > small { display: block; color: var(--faint); font-size: 10px; line-height: 1.4; }
+.sponsor-row.blocked .touch-tag { color: var(--red); border-color: #f3c7c3; background: var(--red-tint); }
 .crm-sheet th {
   position: sticky; top: 0; z-index: 8; height: 36px; padding: 0 10px; text-align: left;
   color: var(--muted); background: #f2f6fc; border-bottom: 1px solid var(--line); border-right: 1px solid var(--line);
@@ -5419,13 +5601,14 @@ mod tests {
     use super::{
         brand_meta, brand_tab_counts, display_written_at, execution_dashboard, favicon,
         gtm_snapshot, local_write_headers, page_head, render_gtm_lab, render_html, render_hub,
-        render_strategy_brand, render_strategy_hub, Crm, BRANDS, FAVICON_SVG,
+        render_sponsorship_table, render_strategy_brand, render_strategy_hub, Crm,
+        ExecutionOpportunity, ExecutionOpportunityContact, BRANDS, FAVICON_SVG,
     };
     use crate::business::Businesses;
     use crate::db::{
-        AccountPlayAssessment, CustomerDevelopmentRecord, Db, Lead, Mailbox,
-        OpportunityStakeholder, Person, Reply, SalesOpportunity, Sequence, SignalObservation,
-        Touch,
+        AccountPlayAssessment, CustomerDevelopmentRecord, Db, Lead, Mailbox, Opportunity,
+        OpportunityContact, OpportunityStakeholder, OpportunityTouch, Person, Reply,
+        SalesOpportunity, Sequence, SignalObservation, Touch,
     };
     use crate::playbook::Playbooks;
     use axum::http::{HeaderMap, HeaderValue};
@@ -5453,6 +5636,48 @@ mod tests {
             response.headers().get(axum::http::header::CACHE_CONTROL),
             Some(&HeaderValue::from_static("public, max-age=86400"))
         );
+    }
+
+    #[test]
+    fn sponsorship_table_surfaces_full_manual_drafts_without_clicks_or_approval() {
+        let entry = ExecutionOpportunity {
+            opportunity: Opportunity {
+                id: "sponsor-opportunity".into(),
+                brand: "outagehub".into(),
+                kind: "sponsorship".into(),
+                funder: "Canadian Resilience Co.".into(),
+                canonical_url: "https://example.org/sponsor-evidence".into(),
+                evidence: vec!["organization_relevance: outage resilience".into()],
+                ..Default::default()
+            },
+            contacts: vec![ExecutionOpportunityContact {
+                contact: OpportunityContact {
+                    name: "Maya Chen".into(),
+                    title: "CEO".into(),
+                    email: "maya@example.org".into(),
+                    ..Default::default()
+                },
+                touches: vec![OpportunityTouch {
+                    id: "sponsor-touch".into(),
+                    status: "draft".into(),
+                    review_passes: Some(true),
+                    subject: "OutageHub founding sponsorship".into(),
+                    body: "A complete manual-review sponsorship email.".into(),
+                    ..Default::default()
+                }],
+            }],
+            application: None,
+        };
+        let mut html = String::new();
+        render_sponsorship_table(&mut html, &[entry]);
+
+        assert!(html.contains("<table class=\"crm-sheet sponsorship-sheet\""));
+        assert!(html.contains("Canadian Resilience Co."));
+        assert!(html.contains("maya@example.org"));
+        assert!(html.contains("A complete manual-review sponsorship email."));
+        assert!(html.contains("technically blocked from scheduling and sending"));
+        assert!(!html.contains("<details"));
+        assert!(!html.contains("/opportunities/approve/"));
     }
 
     #[test]
