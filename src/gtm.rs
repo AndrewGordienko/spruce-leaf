@@ -705,6 +705,64 @@ fn wapahki_discovery_touch_block_reason(
     None
 }
 
+/// Deterministic closing-difficulty band for one Wapahki account, separate
+/// from opportunity value (value stays founder-entered in
+/// `CommercialAssessment`; conflating the two is how a pipeline fills with
+/// impressive but distant companies).
+///
+/// 0 = easy: facility-linked URL-backed task, evidenced economic pressure, a
+///     workflow-adjacent contact, and a procurement surface small enough for a
+///     paid step in roughly 30–60 days.
+/// 1 = medium: a real facility-linked task but missing economics or sized so
+///     that more stakeholders and validation are likely (two–six months).
+/// 2 = hard: weak or missing lineage, no workflow contact, or an
+///     enterprise-scale parent whose procurement outlives a pre-seed runway.
+pub fn wapahki_commercial_difficulty_band(context: &GtmActionContext, headcount: i64) -> u8 {
+    let Some(opportunity) = &context.opportunity else {
+        return 2;
+    };
+    let supported_claim = |claim_type: &str| {
+        context.evidence_claims.iter().any(|claim| {
+            claim.claim_type == claim_type
+                && matches!(claim.status.as_str(), "observed" | "verified")
+                && crate::db::credible_source_url(&claim.source_url)
+        })
+    };
+    let facility_linked = !opportunity.facility_id.trim().is_empty();
+    let task_supported = supported_claim("account.bounded_repetitive_task");
+    let workflow_contact = context
+        .stakeholders
+        .iter()
+        .any(|stakeholder| matches!(stakeholder.role_fit.as_str(), "direct" | "adjacent"));
+    let enterprise_procurement = headcount > 2000;
+    if !facility_linked || !task_supported || !workflow_contact || enterprise_procurement {
+        return 2;
+    }
+    let economic_pressure = supported_claim("account.manual_task_economic_pressure");
+    if economic_pressure && headcount > 0 && headcount <= 600 {
+        0
+    } else {
+        1
+    }
+}
+
+/// Planning order for one candidate recipient: evidence state stays dominant
+/// (an easy-but-unsupported account never outranks a supported one), and for
+/// Wapahki the closing-difficulty band breaks ties so near-term-cash accounts
+/// are drafted before distant enterprise accounts. Other brands keep their
+/// pure state ordering.
+pub fn planning_priority(context: &GtmActionContext, brand: &str, headcount: i64) -> u8 {
+    let state_rank = match context.state.as_str() {
+        "action_ready" => 0u8,
+        "discovery_ready" => 1,
+        _ => 2,
+    };
+    if !brand.eq_ignore_ascii_case("wapahki") {
+        return state_rank * 3;
+    }
+    state_rank * 3 + wapahki_commercial_difficulty_band(context, headcount)
+}
+
 fn outagehub_workflow_contact(
     db: &SharedDb,
     lead_id: &str,
@@ -2316,5 +2374,84 @@ mod tests {
             .expect("sequence row");
         assert_eq!(sequence.status, "paused");
         remove_temp_db(&path);
+    }
+
+    #[test]
+    fn wapahki_difficulty_separates_closing_effort_from_evidence_state() {
+        let claim = |claim_type: &str, source_url: &str| crate::db::EvidenceClaim {
+            claim_type: claim_type.into(),
+            status: "observed".into(),
+            source_url: source_url.into(),
+            ..Default::default()
+        };
+        let workflow_stakeholder = crate::db::OpportunityStakeholder {
+            role_fit: "adjacent".into(),
+            ..Default::default()
+        };
+        let base = GtmActionContext {
+            state: "action_ready".into(),
+            opportunity: Some(crate::db::SalesOpportunity {
+                facility_id: "facility-1".into(),
+                ..Default::default()
+            }),
+            evidence_claims: vec![
+                claim(
+                    "account.bounded_repetitive_task",
+                    "https://example.com/jobs/palletizer",
+                ),
+                claim(
+                    "account.manual_task_economic_pressure",
+                    "https://example.com/jobs/palletizer",
+                ),
+            ],
+            stakeholders: vec![workflow_stakeholder.clone()],
+            ..Default::default()
+        };
+        // Small facility, full lineage: easy.
+        assert_eq!(super::wapahki_commercial_difficulty_band(&base, 180), 0);
+        // Same evidence at enterprise scale: hard, regardless of fit polish.
+        assert_eq!(super::wapahki_commercial_difficulty_band(&base, 12_000), 2);
+        // Missing economic pressure: medium, not easy.
+        let mut no_economics = base.clone();
+        no_economics.evidence_claims = vec![claim(
+            "account.bounded_repetitive_task",
+            "https://example.com/jobs/palletizer",
+        )];
+        assert_eq!(
+            super::wapahki_commercial_difficulty_band(&no_economics, 180),
+            1
+        );
+        // A fabricated task source is no lineage at all: hard.
+        let mut fabricated = base.clone();
+        fabricated.evidence_claims = vec![
+            claim(
+                "account.bounded_repetitive_task",
+                "not provided in account payload",
+            ),
+            claim(
+                "account.manual_task_economic_pressure",
+                "https://example.com/jobs/palletizer",
+            ),
+        ];
+        assert_eq!(
+            super::wapahki_commercial_difficulty_band(&fabricated, 180),
+            2
+        );
+        // No facility: hard.
+        let mut no_facility = base.clone();
+        no_facility.opportunity = Some(crate::db::SalesOpportunity::default());
+        assert_eq!(
+            super::wapahki_commercial_difficulty_band(&no_facility, 180),
+            2
+        );
+        // Evidence state stays dominant in planning order: a hard action-ready
+        // account still outranks an easy discovery-ready one.
+        let mut discovery = base.clone();
+        discovery.state = "discovery_ready".into();
+        let hard_action = super::planning_priority(&base, "wapahki", 12_000);
+        let easy_discovery = super::planning_priority(&discovery, "wapahki", 180);
+        assert!(hard_action < easy_discovery);
+        // Other brands keep pure state ordering.
+        assert_eq!(super::planning_priority(&base, "gnk", 12_000), 0);
     }
 }

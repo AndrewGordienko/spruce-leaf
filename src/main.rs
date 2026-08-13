@@ -940,11 +940,15 @@ fn main() -> Result<()> {
                                 .map(|context| {
                                     (
                                         person.clone(),
-                                        match context.state.as_str() {
-                                            "action_ready" => 0u8,
-                                            "discovery_ready" => 1u8,
-                                            _ => 2u8,
-                                        },
+                                        // Evidence state stays dominant; for
+                                        // Wapahki the closing-difficulty band
+                                        // breaks ties so near-term accounts
+                                        // are drafted before enterprise ones.
+                                        crate::gtm::planning_priority(
+                                            &context,
+                                            &cli.brand,
+                                            lead.headcount,
+                                        ),
                                     )
                                 })
                         })

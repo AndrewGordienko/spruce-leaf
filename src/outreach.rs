@@ -4150,6 +4150,58 @@ fn copy_sentence_count(body: &str, signature: &str) -> usize {
 /// plus a call-or-email CTA can naturally contain three marks (and appears in
 /// the human validation set). Semantic review still rejects a survey or several
 /// unrelated operating questions.
+/// Deterministic repeated-question guard: a sequence that re-asks the same
+/// question in a later touch is an interview loop, not a conversation. The
+/// semantic reviewer repeatedly approved paraphrased repeats ("which sites get
+/// checked first?" asked three ways), so this cannot be left to model judgment.
+fn repeated_question_issues(sequence: &CopySequence) -> Vec<String> {
+    fn question_word_sets(body: &str) -> Vec<HashSet<String>> {
+        let mut questions = Vec::new();
+        let mut sentence = String::new();
+        for character in body.chars() {
+            match character {
+                '?' => {
+                    let words = sentence
+                        .split(|c: char| !c.is_ascii_alphanumeric())
+                        .filter(|word| word.len() >= 3)
+                        .map(|word| word.to_ascii_lowercase())
+                        .collect::<HashSet<_>>();
+                    if words.len() >= 4 {
+                        questions.push(words);
+                    }
+                    sentence.clear();
+                }
+                '.' | '!' | '\n' => sentence.clear(),
+                _ => sentence.push(character),
+            }
+        }
+        questions
+    }
+    let per_stage = sequence
+        .touches
+        .iter()
+        .map(|touch| (touch.stage, question_word_sets(&touch.body)))
+        .collect::<Vec<_>>();
+    let mut issues = Vec::new();
+    for (index, (stage, questions)) in per_stage.iter().enumerate() {
+        for (earlier_stage, earlier_questions) in per_stage.iter().take(index) {
+            for question in questions {
+                for earlier in earlier_questions {
+                    let overlap = question.intersection(earlier).count();
+                    let smaller = question.len().min(earlier.len());
+                    if smaller >= 4 && overlap * 100 >= smaller * 80 {
+                        issues.push(format!(
+                            "stage {stage} repeats a question already asked in stage {earlier_stage}; a later touch must add a new angle, not re-ask"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    issues.dedup();
+    issues
+}
+
 fn touch_question_limit(stage: u32) -> usize {
     if stage == 1 {
         3
@@ -5517,6 +5569,7 @@ fn sequence_quality_issues(
             "sequence asks questions in {question_touches} touches (maximum {question_touch_limit})"
         ));
     }
+    issues.extend(repeated_question_issues(sequence));
 
     let retreat_touches = sequence
         .touches
