@@ -27,6 +27,7 @@ use crate::playbook::{self, Playbook, Shared};
 use crate::verify;
 
 const MAX_DOCUMENT_CHARS: usize = 80_000;
+const MAX_VERIFICATION_DOCUMENT_CHARS: usize = 1_000_000;
 const MAX_RAW_SNAPSHOT_CHARS: usize = 20_000;
 
 #[derive(Debug, Default)]
@@ -355,6 +356,28 @@ impl ResearchClient {
             );
         }
         Ok(limit_chars(&text, MAX_DOCUMENT_CHARS))
+    }
+
+    /// Fetch the publisher response itself. Verification uses this alongside
+    /// the reader view because some first-party HTML renders email addresses
+    /// in markup that a readability pass legitimately omits.
+    async fn read_direct(&self, url: &str) -> Result<String> {
+        let url = validated_research_url(url)?;
+        let resp = self
+            .http
+            .get(url.clone())
+            .send()
+            .await
+            .with_context(|| format!("fetching {url}"))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            bail!(
+                "fetching {url} returned {status}: {}",
+                limit_chars(&text, 300)
+            );
+        }
+        Ok(limit_chars(&text, MAX_VERIFICATION_DOCUMENT_CHARS))
     }
 
     /// Best-effort public web discovery for account research when no paid Jina
@@ -1390,6 +1413,7 @@ async fn import_one_sponsorship_candidate(
         "flood",
         "critical infrastructure",
         "utility",
+        "utilities",
         "telecom",
         "cloud",
         "charging",
@@ -1691,7 +1715,21 @@ async fn refresh_cached(
 ) -> Result<String> {
     cache.remove(url);
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    read_cached(research, cache, url).await
+    let reader = research.read(url).await;
+    let direct = research.read_direct(url).await;
+    let page = match (reader, direct) {
+        (Ok(reader), Ok(direct)) => format!("{reader}\n\nFIRST-PARTY HTML:\n{direct}"),
+        (Ok(reader), Err(_)) => reader,
+        (Err(_), Ok(direct)) => direct,
+        (Err(reader_error), Err(direct_error)) => {
+            return Err(anyhow!(
+                "reader and first-party fetch failed: {reader_error:#}; {direct_error:#}"
+            ));
+        }
+    };
+    let page = limit_chars(&page, MAX_VERIFICATION_DOCUMENT_CHARS + MAX_DOCUMENT_CHARS);
+    cache.insert(url.to_string(), page.clone());
+    Ok(page)
 }
 
 fn normalized_contains(page: &str, excerpt: &str) -> bool {
