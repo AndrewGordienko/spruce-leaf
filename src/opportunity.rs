@@ -128,6 +128,8 @@ pub struct SponsorshipResearchContact {
     #[serde(default)]
     pub linkedin_url: String,
     #[serde(default)]
+    pub person_source_url: String,
+    #[serde(default)]
     pub email_source_url: String,
 }
 
@@ -1384,6 +1386,7 @@ async fn import_one_sponsorship_candidate(
         "critical infrastructure",
         "utility",
         "telecom",
+        "cloud",
         "charging",
         "insurance",
         "climate",
@@ -1438,27 +1441,72 @@ async fn import_one_sponsorship_candidate(
                 bail!("new contact title does not match the recipient route");
             }
             if !host_matches_allowed_domain(&row.contact.email_source_url, &domain) {
-                bail!("contact source must be on {domain} or its subdomain");
+                bail!("contact email source must be on {domain} or its subdomain");
             }
-            let page = read_cached(research, page_cache, &row.contact.email_source_url).await?;
-            let page_lower = page.to_ascii_lowercase();
-            if !page_lower.contains(&row.contact.email.trim().to_ascii_lowercase())
-                || !normalized_contains(&page, &row.contact.name)
+            let email_page =
+                read_cached(research, page_cache, &row.contact.email_source_url).await?;
+            if !email_page
+                .to_ascii_lowercase()
+                .contains(&row.contact.email.trim().to_ascii_lowercase())
             {
-                bail!("first-party contact page does not publish the exact name and email");
+                bail!("first-party contact page does not publish the exact email");
+            }
+            let person_source_url = if row.contact.person_source_url.trim().is_empty() {
+                row.contact.email_source_url.as_str()
+            } else {
+                row.contact.person_source_url.as_str()
+            };
+            let person_page = read_cached(research, page_cache, person_source_url).await?;
+            if !normalized_contains(&person_page, &row.contact.name)
+                || !normalized_contains(&person_page, &row.contact.title)
+            {
+                bail!("person source does not publish the exact name and title");
+            }
+            if !host_matches_allowed_domain(person_source_url, &domain)
+                && !normalized_contains(&person_page, &row.organization)
+                && !normalized_contains(&person_page, &domain)
+            {
+                bail!("third-party person source must explicitly identify the organization");
             }
             if !crate::verify::syntax_ok(&row.contact.email)
-                || !crate::verify::has_mx(
-                    row.contact.email.split('@').nth(1).unwrap_or_default(),
-                )
-                .await
+                || !crate::verify::has_mx(row.contact.email.split('@').nth(1).unwrap_or_default())
+                    .await
             {
                 bail!("published contact email fails syntax or mail-domain verification");
             }
+            let mailbox = row
+                .contact
+                .email
+                .split('@')
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let is_routed = [
+                "info",
+                "hello",
+                "contact",
+                "sales",
+                "service",
+                "support",
+                "marketing",
+                "partnerships",
+                "community",
+                "office",
+                "admin",
+            ]
+            .contains(&mailbox.as_str());
             (
                 row.contact.clone(),
-                format!("first-party:{}", row.contact.email.trim().to_ascii_lowercase()),
-                "first_party_published".to_string(),
+                format!(
+                    "first-party:{}",
+                    row.contact.email.trim().to_ascii_lowercase()
+                ),
+                if is_routed {
+                    "first_party_published_routed"
+                } else {
+                    "first_party_published_direct"
+                }
+                .to_string(),
                 String::new(),
             )
         };
@@ -1516,13 +1564,22 @@ async fn import_one_sponsorship_candidate(
             } else {
                 row.contact.email_source_url.clone()
             },
+            if row.contact.person_source_url.is_empty() {
+                row.contact.email_source_url.clone()
+            } else {
+                row.contact.person_source_url.clone()
+            },
         ],
-        fit_score: 88,
+        fit_score: if contact_source == "first_party_published_routed" {
+            80
+        } else {
+            92
+        },
         fit_status: "strong_fit".into(),
         fit_reasons: vec![
             "Named organization.".into(),
             "Exact first-party budget/program evidence re-fetched and matched.".into(),
-            "Named verified person with a route-matched title.".into(),
+            format!("Named verified person with a route-matched title; contact route: {contact_source}."),
             "Exact first-party reason OutageHub matters re-fetched and matched.".into(),
             format!("Configured recipient type: {}.", route.recipient_kind),
             format!("Configured benefit Andrew will provide: {}", row.permitted_benefit),
@@ -1579,11 +1636,20 @@ async fn read_cached(
 
 fn normalized_contains(page: &str, excerpt: &str) -> bool {
     let normalize = |value: &str| {
-        value
-            .to_ascii_lowercase()
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
+        let mut normalized = String::with_capacity(value.len());
+        let mut pending_space = false;
+        for character in value.to_lowercase().chars() {
+            if character.is_alphanumeric() {
+                if pending_space && !normalized.is_empty() {
+                    normalized.push(' ');
+                }
+                normalized.push(character);
+                pending_space = false;
+            } else {
+                pending_space = true;
+            }
+        }
+        normalized
     };
     normalize(page).contains(&normalize(excerpt))
 }
@@ -2183,9 +2249,13 @@ fn sponsorship_copy_issues(
             issues.push("sponsorship touch 1 must name eventual impact-report inclusion".into());
         }
         if !(lower.contains("someone else")
-            && (lower.contains("point me") || lower.contains("route") || lower.contains("introduc")))
+            && (lower.contains("point me")
+                || lower.contains("route")
+                || lower.contains("introduc")))
         {
-            issues.push("sponsorship touch 1 must request routing if someone else owns the budget".into());
+            issues.push(
+                "sponsorship touch 1 must request routing if someone else owns the budget".into(),
+            );
         }
         let route_ok = match recipient_kind {
             "commercial_sponsor" => {
@@ -2764,8 +2834,9 @@ fn application_schema() -> Value {
 mod tests {
     use super::{
         best_org_match, dedupe_candidates, domain_from_url, host_matches_allowed_domain,
-        interleave_candidate_batches, opportunity_fingerprint, sponsorship_contact_score,
-        sponsorship_copy_issues, sponsorship_recipient_kind, validated_research_url, Candidate,
+        interleave_candidate_batches, normalized_contains, opportunity_fingerprint,
+        sponsorship_contact_score, sponsorship_copy_issues, sponsorship_recipient_kind,
+        validated_research_url, Candidate,
     };
     use crate::apollo::ApolloOrg;
     use crate::business::SponsorshipRoute;
@@ -2893,6 +2964,15 @@ mod tests {
         };
         assert!(sponsorship_contact_score("Director, Community Investment", &route).is_some());
         assert!(sponsorship_contact_score("Network Operations Manager", &route).is_none());
+    }
+
+    #[test]
+    fn evidence_matching_ignores_markup_and_punctuation_boundaries() {
+        let page = "As a**Gold Sponsor**, Get Ready Global is proud to participate.";
+        assert!(normalized_contains(
+            page,
+            "As a Gold Sponsor, Get Ready Global is proud to participate"
+        ));
     }
 
     #[test]

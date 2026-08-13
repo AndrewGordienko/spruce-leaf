@@ -1591,9 +1591,7 @@ fn main() -> Result<()> {
             let businesses = load_businesses(&cli)?;
             let profile = businesses.get(&cli.brand)?;
             let summary = rt.block_on(opportunity::import_sponsorship_research(
-                &db,
-                profile,
-                &file,
+                &db, profile, &file,
             ))?;
             println!(
                 "\u{2713} sponsorship research re-verified {} row(s): {} imported, {} rejected.",
