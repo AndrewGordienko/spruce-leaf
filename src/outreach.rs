@@ -1129,7 +1129,7 @@ pub async fn plan_pending(
                         &lead,
                         person,
                         context,
-                        n_touches,
+                        unit_touches,
                         &generation_backend,
                         &generation_model,
                     ) {
@@ -1153,7 +1153,7 @@ pub async fn plan_pending(
                 shared,
                 &lead,
                 &recipients,
-                n_touches,
+                unit_touches,
                 &business_context,
                 &performance_context,
                 &knowledge,
