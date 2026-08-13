@@ -1587,7 +1587,7 @@ async fn write_account_sequences(
     };
     let writer_knowledge = knowledge.writer.block.clone();
     let brand_trigger_contract = brand_trigger_contract(&pb.key, n);
-    let t1_contract = "T1 CONTRACT: Write a complete founder note inside the configured word band. Explain why this person, name one recognizable problem and plausible consequence, state one concrete and evidence-safe seller contribution, and offer one natural response path. For a discovery-ready account, the one direct operating answer is the sole CTA; do not add a call before the missing term is confirmed. A correction may be useful, but Andrew's desire for one is never the recipient's reason to answer. When the operator requested a supported operating decision or response, preserve it in T1; never broaden it into a generic workflow interview such as `what takes the most time`, `what happens today`, or `how do you handle this`. Keep every attributed claim faithful to its exact source: never replace a source's generic noun with a more specific noun learned from another URL. If a job posting says `finished products` and the company page separately names the product, retain `finished products` when describing the posting or state the two facts in separate sentences. The subject is also a factual claim: never put the unconfirmed term being asked about—such as `manual`, `staffed by hand`, a guessed system, or a presumed consequence—into it. Start with the one most salient exact observation in ordinary spoken language; do not inventory every sourced duty or use evidence-audit phrases such as `company-attributed posting`. Put Andrew's practical reason for the recipient to answer before the final question. Hold rather than manufacture any missing account foundation.";
+    let t1_contract = "T1 CONTRACT: Write a complete founder note inside the configured word band. Explain why this person, name one recognizable problem and plausible consequence, state one concrete and evidence-safe seller contribution, and offer one natural response path. For a discovery-ready account, the one direct operating answer is the sole CTA; do not add a call before the missing term is confirmed. A correction may be useful, but Andrew's desire for one is never the recipient's reason to answer. When the operator requested a supported operating decision or response, preserve it in T1; never broaden it into a generic workflow interview such as `what takes the most time`, `what happens today`, or `how do you handle this`. Keep every attributed claim faithful to its exact source: never replace a source's generic noun with a more specific noun learned from another URL. If a job posting says `finished products` and the company page separately names the product, retain `finished products` when describing the posting or state the two facts in separate sentences. The subject is also a factual claim: never put the unconfirmed term being asked about—such as `manual`, `staffed by hand`, a guessed system, or a presumed consequence—into it. A concise source-backed quantity may be used when it makes the operating burden concrete; never invent or estimate one. Start with the one most salient exact observation in ordinary spoken language; do not inventory every sourced duty or use evidence-audit phrases such as `company-attributed posting`. Put Andrew's practical reason for the recipient to answer before the final question. Hold rather than manufacture any missing account foundation.";
     let writer_instructions = format!(
         r#"Write one {n}-touch no-reply sequence for each recipient. {planning_contract}
 
@@ -2593,7 +2593,24 @@ fn apply_targeted_repairs(
                 .iter()
                 .find(|review| review.stage == *stage)
                 .expect("validated editor stages");
-            if edit.revised_body.trim().is_empty() {
+            let relevant = findings
+                .iter()
+                .filter(|finding| {
+                    let stages = affected_stages(finding, expected_touches);
+                    stages.is_empty() || stages.contains(stage)
+                })
+                .collect::<Vec<_>>();
+            let subject_only = !relevant.is_empty()
+                && relevant
+                    .iter()
+                    .all(|finding| finding.to_ascii_lowercase().contains("subject"));
+            let email_stage = sequence
+                .touches
+                .iter()
+                .find(|touch| touch.stage == *stage)
+                .is_some_and(|touch| is_email_capable_channel(&touch.channel));
+            let has_subject_repair = email_stage && !edit.revised_subject.trim().is_empty();
+            if edit.revised_body.trim().is_empty() && !(subject_only && has_subject_repair) {
                 return Err(anyhow!(
                     "stage {} copy editor omitted the required rewrite",
                     stage
@@ -3402,7 +3419,7 @@ async fn request_copy_review_with_tier(
     let task = if verify_only {
         "This is a final gate over already-repaired copy. Do not edit it. Return empty revised fields. Mark passes=true only when the CURRENT touch is natural, accurate, easy to answer, and ready for Andrew to send unchanged. List only unresolved issues."
     } else if !deterministic.is_empty() {
-        "Repair the named findings as hard constraints. Any feedback string containing 'stage N' names stage N. Change only named stages unless a finding applies to the whole sequence. For EVERY named stage you MUST return a nonempty complete corrected body, even if you disagree with the feedback; never mark a named stage passed with an empty revised body. If a finding names an unverified task or object, remove that noun from every named stage and use only a supported category such as product, package, packing, or handling; do not preserve specificity merely because it appears in the hypothesis. Return a complete corrected subject only when the feedback concerns the subject; an empty revised_subject preserves an already-good subject. Count the corrected stage's words and question marks before returning: it must fall inside every stated range. Stage 1 may contain one operating question plus one short CTA question; stages 2 through 6 may contain at most one question mark, and stage 7 must contain none. Preserve verified facts, natural phrasing, and unnamed stages. The passes flag and score must grade the FINAL corrected wording you return. List only issues still present after your correction."
+        "Repair the named findings as hard constraints. Any feedback string containing 'stage N' names stage N. Change only named stages unless a finding applies to the whole sequence. For every named stage with a body finding, return a nonempty complete corrected body even if you disagree. When every relevant finding is subject-only, return a complete corrected subject and leave revised_body empty to preserve the already-good body. If a finding names an unverified task or object, remove that noun from every named stage and use only a supported category such as product, package, packing, or handling; do not preserve specificity merely because it appears in the hypothesis. Return a complete corrected subject only when the feedback concerns the subject; an empty revised_subject preserves an already-good subject. Count any corrected body stage's words and question marks before returning: it must fall inside every stated range. Stage 1 may contain one operating question plus one short CTA question; stages 2 through 6 may contain at most one question mark, and stage 7 must contain none. Preserve verified facts, natural phrasing, and unnamed stages. The passes flag and score must grade the FINAL corrected wording you return. List only issues still present after your correction."
     } else {
         "Review and repair the copy. For every touch that is not ready to send, return a complete corrected body and, for email, a complete corrected subject. Stage 1 may contain one operating question plus one short CTA question; stages 2 through 6 may contain at most one question mark, and the final close contains none. The passes flag and score must grade the FINAL corrected wording you return, not the original. List only issues that remain unresolved after your correction. If it cannot be fixed without inventing facts, mark it failed."
     };
@@ -4175,9 +4192,44 @@ fn narrates_internal_copy_logic(body: &str) -> bool {
         "the practical split is",
         "decision consequential",
         "i respect that work",
+        "company-attributed",
+        "source-attributed",
+        "account-attributed",
     ]
     .iter()
     .any(|marker| body.contains(marker))
+}
+
+fn wapahki_leads_with_generic_facility_fit(body: &str) -> bool {
+    let first_sentence = body
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .skip(1)
+        .collect::<Vec<_>>()
+        .join(" ")
+        .split(['.', '?', '!'])
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let generic_scale = [
+        "square foot",
+        "square-foot",
+        "square feet",
+        "sq ft",
+        "sq. ft",
+        "facility size",
+        "plant size",
+    ]
+    .iter()
+    .any(|marker| first_sentence.contains(marker));
+    let task_detail = [
+        "pack", "label", "pallet", "lift", "carry", "push", "pull", "load", "unload", "pick",
+        "place", "sort", "inspect", "weld", "machine", "tend",
+    ]
+    .iter()
+    .any(|marker| first_sentence.contains(marker));
+    generic_scale && !task_detail
 }
 
 /// A subject can be mechanically short and still be invisible in an inbox.
@@ -4537,6 +4589,47 @@ fn unconfirmed_subject_claim_issues(
     issues
 }
 
+fn unsupported_subject_number_issues(
+    account: &CopyAccount,
+    context: Option<&GtmActionContext>,
+    sequence: &CopySequence,
+) -> Vec<String> {
+    let evidence = context
+        .map(|context| {
+            context
+                .evidence_claims
+                .iter()
+                .filter(|claim| matches!(claim.status.as_str(), "observed" | "verified"))
+                .map(|claim| claim.source_excerpt.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|evidence| !evidence.trim().is_empty())
+        .unwrap_or_else(|| account.observed_facts.join(" "));
+    let evidence_numbers = evidence
+        .split(|character: char| !character.is_ascii_digit())
+        .filter(|number| !number.is_empty())
+        .collect::<HashSet<_>>();
+    let mut issues = Vec::new();
+    for touch in &sequence.touches {
+        for number in touch
+            .subject
+            .split(|character: char| !character.is_ascii_digit())
+            .filter(|number| !number.is_empty())
+        {
+            if !evidence_numbers.contains(number) {
+                issues.push(format!(
+                    "stage {} subject contains unsupported number `{number}`; use only an exact quantity present in active evidence",
+                    touch.stage
+                ));
+            }
+        }
+    }
+    issues.sort();
+    issues.dedup();
+    issues
+}
+
 #[allow(clippy::too_many_arguments)]
 fn account_sequence_quality_issues(
     pb: &Playbook,
@@ -4554,6 +4647,11 @@ fn account_sequence_quality_issues(
     issues.extend(source_attribution_issues(account, gtm_context, sequence));
     issues.extend(unconfirmed_subject_claim_issues(
         pb,
+        account,
+        gtm_context,
+        sequence,
+    ));
+    issues.extend(unsupported_subject_number_issues(
         account,
         gtm_context,
         sequence,
@@ -4644,9 +4742,9 @@ fn sequence_quality_issues(
                     ));
                 }
             }
-            if touch.subject.contains('?') || touch.subject.chars().any(|c| c.is_ascii_digit()) {
+            if touch.subject.contains('?') {
                 issues.push(format!(
-                    "stage {} subject must not be a question or contain a number",
+                    "stage {} subject must not be a question",
                     touch.stage
                 ));
             }
@@ -4801,6 +4899,15 @@ fn sequence_quality_issues(
                 "stage {} narrates the outreach logic instead of speaking naturally to the recipient",
                 touch.stage
             ));
+        }
+        if pb.key == "wapahki"
+            && touch.stage == 1
+            && wapahki_leads_with_generic_facility_fit(&touch.body)
+        {
+            issues.push(
+                "Wapahki stage 1 opens with generic facility scale rather than the sourced physical task; lead with the task or operating burden and omit irrelevant square footage"
+                    .into(),
+            );
         }
         let lint = lint_copy_touch(pb, shared, touch);
         if !lint.forbidden_hits.is_empty() {
@@ -5465,7 +5572,8 @@ mod tests {
         provisional_day_offset, select_people_for_planning, sequence_quality_issues,
         source_attribution_issues, supported_touch_count, supported_touch_count_for_brand,
         touch_question_limit, touch_word_band, unconfirmed_subject_claim_issues,
-        unsupported_account_task_noun_issues, wapahki_names_operating_consequence,
+        unsupported_account_task_noun_issues, unsupported_subject_number_issues,
+        wapahki_leads_with_generic_facility_fit, wapahki_names_operating_consequence,
         word_set_similarity, CopyAccount, CopySequence, CopyTouch, EditDoc, EditReview,
         PlanProgressRecipient, PlanProgressUpdate, TouchReview,
     };
@@ -5838,6 +5946,48 @@ mod tests {
     }
 
     #[test]
+    fn subject_only_feedback_preserves_an_already_good_body() {
+        let original_body = "Hi Anil,\n\nA sourced and useful operating note.\n\nAndrew";
+        let mut sequence = CopySequence {
+            touches: vec![CopyTouch {
+                stage: 1,
+                day_offset: 0,
+                channel: "email".into(),
+                subject: "Generic packaging topic".into(),
+                body: original_body.into(),
+                purpose: String::new(),
+                goal: String::new(),
+            }],
+            applied_principles: Vec::new(),
+        };
+        let doc = EditDoc {
+            sequence_passes: true,
+            sequence_score: 90,
+            sequence_issues: Vec::new(),
+            reviews: vec![EditReview {
+                stage: 1,
+                passes: true,
+                score: 90,
+                issues: Vec::new(),
+                revised_subject: "50-lb line-end handling".into(),
+                revised_body: String::new(),
+            }],
+        };
+        apply_targeted_repairs(
+            &mut sequence,
+            &doc,
+            &[
+                "sequence final-verifier feedback: the subject fails the inbox test".into(),
+                "stage 1 final-verifier feedback: subject is a generic category label".into(),
+            ],
+            1,
+        )
+        .expect("subject-only repair");
+        assert_eq!(sequence.touches[0].subject, "50-lb line-end handling");
+        assert_eq!(sequence.touches[0].body, original_body);
+    }
+
+    #[test]
     fn gnk_email_bands_leave_room_for_substance_without_a_dossier() {
         let playbooks = Playbooks::load("playbooks").expect("load playbooks");
         let pb = playbooks.get("gnk").expect("gnk playbook");
@@ -5918,6 +6068,19 @@ mod tests {
         ));
         assert!(narrates_internal_copy_logic(
             "The distinction I have in mind is detection versus response."
+        ));
+        assert!(narrates_internal_copy_logic(
+            "A company-attributed posting describes palletizing."
+        ));
+    }
+
+    #[test]
+    fn wapahki_opens_on_the_task_not_generic_facility_scale() {
+        assert!(wapahki_leads_with_generic_facility_fit(
+            "Hi Anil,\n\nNew World Friction lists a 140,000-square-foot Cambridge facility. A posting describes repetitive lifting.\n\nAndrew"
+        ));
+        assert!(!wapahki_leads_with_generic_facility_fit(
+            "Hi Anil,\n\nA Cambridge posting describes repetitive lifting up to 50 lb at line end.\n\nAndrew"
         ));
     }
 
@@ -6095,6 +6258,50 @@ mod tests {
             applied_principles: Vec::new(),
         };
         assert!(unconfirmed_subject_claim_issues(pb, &account, None, &safe).is_empty());
+    }
+
+    #[test]
+    fn subject_numbers_must_come_from_active_evidence() {
+        let account = CopyAccount {
+            name: "New World Friction".into(),
+            industry: "manufacturing".into(),
+            hq: "Cambridge, Ontario".into(),
+            observed_facts: vec!["The role handles materials up to 50 lb.".into()],
+            inferences: Vec::new(),
+            hypothesis: String::new(),
+            mechanism: String::new(),
+            consequence_metric: String::new(),
+            signals: Vec::new(),
+            system_concept: String::new(),
+            hard_buyer_question: String::new(),
+            kill_condition: String::new(),
+            magnitude_note: String::new(),
+            applied_principles: Vec::new(),
+        };
+        let sequence = |subject: &str| CopySequence {
+            touches: vec![CopyTouch {
+                stage: 1,
+                day_offset: 0,
+                channel: "email".into(),
+                subject: subject.into(),
+                body: "Hi Anil,\n\nA sourced operating question.\n\nAndrew".into(),
+                purpose: String::new(),
+                goal: String::new(),
+            }],
+            applied_principles: Vec::new(),
+        };
+        assert!(unsupported_subject_number_issues(
+            &account,
+            None,
+            &sequence("50-lb line-end work")
+        )
+        .is_empty());
+        assert!(!unsupported_subject_number_issues(
+            &account,
+            None,
+            &sequence("75-lb line-end work")
+        )
+        .is_empty());
     }
 
     #[test]

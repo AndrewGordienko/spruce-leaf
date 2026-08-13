@@ -64,7 +64,10 @@ use uuid::Uuid;
 // an evidence-linked opportunity. A company may belong to several portfolio
 // brands; copy is attributable to one facility/use case and one mapped buying
 // committee while only one cold thread is active at a time.
-pub const CURRENT_COPY_POLICY_VERSION: i64 = 32;
+// v33 makes atomic source attribution a deterministic sendability invariant,
+// treats the subject as a factual claim, and retires stale drafts as well as
+// stale schedules so an old reviewer score cannot masquerade as current copy.
+pub const CURRENT_COPY_POLICY_VERSION: i64 = 33;
 
 /// A real company sourced from Apollo and (optionally) qualified against a brand
 /// thesis. Everything the model *guesses* stays in the inference/hypothesis
@@ -1291,25 +1294,40 @@ impl Db {
             params![now()],
         )?;
         // A copy-policy cutover is an execution stop, not merely a dashboard
-        // filter. Preserve stale rows for audit while pausing any active
-        // sequence that still has unsent scheduled work.
+        // filter. Preserve stale rows for audit while pausing every old active
+        // sequence. Drafts must be retired too: leaving them active makes an
+        // obsolete reviewer score look current even when nothing was scheduled.
         conn.execute(
             "UPDATE sequences SET status='paused'
-             WHERE status='active' AND copy_policy_version<?1
-               AND EXISTS (
-                 SELECT 1 FROM touches t
-                 WHERE t.sequence_id=sequences.id AND t.status='scheduled'
-               )",
+             WHERE status='active' AND copy_policy_version<?1",
             params![CURRENT_COPY_POLICY_VERSION],
         )?;
         conn.execute(
             "UPDATE touches SET status='cancelled',
                     error='Cancelled by copy-policy cutover; regenerate from current evidence.'
-             WHERE status='scheduled' AND EXISTS (
+             WHERE status IN ('draft','scheduled') AND EXISTS (
                SELECT 1 FROM sequences s
                WHERE s.id=touches.sequence_id AND s.status='paused'
                  AND s.copy_policy_version<?1
              )",
+            params![CURRENT_COPY_POLICY_VERSION],
+        )?;
+        // A provider interruption could leave an old-policy checkpoint in
+        // `building` forever. It is neither a current draft nor useful active
+        // work, so terminate it explicitly while preserving its audit trail.
+        conn.execute(
+            "UPDATE touches SET status='blocked',review_passes=0,
+                    error='Abandoned by copy-policy cutover; regenerate from current evidence.'
+             WHERE status IN ('writing','reviewing') AND EXISTS (
+               SELECT 1 FROM sequences s
+               WHERE s.id=touches.sequence_id AND s.status='building'
+                 AND s.copy_policy_version<?1
+             )",
+            params![CURRENT_COPY_POLICY_VERSION],
+        )?;
+        conn.execute(
+            "UPDATE sequences SET status='rejected'
+             WHERE status='building' AND copy_policy_version<?1",
             params![CURRENT_COPY_POLICY_VERSION],
         )?;
         // Databases predating opportunity-level thread enforcement may contain
@@ -9425,7 +9443,7 @@ mod tests {
     }
 
     #[test]
-    fn reopening_database_pauses_scheduled_sequences_from_an_old_copy_policy() {
+    fn reopening_database_pauses_all_sequences_from_an_old_copy_policy() {
         let path = std::env::temp_dir().join(format!(
             "spruce-copy-cutover-test-{}.sqlite",
             Uuid::new_v4()
@@ -9453,6 +9471,50 @@ mod tests {
             ..Default::default()
         })
         .expect("create scheduled touch");
+        let draft_sequence_id = db
+            .create_sequence(&Sequence {
+                id: "stale-policy-draft-sequence".into(),
+                person_id: "stale-policy-draft-person".into(),
+                lead_id: "stale-policy-draft-lead".into(),
+                brand: "wapahki".into(),
+                copy_policy_version: CURRENT_COPY_POLICY_VERSION - 1,
+                status: "active".into(),
+                ..Default::default()
+            })
+            .expect("create stale draft sequence");
+        db.insert_touch(&Touch {
+            id: "stale-policy-draft-touch".into(),
+            sequence_id: draft_sequence_id.clone(),
+            person_id: "stale-policy-draft-person".into(),
+            lead_id: "stale-policy-draft-lead".into(),
+            brand: "wapahki".into(),
+            stage: 1,
+            status: "draft".into(),
+            ..Default::default()
+        })
+        .expect("create draft touch");
+        let building_sequence_id = db
+            .create_sequence(&Sequence {
+                id: "stale-policy-building-sequence".into(),
+                person_id: "stale-policy-building-person".into(),
+                lead_id: "stale-policy-building-lead".into(),
+                brand: "outagehub".into(),
+                copy_policy_version: CURRENT_COPY_POLICY_VERSION - 1,
+                status: "building".into(),
+                ..Default::default()
+            })
+            .expect("create stale building sequence");
+        db.insert_touch(&Touch {
+            id: "stale-policy-building-touch".into(),
+            sequence_id: building_sequence_id.clone(),
+            person_id: "stale-policy-building-person".into(),
+            lead_id: "stale-policy-building-lead".into(),
+            brand: "outagehub".into(),
+            stage: 1,
+            status: "reviewing".into(),
+            ..Default::default()
+        })
+        .expect("create reviewing touch");
         drop(db);
 
         let reopened = Db::open(&path).expect("reopen temp db");
@@ -9465,6 +9527,24 @@ mod tests {
             .list_touches_for_sequence(&sequence_id)
             .expect("touch query");
         assert_eq!(touches[0].status, "cancelled");
+        let draft_sequence = reopened
+            .sequence_gtm_attribution(&draft_sequence_id)
+            .expect("draft sequence query")
+            .expect("stale draft sequence");
+        assert_eq!(draft_sequence.status, "paused");
+        let draft_touches = reopened
+            .list_touches_for_sequence(&draft_sequence_id)
+            .expect("draft touch query");
+        assert_eq!(draft_touches[0].status, "cancelled");
+        let building_sequence = reopened
+            .sequence_gtm_attribution(&building_sequence_id)
+            .expect("building sequence query")
+            .expect("stale building sequence");
+        assert_eq!(building_sequence.status, "rejected");
+        let building_touches = reopened
+            .list_touches_for_sequence(&building_sequence_id)
+            .expect("building touch query");
+        assert_eq!(building_touches[0].status, "blocked");
         drop(reopened);
         remove_temp_db(&path);
     }
