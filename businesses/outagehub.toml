@@ -56,7 +56,7 @@ lane = "cash_now"
 description = "A CAD $10,000 non-equity sponsorship toward the team time and infrastructure required to keep the already-operating OutageHub map and API online and improve coverage."
 price_min_cents = 1000000
 price_max_cents = 1000000
-payment_structure = "CAD $10,000 invoiced under a one-page sponsorship agreement with 12 months of founding-sponsor recognition; payment timing remains subject to buyer confirmation."
+payment_structure = "CAD $10,000 invoiced under a one-page sponsorship agreement; the recognition period and payment timing remain subject to buyer confirmation."
 estimate_confidence = "hypothesis"
 estimate_basis = [
   "Founder-selected initial sponsorship ask of CAD $10,000; not yet validated by a recorded buyer payment.",
@@ -257,7 +257,7 @@ dynamic_metrics = [
   "Never hard-code an old metric into sponsorship copy.",
 ]
 founder_reported_conversations = [
-  "Andrew has discussed OutageHub with people in government.",
+  "Andrew has discussed OutageHub with federal and regional government representatives.",
   "Andrew has discussed OutageHub with Electricity Canada.",
   "Electricity Canada conversations included concerns about fair and accurate representation of utility data, and OutageHub made changes in response.",
   "Andrew has discussed OutageHub and its data with news organizations.",
@@ -270,25 +270,24 @@ conversation_claim_rules = [
   "Do not name an individual or describe their reaction unless the CRM contains notes supporting the claim.",
 ]
 sponsorship_need = """
-OutageHub is seeking one paid CAD $10,000 founding sponsorship toward the team
-time and infrastructure required to keep its provider ingestion, normalization,
-database, public map, and API operating and improve coverage. The team funded
-the past year of development themselves. The writer must not frame this as
-merely a server bill, repayment for prior work, generic runway, or funding for an
-unbuilt idea. Do not invent how long the money funds operations or a cost
-breakdown. Twelve months describes the recognition benefit, not operating runway.
+OutageHub is seeking one paid CAD $10,000 founding sponsorship to provide
+short-term runway for servers and continued development while the team works to
+close its first customers. The team funded the past year of development
+themselves. The writer must not frame this as repayment for prior work or funding
+for an unbuilt idea. Do not invent how many months the sponsorship funds or a
+cost breakdown.
 """
 public_interest_case = [
   "Canadian outage information is published through many inconsistent provider systems.",
+  "OutageHub's goal is to make Canada safer by reducing blind spots created by fragmented utility reporting.",
   "Maintaining a normalized view makes the information more accessible to operators, researchers, journalists, public-interest organizations, and companies with outage-sensitive locations.",
   "Provider-level completeness reporting creates visibility into what data exists and what remains unavailable.",
   "The sponsorship preserves an already operating Canadian data resource.",
 ]
 permitted_sponsor_benefits = [
-  "Recognition as a founding sponsor for 12 months on an agreed website or report location.",
+  "Recognition as a founding sponsor on an agreed website or report location.",
   "Authenticated OutageHub API access under an agreed usage allowance.",
   "Quarterly briefings on Canadian outage-data coverage and completeness.",
-  "Inclusion in the eventual annual OutageHub impact report.",
 ]
 sponsor_independence = [
   "A sponsor cannot control outage records, completeness scores, provider treatment, or published conclusions.",
@@ -306,14 +305,16 @@ prohibited_claims = [
   "Do not use vague claims such as 'revolutionizing critical infrastructure.'",
 ]
 email_structure = [
-  "Open with one human sentence: Andrew is a U of T student who spent the past year building OutageHub with a few friends.",
-  "Explain in one sentence what is already operating.",
-  "State that the team funded development themselves so far without sounding helpless.",
-  "State the CAD $10,000 sponsorship request directly.",
-  "Explain that it supports team time and infrastructure needed to keep OutageHub operating and improve coverage.",
-  "Give one exact source-backed sentence connecting the recipient's company to outage resilience.",
-  "Name 12-month recognition, API access, quarterly coverage/data-quality briefings, eventual annual impact-report inclusion, and the independence boundary.",
-  "Ask whether this can fit the recipient's partnerships, community-investment, or innovation budget and, within the same question, request routing if someone else owns it.",
+  "Use a personal Hi [First name] greeting. Only named people with verified direct emails are eligible.",
+  "Open with Andrew as a U of T student and say that over the past year a few friends and he built OutageHub, a live platform bringing Canadian utilities' public outage reports into one map and API.",
+  "State that the goal is to make Canada safer by reducing blind spots created by fragmented utility reporting.",
+  "Say the friends funded development themselves and that conversations with federal and regional government representatives, Electricity Canada, news organizations, and others helped refine the platform. Never imply endorsement.",
+  "Say the team is actively working to close its first customers and is seeking short-term support to keep the service online while it does.",
+  "Give one exact source-backed paragraph connecting the recipient company to OutageHub or its sponsorship route.",
+  "State that a $10,000 founding sponsorship provides runway for servers and continued development.",
+  "Offer founding-sponsor recognition, API access, and quarterly coverage briefings. Where relevant, offer to explore a concrete way OutageHub could support or work with the company.",
+  "End with one natural question asking for a short discussion or the most appropriate evidenced next step.",
+  "Close with Thanks, Andrew Gordienko, Founder, OutageHub, and https://outagehub.ca.",
 ]
 voice = [
   "Founder-written, ordinary language, concise and specific.",
@@ -325,8 +326,8 @@ voice = [
   "Do not write a seven-touch sales sequence.",
   "One initial email and one evidence-adding follow-up only.",
 ]
-min_words = 125
-max_words = 190
+min_words = 175
+max_words = 220
 default_touches = 2
 doctrine = """
 This is a commercial founding sponsorship, not a grant request, donation,
@@ -339,18 +340,19 @@ marketing director, or partnerships lead can plausibly approve or route the ask
 quickly. Hold government, major utilities, and large corporations for later.
 Lead with Andrew's human founder story, explain what is already operating and
 that the team funded the past year themselves, use one exact source-backed reason
-the organization is relevant, and state CAD $10,000 directly. Include the
-configured sponsor benefits and independence boundary. Ask exactly one direct
-budget-or-routing question. Never invent a budget, operating runway,
-infrastructure-cost breakdown, dynamic metric, endorsement, partnership, user,
-customer, SLA, or private site status. Use one active cold contact per
-organization and keep every draft manual until reviewed.
+the organization is relevant, and state CAD $10,000 directly. Use the approved
+founder template as the campaign skeleton while keeping the company connection
+specific. Ask exactly one natural discussion-or-next-step question. Never invent
+a budget, operating period, infrastructure-cost breakdown, dynamic metric,
+endorsement, partnership, user, customer, SLA, or private site status. Only a
+named person with a verified direct email may receive a draft. Use one active
+cold contact per organization and keep every draft manual until reviewed.
 """
 
 [[sponsorship.routes]]
 recipient_kind = "commercial_sponsor"
-action = "Ask directly whether CAD $10,000 can fit a partnerships, community-investment, or innovation budget; if another person owns it, ask for routing in the same question."
-target_roles = ["Founder", "Co-Founder", "Owner", "CEO", "Chief Executive Officer", "President", "Executive Offices", "General Manager", "COO", "Chief Operating Officer", "Managing Partner", "Chief of Staff", "Marketing", "Marketing Director", "Director of Marketing", "Head of Marketing", "Brand Marketing Manager", "Marketing Manager", "Partnerships", "Corporate Partnerships", "Business Development", "Community Investment", "Community Relations", "Innovation", "Infrastructure Resilience", "Data Partnerships", "Corporate Affairs", "Communications", "Public Relations", "PR Contact"]
+action = "Ask the named person directly whether they would be open to a short sponsorship discussion or, when a sourced sponsorship form exists, whether that form is the best next step."
+target_roles = ["Founder", "Co-Founder", "Owner", "CEO", "Chief Executive Officer", "President", "Executive Offices", "General Manager", "COO", "Chief Operating Officer", "CFO", "Chief Financial Officer", "Managing Partner", "Chief of Staff", "Marketing", "Marketing Director", "Director of Marketing", "Head of Marketing", "Brand Marketing Manager", "Marketing Manager", "Partnerships", "Corporate Partnerships", "Business Development", "Community Investment", "Community Relations", "Innovation", "Strategy", "Head of Strategy", "Infrastructure Resilience", "Data Partnerships", "Corporate Affairs", "Communications", "Public Relations", "PR Contact"]
 budget_evidence_terms = ["sponsorship", "sponsor", "platinum partner", "silver partner", "corporate partner", "community investment", "community support", "support the local community", "regularly support local", "charitable contribution", "support for local events", "innovation fund", "innovation program", "resilience budget", "data partnership", "corporate affairs", "marketing budget", "grant money"]
 
 [[sponsorship.routes]]

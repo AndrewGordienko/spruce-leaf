@@ -22,7 +22,7 @@ use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
@@ -4873,6 +4873,29 @@ impl Db {
             "UPDATE opportunity_contacts SET status=?2,updated_at=?3 WHERE id=?1",
             params![id, status, now()],
         )?;
+        Ok(())
+    }
+
+    pub fn set_primary_opportunity_contact(
+        &self,
+        opportunity_id: &str,
+        contact_id: &str,
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let belongs: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM opportunity_contacts WHERE id=?1 AND opportunity_id=?2)",
+            params![contact_id, opportunity_id],
+            |row| row.get(0),
+        )?;
+        if !belongs {
+            bail!("contact does not belong to sponsorship opportunity");
+        }
+        tx.execute(
+            "UPDATE opportunity_contacts SET primary_contact=(id=?2),updated_at=?3 WHERE opportunity_id=?1",
+            params![opportunity_id, contact_id, now()],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
