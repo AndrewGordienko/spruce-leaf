@@ -350,8 +350,8 @@ organization and keep every draft manual until reviewed.
 [[sponsorship.routes]]
 recipient_kind = "commercial_sponsor"
 action = "Ask directly whether CAD $10,000 can fit a partnerships, community-investment, or innovation budget; if another person owns it, ask for routing in the same question."
-target_roles = ["Founder", "Owner", "CEO", "Chief Executive Officer", "President", "Chief of Staff", "Marketing", "Marketing Director", "Director of Marketing", "Head of Marketing", "Brand Marketing Manager", "Marketing Manager", "Partnerships", "Corporate Partnerships", "Community Investment", "Community Relations", "Innovation", "Infrastructure Resilience", "Data Partnerships", "Corporate Affairs", "Communications"]
-budget_evidence_terms = ["sponsorship", "sponsor", "community investment", "community support", "charitable contribution", "support for local events", "innovation fund", "innovation program", "resilience budget", "data partnership", "corporate affairs", "marketing budget", "grant money"]
+target_roles = ["Founder", "Co-Founder", "Owner", "CEO", "Chief Executive Officer", "President", "General Manager", "Chief Operating Officer", "Chief of Staff", "Marketing", "Marketing Director", "Director of Marketing", "Head of Marketing", "Brand Marketing Manager", "Marketing Manager", "Partnerships", "Corporate Partnerships", "Business Development", "Community Investment", "Community Relations", "Innovation", "Infrastructure Resilience", "Data Partnerships", "Corporate Affairs", "Communications", "Public Relations", "PR Contact"]
+budget_evidence_terms = ["sponsorship", "sponsor", "platinum partner", "silver partner", "corporate partner", "community investment", "community support", "charitable contribution", "support for local events", "innovation fund", "innovation program", "resilience budget", "data partnership", "corporate affairs", "marketing budget", "grant money"]
 
 [[sponsorship.routes]]
 recipient_kind = "electricity_canada_or_industry_association"
@@ -374,5 +374,5 @@ budget_evidence_terms = ["data licensing", "commercial data", "data partnership"
 [[sponsorship.routes]]
 recipient_kind = "cloud_or_infrastructure_vendor"
 action = "Ask directly whether the paid CAD $10,000 founding sponsorship can fit a partnerships, community-investment, or innovation budget; if another person owns it, ask for routing in the same question."
-target_roles = ["Founder", "Owner", "CEO", "Chief Executive Officer", "President", "Chief of Staff", "Marketing", "Marketing Director", "Director of Marketing", "Head of Marketing", "Brand Marketing Manager", "Marketing Manager", "Partnerships", "Cloud Partnerships", "Community", "Sponsorship", "Innovation", "Communications"]
-budget_evidence_terms = ["sponsorship", "sponsor", "community investment", "community support", "innovation program", "marketing budget", "joint marketing", "mdf"]
+target_roles = ["Founder", "Co-Founder", "Owner", "CEO", "Chief Executive Officer", "President", "General Manager", "Chief Operating Officer", "Chief of Staff", "Marketing", "Marketing Director", "Director of Marketing", "Head of Marketing", "Brand Marketing Manager", "Marketing Manager", "Partnerships", "Cloud Partnerships", "Business Development", "Community", "Sponsorship", "Innovation", "Communications", "Public Relations", "PR Contact"]
+budget_evidence_terms = ["sponsorship", "sponsor", "platinum partner", "silver partner", "corporate partner", "community investment", "community support", "innovation program", "marketing budget", "joint marketing", "mdf"]

@@ -1486,8 +1486,10 @@ async fn import_one_sponsorship_candidate(
         }
         let contact_email_domain =
             normalize_domain(row.contact.email.split('@').nth(1).unwrap_or_default());
-        if contact_email_domain != domain {
-            bail!("published contact email must use the organization's domain");
+        if !email_source_is_first_party && contact_email_domain != domain {
+            bail!(
+                "third-party published contact email must use the organization's canonical domain"
+            );
         }
         let mailbox = row
             .contact
@@ -1506,9 +1508,16 @@ async fn import_one_sponsorship_candidate(
             "marketing",
             "partnerships",
             "community",
+            "donations",
+            "media",
             "office",
             "admin",
             "executiveassistant",
+            "ontario",
+            "east",
+            "west",
+            "tantalusinfo",
+            "hay",
         ]
         .contains(&mailbox.as_str());
         (
@@ -1560,7 +1569,7 @@ async fn import_one_sponsorship_candidate(
         funder: row.organization.clone(),
         funder_domain: domain,
         summary: format!(
-            "{} has verified first-party relevance and budget/program evidence for the '{}' route.",
+            "{} has verified first-party relevance and independently published budget/program evidence for the '{}' route.",
             row.organization, route.recipient_kind
         ),
         geography: row.geography.clone(),
@@ -1596,7 +1605,7 @@ async fn import_one_sponsorship_candidate(
         fit_status: "strong_fit".into(),
         fit_reasons: vec![
             "Named organization.".into(),
-            "Exact first-party budget/program evidence re-fetched and matched.".into(),
+            "Exact independently published budget/program evidence re-fetched and matched.".into(),
             format!("Named verified person with a route-matched title; contact route: {contact_source}."),
             "Exact first-party reason OutageHub matters re-fetched and matched.".into(),
             format!("Configured recipient type: {}.", route.recipient_kind),
