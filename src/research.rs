@@ -38,6 +38,17 @@ pub struct CompanyBrief {
     pub why: String,
     #[serde(default)]
     pub sources: Vec<String>,
+    /// Deterministically extracted from the exact fetched source page. This is
+    /// not model output and is used only to bind a physical task to the same
+    /// page's Ontario location.
+    #[serde(skip)]
+    pub source_locations: Vec<SourceLocation>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SourceLocation {
+    pub source_url: String,
+    pub city: String,
 }
 
 impl CompanyBrief {
@@ -527,6 +538,7 @@ pub async fn research_company(
         return Some(brief_with_outage_evidence(outage_evidence));
     }
     let corpus = limit_chars(&corpus, MAX_CORPUS_CHARS);
+    let source_locations = source_locations_from_corpus(&corpus);
 
     let system = "You are a research analyst. You read a real company's website and hiring text and \
         extract only what it supports — never invent customers, metrics, dollar figures, or \
@@ -570,6 +582,7 @@ pub async fn research_company(
     {
         Ok(mut brief) => {
             brief.sources = sources;
+            brief.source_locations = source_locations;
             add_outage_evidence(&mut brief, outage_evidence);
             if brief.is_empty() {
                 None
@@ -579,6 +592,34 @@ pub async fn research_company(
         }
         Err(_) => None,
     }
+}
+
+fn source_locations_from_corpus(corpus: &str) -> Vec<SourceLocation> {
+    let mut locations = Vec::new();
+    for source in corpus.split("SOURCE URL: ").skip(1) {
+        let Some((url, body)) = source.split_once('\n') else {
+            continue;
+        };
+        let url = url.trim();
+        if url.is_empty() {
+            continue;
+        }
+        let body = body.split("SOURCE URL: ").next().unwrap_or(body);
+        let Some(city) = crate::db::ontario_site_from_text(body) else {
+            continue;
+        };
+        if locations.iter().any(|location: &SourceLocation| {
+            location.source_url.trim_end_matches('/') == url.trim_end_matches('/')
+                && location.city == city
+        }) {
+            continue;
+        }
+        locations.push(SourceLocation {
+            source_url: url.to_string(),
+            city: city.to_string(),
+        });
+    }
+    locations
 }
 
 fn brief_with_outage_evidence(evidence: Vec<String>) -> CompanyBrief {
@@ -1436,9 +1477,21 @@ mod tests {
         compact_page_text, company_mentioned, job_evidence_window, job_location_priority,
         job_page_has_task_evidence, linked_job_page_credible, ranked_internal_links,
         relevant_internal_links, relevant_job_links, research_page_usable,
-        research_seed_urls_from_json, role_search_queries, search_result_urls, trusted_ats_host,
-        trusted_job_mirror_host, CompanyBrief,
+        research_seed_urls_from_json, role_search_queries, search_result_urls,
+        source_locations_from_corpus, trusted_ats_host, trusted_job_mirror_host, CompanyBrief,
     };
+
+    #[test]
+    fn source_locations_require_ontario_on_the_exact_page() {
+        let corpus = "FIRST PAGE\nSOURCE URL: https://jobs.example.com/cambridge\nTitle: Operator - Cambridge, ON\nPackages cases.\n\nSECOND PAGE\nSOURCE URL: https://jobs.example.com/london\nTitle: Operator - London, UK\nPalletizes cases.";
+        let locations = source_locations_from_corpus(corpus);
+        assert_eq!(locations.len(), 1);
+        assert_eq!(
+            locations[0].source_url,
+            "https://jobs.example.com/cambridge"
+        );
+        assert_eq!(locations[0].city, "Cambridge");
+    }
 
     #[test]
     fn compacts_repeated_reader_chrome_without_losing_operating_facts() {

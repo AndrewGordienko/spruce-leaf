@@ -1216,7 +1216,7 @@ async fn qualify_candidate(
             ..Default::default()
         })
     } else {
-        let (research_block, research_sources) = match researcher {
+        let (research_block, research_sources, source_locations) = match researcher {
             Some(researcher) => {
                 match research::research_company(client, researcher, pb, &org, thesis).await {
                     Some(brief) => {
@@ -1225,12 +1225,16 @@ async fn qualify_candidate(
                             org.name,
                             compact_list(&brief.sources, 8)
                         ));
-                        (brief.as_facts_block(), brief.sources)
+                        (
+                            brief.as_facts_block(),
+                            brief.sources,
+                            brief.source_locations,
+                        )
                     }
-                    None => (String::new(), Vec::new()),
+                    None => (String::new(), Vec::new(), Vec::new()),
                 }
             }
-            None => (String::new(), Vec::new()),
+            None => (String::new(), Vec::new(), Vec::new()),
         };
         let mut qualification = qualify_org(
             client,
@@ -1246,6 +1250,7 @@ async fn qualify_candidate(
         .await;
         if let Ok(value) = &mut qualification {
             value.research_sources = research_sources;
+            bind_wapahki_task_locations(&pb.key, &mut value.structured_signals, &source_locations);
         }
         qualification
     };
@@ -1312,6 +1317,8 @@ fn enforce_play_qualification(
         &qualification.structured_signals,
         &play.required_signal_keys,
     );
+    let facility_foundation =
+        source_bound_facility_present(&play.brand, &qualification.structured_signals);
     let minimum = play.minimum_signal_matches.max(1) as usize;
     let fully_supported = required_matches >= minimum
         && independent_lineages >= 2
@@ -1322,11 +1329,13 @@ fn enforce_play_qualification(
         // consequence may come from separate facts. Preserve the higher fit
         // floor so weakly connected foundations remain discovery-ready.
         && qualification.play_fit_score >= 65
+        && facility_foundation
         && qualification.disqualifiers.is_empty();
     let has_account_fit = matched.iter().any(|key| key == "account.fit_evidence");
     let has_source_backed_fit = has_account_fit || !qualification.observed_facts.is_empty();
     let discovery_candidate = has_source_backed_fit
         && qualification_discovery_foundations_present(&play.brand, &matched)
+        && facility_foundation
         && qualification.play_fit_score >= 45
         && qualification.disqualifiers.is_empty();
     let hard_research_candidate = has_account_fit
@@ -1389,6 +1398,32 @@ fn enforce_play_qualification(
             reasons.push("no source-backed account-fit evidence".into());
         }
         qualification.reject_reason = reasons.join("; ");
+    }
+}
+
+fn bind_wapahki_task_locations(
+    brand: &str,
+    signals: &mut [SignalCandidate],
+    source_locations: &[research::SourceLocation],
+) {
+    if !brand.eq_ignore_ascii_case("wapahki") {
+        return;
+    }
+    for signal in signals.iter_mut().filter(|signal| {
+        signal.definition_key == "account.bounded_repetitive_task"
+            && crate::db::ontario_site_from_text(&signal.evidence).is_none()
+    }) {
+        let source_url = signal.source_url.trim().trim_end_matches('/');
+        let Some(location) = source_locations.iter().find(|location| {
+            !source_url.is_empty() && location.source_url.trim().trim_end_matches('/') == source_url
+        }) else {
+            continue;
+        };
+        signal.evidence = format!(
+            "{} The same source locates this role or task in {}, Ontario.",
+            signal.evidence.trim_end_matches('.'),
+            location.city
+        );
     }
 }
 
@@ -1849,6 +1884,8 @@ fn enforce_refresh_qualification(
         .count();
     let independent_lineages =
         independent_source_lineages(&refresh.structured_signals, &play.required_signal_keys);
+    let facility_foundation =
+        source_bound_facility_present(&play.brand, &refresh.structured_signals);
     let minimum = play.minimum_signal_matches.max(1) as usize;
     let fully_supported = required_matches >= minimum
         && independent_lineages >= 2
@@ -1856,11 +1893,13 @@ fn enforce_refresh_qualification(
         && !refresh.root_cause.trim().is_empty()
         && !refresh.proof_fit.trim().is_empty()
         && refresh.play_fit_score >= 65
+        && facility_foundation
         && refresh.disqualifiers.is_empty();
     let has_source_backed_fit = matched.iter().any(|key| key == "account.fit_evidence")
         || !refresh.observed_facts.is_empty();
     let discovery_candidate = has_source_backed_fit
         && qualification_discovery_foundations_present(&play.brand, &matched)
+        && facility_foundation
         && refresh.play_fit_score >= 45
         && refresh.disqualifiers.is_empty();
     let hard_research_candidate = matched.iter().any(|key| key == "account.fit_evidence")
@@ -1883,6 +1922,14 @@ fn enforce_refresh_qualification(
     } else {
         "rejected".into()
     }
+}
+
+fn source_bound_facility_present(brand: &str, signals: &[SignalCandidate]) -> bool {
+    !brand.eq_ignore_ascii_case("wapahki")
+        || signals.iter().any(|signal| {
+            signal.definition_key == "account.bounded_repetitive_task"
+                && crate::db::ontario_site_from_text(&signal.evidence).is_some()
+        })
 }
 
 /// A refresh is a reassessment, not permission for the model to erase
@@ -2869,6 +2916,9 @@ async fn qualify_org(
          one-line reject_reason. Preserve the readable `signals` list, and also map every supported \
          observation you can to `structured_signals` using the canonical catalog. Every canonical \
          signal needs its own direct Apollo or first-party website evidence and source_url. Full \
+         For a Wapahki bounded-task signal, include the city and province in that signal's evidence \
+         when and only when the exact same source page states them; never borrow a location from a \
+         separate company page. \
          qualification requires at least two independent source documents; repeating one page under \
          several signal labels never satisfies that boundary. A technology name, broad \
          product range, company scale, or the existence of several portals does not by itself prove \
@@ -4143,7 +4193,7 @@ pub async fn refresh_lead_context(
         let thesis = thesis.to_string();
         let gtm_play_context = gtm_play_context.clone();
         async move {
-            let website_research = match researcher_ref {
+            let (website_research, source_locations) = match researcher_ref {
                 Some(researcher) => {
                     let org = ApolloOrg {
                         id: lead.apollo_org_id.clone(),
@@ -4155,12 +4205,12 @@ pub async fn refresh_lead_context(
                         annual_revenue_printed: lead.revenue.clone(),
                         ..Default::default()
                     };
-                    research::research_company(client, researcher, pb, &org, &thesis)
-                        .await
-                        .map(|brief| brief.as_facts_block())
-                        .unwrap_or_default()
+                    match research::research_company(client, researcher, pb, &org, &thesis).await {
+                        Some(brief) => (brief.as_facts_block(), brief.source_locations),
+                        None => (String::new(), Vec::new()),
+                    }
                 }
-                None => String::new(),
+                None => (String::new(), Vec::new()),
             };
             let refresh = refresh_one_lead(
                 client,
@@ -4174,7 +4224,7 @@ pub async fn refresh_lead_context(
                 &knowledge,
             )
             .await;
-            (lead, refresh)
+            (lead, refresh, source_locations)
         }
     }))
     .buffered(concurrency)
@@ -4182,10 +4232,15 @@ pub async fn refresh_lead_context(
     .await;
 
     let mut refreshed = 0usize;
-    for (mut lead, result) in results {
+    for (mut lead, result, source_locations) in results {
         match result {
             Ok(mut doc) => {
                 merge_prior_refresh_evidence(&lead, &mut doc);
+                bind_wapahki_task_locations(
+                    &pb.key,
+                    &mut doc.structured_signals,
+                    &source_locations,
+                );
                 let routing_status = enforce_refresh_qualification(
                     &mut doc,
                     active_play.as_ref(),
@@ -4301,6 +4356,9 @@ async fn refresh_one_lead(
          Do not promote an old inference into concrete copy merely because it sounds plausible. \
          why_this_company: one plain sentence a founder could say out loud. Preserve \
          readable `signals` and map supported evidence to `structured_signals` using only the catalog. \
+         For a Wapahki bounded-task signal, include the city and province in that signal's evidence \
+         when and only when the exact same source page states them; never borrow a location from a \
+         separate company page. \
          Every structured signal's evidence must quote or closely paraphrase a prior_observed_fact; \
          prior_inferences, prior_hypothesis, prior_signals, technology lists, and generic company breadth \
          cannot independently prove a manual workflow, cross-system reconciliation, pain, consequence, \
@@ -4404,17 +4462,45 @@ mod tests {
 
     use super::{
         apply_brand_icp_guard, augment_gnk_signals, augment_outage_signals,
-        augment_wapahki_signals, brand_candidate_precheck, brand_qualification_guard,
-        clamp_employee_ranges, committee_role_for_title, committee_title_groups,
-        company_identity_keys, credible_canonical_signal, enforce_play_qualification,
-        enforce_refresh_qualification, may_revisit_owned_account, merge_prior_refresh_evidence,
-        portfolio_orgs_for_exact_domains, preferred_contact_locations,
-        qualification_skip_keys_for_run, reusable_workflow_contact, reuse_lead_score,
-        reuse_person_score, reuse_portfolio_people, select_reuse_excluding,
+        augment_wapahki_signals, bind_wapahki_task_locations, brand_candidate_precheck,
+        brand_qualification_guard, clamp_employee_ranges, committee_role_for_title,
+        committee_title_groups, company_identity_keys, credible_canonical_signal,
+        enforce_play_qualification, enforce_refresh_qualification, may_revisit_owned_account,
+        merge_prior_refresh_evidence, portfolio_orgs_for_exact_domains,
+        preferred_contact_locations, qualification_skip_keys_for_run, reusable_workflow_contact,
+        reuse_lead_score, reuse_person_score, reuse_portfolio_people, select_reuse_excluding,
         source_candidate_target, Icp, LeadRefresh, OrgQual,
     };
     use crate::apollo::ApolloOrg;
     use crate::db::{AccountPlayAssessment, Db, Lead, Person};
+    use crate::gtm::SignalCandidate;
+    use crate::research::SourceLocation;
+
+    #[test]
+    fn wapahki_task_location_is_bound_only_from_the_same_fetched_page() {
+        let mut signals = vec![SignalCandidate {
+            definition_key: "account.bounded_repetitive_task".into(),
+            evidence: "The operator packages, labels, and palletizes finished products.".into(),
+            source_url: "https://jobs.example.com/line-end".into(),
+            confidence: 0.9,
+        }];
+        bind_wapahki_task_locations(
+            "wapahki",
+            &mut signals,
+            &[
+                SourceLocation {
+                    source_url: "https://example.com/facility".into(),
+                    city: "Toronto".into(),
+                },
+                SourceLocation {
+                    source_url: "https://jobs.example.com/line-end/".into(),
+                    city: "Cambridge".into(),
+                },
+            ],
+        );
+        assert!(signals[0].evidence.contains("Cambridge, Ontario"));
+        assert!(!signals[0].evidence.contains("Toronto"));
+    }
 
     #[test]
     fn committee_mapping_has_six_distinct_commercial_roles() {
@@ -4832,7 +4918,7 @@ mod tests {
             "After a loss-of-power alarm, operators decide whether to dispatch maintenance or hold the response when a utility outage is reported."
         ));
     }
-    use crate::gtm::{default_plays, SignalCandidate};
+    use crate::gtm::default_plays;
     use crate::playbook::Playbooks;
 
     #[test]
@@ -5259,7 +5345,7 @@ mod tests {
             ),
             (
                 "account.bounded_repetitive_task",
-                "Each production run moves sealed cases from the packing conveyor to pallets.",
+                "At the Toronto, Ontario plant, each production run moves sealed cases from the packing conveyor to pallets.",
             ),
         ]
         .into_iter()
@@ -5294,6 +5380,51 @@ mod tests {
     }
 
     #[test]
+    fn wapahki_account_classifier_cannot_outrank_the_facility_gate() {
+        let play = default_plays()
+            .into_iter()
+            .find(|play| play.brand == "wapahki")
+            .expect("wapahki play");
+        let allowed = play
+            .required_signal_keys
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
+        let mut qualification = OrgQual {
+            qualified: true,
+            play_fit_score: 82,
+            structured_signals: vec![
+                SignalCandidate {
+                    definition_key: "account.fit_evidence".into(),
+                    evidence: "The company manufactures packaged food in Ontario.".into(),
+                    source_url: "https://example.com/company".into(),
+                    confidence: 0.9,
+                },
+                SignalCandidate {
+                    definition_key: "account.bounded_repetitive_task".into(),
+                    evidence: "Operators palletize finished cases each production run.".into(),
+                    source_url: "https://example.com/jobs/operator".into(),
+                    confidence: 0.9,
+                },
+                SignalCandidate {
+                    definition_key: "account.manual_task_economic_pressure".into(),
+                    evidence: "The role repeatedly lifts finished cases weighing 20 kg.".into(),
+                    source_url: "https://example.com/jobs/operator".into(),
+                    confidence: 0.9,
+                },
+            ],
+            root_cause: "A stable physical normal case may remain manual.".into(),
+            proof_fit: "Review a representative run and exception set.".into(),
+            ..Default::default()
+        };
+
+        enforce_play_qualification(&mut qualification, Some(&play), &allowed);
+
+        assert!(!qualification.qualified);
+        assert_eq!(qualification.routing_status, "research_required");
+    }
+
+    #[test]
     fn one_source_page_cannot_masquerade_as_independent_qualification_evidence() {
         let play = default_plays()
             .into_iter()
@@ -5317,7 +5448,8 @@ mod tests {
                 },
                 SignalCandidate {
                     definition_key: "account.bounded_repetitive_task".into(),
-                    evidence: "The page names a recurring transfer station.".into(),
+                    evidence: "The Toronto, Ontario page names a recurring transfer station."
+                        .into(),
                     source_url: same_page.into(),
                     confidence: 0.9,
                 },

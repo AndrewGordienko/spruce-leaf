@@ -427,7 +427,8 @@ pub struct Facility {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SalesOpportunity {
     pub id: String,
-    /// Stable company + facility + play + task identity. Unlike the display
+    /// Stable company + facility + task identity. A play-policy version is
+    /// attribution, not a new commercial opportunity. Unlike the display
     /// title, this must not change when copy or explanatory prose is refined.
     pub identity_key: String,
     /// Stable identity of the task/decision within its facility or account.
@@ -1075,7 +1076,13 @@ impl Db {
                 .current_gtm_play(&assessment.brand)?
                 .is_some_and(|play| play.id == assessment.play_id);
             if is_current {
-                self.materialize_sales_opportunity(&assessment)?;
+                self.materialize_sales_opportunity(&assessment)
+                    .with_context(|| {
+                        format!(
+                            "materializing current {} opportunity for lead {}",
+                            assessment.brand, assessment.lead_id
+                        )
+                    })?;
             }
         }
         // Policy versions are audit history, not separate commercial
@@ -1254,6 +1261,7 @@ impl Db {
                 [],
             )?;
         }
+        rebuild_sales_opportunities_without_legacy_title_unique(&conn)?;
         conn.execute_batch(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_sales_opportunities_identity
              ON sales_opportunities(identity_key) WHERE identity_key<>'';
@@ -1658,15 +1666,10 @@ impl Db {
                         market_account_id: account.id.clone(),
                         name: facility_label(&lead, &observation.evidence),
                         facility_type: facility_type_from_evidence(&observation.evidence).into(),
-                        region: if observation
-                            .evidence
-                            .to_ascii_lowercase()
-                            .contains("ontario")
-                        {
-                            "Ontario".into()
-                        } else {
-                            String::new()
-                        },
+                        city: ontario_site_from_text(&observation.evidence)
+                            .unwrap_or_default()
+                            .into(),
+                        region: "Ontario".into(),
                         country: "Canada".into(),
                         source_url: observation.source_url.clone(),
                         source_excerpt: observation.evidence.clone(),
@@ -2038,6 +2041,53 @@ impl Db {
                         opportunity.kind,
                         task_key,
                         opportunity.play_id,
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()?,
+        };
+        // A task first discovered without an exact facility is deliberately
+        // held in research. When a later read binds that *same stable task
+        // key* to a cited facility, upgrade the single facility-less row in
+        // place. Creating a second row would collide with legacy title
+        // uniqueness and would misrepresent one task as two opportunities.
+        let existing = match existing {
+            Some(id) => Some(id),
+            None if !opportunity.facility_id.trim().is_empty() => conn
+                .query_row(
+                    "SELECT id FROM sales_opportunities
+                     WHERE brand=?1 AND market_account_id=?2 AND facility_id=''
+                       AND kind=?3 AND task_key=?4 AND status<>'superseded'
+                     ORDER BY updated_at DESC LIMIT 1",
+                    params![
+                        opportunity.brand,
+                        opportunity.market_account_id,
+                        opportunity.kind,
+                        task_key,
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()?,
+            None => None,
+        };
+        // A stricter refresh may also remove an earlier heuristic facility.
+        // When exactly one live row has this source-stable task key, update it
+        // in place in either direction. If several facilities legitimately
+        // share a task key, ambiguity is preserved and no row is guessed.
+        let existing = match existing {
+            Some(id) => Some(id),
+            None => conn
+                .query_row(
+                    "SELECT MIN(id) FROM sales_opportunities
+                     WHERE brand=?1 AND market_account_id=?2 AND kind=?3 AND task_key=?4
+                       AND status<>'superseded'
+                     GROUP BY brand,market_account_id,kind,task_key
+                     HAVING COUNT(*)=1",
+                    params![
+                        opportunity.brand,
+                        opportunity.market_account_id,
+                        opportunity.kind,
+                        task_key,
                     ],
                     |row| row.get(0),
                 )
@@ -7799,23 +7849,25 @@ fn enforce_sales_opportunity_boundaries(opportunity: &mut SalesOpportunity) {
 }
 
 fn evidence_names_operating_site(evidence: &str) -> bool {
+    ontario_site_from_text(evidence).is_some()
+}
+
+/// Resolve an Ontario city only when the source also supplies the province.
+/// A bare city-name substring is insufficient: notably, `London` must never
+/// turn a UK job page into a Canadian facility.
+pub(crate) fn ontario_site_from_text(evidence: &str) -> Option<&'static str> {
     let text = evidence.to_ascii_lowercase();
-    ONTARIO_SITE_NAMES
-        .iter()
-        .any(|place| text.contains(&place.to_ascii_lowercase()))
-        || [
-            " at the facility",
-            " at its facility",
-            " at their facility",
-            " facility in ",
-            " plant in ",
-            " warehouse in ",
-            " distribution centre in ",
-            " distribution center in ",
-            " operating site in ",
+    ONTARIO_SITE_NAMES.iter().copied().find(|city| {
+        let city = city.to_ascii_lowercase();
+        [
+            format!("{city}, on"),
+            format!("{city}, ontario"),
+            format!("{city} ontario"),
+            format!("{city}, ca on"),
         ]
         .iter()
-        .any(|term| text.contains(term))
+        .any(|pattern| text.contains(pattern))
+    })
 }
 
 /// A Wapahki task belongs to a facility only when the task claim itself names
@@ -7856,14 +7908,8 @@ fn facility_type_from_evidence(evidence: &str) -> &'static str {
 }
 
 fn facility_label(lead: &Lead, evidence: &str) -> String {
-    let lower = evidence.to_ascii_lowercase();
-    if let Some(city) = ONTARIO_SITE_NAMES
-        .iter()
-        .find(|city| lower.contains(&city.to_ascii_lowercase()))
-    {
+    if let Some(city) = ontario_site_from_text(evidence) {
         format!("{} operating site", city)
-    } else if !lead.hq.trim().is_empty() && lower.contains(&lead.hq.trim().to_ascii_lowercase()) {
-        format!("{} operating site", lead.hq.trim())
     } else {
         format!("{} site documented in task source", lead.name.trim())
     }
@@ -7893,8 +7939,11 @@ const ONTARIO_SITE_NAMES: &[&str] = &[
     "Oakville",
     "Ottawa",
     "Pickering",
+    "Quinte West",
     "Richmond Hill",
+    "St. Marys",
     "Toronto",
+    "Trenton",
     "Vars",
     "Vaughan",
     "Waterloo",
@@ -8358,6 +8407,100 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str)
     Ok(())
 }
 
+/// v30's first durable-opportunity table still carried the legacy
+/// `(brand, lead, play, title)` uniqueness constraint. That constraint makes a
+/// title or policy version part of commercial identity and prevents one title
+/// from existing at two facilities. SQLite cannot drop a table constraint in
+/// place, so rebuild only databases whose stored DDL still contains it.
+fn rebuild_sales_opportunities_without_legacy_title_unique(conn: &Connection) -> Result<()> {
+    let table_sql: String = conn.query_row(
+        "SELECT COALESCE(sql,'') FROM sqlite_master
+         WHERE type='table' AND name='sales_opportunities'",
+        [],
+        |row| row.get(0),
+    )?;
+    let normalized = table_sql
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if !normalized.contains("unique(brand,lead_id,play_id,title)") {
+        return Ok(());
+    }
+    let temporary_exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type='table' AND name='sales_opportunities_rebuilt_v33'",
+        [],
+        |row| row.get(0),
+    )?;
+    if temporary_exists != 0 {
+        anyhow::bail!(
+            "cannot rebuild sales opportunities: recovery table sales_opportunities_rebuilt_v33 already exists"
+        );
+    }
+
+    conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
+    let rebuild = conn.execute_batch(
+        "BEGIN IMMEDIATE;
+         CREATE TABLE sales_opportunities_rebuilt_v33 (
+           id TEXT PRIMARY KEY,
+           identity_key TEXT NOT NULL DEFAULT '',
+           task_key TEXT NOT NULL DEFAULT '',
+           brand TEXT NOT NULL,
+           market_account_id TEXT NOT NULL,
+           lead_id TEXT NOT NULL,
+           segment_id TEXT DEFAULT '',
+           facility_id TEXT DEFAULT '',
+           play_id TEXT NOT NULL,
+           kind TEXT NOT NULL,
+           title TEXT NOT NULL,
+           task_or_decision TEXT NOT NULL,
+           mechanism TEXT DEFAULT '',
+           consequence TEXT DEFAULT '',
+           system_concept TEXT DEFAULT '',
+           proof_offer TEXT DEFAULT '',
+           evidence_status TEXT NOT NULL DEFAULT 'research_required',
+           evidence_tier TEXT NOT NULL DEFAULT 'research_required',
+           fit_score INTEGER NOT NULL DEFAULT 0,
+           status TEXT NOT NULL DEFAULT 'research',
+           evidence_gaps TEXT NOT NULL DEFAULT '[]',
+           created_at TEXT NOT NULL,
+           updated_at TEXT NOT NULL,
+           FOREIGN KEY(market_account_id) REFERENCES market_accounts(id),
+           FOREIGN KEY(lead_id) REFERENCES leads(id)
+         );
+         INSERT INTO sales_opportunities_rebuilt_v33 (
+           id,identity_key,task_key,brand,market_account_id,lead_id,segment_id,
+           facility_id,play_id,kind,title,task_or_decision,mechanism,consequence,
+           system_concept,proof_offer,evidence_status,evidence_tier,fit_score,
+           status,evidence_gaps,created_at,updated_at
+         )
+         SELECT id,identity_key,task_key,brand,market_account_id,lead_id,segment_id,
+           facility_id,play_id,kind,title,task_or_decision,mechanism,consequence,
+           system_concept,proof_offer,evidence_status,evidence_tier,fit_score,
+           status,evidence_gaps,created_at,updated_at
+         FROM sales_opportunities;
+         DROP TABLE sales_opportunities;
+         ALTER TABLE sales_opportunities_rebuilt_v33 RENAME TO sales_opportunities;
+         COMMIT;",
+    );
+    if let Err(error) = rebuild {
+        let _ = conn.execute_batch("ROLLBACK; PRAGMA foreign_keys=ON;");
+        return Err(error).context("rebuilding legacy sales-opportunity identity table");
+    }
+    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+    let violations: i64 =
+        conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })?;
+    if violations != 0 {
+        anyhow::bail!(
+            "sales-opportunity identity migration left {violations} foreign-key violation(s)"
+        );
+    }
+    Ok(())
+}
+
 fn migrate_customer_development_to_opportunities(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "BEGIN IMMEDIATE;
@@ -8797,7 +8940,6 @@ CREATE TABLE IF NOT EXISTS sales_opportunities (
     evidence_gaps TEXT NOT NULL DEFAULT '[]',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    UNIQUE(identity_key),
     FOREIGN KEY(market_account_id) REFERENCES market_accounts(id),
     FOREIGN KEY(lead_id) REFERENCES leads(id)
 );
@@ -9214,10 +9356,13 @@ mod tests {
             "The Warehouse Selector role loads full cases onto pallets."
         ));
         assert!(evidence_names_operating_site(
-            "The Brantford role loads cartons into cases and palletizes finished goods."
+            "The Brantford, Ontario role loads cartons into cases and palletizes finished goods."
         ));
         assert!(evidence_names_operating_site(
-            "The Dunnville posting lists manual packing and repetitive work."
+            "The Dunnville, ON posting lists manual packing and repetitive work."
+        ));
+        assert!(!evidence_names_operating_site(
+            "The London, UK role loads cartons into cases and palletizes finished goods."
         ));
     }
 
@@ -9259,7 +9404,8 @@ mod tests {
         let same_page_site = SignalObservation {
             definition_key: "account.job_posting_workflow_evidence".into(),
             source_url: "https://example.com/jobs/operator/".into(),
-            evidence: "The Newmarket role is based at the company's production plant.".into(),
+            evidence: "The Newmarket, Ontario role is based at the company's production plant."
+                .into(),
             ..Default::default()
         };
         let unrelated_site = SignalObservation {
@@ -9273,7 +9419,7 @@ mod tests {
             facility_observation_for_task(&linked)
                 .expect("same-page facility")
                 .evidence,
-            "The Newmarket role is based at the company's production plant."
+            "The Newmarket, Ontario role is based at the company's production plant."
         );
         assert!(facility_observation_for_task(&[task, unrelated_site]).is_none());
     }
@@ -9595,6 +9741,52 @@ mod tests {
             .unwrap();
         assert_eq!(superseded, 1);
         assert_eq!(membership_tier, "action_ready");
+    }
+
+    #[test]
+    fn exact_task_can_gain_a_verified_facility_without_becoming_a_duplicate() {
+        let db = Db::open(":memory:").expect("open memory db");
+        let lead_id = db
+            .upsert_lead(&Lead {
+                brand: "wapahki".into(),
+                apollo_org_id: "facility-upgrade-org".into(),
+                name: "Facility Upgrade Foods".into(),
+                domain: "facility-upgrade.example".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let account = db.market_account_for_lead(&lead_id).unwrap().unwrap();
+        let current_play = db.current_gtm_play("wapahki").unwrap().unwrap();
+        let without_facility = SalesOpportunity {
+            brand: "wapahki".into(),
+            market_account_id: account.id,
+            lead_id: lead_id.clone(),
+            play_id: current_play.id,
+            kind: "physical_task".into(),
+            title: "Finished-case palletizing".into(),
+            task_or_decision: "Finished-case palletizing".into(),
+            task_key: "source-task:stable-job-page".into(),
+            evidence_status: "research_required".into(),
+            evidence_tier: "research_required".into(),
+            status: "research".into(),
+            ..Default::default()
+        };
+        let original_id = db.upsert_sales_opportunity(&without_facility).unwrap();
+        let upgraded_id = db
+            .upsert_sales_opportunity(&SalesOpportunity {
+                facility_id: "verified-facility".into(),
+                evidence_status: "discovery_ready".into(),
+                evidence_tier: "discovery_ready".into(),
+                status: "mapped".into(),
+                ..without_facility
+            })
+            .unwrap();
+        assert_eq!(upgraded_id, original_id);
+        let opportunities = db
+            .list_sales_opportunities(Some("wapahki"), Some(&lead_id))
+            .unwrap();
+        assert_eq!(opportunities.len(), 1);
+        assert_eq!(opportunities[0].facility_id, "verified-facility");
     }
 
     #[test]
