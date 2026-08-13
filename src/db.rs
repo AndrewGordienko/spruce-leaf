@@ -3627,6 +3627,21 @@ impl Db {
         Ok(())
     }
 
+    /// Active sequences approved under a different copy policy than this
+    /// running binary. Startup migration pauses them, so a nonzero count means
+    /// an older binary or daemon has been writing since — exactly the state
+    /// where the CRM could present retired copy as current work.
+    pub fn stale_active_sequence_count(&self, brand: Option<&str>) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let stale: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sequences WHERE status='active'
+               AND COALESCE(copy_policy_hash,'')<>?1 AND (?2 IS NULL OR brand=?2)",
+            params![current_copy_policy_hash(), brand],
+            |row| row.get(0),
+        )?;
+        Ok(stale.max(0) as usize)
+    }
+
     /// True when a lower-numbered stage in the same sequence is still pending.
     /// Deterministic delivery guard: a later touch must never send before its
     /// opener, whatever its stored due_at claims.

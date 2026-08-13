@@ -188,7 +188,7 @@ pub static OUTAGE_SEGMENTS: &[OutageSegment] = &[
         kill_condition: "Dispatch confirms demand is fully planned/contracted and outage response is not a line of business.",
         default_lane: "easy",
         deprioritized: false,
-        evidence_terms: &["generator", "temporary power", "rental fleet", "emergency power", "standby power", "dispatch"],
+        evidence_terms: &["generator fleet", "generator crew", "generator rental", "rental generator", "rental fleet", "temporary power", "emergency power", "standby power"],
         owner_title_terms: &[
             " field operations ",
             " field service ",

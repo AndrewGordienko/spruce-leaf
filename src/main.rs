@@ -37,6 +37,8 @@ mod mailbox;
 mod metrics;
 mod opportunity;
 mod outage_evidence;
+#[cfg(test)]
+mod outagehub_eval;
 mod outreach;
 mod outreach_ablation;
 mod outreach_eval;

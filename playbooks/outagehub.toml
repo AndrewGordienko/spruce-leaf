@@ -43,7 +43,7 @@ vantage_notes = [
 ]
 
 requirements = [
-  "For a one-email discovery test, research must establish a distributed Canadian operating footprint, one specific outage-time decision, and a reachable workflow owner. A completed historical match upgrades the account to easy priority but is not required for the first question.",
+  "For a one-email discovery test, research must establish a source-backed distributed Canadian operating footprint, outage-sensitive exposure, and a segment-matched reachable operating person. The outage-time decision remains an explicit question, never an account fact. A completed historical match plus evidenced decision upgrades the account to action-ready.",
   "A two-email evidence sequence requires a completed historical location-to-utility-event match; T2 cannot present a match without the real location and timestamp.",
   "T1 contains one account-specific diagnosis, dispatch, escalation, continuity, prioritization, or communication moment and a plausible consequence. Do not prescribe a universal dark-site, ticket, dispatch, or internal-system binary.",
   "T1 names OutageHub and explains its location-matched Canadian utility signal in one plain clause. Discovery-ready copy asks for one easy operating answer by email; only action-ready copy may offer a short conversation with an email alternative.",
@@ -82,9 +82,10 @@ copy_doctrine = """
 Cover the market broadly, but make every email narrow. Keep evidence readiness
 separate from cash-now, core, and strategic commercial lanes. Action-ready
 opportunities expose a specific outage-time decision, a reachable owner, and a
-completed location/polygon match. Discovery-ready opportunities expose the
-decision and owner but lack a match; they may receive one complete first email
-only. Research-required opportunities remain in research.
+completed location/polygon match. Discovery-ready opportunities expose a
+source-backed distributed, outage-sensitive footprint and a segment-matched
+operating person; they may receive one complete first email that asks whether
+the decision exists. Exposure without that person remains research-only.
 
 T1 is 60–95 words and contains one account-specific operating question about
 diagnosis, dispatch, escalation, continuity, prioritization, or communication.
@@ -110,7 +111,9 @@ outage-sensitive infrastructure.
 
 Research does the hard work before copy:
   1. Verify a distributed Canadian footprint.
-  2. Identify one exact outage-time decision and its nearest owner.
+  2. For action-ready outreach, evidence one exact outage-time decision and its
+     nearest owner. For a single discovery email, identify the segment-matched
+     operating person and leave the decision as one explicit question.
   3. Separate private telemetry from public utility context.
   4. When possible, preserve a genuine historical location/polygon overlap,
      timestamp, source, and what the API would have returned.

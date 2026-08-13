@@ -251,6 +251,10 @@ struct ExecutionDashboard {
     replies: Vec<crate::db::Reply>,
     events: Vec<Event>,
     customer_development: Vec<CustomerDevelopmentRecord>,
+    /// Active sequences carrying a different copy-policy hash than this
+    /// binary: they are invisible to Pipeline and blocked from delivery, and
+    /// their presence means an old binary/daemon is still writing.
+    stale_policy_sequences: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -441,6 +445,7 @@ fn execution_dashboard(db: &SharedDb, brand: Option<&str>) -> Result<ExecutionDa
             .collect(),
         events: db.recent_events(brand, 40)?,
         customer_development: db.list_customer_development(brand)?,
+        stale_policy_sequences: db.stale_active_sequence_count(brand)?,
     })
 }
 
@@ -2146,6 +2151,13 @@ fn render_sequence_review_page(
         ],
     );
     b.push_str("<main class=\"sheet-scroll sequence-review\">");
+    if let Ok(stale) = db.stale_active_sequence_count(brand.map(|meta| meta.key)) {
+        if stale > 0 {
+            b.push_str(&format!(
+                "<div class=\"policy-warning\">⚠ {stale} active sequence(s) predate the current copy policy; restart running spruce-leaf processes to archive them.</div>"
+            ));
+        }
+    }
     for (meta, accounts) in groups {
         b.push_str(&format!(
             "<section class=\"review-group\"><div class=\"section-title\"><h2>{}</h2><p>Blocked cells show the saved copy and its exact QA finding. Empty cells mean evidence did not authorize writing.</p></div>",
@@ -3695,8 +3707,64 @@ fn render_gtm_lab(
             .find(|stakeholder| stakeholder.active_thread)
             .and_then(|stakeholder| person_names.get(stakeholder.person_id.as_str()).copied())
             .unwrap_or("none");
+        // OutageHub account truth: segment, lane, offer, next missing fact,
+        // and the doctrine-level kill condition, with the full component
+        // breakdown behind a disclosure. "Reviewed copy" elsewhere never
+        // implies any of this is satisfied.
+        let truth_panel = serde_json::from_str::<crate::priority::CommercialPriority>(
+            &opportunity.priority_components,
+        )
+        .ok()
+        .map(|priority| {
+            let segment = crate::segments::segment_by_key(&priority.segment_key);
+            let components = priority
+                .components
+                .iter()
+                .map(|component| {
+                    format!(
+                        "{} · {} — {}",
+                        component.score,
+                        esc(&component.name),
+                        esc(&component.note)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("<br>");
+            format!(
+                "<div class=\"gtm-proof-shape\"><b>Commercial lane: {} · score {}</b><p><b>Segment:</b> {}</p><p><b>Selected offer:</b> {}</p><p><b>First contract / cycle / procurement:</b> {} · {} · {}</p><p><b>Next missing fact:</b> {}</p><p><b>Kill condition:</b> {}</p>{}<details><summary>Priority components</summary><p>{}</p></details></div>",
+                esc(&priority.lane),
+                priority.score,
+                esc(segment.map_or("unclassified — research inventory", |segment| segment.name)),
+                esc(&priority.offer),
+                esc(&priority.first_contract_range),
+                esc(&priority.expected_cycle),
+                esc(&priority.procurement_complexity),
+                esc(&priority.next_missing_fact),
+                esc(segment.map_or("n/a", |segment| segment.kill_condition)),
+                segment
+                    .map(|segment| format!(
+                        "<details><summary>Segment doctrine: {}</summary><p><b>Operating event:</b> {}</p><p><b>Decision:</b> {}</p><p><b>Evidence required:</b> {}</p><p><b>Likely alternatives:</b> {}</p><p><b>Why utility data could help:</b> {}</p><p><b>Why it may add nothing:</b> {}</p><p><b>Witnesses:</b> {} · <b>Owners:</b> {}</p><p><b>Technical (later):</b> {} · <b>Economic (later):</b> {} · <b>Routers:</b> {}</p><p><b>Never contact for this:</b> {}</p></details>",
+                        esc(segment.name),
+                        esc(segment.operating_event),
+                        esc(segment.decision),
+                        esc(segment.evidence_required),
+                        esc(segment.current_alternatives),
+                        esc(segment.utility_context_value),
+                        esc(segment.may_add_nothing),
+                        esc(&segment.witness_titles.join(", ")),
+                        esc(&segment.owner_titles.join(", ")),
+                        esc(&segment.technical_evaluators.join(", ")),
+                        esc(&segment.economic_buyers.join(", ")),
+                        esc(&segment.routers.join(", ")),
+                        esc(&segment.unsuitable_roles.join(", ")),
+                    ))
+                    .unwrap_or_default(),
+                components,
+            )
+        })
+        .unwrap_or_default();
         b.push_str(&format!(
-            "<article class=\"gtm-card\"><div class=\"gtm-card-head\"><div><span class=\"strategy-kicker\">{} · {}</span><h3>{}</h3></div><span class=\"gtm-status {}\">{}</span></div><p><b>Account / facility:</b> {} · {}</p><p><b>Task or decision:</b> {}</p><p><b>Mechanism:</b> {}</p><p><b>Consequence:</b> {}</p><div class=\"gtm-proof-shape\"><b>Proof contribution</b><p>{}</p></div><p class=\"gtm-meta\">{} atomic claims · {} committee roles · active cold thread: {}<br>Gaps: {}</p></article>",
+            "<article class=\"gtm-card\"><div class=\"gtm-card-head\"><div><span class=\"strategy-kicker\">{} · {}</span><h3>{}</h3></div><span class=\"gtm-status {}\">{}</span></div><p><b>Account / facility:</b> {} · {}</p><p><b>Task or decision:</b> {}</p><p><b>Mechanism:</b> {}</p><p><b>Consequence:</b> {}</p><div class=\"gtm-proof-shape\"><b>Proof contribution</b><p>{}</p></div>{}<p class=\"gtm-meta\">{} atomic claims · {} committee roles · active cold thread: {}<br>Gaps: {}</p></article>",
             esc(&opportunity.brand),
             esc(&opportunity.evidence_tier),
             esc(&opportunity.title),
@@ -3708,6 +3776,7 @@ fn render_gtm_lab(
             esc(&opportunity.mechanism),
             esc(&opportunity.consequence),
             esc(&opportunity.proof_offer),
+            truth_panel,
             claims,
             committee.len(),
             esc(active_person),
@@ -3731,12 +3800,19 @@ fn render_gtm_lab(
                 .get(stakeholder.person_id.as_str())
                 .copied()
                 .unwrap_or("Unknown person")),
-            esc(&stakeholder.role),
+            esc(&format!(
+                "{} · fit: {}",
+                stakeholder.role, stakeholder.role_fit
+            )),
             esc(&stakeholder.relationship_to_task),
             if stakeholder.active_thread {
                 "active cold thread"
+            } else if stakeholder.status == "held" {
+                "held"
+            } else if stakeholder.role_fit == "direct" {
+                "mapped · direct evidence"
             } else {
-                "mapped / held"
+                "mapped · not outreach-eligible"
             },
         ));
     }
@@ -4071,6 +4147,12 @@ fn render_bullet_block(b: &mut String, title: &str, items: &[String], class: &st
 fn render_execution(b: &mut String, dashboard: &ExecutionDashboard) {
     let f = &dashboard.funnel;
     b.push_str("<section id=\"execution\" class=\"execution\">");
+    if dashboard.stale_policy_sequences > 0 {
+        b.push_str(&format!(
+            "<div class=\"policy-warning\">⚠ {} active sequence(s) were approved under a different copy policy than this binary. They are hidden from Pipeline and blocked from delivery, but an older daemon or binary appears to still be writing — restart every running spruce-leaf process so the cutover migration can archive them.</div>",
+            dashboard.stale_policy_sequences
+        ));
+    }
     b.push_str("<div class=\"section-title\"><h2>Real execution</h2><p>Apollo identities, verified delivery state, scheduled touches, and replies.</p></div>");
     b.push_str("<div class=\"funnel\">");
     for (label, value) in [
@@ -5672,6 +5754,7 @@ a.brand-lockup { text-decoration: none; color: var(--ink); flex: 0 0 auto; }
   background: #fff; border: 1px solid var(--line); border-radius: 14px;
   box-shadow: 0 1px 2px rgba(60,64,67,.05);
 }
+.policy-warning { margin: 10px 0; padding: 10px 14px; border: 1px solid #d97706; border-radius: 10px; background: #fef3c7; color: #92400e; font-size: 13px; }
 .gtm-card-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); gap: 12px; }
 .gtm-card { padding: 15px; border: 1px solid var(--line); border-radius: 12px; background: #fff; }
 .gtm-card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }

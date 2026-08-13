@@ -1447,6 +1447,17 @@ fn augment_outage_signals(
     research_sources: &[String],
     structured_signals: &mut Vec<SignalCandidate>,
 ) {
+    // A model can extract the right atomic fact and source but assign only the
+    // broad fit label. Reuse that exact source-backed row for another canonical
+    // label when the deterministic predicate independently supports it. This
+    // changes taxonomy, never evidence or lineage.
+    let source_backed_structured = structured_signals
+        .iter()
+        .filter(|signal| {
+            !signal.evidence.trim().is_empty() && crate::db::credible_source_url(&signal.source_url)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     for key in [
         "account.distributed_locations",
         "account.outage_sensitive_exposure",
@@ -1461,14 +1472,19 @@ fn augment_outage_signals(
         }) {
             continue;
         }
-        let Some((evidence, source_url)) =
-            atomic_evidence_rows(observed_facts, readable_signals, research_sources)
-                .into_iter()
-                .find(|(evidence, source)| {
-                    !source.is_empty()
-                        && crate::qualification::credible_outagehub_signal(key, evidence)
-                })
-        else {
+        let candidate = source_backed_structured
+            .iter()
+            .find(|signal| crate::qualification::credible_outagehub_signal(key, &signal.evidence))
+            .map(|signal| (signal.evidence.clone(), signal.source_url.clone()))
+            .or_else(|| {
+                atomic_evidence_rows(observed_facts, readable_signals, research_sources)
+                    .into_iter()
+                    .find(|(evidence, source)| {
+                        !source.is_empty()
+                            && crate::qualification::credible_outagehub_signal(key, evidence)
+                    })
+            });
+        let Some((evidence, source_url)) = candidate else {
             continue;
         };
         structured_signals.push(SignalCandidate {
@@ -1869,9 +1885,7 @@ fn qualification_discovery_foundations_present(brand: &str, matched: &[String]) 
         has("account.specific_recurring_decision")
             || has("account.external_trigger_or_mechanism_evidence")
     } else if brand.eq_ignore_ascii_case("outagehub") {
-        has("account.distributed_locations")
-            && has("account.outage_sensitive_exposure")
-            && has("account.outage_sensitive_decision")
+        has("account.distributed_locations") && has("account.outage_sensitive_exposure")
     } else {
         true
     }
@@ -2938,15 +2952,21 @@ fn committee_title_groups(
 fn outagehub_committee_title_groups(
     decision_context: &str,
 ) -> Vec<(&'static str, &'static [&'static str])> {
-    if !crate::qualification::credible_outagehub_signal(
+    let has_decision = crate::qualification::credible_outagehub_signal(
         "account.outage_sensitive_decision",
         decision_context,
-    ) {
-        // No evidenced decision means no buyer-title fishing.
+    );
+    let has_exposure = crate::qualification::credible_outagehub_signal(
+        "account.outage_sensitive_exposure",
+        decision_context,
+    );
+    if !has_decision && !has_exposure {
+        // No credible segment evidence means no buyer-title fishing.
         return Vec::new();
     }
     // The segment catalog owns which witnesses and owners are plausibly near
-    // this exact decision; deprioritized segments never enter contact search.
+    // this operation. Exposure may map a research committee, but only the
+    // downstream single-touch gate can authorize premise-testing outreach.
     let Some(segment) = crate::segments::segment_for_evidence(decision_context) else {
         return Vec::new();
     };
@@ -3129,7 +3149,8 @@ async fn qualify_org(
          business's goals and constraints above, and if so frame the \
          doctrine fields. THESIS: {thesis}\n\nAPOLLO FACTS (the ONLY things you may state as fact):\n{facts}\n\n{research_block}{knowledge}\n\n\
          Rules: observed_facts must each be supported by the Apollo facts OR the website research \
-         above — never invent a customer, metric, or dollar figure. Put every reasonable-but-unproven \
+         above — never invent a customer, metric, or dollar figure. Every website-derived observed_fact \
+         must preserve the exact `[source URL]` prefix supplied in the research; do not combine pages. Put every reasonable-but-unproven \
          guess in inferences. Keep physical and operational specificity evidence-bound: a hypothesis \
          may name a tray, pouch, case, pallet, conveyor, machine, alarm, dispatch, or internal handoff \
          only when a public source names that object or task. Otherwise use the supported category \
@@ -4582,7 +4603,9 @@ async fn refresh_one_lead(
          Rules: observed_facts must stay grounded in the on-file fields above, prior facts, or the \
          new official-site research. Inside that research, only `what they do`, `fact`, and a \
          narrowly bounded explicit hiring signal are observations; `signal`, `possible fit`, and \
-         `why` remain analyst hypotheses. Put the supporting official URL in source_url for every \
+         `why` remain analyst hypotheses. Every new website-derived observed_fact must preserve the \
+         exact `[source URL]` prefix supplied in the official-site research, and existing prefixes \
+         must not be removed; never combine facts from different pages. Put the supporting official URL in source_url for every \
          structured signal derived from the new website evidence. \
          Never invent customers, systems, volumes, or dollar figures. consequence_metric is measurable \
          and non-dollar. A hypothesis or mechanism may name a physical object, station, machine, alarm, \
@@ -4778,6 +4801,17 @@ mod tests {
             "The company merely operates several laboratories."
         )
         .is_empty());
+
+        let exposure_only = committee_title_groups(
+            "outagehub",
+            "The company operates laboratories and patient service centres that process clinical specimens across Ontario and Quebec.",
+        );
+        let exposure_titles = exposure_only
+            .iter()
+            .flat_map(|(_, titles)| titles.iter().copied())
+            .collect::<Vec<_>>();
+        assert!(exposure_titles.contains(&"director of operations"));
+        assert!(!exposure_titles.iter().any(|title| title.contains("sales")));
     }
 
     #[test]
@@ -4820,6 +4854,34 @@ mod tests {
                     && crate::qualification::credible_outagehub_signal(key, &signal.evidence)
             }));
         }
+    }
+
+    #[test]
+    fn outage_augmentation_relabels_an_atomic_sourced_fact_without_new_evidence() {
+        let source = "https://operator.example/network";
+        let evidence = "The operator manages and monitors an EV charging network with sites across Ontario and Quebec.";
+        let mut signals = vec![SignalCandidate {
+            definition_key: "account.fit_evidence".into(),
+            evidence: evidence.into(),
+            source_url: source.into(),
+            confidence: 0.9,
+        }];
+        augment_outage_signals(&[], &[], &[], &mut signals);
+        for key in [
+            "account.distributed_locations",
+            "account.outage_sensitive_exposure",
+            "account.operated_ev_charging_network",
+        ] {
+            let mapped = signals
+                .iter()
+                .find(|signal| signal.definition_key == key)
+                .expect("deterministic relabel");
+            assert_eq!(mapped.evidence, evidence);
+            assert_eq!(mapped.source_url, source);
+        }
+        assert!(!signals
+            .iter()
+            .any(|signal| signal.definition_key == "account.outage_sensitive_decision"));
     }
 
     #[test]

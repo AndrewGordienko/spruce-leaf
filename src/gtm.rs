@@ -242,7 +242,7 @@ pub fn sourcing_play_block(play: Option<&GtmPlay>) -> String {
          Name: {} v{}\nTarget ICP: {}\nHypothesis: {}\nRequired signal catalog keys: {} (minimum {} distinct catalog keys, not repeated examples)\n\
          A single completed historical location/event result satisfies the historical-match key when its evidence boundary is met; never demand four locations because the play requires four different keys. Missing evidence is a research gap, not a hard disqualifier.\n\
          Action policy: {}\nProof we can actually deliver: {}\nSuccess metric: {}\nKill condition: {}\n\
-         Use this play to choose, qualify, and RANK accounts. Reject superficial industry/technology matches and enforce the declared minimum rather than silently making every catalog key mandatory. Exposure evidence may prioritize research, but it never proves an outage-time decision and never authorizes copy by itself. Require source-backed evidence of the specific decision and current mechanism before discovery outreach. Always require a credible path to the bounded proof.",
+         Use this play to choose, qualify, and RANK accounts. Reject superficial industry/technology matches and enforce the declared minimum rather than silently making every catalog key mandatory. Exposure evidence may prioritize research, but it never proves an outage-time decision and never authorizes copy by itself. For OutageHub only, a source-backed distributed exposure plus a segment-matched operating recipient may authorize one manually reviewed discovery email whose decision remains an explicit question; multi-touch or action copy still requires source-backed decision evidence and the current mechanism. Always require a credible path to the bounded proof.",
         play.name,
         play.version,
         play.target_icp,
@@ -465,6 +465,7 @@ impl GtmActionContext {
         );
         let action = match self.state.as_str() {
             "action_ready" => "The account has enough sourced evidence for one narrow commercial note. Use only a supplied observation as the company-specific signal. Lead with a role-relevant implication and a credible point of view. A cold outcome may be a short working conversation, interest, correction, or referral; it is not yet a pilot or proof. Never invent collateral or claim an asset exists unless verified seller context explicitly supplies it.",
+            "discovery_ready" if self.is_outagehub() => "This opportunity is discovery-ready, not action-ready: research supports a distributed, outage-sensitive operating footprint and this recipient's title matches that segment, but the account's outage-time decision is unproved. Write one complete first email only. State one sourced exposure fact, ask one explicit operating question without implying the workflow exists, explain OutageHub's address-and-time matching contribution, and make a direct email answer the sole next step. Do not ask for a call, describe a private workflow as fact, or schedule follow-ups before a reply.",
             "discovery_ready" => "This opportunity is discovery-ready, not action-ready: research supports one concrete operating task, decision, or mechanism and this recipient is close to it, but one economic or workflow term remains unproved. Write one complete, useful first email only. State sourced account details as facts, present the exact missing term as one honest question, explain the seller's relevant contribution, and make a direct email answer the sole next step. Do not ask for a call before the missing term is confirmed. Never use a universal diagnostic template or schedule follow-ups before a reply.",
             _ => "The account does not yet have enough sourced evidence for a multi-touch sequence. Hold it for research or use one manual routing note; do not manufacture discovery questions or explain a proof, integration, pilot, or product.",
         };
@@ -528,10 +529,10 @@ pub fn recipient_sequence_block_reason(
         ));
     }
     if brand.eq_ignore_ascii_case("outagehub")
-        && !outagehub_workflow_contact(db, lead_id, &person.title, &person.vantage)?
+        && !outagehub_workflow_contact(db, lead_id, &person.title, &person.vantage, touches == 1)?
     {
         return Ok(Some(
-            "OutageHub requires a role mapped to the exact evidenced outage-time decision; exposure, title seniority, or a generic operations label is insufficient"
+            "OutageHub requires a role mapped to the evidenced outage-time decision, or for one discovery email only, to the source-backed outage-sensitive segment; title seniority or a generic operations label is insufficient"
                 .into(),
         ));
     }
@@ -578,7 +579,7 @@ fn opportunity_role_block_reason(
         ));
     };
     if stakeholder.role_fit != "direct" || stakeholder.evidence_claim_ids.is_empty() {
-        // Wapahki alone has a bounded discovery lane: exactly one
+        // Wapahki and OutageHub have bounded discovery lanes: exactly one
         // evidence-seeking email. Cold provider data can rarely prove
         // person-to-facility employment (it requires the contact's own
         // location record to name the exact facility city), and demanding
@@ -590,6 +591,15 @@ fn opportunity_role_block_reason(
         if brand.eq_ignore_ascii_case("wapahki") && touches == 1 {
             let claims = db.list_evidence_claims(Some(&opportunity.id), Some(brand))?;
             return Ok(wapahki_discovery_touch_block_reason(
+                &opportunity,
+                stakeholder,
+                person,
+                &claims,
+            ));
+        }
+        if brand.eq_ignore_ascii_case("outagehub") && touches == 1 {
+            let claims = db.list_evidence_claims(Some(&opportunity.id), Some(brand))?;
+            return Ok(outagehub_discovery_touch_block_reason(
                 &opportunity,
                 stakeholder,
                 person,
@@ -705,6 +715,66 @@ fn wapahki_discovery_touch_block_reason(
     None
 }
 
+/// Eligibility for OutageHub's single premise-testing email. The public
+/// evidence may prove exposure and footprint, but not the account's private
+/// outage workflow. The recipient must be close to the segment and the email
+/// must leave that workflow as a question. Multi-touch remains unavailable.
+fn outagehub_discovery_touch_block_reason(
+    opportunity: &SalesOpportunity,
+    stakeholder: &crate::db::OpportunityStakeholder,
+    person: &Person,
+    claims: &[crate::db::EvidenceClaim],
+) -> Option<String> {
+    if !matches!(
+        opportunity.evidence_status.as_str(),
+        "action_ready" | "discovery_ready"
+    ) {
+        return Some(format!(
+            "opportunity evidence state '{}' does not authorize outreach",
+            opportunity.evidence_status
+        ));
+    }
+    if !matches!(stakeholder.role_fit.as_str(), "direct" | "adjacent") {
+        return Some(
+            "recipient is mapped as a router or unrelated; a discovery email needs someone near the outage-sensitive operation"
+                .into(),
+        );
+    }
+    let active_claim = |claim_type: &str| {
+        claims.iter().find(|claim| {
+            claim.claim_type == claim_type
+                && claim.task_key == opportunity.task_key
+                && matches!(claim.status.as_str(), "observed" | "verified")
+                && crate::db::credible_source_url(&claim.source_url)
+        })
+    };
+    let Some(exposure) = active_claim("account.outage_sensitive_exposure") else {
+        return Some(
+            "no URL-backed outage-sensitive exposure supports this opportunity; the account stays in research"
+                .into(),
+        );
+    };
+    if active_claim("account.fit_evidence").is_none()
+        || active_claim("account.distributed_locations").is_none()
+    {
+        return Some(
+            "one discovery email requires URL-backed account fit, distributed locations, and outage-sensitive exposure"
+                .into(),
+        );
+    }
+    if !crate::qualification::outagehub_role_matches_decision(
+        &person.title,
+        &person.vantage,
+        &exposure.claim_text,
+    ) {
+        return Some(format!(
+            "title '{}' is not mapped to the source-backed outage-sensitive segment",
+            person.title.trim()
+        ));
+    }
+    None
+}
+
 /// Deterministic closing-difficulty band for one Wapahki account, separate
 /// from opportunity value (value stays founder-entered in
 /// `CommercialAssessment`; conflating the two is how a pipeline fills with
@@ -768,10 +838,14 @@ fn outagehub_workflow_contact(
     lead_id: &str,
     title: &str,
     vantage: &str,
+    allow_exposure_hypothesis: bool,
 ) -> Result<bool> {
-    let decision_evidence = db
+    let observations = db
         .list_active_signal_observations(Some("outagehub"), Some(lead_id), None)?
         .into_iter()
+        .collect::<Vec<_>>();
+    let mut decision_evidence = observations
+        .iter()
         .filter(|observation| observation.definition_key == "account.outage_sensitive_decision")
         .filter(|observation| {
             crate::qualification::credible_outagehub_signal(
@@ -779,9 +853,23 @@ fn outagehub_workflow_contact(
                 &observation.evidence,
             )
         })
-        .map(|observation| observation.evidence)
+        .map(|observation| observation.evidence.as_str())
         .collect::<Vec<_>>()
         .join(" ");
+    if decision_evidence.is_empty() && allow_exposure_hypothesis {
+        decision_evidence = observations
+            .iter()
+            .filter(|observation| {
+                observation.definition_key == "account.outage_sensitive_exposure"
+                    && crate::qualification::credible_outagehub_signal(
+                        "account.outage_sensitive_exposure",
+                        &observation.evidence,
+                    )
+            })
+            .map(|observation| observation.evidence.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+    }
     Ok(crate::qualification::outagehub_role_matches_decision(
         title,
         vantage,
@@ -1088,7 +1176,22 @@ pub fn prepare_action(
                             && matches!(claim.status.as_str(), "observed" | "verified")
                     })))
     });
-    if person_is_direct && has_reachable_channel && has_workflow_vantage {
+    let outagehub_person_can_discover = brand.eq_ignore_ascii_case("outagehub")
+        && opportunity.as_ref().is_some_and(|opportunity| {
+            person_stakeholder.is_some_and(|stakeholder| {
+                outagehub_discovery_touch_block_reason(
+                    opportunity,
+                    stakeholder,
+                    person,
+                    &evidence_claims,
+                )
+                .is_none()
+            })
+        });
+    if (person_is_direct || outagehub_person_can_discover)
+        && has_reachable_channel
+        && has_workflow_vantage
+    {
         claim_keys.push("account.reachable_workflow_owner".into());
     }
     claim_keys.sort();
@@ -1116,9 +1219,12 @@ pub fn prepare_action(
     let opportunity_state = opportunity
         .as_ref()
         .map_or("research_required", |opportunity| {
-            if !person_is_direct || !opportunity_has_required_site {
+            if (!person_is_direct && !outagehub_person_can_discover)
+                || !opportunity_has_required_site
+            {
                 "research_required"
-            } else if opportunity.evidence_status == "action_ready"
+            } else if person_is_direct
+                && opportunity.evidence_status == "action_ready"
                 && mandatory_action_signals_present(brand, &claim_keys)
                 && independent_lineages >= 2
             {
@@ -1253,9 +1359,7 @@ fn mandatory_discovery_signals_present(brand: &str, matched: &[String]) -> bool 
         has("account.specific_recurring_decision")
             || has("account.external_trigger_or_mechanism_evidence")
     } else if brand.eq_ignore_ascii_case("outagehub") {
-        has("account.distributed_locations")
-            && has("account.outage_sensitive_exposure")
-            && has("account.outage_sensitive_decision")
+        has("account.distributed_locations") && has("account.outage_sensitive_exposure")
     } else {
         true
     }
@@ -2071,6 +2175,101 @@ mod tests {
             Some(&context),
         );
         assert!(issues.is_empty(), "end-to-end copy issues: {issues:?}");
+        drop(db);
+        remove_temp_db(&path);
+    }
+
+    #[test]
+    fn outagehub_exposure_and_segment_owner_allow_one_question_not_a_cadence() {
+        let path = std::env::temp_dir().join(format!(
+            "spruce-outage-discovery-test-{}.sqlite",
+            Uuid::new_v4()
+        ));
+        let db = Arc::new(Db::open(&path).expect("open temp db"));
+        seed_defaults(&db).expect("seed GTM defaults");
+        let lead_id = db
+            .upsert_lead(&Lead {
+                brand: "outagehub".into(),
+                apollo_org_id: "org-lab-discovery".into(),
+                name: "Example Diagnostics".into(),
+                observed_facts: vec!["Example Diagnostics operates laboratories and patient service centres across Ontario and Quebec.".into()],
+                hypothesis: "When a location reports a power issue, operations may check the local utility separately.".into(),
+                ..Default::default()
+            })
+            .expect("lead");
+        let person_id = db
+            .upsert_person(&Person {
+                lead_id: lead_id.clone(),
+                brand: "outagehub".into(),
+                apollo_person_id: "person-lab-operations".into(),
+                name: "Karina Operator".into(),
+                title: "Director of Operations".into(),
+                apollo_org_id: "org-lab-discovery".into(),
+                employer_verification: "apollo".into(),
+                vantage: "process_owner".into(),
+                email_status: "verified".into(),
+                ..Default::default()
+            })
+            .expect("person");
+        let signals = vec![
+            SignalCandidate {
+                definition_key: "account.fit_evidence".into(),
+                evidence: "Example Diagnostics operates Canadian laboratories and patient service centres.".into(),
+                source_url: "https://example.test/about".into(),
+                confidence: 0.9,
+            },
+            SignalCandidate {
+                definition_key: "account.distributed_locations".into(),
+                evidence: "Example Diagnostics operates laboratory facilities across Ontario and Quebec.".into(),
+                source_url: "https://example.test/locations".into(),
+                confidence: 0.9,
+            },
+            SignalCandidate {
+                definition_key: "account.outage_sensitive_exposure".into(),
+                evidence: "Example Diagnostics operates laboratories and patient service centres that process clinical specimens across Ontario and Quebec.".into(),
+                source_url: "https://example.test/laboratories".into(),
+                confidence: 0.9,
+            },
+        ];
+        db.record_signal_candidates("outagehub", &lead_id, &signals, "test")
+            .expect("signals");
+        let play = db
+            .current_gtm_play("outagehub")
+            .expect("play query")
+            .expect("play");
+        db.upsert_account_play_assessment(&AccountPlayAssessment {
+            lead_id: lead_id.clone(),
+            brand: "outagehub".into(),
+            play_id: play.id,
+            play_version: play.version,
+            status: "research_needed".into(),
+            fit_score: 60,
+            matched_signal_keys: signals
+                .iter()
+                .map(|signal| signal.definition_key.clone())
+                .collect(),
+            symptom: "A location reports a power issue; whether operations separately checks the utility is unknown.".into(),
+            source: "test".into(),
+            ..Default::default()
+        })
+        .expect("assessment");
+
+        let person = db.get_person(&person_id).unwrap().unwrap();
+        let context = prepare_action(&db, "outagehub", &lead_id, &person).expect("context");
+        assert_eq!(context.state, "discovery_ready", "{context:#?}");
+        assert!(context.sequence_ready_for(1));
+        assert!(!context.sequence_ready_for(2));
+        assert!(
+            super::recipient_sequence_block_reason(&db, "outagehub", &lead_id, &person, 1,)
+                .expect("one-touch gate")
+                .is_none()
+        );
+        assert!(
+            super::recipient_sequence_block_reason(&db, "outagehub", &lead_id, &person, 2,)
+                .expect("multi-touch gate")
+                .is_some()
+        );
+
         drop(db);
         remove_temp_db(&path);
     }

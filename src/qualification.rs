@@ -411,13 +411,29 @@ fn outage_sensitive_exposure(text: &str) -> bool {
         && has(text, &["generator", "customer sites"]))
         || (has(text, &["emergency response"]) && has(text, &["generator", "temporary power"]));
     let managed_power_response = power_service && response_operation;
+    // An insurer's outage-sensitive operation is the claims process itself:
+    // storm/CAT response is driven by grid events even though the carrier
+    // operates no exposed sites. Generic underwriting never counts.
+    let claims_response = has(
+        text,
+        &[
+            "claims operations",
+            "claims team",
+            "cat claims",
+            "catastrophe response",
+        ],
+    ) && has(
+        text,
+        &["storm", "catastrophe", "outage", "power", "weather event"],
+    );
 
     (owns_or_runs
         && (charging_network
             || laboratory_service
             || cold_chain
             || care_portfolio
-            || communications_network))
+            || communications_network
+            || claims_response))
         || managed_power_response
 }
 
