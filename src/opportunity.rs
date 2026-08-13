@@ -2049,8 +2049,12 @@ pub async fn plan_sponsorship_outreach(
             )
         })?
         .clone();
-    if !db.list_opportunity_touches(&selected.id)?.is_empty() {
+    let existing = db.list_opportunity_touches(&selected.id)?;
+    if existing.iter().any(|touch| touch.status != "blocked") {
         return Ok(FundingPlanSummary::default());
+    }
+    if !existing.is_empty() {
+        db.delete_blocked_opportunity_touches(&selected.id)?;
     }
 
     let mut sequence = write_sponsorship_sequence(
@@ -2071,45 +2075,56 @@ pub async fn plan_sponsorship_outreach(
     sequence.touches.sort_by_key(|touch| touch.stage);
     let forbidden = playbook.forbidden(shared);
     let mut semantic_issues = Vec::new();
-    let mut semantic_passes = true;
-    for audit_round in 1..=2 {
-        let review = review_sponsorship_sequence(
-            engine,
-            profile,
-            &opportunity,
-            &selected,
-            &sequence,
-            audit_round == 2,
-        )
-        .await?;
-        if review.passes && review.score >= 85 && review.issues.is_empty() {
-            continue;
+    let mut semantic_passes = false;
+    for repair_attempt in 0..=2 {
+        let mut repaired = false;
+        let mut attempt_passes = true;
+        semantic_issues.clear();
+        for audit_round in 1..=2 {
+            let review = review_sponsorship_sequence(
+                engine,
+                profile,
+                &opportunity,
+                &selected,
+                &sequence,
+                audit_round == 2,
+            )
+            .await?;
+            if review.passes && review.score >= 85 && review.issues.is_empty() {
+                continue;
+            }
+            attempt_passes = false;
+            semantic_issues.extend(
+                review
+                    .issues
+                    .iter()
+                    .map(|issue| format!("audit {audit_round} ({}/100): {issue}", review.score)),
+            );
+            if review.issues.is_empty() {
+                semantic_issues.push(format!(
+                    "audit {audit_round} rejected the sequence at {}/100 without a specific repair",
+                    review.score
+                ));
+            }
+            if repair_attempt < 2
+                && !review.revised_subject.trim().is_empty()
+                && !review.revised_body.trim().is_empty()
+                && sequence.touches.len() == 1
+            {
+                sequence.touches[0].subject = review.revised_subject;
+                sequence.touches[0].body = review.revised_body;
+                repaired = true;
+            }
+            break;
         }
-        semantic_passes = false;
-        semantic_issues.extend(
-            review
-                .issues
-                .iter()
-                .map(|issue| format!("audit {audit_round} ({}/100): {issue}", review.score)),
-        );
-        if review.issues.is_empty() {
-            semantic_issues.push(format!(
-                "audit {audit_round} rejected the sequence at {}/100 without a specific repair",
-                review.score
-            ));
-        }
-        if audit_round == 1
-            && !review.revised_subject.trim().is_empty()
-            && !review.revised_body.trim().is_empty()
-            && sequence.touches.len() == 1
-        {
-            sequence.touches[0].subject = review.revised_subject;
-            sequence.touches[0].body = review.revised_body;
+        if attempt_passes {
             semantic_passes = true;
             semantic_issues.clear();
-            continue;
+            break;
         }
-        break;
+        if !repaired {
+            break;
+        }
     }
 
     let now = Utc::now();

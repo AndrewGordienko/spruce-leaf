@@ -4948,6 +4948,14 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    pub fn delete_blocked_opportunity_touches(&self, contact_id: &str) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute(
+            "DELETE FROM opportunity_touches WHERE contact_id=?1 AND status='blocked'",
+            params![contact_id],
+        )?)
+    }
+
     pub fn due_opportunity_touches(&self, limit: i64) -> Result<Vec<OpportunityTouch>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
