@@ -1071,13 +1071,48 @@ impl Db {
         // Signals are already durable; assessments turn them into opportunity
         // claims without upgrading any routing status.
         for assessment in self.list_account_play_assessments(None)? {
-            self.materialize_sales_opportunity(&assessment)?;
+            let is_current = self
+                .current_gtm_play(&assessment.brand)?
+                .is_some_and(|play| play.id == assessment.play_id);
+            if is_current {
+                self.materialize_sales_opportunity(&assessment)?;
+            }
         }
+        // Policy versions are audit history, not separate commercial
+        // opportunities. Keep their rows for lineage while ensuring only the
+        // current governed play can authorize research, copy, or reporting.
+        self.supersede_noncurrent_play_opportunities()?;
         // Contact rows then populate the full committee map. They remain
         // inactive until the planner selects one cold thread.
         for person in self.list_people(None, None)? {
             self.upsert_person(&person)?;
         }
+        Ok(())
+    }
+
+    fn supersede_noncurrent_play_opportunities(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let timestamp = now();
+        conn.execute(
+            "UPDATE sales_opportunities
+             SET status='superseded',evidence_status='research_required',
+               evidence_tier='research_required',updated_at=?1
+             WHERE status<>'superseded'
+               AND EXISTS (
+                 SELECT 1 FROM gtm_plays current
+                 WHERE current.brand=sales_opportunities.brand
+                   AND current.lifecycle IN ('proven','testing')
+               )
+               AND play_id<>(
+                 SELECT current.id FROM gtm_plays current
+                 WHERE current.brand=sales_opportunities.brand
+                   AND current.lifecycle IN ('proven','testing')
+                 ORDER BY CASE current.lifecycle WHEN 'proven' THEN 0 ELSE 1 END,
+                   current.version DESC LIMIT 1
+               )",
+            params![timestamp],
+        )?;
+        refresh_all_membership_readiness(&conn, &timestamp)?;
         Ok(())
     }
 
@@ -1982,6 +2017,32 @@ impl Db {
                 )
                 .optional()?,
         };
+        // v30 initially included version-specific play_id in identity. That
+        // manufactured a new "opportunity" at every policy bump. Adopt the
+        // durable account + facility + kind + task row regardless of play
+        // version; play_id remains attribution to the assessment that most
+        // recently refreshed the opportunity.
+        let existing = match existing {
+            Some(id) => Some(id),
+            None => conn
+                .query_row(
+                    "SELECT id FROM sales_opportunities
+                     WHERE brand=?1 AND market_account_id=?2 AND facility_id=?3
+                       AND kind=?4 AND task_key=?5 AND status<>'superseded'
+                     ORDER BY CASE WHEN play_id=?6 THEN 0 ELSE 1 END,
+                       updated_at DESC LIMIT 1",
+                    params![
+                        opportunity.brand,
+                        opportunity.market_account_id,
+                        opportunity.facility_id,
+                        opportunity.kind,
+                        task_key,
+                        opportunity.play_id,
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()?,
+        };
         // Adopt a pre-identity row only when its old display-level identity is
         // an exact match. Crucially, never select merely by company + play:
         // that was the collapse that overwrote a second facility or task.
@@ -2054,7 +2115,7 @@ impl Db {
               facility_id=?6,kind=?7,title=?8,task_or_decision=?9,mechanism=?10,
               consequence=?11,system_concept=?12,proof_offer=?13,evidence_status=?14,
               evidence_tier=?15,fit_score=?16,status=?17,evidence_gaps=?18,
-              updated_at=?19 WHERE id=?1",
+              play_id=?19,updated_at=?20 WHERE id=?1",
             params![
                 id,
                 identity_key,
@@ -2074,25 +2135,32 @@ impl Db {
                 opportunity.fit_score.clamp(0, 100),
                 status_or(&opportunity.status, "research"),
                 js(&opportunity.evidence_gaps),
+                opportunity.play_id,
                 timestamp,
             ],
         )?;
         conn.execute(
-            "UPDATE brand_account_memberships SET evidence_tier=?3,status=?4,updated_at=?5
-             WHERE brand=?1 AND lead_id=?2",
+            "UPDATE sales_opportunities SET status='superseded',
+               evidence_status='research_required',evidence_tier='research_required',updated_at=?7
+             WHERE id<>?1 AND brand=?2 AND market_account_id=?3 AND facility_id=?4
+               AND kind=?5 AND task_key=?6 AND status<>'superseded'",
             params![
+                id,
                 opportunity.brand,
-                opportunity.lead_id,
-                status_or(&opportunity.evidence_tier, "research_required"),
-                status_or(&opportunity.status, "research"),
+                opportunity.market_account_id,
+                opportunity.facility_id,
+                opportunity.kind,
+                task_key,
                 timestamp,
             ],
         )?;
+        refresh_membership_readiness(&conn, &opportunity.brand, &opportunity.lead_id, &timestamp)?;
         if !opportunity.segment_id.trim().is_empty() {
             conn.execute(
                 "UPDATE market_segments SET
                   accounts_with_opportunities=(SELECT COUNT(DISTINCT market_account_id)
-                    FROM sales_opportunities WHERE segment_id=?1 AND status<>'rejected'),
+                    FROM sales_opportunities
+                    WHERE segment_id=?1 AND status NOT IN ('rejected','superseded')),
                   updated_at=?2 WHERE id=?1",
                 params![opportunity.segment_id, timestamp],
             )?;
@@ -2108,7 +2176,8 @@ impl Db {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT * FROM sales_opportunities
-             WHERE (?1 IS NULL OR brand=?1) AND (?2 IS NULL OR lead_id=?2)
+             WHERE status<>'superseded'
+               AND (?1 IS NULL OR brand=?1) AND (?2 IS NULL OR lead_id=?2)
              ORDER BY CASE evidence_tier WHEN 'action_ready' THEN 0 WHEN 'discovery_ready' THEN 1 ELSE 2 END,
                       fit_score DESC,updated_at DESC",
         )?;
@@ -2127,7 +2196,8 @@ impl Db {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
             "SELECT * FROM sales_opportunities
-             WHERE brand=?1 AND lead_id=?2 AND play_id=?3 AND status<>'rejected'
+             WHERE brand=?1 AND lead_id=?2 AND play_id=?3
+               AND status NOT IN ('rejected','superseded')
              ORDER BY CASE evidence_tier WHEN 'action_ready' THEN 0 WHEN 'discovery_ready' THEN 1 ELSE 2 END,
                       fit_score DESC,updated_at DESC LIMIT 1",
             params![brand, lead_id, play_id],
@@ -2149,7 +2219,8 @@ impl Db {
         let tx = conn.transaction()?;
         let opportunity_brand: Option<String> = tx
             .query_row(
-                "SELECT brand FROM sales_opportunities WHERE id=?1 AND status<>'rejected'",
+                "SELECT brand FROM sales_opportunities
+                 WHERE id=?1 AND status NOT IN ('rejected','superseded')",
                 params![assessment.sales_opportunity_id],
                 |row| row.get(0),
             )
@@ -2271,14 +2342,16 @@ impl Db {
     ) -> Result<Vec<CommercialAssessment>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT * FROM commercial_assessments
-             WHERE lifecycle='current' AND (?1 IS NULL OR brand=?1)
-             ORDER BY CASE commercial_lane
+            "SELECT a.* FROM commercial_assessments a
+             JOIN sales_opportunities o ON o.id=a.sales_opportunity_id
+             WHERE a.lifecycle='current' AND o.status NOT IN ('rejected','superseded')
+               AND (?1 IS NULL OR a.brand=?1)
+             ORDER BY CASE a.commercial_lane
                WHEN 'cash_now' THEN 0 WHEN 'core' THEN 1 WHEN 'strategic' THEN 2
                WHEN 'parked' THEN 4 ELSE 3 END,
-               CASE WHEN next_action_due_at<>'' AND next_action_due_at<=?2 THEN 0 ELSE 1 END,
-               CASE WHEN days_to_first_cash IS NULL THEN 1 ELSE 0 END,
-               days_to_first_cash ASC,updated_at DESC",
+               CASE WHEN a.next_action_due_at<>'' AND a.next_action_due_at<=?2 THEN 0 ELSE 1 END,
+               CASE WHEN a.days_to_first_cash IS NULL THEN 1 ELSE 0 END,
+               a.days_to_first_cash ASC,a.updated_at DESC",
         )?;
         let rows = stmt.query_map(params![brand, now()], |row| {
             Ok(row_to_commercial_assessment(row))
@@ -2291,7 +2364,8 @@ impl Db {
         let conn = self.conn.lock().unwrap();
         let opportunity_brand: Option<String> = conn
             .query_row(
-                "SELECT brand FROM sales_opportunities WHERE id=?1",
+                "SELECT brand FROM sales_opportunities
+                 WHERE id=?1 AND status NOT IN ('rejected','superseded')",
                 params![event.sales_opportunity_id],
                 |row| row.get(0),
             )
@@ -2662,7 +2736,8 @@ impl Db {
         let mut stmt = conn.prepare(
             "SELECT s.* FROM opportunity_stakeholders s
              JOIN sales_opportunities o ON o.id=s.sales_opportunity_id
-             WHERE (?1 IS NULL OR s.sales_opportunity_id=?1) AND (?2 IS NULL OR o.brand=?2)
+             WHERE o.status NOT IN ('rejected','superseded')
+               AND (?1 IS NULL OR s.sales_opportunity_id=?1) AND (?2 IS NULL OR o.brand=?2)
              ORDER BY s.active_thread DESC,s.priority,s.updated_at DESC",
         )?;
         let rows = stmt.query_map(params![sales_opportunity_id, brand], |row| {
@@ -2740,7 +2815,8 @@ impl Db {
             .query_row(
                 "SELECT o.id FROM sales_opportunities o
                  JOIN gtm_plays gp ON gp.id=o.play_id
-                 WHERE o.brand=?1 AND o.lead_id=?2 AND o.status<>'rejected'
+                 WHERE o.brand=?1 AND o.lead_id=?2
+                   AND o.status NOT IN ('rejected','superseded')
                    AND gp.lifecycle IN ('proven','testing')
                  ORDER BY CASE gp.lifecycle WHEN 'proven' THEN 0 ELSE 1 END,
                           gp.version DESC,
@@ -7543,6 +7619,64 @@ fn status_or(s: &str, default: &str) -> String {
     }
 }
 
+fn refresh_membership_readiness(
+    conn: &Connection,
+    brand: &str,
+    lead_id: &str,
+    timestamp: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE brand_account_memberships
+         SET evidence_tier=COALESCE((
+               SELECT o.evidence_tier FROM sales_opportunities o
+               WHERE o.brand=?1 AND o.lead_id=?2
+                 AND o.status NOT IN ('rejected','superseded')
+               ORDER BY CASE o.evidence_tier
+                 WHEN 'action_ready' THEN 0 WHEN 'discovery_ready' THEN 1 ELSE 2 END,
+                 o.fit_score DESC,o.updated_at DESC LIMIT 1
+             ),'research_required'),
+             status=COALESCE((
+               SELECT o.status FROM sales_opportunities o
+               WHERE o.brand=?1 AND o.lead_id=?2
+                 AND o.status NOT IN ('rejected','superseded')
+               ORDER BY CASE o.evidence_tier
+                 WHEN 'action_ready' THEN 0 WHEN 'discovery_ready' THEN 1 ELSE 2 END,
+                 o.fit_score DESC,o.updated_at DESC LIMIT 1
+             ),CASE WHEN status IN ('mapped','qualified') THEN 'research' ELSE status END),
+             updated_at=?3
+         WHERE brand=?1 AND lead_id=?2",
+        params![brand, lead_id, timestamp],
+    )?;
+    Ok(())
+}
+
+fn refresh_all_membership_readiness(conn: &Connection, timestamp: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE brand_account_memberships
+         SET evidence_tier=COALESCE((
+               SELECT o.evidence_tier FROM sales_opportunities o
+               WHERE o.brand=brand_account_memberships.brand
+                 AND o.lead_id=brand_account_memberships.lead_id
+                 AND o.status NOT IN ('rejected','superseded')
+               ORDER BY CASE o.evidence_tier
+                 WHEN 'action_ready' THEN 0 WHEN 'discovery_ready' THEN 1 ELSE 2 END,
+                 o.fit_score DESC,o.updated_at DESC LIMIT 1
+             ),'research_required'),
+             status=COALESCE((
+               SELECT o.status FROM sales_opportunities o
+               WHERE o.brand=brand_account_memberships.brand
+                 AND o.lead_id=brand_account_memberships.lead_id
+                 AND o.status NOT IN ('rejected','superseded')
+               ORDER BY CASE o.evidence_tier
+                 WHEN 'action_ready' THEN 0 WHEN 'discovery_ready' THEN 1 ELSE 2 END,
+                 o.fit_score DESC,o.updated_at DESC LIMIT 1
+             ),CASE WHEN status IN ('mapped','qualified') THEN 'research' ELSE status END),
+             updated_at=?1",
+        params![timestamp],
+    )?;
+    Ok(())
+}
+
 fn canonical_domain(raw: &str) -> String {
     raw.trim()
         .trim_start_matches("https://")
@@ -7617,11 +7751,10 @@ fn sales_opportunity_identity_key(opportunity: &SalesOpportunity, task_key: &str
     format!(
         "opportunity:{:016x}",
         stable_hash(&format!(
-            "{}|{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}",
             opportunity.brand.trim().to_ascii_lowercase(),
             opportunity.market_account_id.trim(),
             opportunity.facility_id.trim(),
-            opportunity.play_id.trim(),
             opportunity.kind.trim().to_ascii_lowercase(),
             task_key.trim().to_ascii_lowercase(),
         ))
@@ -9356,6 +9489,22 @@ mod tests {
                 .len(),
             2
         );
+        let new_play_version_id = db
+            .upsert_sales_opportunity(&SalesOpportunity {
+                play_id: "play-two".into(),
+                ..base.clone()
+            })
+            .expect("refresh same task under a new play version");
+        assert_eq!(
+            new_play_version_id, case_id,
+            "policy versions must not manufacture duplicate opportunities"
+        );
+        assert_eq!(
+            db.list_sales_opportunities(Some("wapahki"), Some(&lead_id))
+                .unwrap()
+                .len(),
+            2
+        );
         let renamed_case_id = db
             .upsert_sales_opportunity(&SalesOpportunity {
                 title: "Refined case-packing title".into(),
@@ -9369,6 +9518,83 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn retired_play_rows_are_history_and_membership_uses_best_current_task() {
+        let db = Db::open(":memory:").expect("open memory db");
+        let lead_id = db
+            .upsert_lead(&Lead {
+                brand: "gnk".into(),
+                apollo_org_id: "version-history-org".into(),
+                name: "Version History Co".into(),
+                domain: "version-history.example".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let account = db.market_account_for_lead(&lead_id).unwrap().unwrap();
+        let current_play = db.current_gtm_play("gnk").unwrap().unwrap();
+        let base = SalesOpportunity {
+            brand: "gnk".into(),
+            market_account_id: account.id,
+            lead_id: lead_id.clone(),
+            play_id: current_play.id,
+            kind: "software_workflow".into(),
+            title: "Current workflow".into(),
+            task_or_decision: "Current workflow".into(),
+            task_key: "current-workflow".into(),
+            evidence_status: "action_ready".into(),
+            evidence_tier: "action_ready".into(),
+            status: "mapped".into(),
+            ..Default::default()
+        };
+        db.upsert_sales_opportunity(&base).unwrap();
+        db.upsert_sales_opportunity(&SalesOpportunity {
+            title: "Second current workflow".into(),
+            task_or_decision: "Second current workflow".into(),
+            task_key: "second-current-workflow".into(),
+            evidence_status: "research_required".into(),
+            evidence_tier: "research_required".into(),
+            status: "research".into(),
+            ..base.clone()
+        })
+        .unwrap();
+        db.upsert_sales_opportunity(&SalesOpportunity {
+            title: "Retired workflow".into(),
+            task_or_decision: "Retired workflow".into(),
+            task_key: "retired-workflow".into(),
+            play_id: "retired-play-version".into(),
+            ..base
+        })
+        .unwrap();
+
+        db.supersede_noncurrent_play_opportunities().unwrap();
+        assert_eq!(
+            db.list_sales_opportunities(Some("gnk"), Some(&lead_id))
+                .unwrap()
+                .len(),
+            2,
+            "retired policy rows remain stored but cannot enter the live queue"
+        );
+        let conn = db.conn.lock().unwrap();
+        let superseded: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sales_opportunities
+                 WHERE lead_id=?1 AND status='superseded'",
+                rusqlite::params![lead_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let membership_tier: String = conn
+            .query_row(
+                "SELECT evidence_tier FROM brand_account_memberships
+                 WHERE brand='gnk' AND lead_id=?1",
+                rusqlite::params![lead_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(superseded, 1);
+        assert_eq!(membership_tier, "action_ready");
     }
 
     #[test]
