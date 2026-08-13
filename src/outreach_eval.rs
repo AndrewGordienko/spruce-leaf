@@ -29,6 +29,12 @@ pub(crate) struct EvalCase {
     pub(crate) candidate_b: String,
     /// Human gold label: a, b, or tie.
     pub(crate) expected: String,
+    /// Absolute human sendability labels. Pairwise preference alone can choose
+    /// the less-bad draft even when neither message should be sent.
+    #[serde(default)]
+    pub(crate) expected_sendable_a: Option<bool>,
+    #[serde(default)]
+    pub(crate) expected_sendable_b: Option<bool>,
     #[serde(default)]
     pub(crate) editor_note: String,
 }
@@ -36,6 +42,8 @@ pub(crate) struct EvalCase {
 #[derive(Debug, Deserialize)]
 pub(crate) struct PairwiseVerdict {
     pub(crate) preferred: String,
+    pub(crate) sendable_a: bool,
+    pub(crate) sendable_b: bool,
     pub(crate) rationale: String,
     #[serde(default)]
     pub(crate) unsupported_claims_a: Vec<String>,
@@ -45,18 +53,30 @@ pub(crate) struct PairwiseVerdict {
 
 pub async fn run(engine: &Engine, path: &Path, double_blind: bool) -> Result<()> {
     let cases = load(path)?;
-    if cases.is_empty() {
-        bail!("outreach eval corpus is empty: {}", path.display());
+    if cases.len() < 30 {
+        bail!(
+            "outreach promotion requires at least 30 cases; {} contains {}",
+            path.display(),
+            cases.len()
+        );
+    }
+    if !double_blind {
+        bail!("outreach promotion requires --double-blind order checking");
     }
 
     let mut correct = 0usize;
     let mut consistent = 0usize;
+    let mut absolute_correct = 0usize;
+    let mut absolute_labels = 0usize;
+    let mut unsupported_sendable = 0usize;
     for case in &cases {
         let forward = judge(engine, case, false).await?;
+        let reverse = judge(engine, case, true).await?;
         let preferred = if double_blind {
-            let reverse = judge(engine, case, true).await?;
             let reverse_normalized = swap_label(&reverse.preferred);
-            if normalize_label(&forward.preferred) == reverse_normalized {
+            let absolute_consistent = forward.sendable_a == reverse.sendable_b
+                && forward.sendable_b == reverse.sendable_a;
+            if normalize_label(&forward.preferred) == reverse_normalized && absolute_consistent {
                 consistent += 1;
                 normalize_label(&forward.preferred)
             } else {
@@ -68,6 +88,24 @@ pub async fn run(engine: &Engine, path: &Path, double_blind: bool) -> Result<()>
         let expected = normalize_label(&case.expected);
         let passed = preferred == expected;
         correct += usize::from(passed);
+        for (expected, judged, unsupported) in [
+            (
+                case.expected_sendable_a,
+                forward.sendable_a,
+                &forward.unsupported_claims_a,
+            ),
+            (
+                case.expected_sendable_b,
+                forward.sendable_b,
+                &forward.unsupported_claims_b,
+            ),
+        ] {
+            if let Some(expected) = expected {
+                absolute_labels += 1;
+                absolute_correct += usize::from(expected == judged);
+                unsupported_sendable += usize::from(expected && !unsupported.is_empty());
+            }
+        }
         println!(
             "{} {} expected={} judged={} - {}",
             if passed { "PASS" } else { "FAIL" },
@@ -89,6 +127,12 @@ pub async fn run(engine: &Engine, path: &Path, double_blind: bool) -> Result<()>
     }
 
     let accuracy = correct as f64 / cases.len() as f64;
+    if absolute_labels < 20 {
+        bail!(
+            "outreach promotion requires at least 20 absolute sendability labels; found {absolute_labels}"
+        );
+    }
+    let absolute_accuracy = absolute_correct as f64 / absolute_labels as f64;
     println!(
         "\nPairwise accuracy: {correct}/{} ({:.1}%){}",
         cases.len(),
@@ -99,10 +143,16 @@ pub async fn run(engine: &Engine, path: &Path, double_blind: bool) -> Result<()>
             String::new()
         }
     );
-    if accuracy < 0.80 {
+    println!(
+        "Absolute sendability accuracy: {absolute_correct}/{absolute_labels} ({:.1}%) · expected-sendable drafts with unsupported claims: {unsupported_sendable}",
+        absolute_accuracy * 100.0
+    );
+    if accuracy < 0.90 || absolute_accuracy < 0.90 || unsupported_sendable > 0 {
         bail!(
-            "outreach evaluation failed: {:.1}% is below the 80% promotion threshold",
-            accuracy * 100.0
+            "outreach evaluation failed: pairwise {:.1}%, absolute {:.1}%, unsupported expected-sendable {} (requires >=90%, >=90%, and zero)",
+            accuracy * 100.0,
+            absolute_accuracy * 100.0,
+            unsupported_sendable
         );
     }
     Ok(())
@@ -166,7 +216,7 @@ pub(crate) async fn judge_candidates(
 
 fn eval_system_prompt() -> String {
     format!(
-        "You are a blind, skeptical cold-outreach evaluator. Choose the message a sensible recipient is more likely to answer under the human style rubric below. Judge evidence safety, recipient relevance, specificity, natural spoken language, cognitive load, and whether replying is easy. Minimum length is not the goal: reward the minimum information needed to make a reply worthwhile, and do not prefer a terse note when it forces the recipient to decode jargon or lacks a reason to care. A short discovery call plus an email alternative is a valid first ask for a credible workflow owner when the note earns it. A scripted yes/no/category/referral menu is not low friction; it makes the recipient complete the sender's form. Penalize invented task nouns and internal labels even when they make a note shorter or more concrete. Do not reward polish or visible framework compliance.\n\nThe verified account facts and verified seller facts are separate exhaustive evidence boundaries; a supplied hypothesis is not a fact. Allow faithful paraphrases, explicitly uncertain questions, reasonable role-vantage inferences, and conservative subset claims. Flag only materially new declarative account details, outcomes, or seller capabilities that cross either boundary. Return tie only when neither is materially better. Never infer the preferred answer from candidate order.\n\nHUMAN STYLE RUBRIC:\n{HUMAN_STYLE_RUBRIC}"
+        "You are a blind, skeptical cold-outreach evaluator. First judge each candidate independently as sendable or not sendable; then choose the stronger message. A winner may still be unsendable. Judge evidence safety, recipient value, specificity, natural spoken language, cognitive load, and whether replying is easy. Minimum length is not the goal. A scripted yes/no/category/referral menu is not low friction. Penalize invented task nouns and internal labels. Do not reward polish or visible framework compliance.\n\nFor Wapahki first touches, sendable means 75–110 words, one source-supported facility/task/consequence, one hypothesis, one concrete contribution, exactly one question, and no call or meeting request. The recipient must not be asked to find the use case.\n\nThe verified account facts and verified seller facts are separate exhaustive evidence boundaries; a supplied hypothesis is not a fact. Flag materially new declarative details or capabilities. Return tie only when neither is materially better. Never infer the preferred answer from candidate order.\n\nHUMAN STYLE RUBRIC:\n{HUMAN_STYLE_RUBRIC}"
     )
 }
 
@@ -191,9 +241,11 @@ fn schema() -> serde_json::Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["preferred", "rationale", "unsupported_claims_a", "unsupported_claims_b"],
+        "required": ["preferred", "sendable_a", "sendable_b", "rationale", "unsupported_claims_a", "unsupported_claims_b"],
         "properties": {
             "preferred": { "type": "string", "enum": ["a", "b", "tie"] },
+            "sendable_a": { "type": "boolean" },
+            "sendable_b": { "type": "boolean" },
             "rationale": { "type": "string" },
             "unsupported_claims_a": { "type": "array", "items": { "type": "string" } },
             "unsupported_claims_b": { "type": "array", "items": { "type": "string" } }
@@ -215,16 +267,20 @@ mod tests {
     }
 
     #[test]
-    fn bundled_corpus_is_valid_jsonl() {
+    fn bundled_corpus_is_parseable_legacy_input() {
         let cases = load(Path::new("evals/outreach-gold.jsonl")).expect("load eval corpus");
-        assert!(cases.len() >= 2);
+        // The checked-in corpus remains readable while `run` deliberately
+        // refuses to promote a policy until it is expanded to 30 cases with
+        // absolute sendability labels.
+        assert!(cases.len() >= 18);
     }
 
     #[test]
     fn blind_judge_uses_human_style_without_gold_labels() {
         let prompt = eval_system_prompt();
         assert!(prompt.contains("scripted yes/no/category/referral menu"));
-        assert!(prompt.contains("short discovery call plus an email alternative"));
+        assert!(prompt.contains("First judge each candidate independently"));
+        assert!(prompt.contains("For Wapahki first touches"));
         assert!(!prompt.contains("expected"));
         assert!(!prompt.contains("editor_note"));
     }

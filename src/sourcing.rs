@@ -404,7 +404,7 @@ pub async fn source(
             .into_iter()
             .find(|run| {
                 run.segment_id == segment.id
-                    && run.source_name == "apollo"
+                    && run.source_name == "apollo_enrichment"
                     && run.query_fingerprint == query_fingerprint
             })
     });
@@ -623,7 +623,7 @@ pub async fn source(
         let _ = db.upsert_coverage_run(&CoverageRun {
             segment_id: segment.id.clone(),
             brand: pb.key.clone(),
-            source_name: "apollo".into(),
+            source_name: "apollo_enrichment".into(),
             query_fingerprint: query_fingerprint.clone(),
             cursor: next_cursor,
             pages_examined: previous_pages + pages_this_run,
@@ -1007,7 +1007,7 @@ pub async fn source(
             db.upsert_account_play_assessment(&assessment)?;
         }
         if let Some(segment) = &market_segment {
-            if db.link_lead_to_market_segment(&lead_id, &segment.id, "apollo")? {
+            if db.link_lead_to_market_segment(&lead_id, &segment.id, "apollo_enrichment")? {
                 segment_accounts_added += 1;
             }
         }
@@ -1043,7 +1043,7 @@ pub async fn source(
             .into_iter()
             .find(|run| {
                 run.segment_id == segment.id
-                    && run.source_name == "apollo"
+                    && run.source_name == "apollo_enrichment"
                     && run.query_fingerprint == query_fingerprint
             })
         {
@@ -1250,6 +1250,13 @@ async fn qualify_candidate(
         .await;
         if let Ok(value) = &mut qualification {
             value.research_sources = research_sources;
+            augment_brand_signals(
+                &pb.key,
+                &value.observed_facts,
+                &value.signals,
+                &value.research_sources,
+                &mut value.structured_signals,
+            );
             bind_wapahki_task_locations(&pb.key, &mut value.structured_signals, &source_locations);
         }
         qualification
@@ -1411,7 +1418,7 @@ fn bind_wapahki_task_locations(
     }
     for signal in signals.iter_mut().filter(|signal| {
         signal.definition_key == "account.bounded_repetitive_task"
-            && crate::db::ontario_site_from_text(&signal.evidence).is_none()
+            && crate::db::canadian_site_from_text(&signal.evidence).is_none()
     }) {
         let source_url = signal.source_url.trim().trim_end_matches('/');
         let Some(location) = source_locations.iter().find(|location| {
@@ -1431,35 +1438,15 @@ fn bind_wapahki_task_locations(
 /// completed location/outage results while forgetting to map those same facts
 /// to every canonical signal key. Do that mapping deterministically so routing
 /// depends on cited evidence, not on whether the model repeated a JSON label.
-#[cfg(test)]
 fn augment_outage_signals(
     observed_facts: &[String],
     readable_signals: &[String],
     research_sources: &[String],
     structured_signals: &mut Vec<SignalCandidate>,
 ) {
-    let evidence = observed_facts
-        .iter()
-        .chain(readable_signals)
-        .map(|value| value.trim())
-        .filter(|value| !value.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
-    if evidence.is_empty() {
-        return;
-    }
-    let company_source = research_sources.iter().find(|source| {
-        !source.contains("natural-resources.canada.ca") && !source.contains("api.outagehub.ca")
-    });
-    let station_source = research_sources
-        .iter()
-        .find(|source| source.contains("natural-resources.canada.ca"));
-    let outage_source = research_sources
-        .iter()
-        .find(|source| source.contains("api.outagehub.ca"));
-
     for key in [
         "account.distributed_locations",
+        "account.outage_sensitive_exposure",
         "account.outage_sensitive_decision",
         "account.operated_ev_charging_network",
         "account.historical_location_outage_match",
@@ -1468,20 +1455,22 @@ fn augment_outage_signals(
             signal.definition_key == key
                 && signal.confidence >= 0.60
                 && crate::qualification::credible_outagehub_signal(key, &signal.evidence)
-        }) || !crate::qualification::credible_outagehub_signal(key, &evidence)
-        {
+        }) {
             continue;
         }
-        let source_url = match key {
-            "account.distributed_locations" => station_source.or(company_source),
-            "account.historical_location_outage_match" => outage_source,
-            _ => company_source,
-        }
-        .cloned()
-        .unwrap_or_default();
+        let Some((evidence, source_url)) =
+            atomic_evidence_rows(observed_facts, readable_signals, research_sources)
+                .into_iter()
+                .find(|(evidence, source)| {
+                    !source.is_empty()
+                        && crate::qualification::credible_outagehub_signal(key, evidence)
+                })
+        else {
+            continue;
+        };
         structured_signals.push(SignalCandidate {
             definition_key: key.into(),
-            evidence: evidence.clone(),
+            evidence,
             source_url,
             confidence: 0.9,
         });
@@ -1494,112 +1483,107 @@ fn augment_outage_signals(
 /// posting cannot be lost because one JSON label was omitted. A single page
 /// still counts as one lineage, so it can earn a discovery-ready first-touch
 /// draft but never an action-ready cadence by itself.
-#[cfg(test)]
 fn augment_wapahki_signals(
     observed_facts: &[String],
     readable_signals: &[String],
     research_sources: &[String],
     structured_signals: &mut Vec<SignalCandidate>,
 ) {
-    let evidence = observed_facts
-        .iter()
-        .chain(readable_signals)
-        .map(|value| value.trim())
-        .filter(|value| !value.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
-    if evidence.is_empty() {
-        return;
-    }
-    let text = evidence.to_ascii_lowercase();
-    let has = |terms: &[&str]| terms.iter().any(|term| text.contains(term));
-    let physical_task = has(&[
-        "pack",
-        "pallet",
-        "stack",
-        "pick",
-        "case",
-        "carton",
-        "crate",
-        "bag",
-        "load",
-        "unload",
-        "lift",
-        "transfer",
-        "material handling",
-    ]);
-    let bounded_motion = physical_task
-        && has(&[
-            "palletize",
-            "palletis",
-            "pack into",
-            "pack products",
-            "pick and pack",
-            "stack cases",
-            "stack them",
-            "load cartons",
-            "assemble boxes",
-            "production line",
-            "end of line",
-            "end-of-line",
-            "finished goods",
-            "finished product",
-        ]);
-    let operating_fit = physical_task
-        && has(&[
-            "manufactur",
-            "production",
-            "plant",
-            "warehouse",
-            "distribution",
-            "factory",
-            "packaging line",
-            "cold storage",
-        ]);
-    let economic_pressure = bounded_motion
-        && has(&[
-            "repetitive",
-            "repeated",
-            "manual",
-            "manually",
-            "lift",
-            " lb",
-            "kg",
-            "shift",
-            "overtime",
-            "throughput",
-            "target",
-            "fast-paced",
-            "cold",
-            "jam",
-            "stoppage",
-            "physical",
-            "ergonomic",
-            "safety",
-        ]);
-    let source_url = research_sources.first().cloned().unwrap_or_default();
-    for (key, supported, confidence) in [
-        ("account.fit_evidence", operating_fit, 0.86),
-        ("account.bounded_repetitive_task", bounded_motion, 0.9),
-        (
-            "account.manual_task_economic_pressure",
-            economic_pressure,
-            0.82,
-        ),
-    ] {
-        if !supported
-            || structured_signals
-                .iter()
-                .any(|signal| signal.definition_key == key && signal.confidence >= 0.60)
-        {
+    for (evidence, source_url) in
+        atomic_evidence_rows(observed_facts, readable_signals, research_sources)
+    {
+        if source_url.is_empty() {
             continue;
         }
-        structured_signals.push(SignalCandidate {
-            definition_key: key.into(),
-            evidence: evidence.clone(),
-            source_url: source_url.clone(),
-            confidence,
-        });
+        let text = evidence.to_ascii_lowercase();
+        let has = |terms: &[&str]| terms.iter().any(|term| text.contains(term));
+        let physical_task = has(&[
+            "pack",
+            "pallet",
+            "stack",
+            "pick",
+            "case",
+            "carton",
+            "crate",
+            "bag",
+            "load",
+            "unload",
+            "lift",
+            "transfer",
+            "material handling",
+        ]);
+        let bounded_motion = physical_task
+            && has(&[
+                "palletize",
+                "palletis",
+                "pack into",
+                "pack products",
+                "pick and pack",
+                "stack cases",
+                "stack them",
+                "load cartons",
+                "assemble boxes",
+                "production line",
+                "end of line",
+                "end-of-line",
+                "finished goods",
+                "finished product",
+            ]);
+        let operating_fit = physical_task
+            && has(&[
+                "manufactur",
+                "production",
+                "plant",
+                "warehouse",
+                "distribution",
+                "factory",
+                "packaging line",
+                "cold storage",
+            ]);
+        let economic_pressure = bounded_motion
+            && has(&[
+                "repetitive",
+                "repeated",
+                "manual",
+                "manually",
+                "lift",
+                " lb",
+                "kg",
+                "shift",
+                "overtime",
+                "throughput",
+                "target",
+                "fast-paced",
+                "cold",
+                "jam",
+                "stoppage",
+                "physical",
+                "ergonomic",
+                "safety",
+            ]);
+        for (key, supported, confidence) in [
+            ("account.fit_evidence", operating_fit, 0.86),
+            ("account.bounded_repetitive_task", bounded_motion, 0.9),
+            (
+                "account.manual_task_economic_pressure",
+                economic_pressure,
+                0.82,
+            ),
+        ] {
+            if !supported
+                || structured_signals
+                    .iter()
+                    .any(|signal| signal.definition_key == key && signal.confidence >= 0.60)
+            {
+                continue;
+            }
+            structured_signals.push(SignalCandidate {
+                definition_key: key.into(),
+                evidence: evidence.clone(),
+                source_url: source_url.clone(),
+                confidence,
+            });
+        }
     }
 }
 
@@ -1607,138 +1591,190 @@ fn augment_wapahki_signals(
 /// keys when the research model extracted the facts but omitted the labels.
 /// This never derives a pain claim from company category or generic software
 /// use; the relevant decision/mechanism words must appear in the cited text.
-#[cfg(test)]
 fn augment_gnk_signals(
     observed_facts: &[String],
     readable_signals: &[String],
     research_sources: &[String],
     structured_signals: &mut Vec<SignalCandidate>,
 ) {
-    let evidence = observed_facts
-        .iter()
-        .chain(readable_signals)
-        .map(|value| value.trim())
-        .filter(|value| !value.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
-    if evidence.is_empty() {
-        return;
-    }
-    let text = evidence.to_ascii_lowercase();
-    let has = |terms: &[&str]| terms.iter().any(|term| text.contains(term));
-    let workflow = has(&[
-        "reconcil",
-        "denial",
-        "denied",
-        "exception",
-        "approval",
-        "payment posting",
-        "accounts receivable",
-        "ar follow-up",
-        "audit",
-        "case management",
-        "settlement",
-        "dispute",
-        "shipment",
-        "release",
-    ]);
-    let specific_decision = workflow
-        && has(&[
-            "approve",
-            "deny",
-            "denied",
-            "eligibility",
-            "resolve",
-            "correct",
-            "resubmit",
-            "review",
-            "investigate",
-            "compare",
-            "match",
-            "route",
-            "escalat",
-            "settle",
-            "write-off",
-            "write off",
-            "release",
-            "recover",
-        ]);
-    let mechanism = workflow
-        && has(&[
-            "bank statement",
-            "supporting document",
-            "authorization",
-            "supervision",
-            "notes",
-            "payer portal",
-            "eob",
-            "remittance",
-            "invoice",
-            "purchase order",
-            "work order",
-            "batch",
-            "record",
-            "system",
-            "spreadsheet",
-            "email",
-            "timeline",
-            "documentation",
-            "data",
-            "three-way match",
-            "3-way match",
-        ]);
-    let consequence = workflow
-        && has(&[
-            "delay",
-            "backlog",
-            "rejection",
-            "reimbursement",
-            "recover revenue",
-            "recovery",
-            "write-off",
-            "write off",
-            "late fee",
-            "penalty",
-            "audit exposure",
-            "service level",
-            "sla",
-            "lost revenue",
-            "payment speed",
-            "settlement time",
-        ]);
-    let source_url = research_sources.first().cloned().unwrap_or_default();
-    for (key, supported, confidence) in [
-        ("account.fit_evidence", workflow, 0.84),
-        (
-            "account.specific_recurring_decision",
-            specific_decision,
-            0.88,
-        ),
-        (
-            "account.external_trigger_or_mechanism_evidence",
-            mechanism,
-            0.86,
-        ),
-        ("account.believable_operating_consequence", consequence, 0.8),
-    ] {
-        if !supported
-            || structured_signals
-                .iter()
-                .any(|signal| signal.definition_key == key && signal.confidence >= 0.60)
-        {
+    for (evidence, source_url) in
+        atomic_evidence_rows(observed_facts, readable_signals, research_sources)
+    {
+        if source_url.is_empty() {
             continue;
         }
-        let canonical_evidence = if key == "account.specific_recurring_decision" {
-            format!("Recurring job-duty evidence: {evidence}")
-        } else {
-            evidence.clone()
-        };
-        structured_signals.push(SignalCandidate {
-            definition_key: key.into(),
-            evidence: canonical_evidence,
-            source_url: source_url.clone(),
-            confidence,
-        });
+        let text = evidence.to_ascii_lowercase();
+        let has = |terms: &[&str]| terms.iter().any(|term| text.contains(term));
+        let workflow = has(&[
+            "reconcil",
+            "denial",
+            "denied",
+            "exception",
+            "approval",
+            "payment posting",
+            "accounts receivable",
+            "ar follow-up",
+            "audit",
+            "case management",
+            "settlement",
+            "dispute",
+            "shipment",
+            "release",
+        ]);
+        let specific_decision = workflow
+            && has(&[
+                "approve",
+                "deny",
+                "denied",
+                "eligibility",
+                "resolve",
+                "correct",
+                "resubmit",
+                "review",
+                "investigate",
+                "compare",
+                "match",
+                "route",
+                "escalat",
+                "settle",
+                "write-off",
+                "write off",
+                "release",
+                "recover",
+            ]);
+        let mechanism = workflow
+            && has(&[
+                "bank statement",
+                "supporting document",
+                "authorization",
+                "supervision",
+                "notes",
+                "payer portal",
+                "eob",
+                "remittance",
+                "invoice",
+                "purchase order",
+                "work order",
+                "batch",
+                "record",
+                "system",
+                "spreadsheet",
+                "email",
+                "timeline",
+                "documentation",
+                "data",
+                "three-way match",
+                "3-way match",
+            ]);
+        let consequence = workflow
+            && has(&[
+                "delay",
+                "backlog",
+                "rejection",
+                "reimbursement",
+                "recover revenue",
+                "recovery",
+                "write-off",
+                "write off",
+                "late fee",
+                "penalty",
+                "audit exposure",
+                "service level",
+                "sla",
+                "lost revenue",
+                "payment speed",
+                "settlement time",
+            ]);
+        for (key, supported, confidence) in [
+            ("account.fit_evidence", workflow, 0.84),
+            (
+                "account.specific_recurring_decision",
+                specific_decision,
+                0.88,
+            ),
+            (
+                "account.external_trigger_or_mechanism_evidence",
+                mechanism,
+                0.86,
+            ),
+            ("account.believable_operating_consequence", consequence, 0.8),
+        ] {
+            if !supported
+                || structured_signals
+                    .iter()
+                    .any(|signal| signal.definition_key == key && signal.confidence >= 0.60)
+            {
+                continue;
+            }
+            let canonical_evidence = if key == "account.specific_recurring_decision" {
+                format!("Recurring job-duty evidence: {evidence}")
+            } else {
+                evidence.clone()
+            };
+            structured_signals.push(SignalCandidate {
+                definition_key: key.into(),
+                evidence: canonical_evidence,
+                source_url: source_url.clone(),
+                confidence,
+            });
+        }
+    }
+}
+
+fn atomic_evidence_rows(
+    observed_facts: &[String],
+    readable_signals: &[String],
+    research_sources: &[String],
+) -> Vec<(String, String)> {
+    let unique_fallback = (research_sources.len() == 1).then(|| research_sources[0].clone());
+    observed_facts
+        .iter()
+        .chain(readable_signals)
+        .filter_map(|value| {
+            let evidence = value.trim();
+            if evidence.is_empty() {
+                return None;
+            }
+            let source = evidence
+                .strip_prefix('[')
+                .and_then(|rest| rest.split_once(']'))
+                .map(|(source, _)| source.trim().to_string())
+                .filter(|source| source.starts_with("http://") || source.starts_with("https://"))
+                .or_else(|| unique_fallback.clone())
+                .unwrap_or_default();
+            Some((evidence.to_string(), source))
+        })
+        .collect()
+}
+
+fn augment_brand_signals(
+    brand: &str,
+    observed_facts: &[String],
+    readable_signals: &[String],
+    research_sources: &[String],
+    structured_signals: &mut Vec<SignalCandidate>,
+) {
+    if brand.eq_ignore_ascii_case("outagehub") {
+        augment_outage_signals(
+            observed_facts,
+            readable_signals,
+            research_sources,
+            structured_signals,
+        );
+    } else if brand.eq_ignore_ascii_case("wapahki") {
+        augment_wapahki_signals(
+            observed_facts,
+            readable_signals,
+            research_sources,
+            structured_signals,
+        );
+    } else if brand.eq_ignore_ascii_case("gnk") {
+        augment_gnk_signals(
+            observed_facts,
+            readable_signals,
+            research_sources,
+            structured_signals,
+        );
     }
 }
 
@@ -1790,6 +1826,7 @@ fn qualification_foundations_present(brand: &str, matched: &[String]) -> bool {
         &[
             "account.fit_evidence",
             "account.distributed_locations",
+            "account.outage_sensitive_exposure",
             "account.outage_sensitive_decision",
             "account.historical_location_outage_match",
         ]
@@ -1829,7 +1866,9 @@ fn qualification_discovery_foundations_present(brand: &str, matched: &[String]) 
         has("account.specific_recurring_decision")
             || has("account.external_trigger_or_mechanism_evidence")
     } else if brand.eq_ignore_ascii_case("outagehub") {
-        has("account.distributed_locations") && has("account.outage_sensitive_decision")
+        has("account.distributed_locations")
+            && has("account.outage_sensitive_exposure")
+            && has("account.outage_sensitive_decision")
     } else {
         true
     }
@@ -1928,7 +1967,7 @@ fn source_bound_facility_present(brand: &str, signals: &[SignalCandidate]) -> bo
     !brand.eq_ignore_ascii_case("wapahki")
         || signals.iter().any(|signal| {
             signal.definition_key == "account.bounded_repetitive_task"
-                && crate::db::ontario_site_from_text(&signal.evidence).is_some()
+                && crate::db::canadian_site_from_text(&signal.evidence).is_some()
         })
 }
 
@@ -2247,16 +2286,31 @@ fn reuse_portfolio_people(
     if domain.is_empty() || limit == 0 {
         return Ok(0);
     }
+    let Some(target_lead) = db.get_lead(target_lead_id)? else {
+        return Ok(0);
+    };
+    if target_lead.apollo_org_id.trim().is_empty()
+        || target_lead.apollo_org_id.starts_with("portfolio-domain:")
+    {
+        return Ok(0);
+    }
+    let shared_domain = shared_domain_requires_official_membership(db, &domain)?;
     let matching_lead_ids = db
         .list_leads(None)?
         .into_iter()
-        .filter(|lead| canonical_company_domain(&lead.domain) == domain)
+        .filter(|lead| lead.apollo_org_id == target_lead.apollo_org_id)
         .map(|lead| lead.id)
         .collect::<HashSet<_>>();
     let mut candidates = db
         .list_people(None, None)?
         .into_iter()
         .filter(|person| matching_lead_ids.contains(&person.lead_id))
+        .filter(|person| person.apollo_org_id == target_lead.apollo_org_id)
+        .filter(|person| {
+            !shared_domain
+                || (person.employer_verification == "official"
+                    && canonical_company_domain(&person.employer_source_url) == domain)
+        })
         .filter(|person| {
             !matches!(
                 person.status.to_ascii_lowercase().as_str(),
@@ -2294,6 +2348,10 @@ fn reuse_portfolio_people(
             last_name: source.last_name.clone(),
             name: source.name.clone(),
             title: source.title.clone(),
+            apollo_org_id: source.apollo_org_id.clone(),
+            employer_name: source.employer_name.clone(),
+            employer_verification: source.employer_verification.clone(),
+            employer_source_url: source.employer_source_url.clone(),
             location: source.location.clone(),
             timezone: source.timezone.clone(),
             vantage: crate::response_design::effective_vantage(&source.title, &source.vantage),
@@ -2314,6 +2372,61 @@ fn reuse_portfolio_people(
         }
     }
     Ok(filed)
+}
+
+fn shared_domain_requires_official_membership(db: &SharedDb, domain: &str) -> Result<bool> {
+    let identities = db
+        .list_leads(None)?
+        .into_iter()
+        .filter(|lead| canonical_company_domain(&lead.domain) == domain)
+        .map(|lead| {
+            if lead.apollo_org_id.trim().is_empty() {
+                format!("name:{}", lead.name.trim().to_ascii_lowercase())
+            } else {
+                format!("apollo:{}", lead.apollo_org_id.trim())
+            }
+        })
+        .collect::<HashSet<_>>();
+    Ok(identities.len() > 1)
+}
+
+fn apollo_person_organization_id(person: &ApolloPerson) -> &str {
+    if !person.organization_id.trim().is_empty() {
+        person.organization_id.trim()
+    } else {
+        person
+            .organization
+            .as_ref()
+            .map(|organization| organization.id.trim())
+            .unwrap_or_default()
+    }
+}
+
+fn apollo_person_belongs_to_org(person: &ApolloPerson, organization_id: &str) -> bool {
+    !organization_id.trim().is_empty()
+        && !organization_id.starts_with("portfolio-domain:")
+        && apollo_person_organization_id(person) == organization_id.trim()
+}
+
+fn official_person_employer_source(
+    db: &SharedDb,
+    lead: &Lead,
+    person: &ApolloPerson,
+) -> Result<Option<String>> {
+    let name = person.full_name().to_ascii_lowercase();
+    if name.trim().is_empty() {
+        return Ok(None);
+    }
+    let official_domain = canonical_company_domain(&lead.domain);
+    Ok(db
+        .list_active_signal_observations(Some(&lead.brand), Some(&lead.id), None)?
+        .into_iter()
+        .find(|observation| {
+            matches!(observation.status.as_str(), "observed" | "verified")
+                && canonical_company_domain(&observation.source_url) == official_domain
+                && observation.evidence.to_ascii_lowercase().contains(&name)
+        })
+        .map(|observation| observation.source_url))
 }
 
 fn reusable_person_identity(person: &Person) -> String {
@@ -2361,7 +2474,17 @@ async fn source_people(
     // n_contacts of the strongest verified people per company.
     let source_pool = n_contacts.saturating_mul(CONTACT_BACKFILL_FACTOR).max(8);
     let preferred_locations = preferred_contact_locations(&pb.key);
-    let people = gather_people(apollo, &pb.key, org, icp, source_pool, &preferred_locations).await;
+    let decision_context = lead.observed_facts.join(" ");
+    let people = gather_people(
+        apollo,
+        &pb.key,
+        org,
+        icp,
+        source_pool,
+        &preferred_locations,
+        &decision_context,
+    )
+    .await;
     if people.is_empty() {
         log_sourcing(format!("no people found for {} (all strategies)", org.name));
         return Ok(0);
@@ -2374,7 +2497,22 @@ async fn source_people(
         });
 
     let mut added = 0usize;
+    let shared_domain =
+        shared_domain_requires_official_membership(db, &canonical_company_domain(&lead.domain))?;
     for (i, ap) in people.iter().enumerate().take(source_pool) {
+        let official_source = if shared_domain {
+            official_person_employer_source(db, lead, ap)?
+        } else {
+            None
+        };
+        if shared_domain && official_source.is_none() {
+            log_sourcing(format!(
+                "held {} at {}: shared domain requires an official agency membership page",
+                ap.full_name(),
+                org.name
+            ));
+            continue;
+        }
         let va = assignments.assignments.iter().find(|a| a.index == i);
         let location = ap.location();
         let timezone_location = if location.is_empty() {
@@ -2394,6 +2532,14 @@ async fn source_people(
             last_name: ap.last_name.clone(),
             name: ap.full_name(),
             title: ap.title.clone(),
+            apollo_org_id: apollo_person_organization_id(ap).to_string(),
+            employer_name: ap
+                .organization
+                .as_ref()
+                .map(|organization| organization.name.clone())
+                .unwrap_or_else(|| org.name.clone()),
+            employer_verification: if shared_domain { "official" } else { "apollo" }.into(),
+            employer_source_url: official_source.unwrap_or_default(),
             location,
             timezone,
             vantage: crate::response_design::effective_vantage(
@@ -2429,9 +2575,9 @@ async fn source_people(
 }
 
 /// Collect up to `n_contacts` real people at an org, deduped, preferring
-/// title/seniority-matched people but broadening to any employee and falling
-/// back across domain/org-id lookups so a company reliably yields contacts even
-/// when Apollo's org-id index is empty or the search record has no domain.
+/// title/seniority-matched people. OutageHub deliberately accepts a shortfall
+/// rather than filling a requested count with arbitrary employees: contact
+/// count is not buying-committee completion.
 async fn gather_people(
     apollo: &Apollo,
     brand: &str,
@@ -2439,14 +2585,16 @@ async fn gather_people(
     icp: &Icp,
     n_contacts: usize,
     preferred_locations: &[String],
+    decision_context: &str,
 ) -> Vec<ApolloPerson> {
     use std::collections::HashSet;
 
     let want = n_contacts.max(1);
     let over = (want * 2).clamp(5, 50) as u32;
 
-    // People search by domain is far more reliable than by org id; resolve a
-    // domain by name if the search record lacks one.
+    // A domain may route several unrelated agencies or business units. Resolve
+    // it only as a search fallback; exact Apollo organization membership is the
+    // acceptance boundary for every returned person.
     let mut domain = org.domain();
     if domain.is_empty() {
         domain = resolve_domain(apollo, org).await;
@@ -2458,7 +2606,7 @@ async fn gather_people(
     // One deliberate search per committee role. Keep at most one strong result
     // from each role before filling the bench, so a page of operations managers
     // cannot masquerade as a mapped buying committee.
-    for (role, titles) in committee_title_groups(brand) {
+    for (role, titles) in committee_title_groups(brand, decision_context) {
         let mut role_found = false;
         let location_attempts = if preferred_locations.is_empty() {
             vec![Vec::new()]
@@ -2469,9 +2617,9 @@ async fn gather_people(
             if role_found {
                 break;
             }
-            let filters = if !domain.is_empty() {
+            let filters = if !org.id.is_empty() && !org.id.starts_with("portfolio-domain:") {
                 PeopleFilters {
-                    organization_domains: vec![domain.clone()],
+                    organization_ids: vec![org.id.clone()],
                     titles: titles.iter().map(|title| (*title).to_string()).collect(),
                     locations,
                     page: 1,
@@ -2480,7 +2628,7 @@ async fn gather_people(
                 }
             } else {
                 PeopleFilters {
-                    organization_ids: vec![org.id.clone()],
+                    organization_domains: vec![domain.clone()],
                     titles: titles.iter().map(|title| (*title).to_string()).collect(),
                     locations,
                     page: 1,
@@ -2492,8 +2640,27 @@ async fn gather_people(
                 Ok(people) => {
                     let preferred = people
                         .iter()
-                        .position(|person| committee_role_for_title(&person.title) == role)
-                        .or_else(|| (!people.is_empty()).then_some(0));
+                        .position(|person| {
+                            apollo_person_belongs_to_org(person, &org.id)
+                                && (!brand.eq_ignore_ascii_case("outagehub")
+                                    || crate::qualification::outagehub_role_matches_decision(
+                                        &person.title,
+                                        "process_owner",
+                                        decision_context,
+                                    ))
+                                && committee_role_for_title(&person.title) == role
+                        })
+                        .or_else(|| {
+                            people.iter().position(|person| {
+                                apollo_person_belongs_to_org(person, &org.id)
+                                    && (!brand.eq_ignore_ascii_case("outagehub")
+                                        || crate::qualification::outagehub_role_matches_decision(
+                                            &person.title,
+                                            "process_owner",
+                                            decision_context,
+                                        ))
+                            })
+                        });
                     if let Some(index) = preferred {
                         let person = people[index].clone();
                         let key = if !person.id.is_empty() {
@@ -2519,9 +2686,27 @@ async fn gather_people(
         }
     }
 
-    // Ordered fallback strategies: most targeted first so remaining bench rows
-    // progressively broader so we still reach the count.
+    // Ordered fallback strategies. For OutageHub these remain title-targeted;
+    // arbitrary-employee fallback would turn a contact count into false buying-
+    // committee coverage.
     let mut attempts: Vec<(&str, PeopleFilters)> = Vec::new();
+    if !preferred_locations.is_empty()
+        && !org.id.is_empty()
+        && !org.id.starts_with("portfolio-domain:")
+    {
+        attempts.push((
+            "org_id+titles+location",
+            PeopleFilters {
+                organization_ids: vec![org.id.clone()],
+                titles: icp.titles.clone(),
+                seniorities: icp.seniorities.clone(),
+                locations: preferred_locations.to_vec(),
+                page: 1,
+                per_page: over,
+                ..Default::default()
+            },
+        ));
+    }
     if !preferred_locations.is_empty() && !domain.is_empty() {
         attempts.push((
             "domain+titles+location",
@@ -2536,34 +2721,10 @@ async fn gather_people(
             },
         ));
     }
-    if !preferred_locations.is_empty() && !org.id.is_empty() {
-        attempts.push((
-            "org_id+titles+location",
-            PeopleFilters {
-                organization_ids: vec![org.id.clone()],
-                titles: icp.titles.clone(),
-                seniorities: icp.seniorities.clone(),
-                locations: preferred_locations.to_vec(),
-                page: 1,
-                per_page: over,
-                ..Default::default()
-            },
-        ));
-    }
-    if !domain.is_empty() {
-        attempts.push((
-            "domain+titles",
-            PeopleFilters {
-                organization_domains: vec![domain.clone()],
-                titles: icp.titles.clone(),
-                seniorities: icp.seniorities.clone(),
-                page: 1,
-                per_page: over,
-                ..Default::default()
-            },
-        ));
-    }
-    if !org.id.is_empty() {
+    if !brand.eq_ignore_ascii_case("outagehub")
+        && !org.id.is_empty()
+        && !org.id.starts_with("portfolio-domain:")
+    {
         attempts.push((
             "org_id+titles",
             PeopleFilters {
@@ -2576,22 +2737,38 @@ async fn gather_people(
             },
         ));
     }
-    if !domain.is_empty() {
+    if !brand.eq_ignore_ascii_case("outagehub") && !domain.is_empty() {
         attempts.push((
-            "domain-any",
+            "domain+titles",
             PeopleFilters {
                 organization_domains: vec![domain.clone()],
+                titles: icp.titles.clone(),
+                seniorities: icp.seniorities.clone(),
                 page: 1,
                 per_page: over,
                 ..Default::default()
             },
         ));
     }
-    if !org.id.is_empty() {
+    if !brand.eq_ignore_ascii_case("outagehub")
+        && !org.id.is_empty()
+        && !org.id.starts_with("portfolio-domain:")
+    {
         attempts.push((
             "org_id-any",
             PeopleFilters {
                 organization_ids: vec![org.id.clone()],
+                page: 1,
+                per_page: over,
+                ..Default::default()
+            },
+        ));
+    }
+    if !brand.eq_ignore_ascii_case("outagehub") && !domain.is_empty() {
+        attempts.push((
+            "domain-any",
+            PeopleFilters {
+                organization_domains: vec![domain.clone()],
                 page: 1,
                 per_page: over,
                 ..Default::default()
@@ -2606,7 +2783,17 @@ async fn gather_people(
         match apollo.search_people(&filters).await {
             Ok(people) => {
                 for p in people {
-                    if p.full_name().trim().is_empty() {
+                    if p.full_name().trim().is_empty() || !apollo_person_belongs_to_org(&p, &org.id)
+                    {
+                        continue;
+                    }
+                    if brand.eq_ignore_ascii_case("outagehub")
+                        && !crate::qualification::outagehub_role_matches_decision(
+                            &p.title,
+                            "process_owner",
+                            decision_context,
+                        )
+                    {
                         continue;
                     }
                     let key = if !p.id.is_empty() {
@@ -2635,7 +2822,7 @@ async fn gather_people(
 
 fn preferred_contact_locations(brand: &str) -> Vec<String> {
     if brand.eq_ignore_ascii_case("wapahki") {
-        vec!["Ontario, Canada".into()]
+        vec!["Canada".into()]
     } else if brand.eq_ignore_ascii_case("outagehub") {
         vec!["Canada".into()]
     } else {
@@ -2643,7 +2830,13 @@ fn preferred_contact_locations(brand: &str) -> Vec<String> {
     }
 }
 
-fn committee_title_groups(brand: &str) -> Vec<(&'static str, &'static [&'static str])> {
+fn committee_title_groups(
+    brand: &str,
+    decision_context: &str,
+) -> Vec<(&'static str, &'static [&'static str])> {
+    if brand.eq_ignore_ascii_case("outagehub") {
+        return outagehub_committee_title_groups(decision_context);
+    }
     let witness: &'static [&'static str] = if brand.eq_ignore_ascii_case("wapahki") {
         &[
             "production supervisor",
@@ -2735,6 +2928,34 @@ fn committee_title_groups(brand: &str) -> Vec<(&'static str, &'static [&'static 
                 "purchasing manager",
                 "strategic sourcing manager",
             ],
+        ),
+    ]
+}
+
+fn outagehub_committee_title_groups(
+    decision_context: &str,
+) -> Vec<(&'static str, &'static [&'static str])> {
+    if !crate::qualification::credible_outagehub_signal(
+        "account.outage_sensitive_decision",
+        decision_context,
+    ) {
+        // No evidenced decision means no buyer-title fishing.
+        return Vec::new();
+    }
+    // The segment catalog owns which witnesses and owners are plausibly near
+    // this exact decision; deprioritized segments never enter contact search.
+    let Some(segment) = crate::segments::segment_for_evidence(decision_context) else {
+        return Vec::new();
+    };
+    if segment.deprioritized {
+        return Vec::new();
+    }
+    vec![
+        ("problem_witness", segment.witness_titles),
+        ("process_owner", segment.owner_titles),
+        (
+            "continuity_owner",
+            crate::segments::CONTINUITY_SEARCH_TITLES,
         ),
     ]
 }
@@ -3142,7 +3363,7 @@ fn apply_brand_icp_guard(brand: &str, thesis: &str, segment_key: Option<&str>, i
     let thesis = thesis.to_ascii_lowercase();
     let segment_key = segment_key.unwrap_or_default().to_ascii_lowercase();
     let coverage: &[&str] = if brand.eq_ignore_ascii_case("wapahki") {
-        let warehouse_segment = segment_key == "ontario_warehouse_case_handling"
+        let warehouse_segment = segment_key == "canada_warehouse_case_handling"
             || (segment_key.is_empty()
                 && [
                     "warehouse",
@@ -3153,7 +3374,7 @@ fn apply_brand_icp_guard(brand: &str, thesis: &str, segment_key: Option<&str>, i
                 ]
                 .iter()
                 .any(|term| thesis.contains(term)));
-        let food_segment = segment_key == "ontario_food_case_palletizing"
+        let food_segment = segment_key == "canada_food_case_palletizing"
             || (segment_key.is_empty()
                 && !["outside food", "non-food", "excluding food"]
                     .iter()
@@ -3376,11 +3597,7 @@ fn apply_brand_icp_guard(brand: &str, thesis: &str, segment_key: Option<&str>, i
         }
     }
     icp.keywords.truncate(10);
-    icp.locations = if brand.eq_ignore_ascii_case("wapahki") {
-        vec!["Ontario, Canada".into()]
-    } else {
-        vec!["Canada".into()]
-    };
+    icp.locations = vec!["Canada".into()];
 }
 
 fn brand_candidate_precheck(brand: &str, org: &ApolloOrg) -> Option<String> {
@@ -3770,14 +3987,14 @@ fn choose_source_segment<'a>(
             .iter()
             .any(|term| context.contains(term))
         {
-            "ontario_warehouse_case_handling"
+            "canada_warehouse_case_handling"
         } else if ["food", "beverage", "pack", "pallet"]
             .iter()
             .any(|term| context.contains(term))
         {
-            "ontario_food_case_palletizing"
+            "canada_food_case_palletizing"
         } else {
-            "ontario_manufacturing_machine_tending"
+            "canada_manufacturing_machine_tending"
         }
     } else if brand.eq_ignore_ascii_case("gnk") {
         if ["construction", "contractor", "change order"]
@@ -4236,6 +4453,21 @@ pub async fn refresh_lead_context(
         match result {
             Ok(mut doc) => {
                 merge_prior_refresh_evidence(&lead, &mut doc);
+                let mut research_sources = doc
+                    .structured_signals
+                    .iter()
+                    .map(|signal| signal.source_url.clone())
+                    .filter(|source| !source.trim().is_empty())
+                    .collect::<Vec<_>>();
+                research_sources.sort();
+                research_sources.dedup();
+                augment_brand_signals(
+                    &pb.key,
+                    &doc.observed_facts,
+                    &doc.signals,
+                    &research_sources,
+                    &mut doc.structured_signals,
+                );
                 bind_wapahki_task_locations(
                     &pb.key,
                     &mut doc.structured_signals,
@@ -4504,7 +4736,7 @@ mod tests {
 
     #[test]
     fn committee_mapping_has_six_distinct_commercial_roles() {
-        let groups = committee_title_groups("wapahki");
+        let groups = committee_title_groups("wapahki", "");
         assert_eq!(groups.len(), 6);
         assert_eq!(groups[0].0, "problem_witness");
         assert!(groups.iter().any(|(role, _)| *role == "process_owner"));
@@ -4524,12 +4756,34 @@ mod tests {
     }
 
     #[test]
+    fn outagehub_contact_search_is_vertical_specific_and_excludes_count_fillers() {
+        let labs = committee_title_groups(
+            "outagehub",
+            "The company operates laboratories where operations checks utility outages during a power interruption.",
+        );
+        let titles = labs
+            .iter()
+            .flat_map(|(_, titles)| titles.iter().copied())
+            .collect::<Vec<_>>();
+        assert!(titles.contains(&"director of operations"));
+        assert!(titles.contains(&"business continuity manager"));
+        assert!(!titles.iter().any(|title| title.contains("finance")));
+        assert!(!titles.iter().any(|title| title.contains("procurement")));
+
+        assert!(committee_title_groups(
+            "outagehub",
+            "The company merely operates several laboratories."
+        )
+        .is_empty());
+    }
+
+    #[test]
     fn outage_facts_are_mapped_to_missing_canonical_labels() {
         let facts = vec![
-            "SWTCH provides EV-charging hardware, a cloud platform, load management, billing, monitoring, maintenance, and support for multifamily, workplace, and public/retail properties.".to_string(),
-            "SWTCH states that it uses AI-assisted 24/7/365 monitoring, remotely intervenes in charger disruptions, and alerts customers when onsite intervention is required.".to_string(),
-            "NRCan lists SWTCH-network public charging stations in Oakville and Guelph.".to_string(),
-            "Completed historical analyses found three listed SWTCH-network public charging locations within reported utility-outage areas at the stated utility timestamps.".to_string(),
+            "[https://swtchenergy.com/technology/] SWTCH operates and monitors a Canadian EV-charging network with public charging sites in Oakville and Guelph.".to_string(),
+            "[https://swtchenergy.com/technology/] SWTCH states that its charging operations team checks utility status before dispatch or customer communication during a charging-site outage.".to_string(),
+            "[https://natural-resources.canada.ca/stations] NRCan lists SWTCH-network public charging stations in Oakville and Guelph.".to_string(),
+            "[https://api.outagehub.ca/v1/outages/37535] On 2026-07-14 at 14:30, the SWTCH charging site at 123 King Street overlapped a utility outage area in a utility report.".to_string(),
         ];
         let sources = vec![
             "https://swtchenergy.com/technology/".to_string(),
@@ -4553,6 +4807,7 @@ mod tests {
         augment_outage_signals(&facts, &[], &sources, &mut signals);
         for key in [
             "account.distributed_locations",
+            "account.outage_sensitive_exposure",
             "account.outage_sensitive_decision",
             "account.operated_ev_charging_network",
             "account.historical_location_outage_match",
@@ -4696,7 +4951,7 @@ mod tests {
         apply_brand_icp_guard(
             "wapahki",
             "Ontario warehouses and distribution centres",
-            Some("ontario_warehouse_case_handling"),
+            Some("canada_warehouse_case_handling"),
             &mut icp,
         );
         assert!(!icp.keywords.contains(&"material handling".to_string()));
@@ -4714,7 +4969,7 @@ mod tests {
         apply_brand_icp_guard(
             "wapahki",
             "Ontario product manufacturing outside food with machine tending",
-            Some("ontario_manufacturing_machine_tending"),
+            Some("canada_manufacturing_machine_tending"),
             &mut non_food,
         );
         assert!(!non_food
@@ -4839,6 +5094,9 @@ mod tests {
             apollo_person_id: "person-1".into(),
             name: "Pat Operator".into(),
             title: "Plant Operations Manager".into(),
+            apollo_org_id: "org-shared".into(),
+            employer_name: "Shared Factory".into(),
+            employer_verification: "apollo".into(),
             vantage: "process_owner".into(),
             why_them: "Outage-specific rationale that must not cross brands".into(),
             email: "pat@shared.example".into(),
@@ -4982,10 +5240,7 @@ mod tests {
 
     #[test]
     fn wapahki_people_search_starts_in_ontario() {
-        assert_eq!(
-            preferred_contact_locations("wapahki"),
-            vec!["Ontario, Canada"]
-        );
+        assert_eq!(preferred_contact_locations("wapahki"), vec!["Canada"]);
         assert_eq!(preferred_contact_locations("outagehub"), vec!["Canada"]);
         assert!(preferred_contact_locations("gnk").is_empty());
     }
@@ -5285,6 +5540,10 @@ mod tests {
                 "Operates a Canadian EV charging network with public site locations.",
             ),
             (
+                "account.outage_sensitive_exposure",
+                "The operator runs and monitors a Canadian EV charging network where power loss interrupts service at its charging sites.",
+            ),
+            (
                 "account.outage_sensitive_decision",
                 "Service Operations checks utility status before dispatch or customer communication when a charging-site availability incident occurs.",
             ),
@@ -5302,7 +5561,7 @@ mod tests {
         .map(|(index, (definition_key, evidence))| SignalCandidate {
             definition_key: definition_key.into(),
             evidence: evidence.into(),
-            source_url: if index == 3 {
+            source_url: if index == 4 {
                 "https://utility.example/outages/2026-07-14".into()
             } else {
                 "https://operator.example/charging-network".into()
@@ -5322,8 +5581,8 @@ mod tests {
 
         enforce_play_qualification(&mut qualification, Some(&play), &allowed);
 
-        assert!(qualification.qualified);
-        assert_eq!(qualification.matched_signal_keys.len(), 4);
+        assert!(qualification.qualified, "{qualification:#?}");
+        assert_eq!(qualification.matched_signal_keys.len(), 5);
         assert_eq!(qualification.routing_status, "qualified");
     }
 

@@ -9,7 +9,8 @@ pub(crate) fn credible_outagehub_signal(key: &str, evidence: &str) -> bool {
     let text = evidence.to_ascii_lowercase();
     match key.trim() {
         "account.distributed_locations" => distributed_operating_footprint(&text),
-        "account.outage_sensitive_decision" => outage_decision_or_exposure(&text),
+        "account.outage_sensitive_exposure" => outage_sensitive_exposure(&text),
+        "account.outage_sensitive_decision" => outage_sensitive_decision(&text),
         "account.operated_ev_charging_network" => operated_ev_charging_network(&text),
         "account.historical_location_outage_match" => historical_location_outage_match(&text),
         _ => true,
@@ -199,9 +200,24 @@ fn historical_location_outage_match(text: &str) -> bool {
             "station in",
             "facility at",
             "facility in",
+            "laboratory at",
+            "laboratory in",
+            "lab at",
+            "lab in",
+            "warehouse at",
+            "warehouse in",
+            "tower at",
+            "tower in",
             "location at",
             "location in",
             "store at",
+            "store in",
+            "residence at",
+            "residence in",
+            "plant at",
+            "plant in",
+            "property at",
+            "property in",
             "asset at",
         ],
     );
@@ -243,7 +259,7 @@ fn historical_location_outage_match(text: &str) -> bool {
     completed_match && utility_event && account_location && time && !hypothetical
 }
 
-fn outage_decision_or_exposure(text: &str) -> bool {
+fn outage_sensitive_decision(text: &str) -> bool {
     let explicit_outage = has(
         text,
         &[
@@ -279,15 +295,36 @@ fn outage_decision_or_exposure(text: &str) -> bool {
             "continuity",
         ],
     );
-    if explicit_outage && explicit_action {
-        return true;
-    }
+    let speculative = has(
+        text,
+        &[
+            "could use",
+            "could improve",
+            "could change",
+            "may use",
+            "may improve",
+            "might use",
+            "might improve",
+            "would use",
+            "would improve",
+            "can use",
+            "can improve",
+            "plausibly",
+            "hypothesis",
+            "proposed workflow",
+            "potential workflow",
+            "trying to learn whether",
+        ],
+    );
 
-    // Public sites rarely describe the private alarm or triage workflow that a
-    // cold email is meant to test. A first-party operating footprint can still
-    // support a cautious hypothesis when loss of grid power has an obvious,
-    // time-sensitive bearing on the service. This is exposure evidence, not
-    // permission to state the internal workflow as fact.
+    explicit_outage && explicit_action && !speculative
+}
+
+/// First-party evidence that grid loss could matter to the operated footprint.
+/// This is deliberately separate from evidence that the account actually makes
+/// a named outage-time decision. Exposure may prioritize research; it can never
+/// satisfy `account.outage_sensitive_decision` or authorize copy by itself.
+fn outage_sensitive_exposure(text: &str) -> bool {
     let owns_or_runs = has(
         text,
         &[
@@ -302,11 +339,18 @@ fn outage_decision_or_exposure(text: &str) -> bool {
             "oversees",
         ],
     );
-    let charging_network = has(text, &["charger", "charging station", "charging network"])
-        && has(
-            text,
-            &["network", "site", "station", "operations", "monitor"],
-        );
+    let charging_network = has(
+        text,
+        &[
+            "charger",
+            "charging station",
+            "charging site",
+            "charging network",
+        ],
+    ) && has(
+        text,
+        &["network", "site", "station", "operations", "monitor"],
+    );
     let laboratory_service = has(text, &["laboratory", "laboratories", "diagnostic lab"])
         && has(
             text,
@@ -377,12 +421,82 @@ fn outage_decision_or_exposure(text: &str) -> bool {
         || managed_power_response
 }
 
+/// Whether a title is close enough to the exact evidenced outage-time decision
+/// to receive customer outreach. Broad operating titles are useful only when
+/// the decision evidence names an operating segment; high-risk corporate
+/// functions never become workflow owners through a model-supplied vantage.
+pub(crate) fn outagehub_role_matches_decision(
+    title: &str,
+    vantage: &str,
+    decision_evidence: &str,
+) -> bool {
+    let title = format!(
+        " {} ",
+        title
+            .trim()
+            .to_ascii_lowercase()
+            .replace(['-', '/', ',', '&'], " ")
+    );
+    let has_title = |terms: &[&str]| terms.iter().any(|term| title.contains(term));
+
+    if has_title(&[
+        " human resources ",
+        " hr ",
+        " people and culture ",
+        " people operations ",
+        " talent ",
+        " recruiter ",
+        " marketing ",
+        " sales ",
+        " business development ",
+        " account manager ",
+        " finance ",
+        " financial ",
+        " accounting ",
+        " controller ",
+        " legal ",
+        " counsel ",
+        " procurement ",
+        " purchasing ",
+        " sourcing ",
+        " underwriter ",
+        " underwriting ",
+    ]) {
+        return false;
+    }
+
+    if !matches!(
+        vantage.trim().to_ascii_lowercase().as_str(),
+        "operator" | "process_owner" | "operational_executive"
+    ) {
+        return false;
+    }
+
+    // The segment catalog owns the evidence→owner-title mapping. No matched
+    // segment means the evidence never named a concrete decision, so no title
+    // is close enough; deprioritized segments hold cold outreach entirely.
+    let Some(segment) = crate::segments::segment_for_evidence(decision_evidence) else {
+        return false;
+    };
+    if segment.deprioritized {
+        return false;
+    }
+
+    // Disruption-coordination functions own outage response across segments
+    // and are valid direct contacts whenever a concrete decision is evidenced.
+    if has_title(crate::segments::CONTINUITY_TITLE_TERMS) {
+        return true;
+    }
+
+    has_title(segment.owner_title_terms)
+}
+
 #[cfg(test)]
 mod tests {
     use super::credible_outagehub_signal;
 
     #[test]
-    fn stable_operating_context_can_support_a_hypothesis_without_a_public_incident() {
+    fn exposure_never_masquerades_as_an_evidenced_decision() {
         for evidence in [
             "The company operates and monitors a charging network across Canadian sites.",
             "The company operates laboratories and service centres that process clinical specimens across Ontario.",
@@ -391,10 +505,26 @@ mod tests {
             "The provider dispatches field technicians and a rental generator fleet to customer sites during emergency response.",
         ] {
             assert!(credible_outagehub_signal(
+                "account.outage_sensitive_exposure",
+                evidence
+            ));
+            assert!(!credible_outagehub_signal(
                 "account.outage_sensitive_decision",
                 evidence
             ));
         }
+    }
+
+    #[test]
+    fn decision_requires_an_actual_outage_event_and_action_not_a_possibility() {
+        assert!(credible_outagehub_signal(
+            "account.outage_sensitive_decision",
+            "Service Operations checks utility outage status before dispatching a field crew."
+        ));
+        assert!(!credible_outagehub_signal(
+            "account.outage_sensitive_decision",
+            "Utility outage context could improve field dispatch."
+        ));
     }
 
     #[test]
@@ -408,7 +538,7 @@ mod tests {
             "The supplier serves 175,000 customer delivery locations across Canada.",
         ] {
             assert!(!credible_outagehub_signal(
-                "account.outage_sensitive_decision",
+                "account.outage_sensitive_exposure",
                 evidence
             ));
         }
@@ -424,5 +554,69 @@ mod tests {
             "account.distributed_locations",
             "The operator runs automated cold-storage facilities across Ontario, Alberta, and Quebec."
         ));
+    }
+
+    #[test]
+    fn vertical_roles_follow_the_evidenced_decision_and_block_corporate_functions() {
+        use super::outagehub_role_matches_decision;
+
+        let lab =
+            "Laboratory operations checks utility status during a facility power interruption.";
+        assert!(outagehub_role_matches_decision(
+            "Director of Operations",
+            "process_owner",
+            lab
+        ));
+        assert!(outagehub_role_matches_decision(
+            "Business Continuity Manager",
+            "process_owner",
+            lab
+        ));
+        assert!(!outagehub_role_matches_decision(
+            "VP Finance",
+            "process_owner",
+            lab
+        ));
+        assert!(!outagehub_role_matches_decision(
+            "Senior Account Manager",
+            "process_owner",
+            lab
+        ));
+
+        let claims =
+            "CAT claims operations prioritizes catastrophe response using utility outage reports.";
+        assert!(outagehub_role_matches_decision(
+            "Director, CAT Claims Operations",
+            "process_owner",
+            claims
+        ));
+        assert!(!outagehub_role_matches_decision(
+            "Property Underwriting Director",
+            "process_owner",
+            claims
+        ));
+    }
+
+    #[test]
+    fn reviewed_export_people_and_corporate_functions_cannot_receive_outagehub_copy() {
+        use super::outagehub_role_matches_decision;
+
+        let decision =
+            "Facility operations checks utility status during a site power interruption.";
+        for (name, title) in [
+            ("Stuart", "Senior Account Manager"),
+            ("Philippe", "Human Resources Director"),
+            (
+                "Lee Hodgkinson",
+                "Commercial Sales & Business Development Manager",
+            ),
+            ("Finance fixture", "VP Finance"),
+            ("Marketing fixture", "Director of Marketing"),
+        ] {
+            assert!(
+                !outagehub_role_matches_decision(title, "process_owner", decision),
+                "{name} with title {title} must remain blocked"
+            );
+        }
     }
 }

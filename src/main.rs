@@ -42,6 +42,7 @@ mod outreach_ablation;
 mod outreach_eval;
 mod pipeline;
 mod playbook;
+mod priority;
 mod prompts;
 mod qualification;
 mod repl;
@@ -49,6 +50,7 @@ mod reply_agent;
 mod report;
 mod research;
 mod response_design;
+mod segments;
 mod send;
 mod sourcing;
 mod storage;
@@ -193,7 +195,7 @@ enum Command {
         thesis: String,
     },
 
-    /// Intersect official public charging locations with historical OutageHub polygons.
+    /// Intersect verified Canadian operating locations with historical OutageHub polygons.
     OutageEvidence {
         /// Historical OutageHub JSON archive containing outage polygons.
         #[arg(long)]
@@ -201,6 +203,9 @@ enum Command {
         /// Evidence report consumed by OutageHub account research.
         #[arg(long, default_value = ".spruce/outage-location-matches.json")]
         output: String,
+        /// Optional verified-location JSON. Without it, uses Canada's public EV station feed.
+        #[arg(long)]
+        locations: Option<String>,
     },
 
     /// Reveal + verify emails for sourced people (Apollo enrichment, costs credits).
@@ -217,7 +222,7 @@ enum Command {
 
     /// Write reviewed outreach drafts for verified contacts.
     Plan {
-        /// Requested touch count; defaults to the full seven-touch sequence.
+        /// Requested touch count. OutageHub normalizes a full-cadence request to one discovery email.
         #[arg(long, default_value_t = 7, value_parser = positive_usize)]
         touches: usize,
         /// Limit planning to the first N existing companies in CRM order.
@@ -626,32 +631,68 @@ fn main() -> Result<()> {
             let businesses = load_businesses(&cli)?;
             let business = businesses.get(&cli.brand)?;
             let lib = rt.block_on(async { library.read().await.clone() });
+            let segment_runs = if cli.brand.eq_ignore_ascii_case("wapahki")
+                && segment.is_none()
+                && domains.is_empty()
+            {
+                db.list_market_segments(Some("wapahki"))?
+                    .into_iter()
+                    .filter(|candidate| candidate.status == "active")
+                    .map(|candidate| Some(candidate.key))
+                    .collect::<Vec<_>>()
+            } else {
+                vec![segment.clone()]
+            };
             eprintln!(
-                "\u{2192} [{}] sourcing real leads from Apollo: {thesis}",
-                pb.name
+                "\u{2192} [{}] sourcing across {} declared segment(s), then enriching through Apollo: {thesis}",
+                pb.name,
+                segment_runs.len()
             );
-            let s = rt.block_on(sourcing::source(
-                &db,
-                &client,
-                &apollo,
-                pb,
-                &playbooks.shared,
-                &business.calendar.fallback_recipient_timezone,
-                &business.operating_context(),
-                &lib,
-                &thesis,
-                accounts,
-                contacts,
-                if domains.is_empty() {
-                    None
-                } else {
-                    Some(domains.as_slice())
-                },
-                segment.as_deref(),
-                None,
-                cli.concurrency,
-                None,
-            ))?;
+            let business_context = business.operating_context();
+            let s = rt.block_on(async {
+                let mut total = sourcing::SourceSummary::default();
+                let run_count = segment_runs.len().max(1);
+                for (index, segment_key) in segment_runs.iter().enumerate() {
+                    let run_accounts = if run_count == 1 {
+                        accounts
+                    } else {
+                        accounts / run_count + usize::from(index < accounts % run_count)
+                    };
+                    if run_accounts == 0 {
+                        continue;
+                    }
+                    let run = sourcing::source(
+                        &db,
+                        &client,
+                        &apollo,
+                        pb,
+                        &playbooks.shared,
+                        &business.calendar.fallback_recipient_timezone,
+                        &business_context,
+                        &lib,
+                        &thesis,
+                        run_accounts,
+                        contacts,
+                        if domains.is_empty() {
+                            None
+                        } else {
+                            Some(domains.as_slice())
+                        },
+                        segment_key.as_deref(),
+                        None,
+                        cli.concurrency,
+                        None,
+                    )
+                    .await?;
+                    total.orgs_found += run.orgs_found;
+                    total.candidates_new += run.candidates_new;
+                    total.leads_qualified += run.leads_qualified;
+                    total.leads_research_needed += run.leads_research_needed;
+                    total.leads_research_required += run.leads_research_required;
+                    total.people_added += run.people_added;
+                }
+                Ok::<_, anyhow::Error>(total)
+            })?;
             println!(
                 "\u{2713} {} orgs \u{2192} {} action-ready, {} discovery-ready, {} research-required leads; {} people.\n  next: spruce-leaf --brand {} enrich",
                 s.orgs_found,
@@ -747,24 +788,39 @@ fn main() -> Result<()> {
             Ok(())
         }
 
-        Command::OutageEvidence { archive, output } => {
-            eprintln!(
-                "\u{2192} matching official Ontario charging locations to historical OutageHub polygons"
-            );
-            let report = rt.block_on(outage_evidence::build_report(
-                Path::new(&archive),
-                Path::new(&output),
-            ))?;
-            let networks = report
+        Command::OutageEvidence {
+            archive,
+            output,
+            locations,
+        } => {
+            eprintln!("\u{2192} matching verified Canadian operating locations to historical OutageHub polygons");
+            let report = match locations {
+                Some(locations) => outage_evidence::build_verified_location_report(
+                    Path::new(&archive),
+                    Path::new(&locations),
+                    Path::new(&output),
+                )?,
+                None => rt.block_on(outage_evidence::build_report(
+                    Path::new(&archive),
+                    Path::new(&output),
+                ))?,
+            };
+            let source_groups = report
                 .matches
                 .iter()
-                .map(|matched| matched.network.as_str())
+                .map(|matched| {
+                    if matched.company.trim().is_empty() {
+                        matched.network.as_str()
+                    } else {
+                        matched.company.as_str()
+                    }
+                })
                 .collect::<std::collections::HashSet<_>>()
                 .len();
             println!(
-                "\u{2713} {} verified location/polygon matches across {} station networks written to {}.",
+                "\u{2713} {} verified location/polygon matches across {} operator/network groups written to {}.",
                 report.matches.len(),
-                networks,
+                source_groups,
                 output
             );
             Ok(())
@@ -873,7 +929,7 @@ fn main() -> Result<()> {
                         })
                         .filter(|person| {
                             crate::gtm::recipient_sequence_block_reason(
-                                &db, &cli.brand, &lead.id, person,
+                                &db, &cli.brand, &lead.id, person, touches,
                             )
                             .is_ok_and(|reason| reason.is_none())
                         })

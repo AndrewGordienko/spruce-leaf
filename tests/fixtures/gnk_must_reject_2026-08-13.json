@@ -1,0 +1,8 @@
+[
+  {"account":"BC Timber Sales","recipient_title_contains":"emergency management","opportunity_task_contains":"bridge","reason":"preparedness contact is a router for the bridge and culvert workflow"},
+  {"account":"BC Timber Sales","recipient_title_contains":"executive operations","opportunity_task_contains":"bridge","reason":"executive-operations contact has no direct bridge or culvert ownership evidence"},
+  {"account":"BC Transit","recipient_title_contains":"","opportunity_task_contains":"trip management","reason":"current trip-management angle conflicts with the selected handyDART replacement platform"},
+  {"account":"BC Vital Statistics","recipient_title_contains":"","opportunity_task_contains":"certificate of death","reason":"paper-replacement premise is contradicted by the listed electronic service and unrelated contacts"},
+  {"account":"Beard Winter","recipient_title_contains":"","opportunity_task_contains":"pre-bill","reason":"pre-billing copy is not the trust-reconciliation opportunity supported by the evidence"},
+  {"account":"Beard Winter","recipient_title_contains":"","opportunity_task_contains":"trust reconciliation","reason":"the rule proves a recurring duty, not a Beard Winter software problem"}
+]

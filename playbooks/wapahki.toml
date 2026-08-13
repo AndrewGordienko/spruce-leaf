@@ -1,7 +1,7 @@
 # Wapahki — flexible robotic arms/cells for factories and warehouses.
 # Wapahki is NOT selling a proven robot with installations and savings. The
-# first email's job is to discover ONE bounded, recurring physical task worth a
-# closer look — not to sell equipment.
+# first email's job is to test ONE already-sourced, facility-linked physical
+# task by offering a concrete first-pass screen.
 
 key = "wapahki"
 name = "Wapahki"
@@ -23,8 +23,8 @@ icp_note = "The long-term market is every plausible factory, product manufacture
 # Match the human-approved founder/researcher notes: enough room for why this
 # operator, the plant hypothesis, Andrew's credible context, and a real path to
 # respond without turning the message into a dossier.
-min_words = 100
-max_words = 180
+min_words = 75
+max_words = 110
 
 min_signals = 2
 
@@ -51,16 +51,16 @@ vantage_notes = [
 ]
 
 requirements = [
-  "T1 is a complete founder/researcher note, not a two-sentence diagnostic template. Explain why this operator, the supported plant moment, one plausible consequence, and one honest automation hypothesis.",
+  "T1 is 75–110 words. Name the sourced plant task and consequence, state one honest automation hypothesis, offer the completed one-page fit screen, and ask exactly one question.",
   "Arrive with one concrete candidate task for the recipient to correct. Never ask them to inspect the plant, identify any suitable use case, translate the operation into a robotics taxonomy, or evaluate Wapahki's task boundary.",
   "Use a source-supported object, station, handoff, package, product, machine, line, warehouse flow, job posting, expansion, or equipment fact. Category alone does not prove the exact task.",
-  "Action-ready accounts also show why the task matters: staffing or vacancies, overtime, throughput, line stoppage, utilization, short-run economics, ergonomics, safety, sanitation burden, or changeover cost. A one-email discovery-ready test may ask about the suspected consequence honestly when the task and recipient are specific.",
+  "Every outreach-ready account shows why the task matters through an atomic economic or operating-consequence claim: staffing or vacancies, overtime, throughput, line stoppage, utilization, short-run economics, ergonomics, safety, sanitation burden, intervention, cycle time, or changeover cost.",
   "Test why an obviously repetitive job may remain manual: sanitation, irregular products, misfeeds, rate, integration, capital payback, or changeover burden. Mention only the one blocker that sharpens this account-specific question.",
   "Ask one natural account-specific operating question. The playbook supplies no fallback task, staffing claim, or automation blocker; every detail must come from account evidence.",
   "After the plant moment is legible, briefly state Andrew's University of Toronto and Automata robotics context and one honest Wapahki contribution.",
-  "T1 is normally 100–180 words and uses one clear primary response path. For an unconfirmed workflow, prefer an email-first answer; earn a short conversation after the premise is supported. If offering the fit screen, make it a give-back after the answer, not a third CTA.",
-  "A call or email response is an appropriate first outcome. A task sketch, video, data request, site visit, evaluation, pilot, or LOI must be earned after engagement.",
-  "Across seven touches, use questions in no more than four. T2 sharpens the mechanism, T3 gives a human reason to connect, T4 contributes one attributed comparison or real aid, T5 answers why existing automation or manual work may be better, T6 routes once, and T7 closes.",
+  "T1 uses one email-first response path and never asks for a call or meeting. Earn a conversation after the recipient replies.",
+  "A task sketch, video, data request, site visit, evaluation, pilot, or LOI must be earned after engagement.",
+  "Cold outreach is one first-touch email only. At most one follow-up may be written after new account evidence or a completed first-pass assessment exists.",
   "The automation-fit screen and discovery-call observations are optional later contributions, not required campaign furniture. Offer or use each at most once and only when it advances this person's thread.",
   "Never turn participant-reported wages, margins, weights, volumes, or automation percentages into prospect claims.",
 ]
@@ -90,6 +90,56 @@ forbidden = [
   "identify any suitable use case",
   "any task that might fit",
   "any task that could fit",
+  "emerging hypothesis",
+  "we're not selling equipment yet",
+  "we are not selling equipment yet",
+  "not selling equipment yet",
+  "20-minute call",
+  "20 minute call",
+  "get",
+  "bank",
+  "credit",
+  "access",
+  "open",
+  "compare",
+  "problem",
+  "now",
+  "billing",
+  "deal",
+  "finance",
+  "financial",
+  "claims",
+  "insurance",
+  "mortgage",
+  "soon",
+  "new",
+  "performance",
+  "freedom",
+  "home",
+  "sales",
+  "medical",
+  "urgent",
+  "life",
+  "marketing",
+  "investment",
+  "diagnostics",
+  "friend",
+  "cash",
+  "invoice",
+  "extra",
+  "purchase",
+  "off chance",
+  "one time",
+  "all good",
+  "following up here",
+  "last note from me here",
+  "great fit",
+  "bumping this once",
+  "just following up once",
+  "one more quick follow-up",
+  "keep this open",
+  "compare notes",
+  "appreciate the reply",
 ]
 
 copy_doctrine = """
@@ -110,10 +160,11 @@ motion fits a bounded exception envelope, or identify any suitable task.
 Keep evidence readiness separate from cash-now, core, and strategic commercial
 lanes. Every first touch needs a
 source-supported package, product, station, line, machine, warehouse flow, job,
-facility, expansion, or other physical operating clue and a recipient close to
-the task. Action-ready opportunities also have a credible economic-pressure
-signal and may support a cadence. Discovery-ready opportunities may receive one
-task-specific email that asks whether the suspected consequence exists.
+facility, expansion, or other physical operating clue and a recipient proven
+to work at that facility. Every outreach-ready opportunity also has a credible,
+atomic economic-pressure claim. Discovery-ready opportunities may receive one
+task-specific email only when the task, consequence, facility, and recipient
+relationship all have explicit lineage.
 Research-required opportunities remain in research.
 Never promote category or product variety into a factual manual-work claim.
 
@@ -136,16 +187,10 @@ interventions, physical boundaries, rate, labour, and payback threshold. It is
 not a benchmark or plant assessment. A later touch may use one explicitly
 attributed discovery-call contrast, never as proof about the target.
 
-The sequence progressively adds a new reason to respond. T1 tests one concrete
-task. T2 introduces the suspected consequence or economic reason. T3 gives a
-plant-specific human reason to connect, not another miniature pitch. T4 routes
-to one specific alternative owner or closes the loop. For a longer sequence,
-only after engagement may a later touch explore the blocker, economics, or a
-fit-screen. Do not repeat the same repeatability-versus-format argument.
-No more than three touches may primarily ask for correction/referral or close.
-Do not produce seven careful blurbs saying Andrew may have chosen the wrong
-task. Caution protects the evidence boundary; concrete objects, motions,
-changes, and exceptions make the message worth reading.
+Cold outreach contains one message. It tests one concrete task by contributing
+the completed fit screen and asking one question. A single follow-up is allowed
+only after it adds new evidence or a completed first-pass assessment. Never
+manufacture a cadence from repeated caveats.
 """
 
 doctrine = """

@@ -163,6 +163,11 @@ pub fn rebalance_approved_sales(
     let mut days = HashSet::<String>::new();
     let mut protected_followups = 0usize;
     let mut admitted_people = 0usize;
+    let sequence_ids = active
+        .iter()
+        .chain(new_plans.iter())
+        .map(|plan| plan.sequence_id.clone())
+        .collect::<Vec<_>>();
 
     for plan in active.iter().chain(new_plans.iter()) {
         let priority = if plan.active {
@@ -225,12 +230,114 @@ pub fn rebalance_approved_sales(
     }
 
     db.apply_touch_schedule(&updates)?;
+    for sequence_id in sequence_ids {
+        align_sequence_touch_order(db, profile, &sequence_id, now)?;
+    }
     Ok(PortfolioScheduleSummary {
         emails: updates.len(),
         protected_followups,
         admitted_people,
         active_days: days.len(),
     })
+}
+
+/// Keep every channel in stage order after the email capacity scheduler moves
+/// an opener. Scheduled email slots remain fixed when they are already valid;
+/// drafts and manual-channel tasks are re-anchored to the final opener.
+pub fn align_sequence_touch_order(
+    db: &SharedDb,
+    profile: &BusinessProfile,
+    sequence_id: &str,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    let mut touches = db.list_touches_for_sequence(sequence_id)?;
+    if touches.is_empty() {
+        return Ok(());
+    }
+    touches.sort_by_key(|touch| touch.stage);
+    let person = db
+        .get_person(&touches[0].person_id)?
+        .ok_or_else(|| anyhow!("missing person for sequence {sequence_id}"))?;
+    let lead = db
+        .get_lead(&touches[0].lead_id)?
+        .ok_or_else(|| anyhow!("missing lead for sequence {sequence_id}"))?;
+    let anchor = touches
+        .iter()
+        .find(|touch| touch.stage == 1)
+        .and_then(|touch| {
+            if touch.status == "sent" {
+                parse_utc(&touch.sent_at)
+            } else {
+                parse_utc(&touch.due_at)
+            }
+        })
+        .unwrap_or(now);
+    let mut previous = None::<DateTime<Utc>>;
+    let mut updates = Vec::<TouchScheduleUpdate>::new();
+
+    for touch in &touches {
+        let desired = anchor + chrono::Duration::days(touch.day_offset.max(0));
+        let not_before = previous
+            .map(|at| desired.max(at + chrono::Duration::minutes(1)))
+            .unwrap_or(desired);
+        let existing = if touch.status == "sent" {
+            parse_utc(&touch.sent_at).or_else(|| parse_utc(&touch.due_at))
+        } else {
+            parse_utc(&touch.due_at)
+        };
+        let automated_email = touch.status == "scheduled"
+            && matches!(
+                touch.channel.trim().to_ascii_lowercase().as_str(),
+                "email" | "linkedin_or_email"
+            );
+        if touch.status == "sent" {
+            let at = existing.ok_or_else(|| anyhow!("sent touch {} has no timestamp", touch.id))?;
+            if previous.is_some_and(|previous| at <= previous) {
+                return Err(anyhow!(
+                    "sent history for sequence {sequence_id} is not strictly increasing at stage {}",
+                    touch.stage
+                ));
+            }
+            previous = Some(at);
+            continue;
+        }
+        if automated_email && existing.is_some_and(|at| at >= not_before) {
+            previous = existing;
+            continue;
+        }
+
+        let stable_key = format!("sequence-order:{}:{}", sequence_id, touch.stage);
+        let context = TimingContext {
+            industry: &lead.industry,
+            title: &person.title,
+            vantage: &person.vantage,
+            channel: &touch.channel,
+            location: if person.location.is_empty() {
+                &lead.hq
+            } else {
+                &person.location
+            },
+            timezone: if person.timezone.is_empty() {
+                &lead.timezone
+            } else {
+                &person.timezone
+            },
+            stable_key: &stable_key,
+        };
+        let slot = next_slot_with_learning(db, profile, &context, not_before.max(now))?;
+        previous = Some(slot.at);
+        updates.push(TouchScheduleUpdate {
+            id: touch.id.clone(),
+            due_at: slot.at.to_rfc3339(),
+            recipient_timezone: slot.recipient_timezone,
+            scheduled_rule: slot.rule,
+            schedule_reason: format!(
+                "sequence-order invariant after final opener; {}",
+                slot.rationale
+            ),
+        });
+    }
+    db.apply_touch_schedule(&updates)
 }
 
 fn plan_eligible(plan: &SequencePlan, now: DateTime<Utc>) -> DateTime<Utc> {
@@ -1259,11 +1366,11 @@ mod tests {
     use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc, Weekday};
 
     use crate::business::Businesses;
-    use crate::db::{Db, Lead, Person, Sequence, Touch, CURRENT_COPY_POLICY_VERSION};
+    use crate::db::{current_copy_policy_version, Db, Lead, Person, Sequence, Touch};
 
     use super::{
-        can_send_now, next_slot, quota_day_bounds, rebalance_approved_sales,
-        schedule_with_capacity, timezone_for_location, TimingContext,
+        align_sequence_touch_order, can_send_now, next_slot, quota_day_bounds,
+        rebalance_approved_sales, schedule_with_capacity, timezone_for_location, TimingContext,
     };
 
     #[test]
@@ -1377,7 +1484,7 @@ mod tests {
                         lead_id: lead_id.clone(),
                         brand: "gnk".into(),
                         status: "active".into(),
-                        copy_policy_version: CURRENT_COPY_POLICY_VERSION,
+                        copy_policy_version: current_copy_policy_version(),
                         ..Default::default()
                     })
                     .unwrap();
@@ -1421,6 +1528,73 @@ mod tests {
             let (start, end, _) = quota_day_bounds(&profile, at).unwrap();
             assert!(db.planned_touch_count_between("gnk", start, end).unwrap() <= 2);
         }
+    }
+
+    #[test]
+    fn lee_cadence_cannot_put_manual_stages_before_a_delayed_opener() {
+        let businesses = Businesses::load("businesses").expect("business profiles");
+        let profile = businesses.get("outagehub").unwrap();
+        let db = Db::open(":memory:").expect("open memory db");
+        let lead_id = db
+            .upsert_lead(&Lead {
+                brand: "outagehub".into(),
+                apollo_org_id: "lee-order-org".into(),
+                name: "Lee cadence regression".into(),
+                hq: "Calgary, Alberta, Canada".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let person_id = db
+            .upsert_person(&Person {
+                lead_id: lead_id.clone(),
+                brand: "outagehub".into(),
+                apollo_person_id: "lee-hodgkinson".into(),
+                name: "Lee Hodgkinson".into(),
+                title: "Field Operations Director".into(),
+                location: "Calgary, Alberta, Canada".into(),
+                timezone: "America/Edmonton".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let sequence_id = db
+            .create_sequence(&Sequence {
+                person_id: person_id.clone(),
+                lead_id: lead_id.clone(),
+                brand: "outagehub".into(),
+                status: "active".into(),
+                copy_policy_version: current_copy_policy_version(),
+                ..Default::default()
+            })
+            .unwrap();
+        for (stage, day_offset, channel, status, due_at) in [
+            (1, 0, "email", "scheduled", "2026-08-20T15:00:00Z"),
+            (2, 3, "linkedin_request", "draft", "2026-08-12T15:00:00Z"),
+            (3, 9, "email", "scheduled", "2026-08-30T15:00:00Z"),
+        ] {
+            db.insert_touch(&Touch {
+                sequence_id: sequence_id.clone(),
+                person_id: person_id.clone(),
+                lead_id: lead_id.clone(),
+                brand: "outagehub".into(),
+                stage,
+                day_offset,
+                channel: channel.into(),
+                status: status.into(),
+                due_at: due_at.into(),
+                ..Default::default()
+            })
+            .unwrap();
+        }
+
+        let now = Utc.with_ymd_and_hms(2026, 8, 10, 8, 0, 0).unwrap();
+        align_sequence_touch_order(&db, profile, &sequence_id, now).unwrap();
+        let touches = db.list_touches_for_sequence(&sequence_id).unwrap();
+        let dates = touches
+            .iter()
+            .map(|touch| DateTime::parse_from_rfc3339(&touch.due_at).unwrap())
+            .collect::<Vec<_>>();
+        assert!(dates.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(dates[1] > DateTime::parse_from_rfc3339("2026-08-20T15:00:00Z").unwrap());
     }
 
     #[test]

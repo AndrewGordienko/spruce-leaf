@@ -605,7 +605,7 @@ fn source_locations_from_corpus(corpus: &str) -> Vec<SourceLocation> {
             continue;
         }
         let body = body.split("SOURCE URL: ").next().unwrap_or(body);
-        let Some(city) = crate::db::ontario_site_from_text(body) else {
+        let Some(city) = crate::db::canadian_site_from_text(body) else {
             continue;
         };
         if locations.iter().any(|location: &SourceLocation| {

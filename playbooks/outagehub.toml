@@ -9,7 +9,7 @@ one_liner = "OutageHub provides normalized live and historical Canadian utility-
 verified_seller_facts = [
   "OutageHub exposes time-range outage queries, individual outage details, and provider coverage through an API authenticated with an API key.",
   "OutageHub records geographic outage polygons and provider-reported fields such as affected-customer count, cause, outage type, planned status, start time, and estimated restoration time when those fields are available.",
-  "OutageHub can compare an operated Canadian charging location with historical public utility outage areas and timestamps.",
+  "OutageHub can compare a verified operated Canadian address with historical public utility outage areas and timestamps.",
   "A historical match is outside confirmation that a location overlapped a reported utility event; it is not proof of private charger or site status.",
 ]
 
@@ -24,15 +24,15 @@ min_signals = 3
 
 system_concept_examples = [
   "an API result showing that an operating location overlapped a utility-reported outage at a specific time",
-  "a utility-status check inside the existing site-diagnosis or ticket workflow",
-  "a location-matched utility webhook inside dispatch, continuity, or customer-status tooling",
+  "an API lookup that returns utility reports for a supplied Canadian address and time",
+  "a location-matched utility webhook for a customer-confirmed operating system",
 ]
 
 subject_examples = [
   "Separating utility and site incidents",
-  "Utility evidence during site diagnosis",
-  "Utility status in dispatch",
-  "Location-level outage context",
+  "Power checks for lab sites",
+  "Store power issue checks",
+  "Tower dispatch after power loss",
 ]
 
 vantage_notes = [
@@ -46,9 +46,9 @@ requirements = [
   "For a one-email discovery test, research must establish a distributed Canadian operating footprint, one specific outage-time decision, and a reachable workflow owner. A completed historical match upgrades the account to easy priority but is not required for the first question.",
   "A two-email evidence sequence requires a completed historical location-to-utility-event match; T2 cannot present a match without the real location and timestamp.",
   "T1 contains one account-specific diagnosis, dispatch, escalation, continuity, prioritization, or communication moment and a plausible consequence. Do not prescribe a universal dark-site, ticket, dispatch, or internal-system binary.",
-  "T1 names OutageHub and explains its location-matched Canadian utility signal in one plain clause, then offers a short conversation with an email answer as the easier path.",
+  "T1 names OutageHub and explains its location-matched Canadian utility signal in one plain clause. Discovery-ready copy asks for one easy operating answer by email; only action-ready copy may offer a short conversation with an email alternative.",
   "When present, a later touch may contribute the completed historical result: the verified location, utility-reported event, and actual timestamp. Without a match, later touches must add another source-supported decision-useful angle rather than implying one exists.",
-  "Action-ready accounts may carry a seven-step review sequence. Each step must contribute a distinct useful angle and follow the shared channel/question cadence; discovery-ready accounts still receive one touch only.",
+  "The default is one discovery email. A verified historical match and correct decision owner may earn a two- or four-touch sequence. Seven-touch OutageHub sequences are retired.",
   "Public utility data is outside confirmation, not proof of charger status and not a replacement for telemetry. State that boundary naturally at most once across the two emails.",
   "Write like an operator discussing site diagnosis. Do not expose phrases such as account file, research, source material, external context, reported interruption, or operational action.",
 ]
@@ -89,11 +89,12 @@ only. Research-required opportunities remain in research.
 T1 is 60–95 words and contains one account-specific operating question about
 diagnosis, dispatch, escalation, continuity, prioritization, or communication.
 Explain why this person was chosen, state the consequence conservatively, and
-name OutageHub's location-matched Canadian utility API. Offer a short
-conversation with an email answer as the easier path. Never reuse a universal
+name OutageHub's location-matched Canadian utility API. Ask for one easy answer
+by email while the account is discovery-ready; reserve a conversation option
+for action-ready copy. Never reuse a universal
 site-goes-dark or equipment-ticket fork.
 
-When an action-ready account receives a full review sequence, every later step
+When an action-ready account receives a two- or four-touch review sequence, every later step
 must earn its existence with a distinct supported angle. A verified location,
 utility-reported event, and timestamp can anchor one touch. Other touches may
 cover the outside-context boundary, provider completeness, a bounded workflow

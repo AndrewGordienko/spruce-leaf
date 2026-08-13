@@ -20,54 +20,59 @@
 
 use std::hash::{Hash, Hasher};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-/// Increment when the buyer-facing copy contract changes materially. The CRM
-/// only presents sequences approved under the current policy.
-// v16 raises the GnK account threshold from plausible workflow fit to a sourced
-// recurring decision + consequence + trigger/mechanism, and changes OutageHub
-// cold outreach to an evidence-first two-email EV-operator experiment. Older
-// copy did not receive those checks and must never remain sendable.
-// v22 turns account readiness into an action/discovery/research queue.
-// Action-ready accounts may use the supported cadence; discovery-ready accounts may receive one complete,
-// hypothesis-led first email when a concrete task/decision and relevant person
-// are supported; research-required accounts stay in research. This is not v19's generic
-// one-question lane: every T1 must explain seller value, a role-specific reason
-// to engage, and an answerable response path, then pass independent QA. The
-// mechanical gate checks factual contribution, not subjective CTA wording.
-// v23 recognizes quantified or explicitly repetitive lifting as a concrete
-// Wapahki operating consequence; v22 could reject an evidence-backed ergonomic
-// wedge merely because the writer did not use the literal word "ergonomic".
-// v24 recognizes semantically equivalent email-first/call response paths rather
-// than requiring one exact CTA phrase. Independent review still decides whether
-// the recipient has enough value and context to justify that response.
-// v25 also recognizes an answerable offer to send the real one-page fit screen
-// as a response path, preventing semantic edits toward recipient value from
-// oscillating against the mechanical CTA vocabulary.
-// v26 recognizes natural reply-here/discuss-briefly phrasing observed in the
-// independent editor's output; the prior literal marker list rejected it.
-// v27 removes the contradictory Wapahki call + email + asset CTA stack. An
-// unconfirmed workflow now gets one email-first response path; calls are earned.
-// v28 keeps the verified fit-screen fact in reviewer context and recognizes
-// natural brief-reply wording that v27's literal response detector missed.
-// v29 restores the higher action-ready fit floor after live review showed that a
-// task signal plus an unrelated lifting condition still leaves the recipient
-// doing seller discovery. Those accounts remain discovery-ready until the consequence
-// is tied to the candidate task.
-// v30 changes the commercial unit from a brand-exclusive company hypothesis to
-// an evidence-linked opportunity. A company may belong to several portfolio
-// brands; copy is attributable to one facility/use case and one mapped buying
-// committee while only one cold thread is active at a time.
-// v33 makes atomic source attribution a deterministic sendability invariant,
-// treats the subject as a factual claim, and retires stale drafts as well as
-// stale schedules so an old reviewer score cannot masquerade as current copy.
-pub const CURRENT_COPY_POLICY_VERSION: i64 = 33;
+/// A content-derived policy identity. The compiled portion covers prompts,
+/// deterministic rules, reviewer routing, playbooks, and personas. Runtime
+/// model selections are included because changing the independent editor or
+/// verifier changes the approval policy even when the source tree does not.
+static COPY_POLICY_HASH: LazyLock<String> = LazyLock::new(|| {
+    let mut hash = Sha256::new();
+    hash.update(env!("SPRUCE_COMPILED_COPY_POLICY_HASH").as_bytes());
+    for key in [
+        "SPRUCE_OPENAI_EDITOR_MODEL",
+        "SPRUCE_OPENAI_VERIFIER_MODEL",
+        "SPRUCE_OPENAI_COPY_MODEL",
+        "SPRUCE_OPENAI_MODEL",
+        "SPRUCE_CODEX_MODEL",
+        "SPRUCE_CLAUDE_MODEL",
+        "SPRUCE_GROK_MODEL",
+    ] {
+        hash.update(key.as_bytes());
+        hash.update([0]);
+        hash.update(std::env::var(key).unwrap_or_default().as_bytes());
+        hash.update([0xff]);
+    }
+    format!("{:x}", hash.finalize())
+});
+
+pub fn current_copy_policy_hash() -> &'static str {
+    COPY_POLICY_HASH.as_str()
+}
+
+/// SQLite retains the legacy integer column for compatibility. Its value is a
+/// collision-resistant fingerprint of `current_copy_policy_hash`, not a human
+/// maintained version number.
+pub fn current_copy_policy_version() -> i64 {
+    let bytes = hex_prefix_bytes(current_copy_policy_hash());
+    (i64::from_be_bytes(bytes) & i64::MAX).max(1)
+}
+
+fn hex_prefix_bytes(hash: &str) -> [u8; 8] {
+    let mut output = [0u8; 8];
+    for (index, byte) in output.iter_mut().enumerate() {
+        let start = index * 2;
+        *byte = u8::from_str_radix(&hash[start..start + 2], 16).unwrap_or_default();
+    }
+    output
+}
 
 /// A real company sourced from Apollo and (optionally) qualified against a brand
 /// thesis. Everything the model *guesses* stays in the inference/hypothesis
@@ -114,6 +119,15 @@ pub struct Person {
     pub last_name: String,
     pub name: String,
     pub title: String,
+    /// Apollo employer identity returned with the person record. This must
+    /// equal the lead's Apollo organization id before the contact can unlock
+    /// outreach; an email domain is never employer verification.
+    pub apollo_org_id: String,
+    pub employer_name: String,
+    /// apollo | official | unverified. Shared institutional domains require
+    /// `official` plus `employer_source_url`.
+    pub employer_verification: String,
+    pub employer_source_url: String,
     pub location: String,
     /// IANA timezone from the person's location, falling back to the lead HQ.
     pub timezone: String,
@@ -176,9 +190,19 @@ pub struct Sequence {
     /// The facility/use-case opportunity this copy was written for. Empty only
     /// on legacy rows created before copy-policy v30.
     pub sales_opportunity_id: String,
+    /// Structural commercial lineage echoed by the writer/reviewer.
+    pub task_key: String,
+    pub evidence_claim_ids: Vec<String>,
+    /// Exact evidence boundary for Wapahki copy. These are snapshots, not
+    /// inferences reconstructed later from prose or titles.
+    pub facility_id: String,
+    pub task_claim_id: String,
+    pub economic_claim_id: String,
+    pub contact_facility_evidence_id: String,
     /// research_required | discovery_ready | action_ready | no_play
     pub gtm_state: String,
     pub copy_policy_version: i64,
+    pub copy_policy_hash: String,
     /// Exact generation lane used for this persisted copy. These snapshots make
     /// reply outcomes attributable even after the operator changes backends.
     pub generation_backend: String,
@@ -441,6 +465,10 @@ pub struct SalesOpportunity {
     pub lead_id: String,
     pub segment_id: String,
     pub facility_id: String,
+    /// Active atomic claims that authorize the physical task and its operating
+    /// consequence. Empty means the opportunity is research-only.
+    pub task_claim_id: String,
+    pub economic_claim_id: String,
     pub play_id: String,
     pub kind: String,
     pub title: String,
@@ -457,6 +485,14 @@ pub struct SalesOpportunity {
     pub fit_score: i64,
     pub status: String,
     pub evidence_gaps: Vec<String>,
+    /// Deterministic, evidence-derived selling lane (easy|medium|hard|research)
+    /// with its persisted component breakdown. This is a computed default for
+    /// allocation and display; a founder CommercialAssessment supersedes it.
+    pub priority_lane: String,
+    pub priority_score: i64,
+    /// Full serialized `crate::priority::CommercialPriority`.
+    pub priority_components: String,
+    pub outage_segment_key: String,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -622,6 +658,13 @@ pub struct OpportunityStakeholder {
     pub person_id: String,
     pub role: String,
     pub relationship_to_task: String,
+    /// direct | adjacent | router | unrelated. Only direct may unlock outreach,
+    /// and direct requires opportunity-specific evidence claim ids.
+    pub role_fit: String,
+    pub evidence_claim_ids: Vec<String>,
+    /// EvidenceClaim id for this exact person, employer, and facility. A
+    /// company-level task claim can never stand in for this relationship.
+    pub contact_facility_evidence_id: String,
     pub can_observe: String,
     pub can_decide: String,
     pub priority: i64,
@@ -1142,6 +1185,14 @@ impl Db {
             ("people", "location", "TEXT DEFAULT ''"),
             ("people", "timezone", "TEXT DEFAULT ''"),
             ("people", "linkedin_status", "TEXT DEFAULT 'unknown'"),
+            ("people", "apollo_org_id", "TEXT DEFAULT ''"),
+            ("people", "employer_name", "TEXT DEFAULT ''"),
+            (
+                "people",
+                "employer_verification",
+                "TEXT DEFAULT 'unverified'",
+            ),
+            ("people", "employer_source_url", "TEXT DEFAULT ''"),
             ("sequences", "applied_principles", "TEXT DEFAULT '[]'"),
             ("sequences", "play_id", "TEXT DEFAULT ''"),
             ("sequences", "play_version", "INTEGER DEFAULT 0"),
@@ -1151,11 +1202,45 @@ impl Db {
             ("sequences", "signal_observation_ids", "TEXT DEFAULT '[]'"),
             ("sequences", "gtm_state", "TEXT DEFAULT ''"),
             ("sequences", "copy_policy_version", "INTEGER DEFAULT 0"),
+            ("sequences", "copy_policy_hash", "TEXT DEFAULT ''"),
             ("sequences", "generation_backend", "TEXT DEFAULT ''"),
             ("sequences", "generation_model", "TEXT DEFAULT ''"),
             ("sequences", "sales_opportunity_id", "TEXT DEFAULT ''"),
+            ("sequences", "task_key", "TEXT DEFAULT ''"),
+            ("sequences", "evidence_claim_ids", "TEXT DEFAULT '[]'"),
+            ("sequences", "facility_id", "TEXT DEFAULT ''"),
+            ("sequences", "task_claim_id", "TEXT DEFAULT ''"),
+            ("sequences", "economic_claim_id", "TEXT DEFAULT ''"),
+            (
+                "sequences",
+                "contact_facility_evidence_id",
+                "TEXT DEFAULT ''",
+            ),
             ("sales_opportunities", "identity_key", "TEXT DEFAULT ''"),
             ("sales_opportunities", "task_key", "TEXT DEFAULT ''"),
+            ("sales_opportunities", "task_claim_id", "TEXT DEFAULT ''"),
+            ("sales_opportunities", "priority_lane", "TEXT DEFAULT ''"),
+            ("sales_opportunities", "priority_score", "INTEGER DEFAULT 0"),
+            (
+                "sales_opportunities",
+                "priority_components",
+                "TEXT DEFAULT ''",
+            ),
+            (
+                "sales_opportunities",
+                "outage_segment_key",
+                "TEXT DEFAULT ''",
+            ),
+            (
+                "sales_opportunities",
+                "economic_claim_id",
+                "TEXT DEFAULT ''",
+            ),
+            (
+                "opportunity_stakeholders",
+                "contact_facility_evidence_id",
+                "TEXT DEFAULT ''",
+            ),
             (
                 "sales_opportunities",
                 "evidence_tier",
@@ -1215,6 +1300,16 @@ impl Db {
                 "TEXT DEFAULT ''",
             ),
             ("evidence_claims", "task_key", "TEXT DEFAULT ''"),
+            (
+                "opportunity_stakeholders",
+                "role_fit",
+                "TEXT DEFAULT 'adjacent'",
+            ),
+            (
+                "opportunity_stakeholders",
+                "evidence_claim_ids",
+                "TEXT DEFAULT '[]'",
+            ),
             ("touches", "recipient_timezone", "TEXT DEFAULT ''"),
             ("touches", "scheduled_rule", "TEXT DEFAULT ''"),
             ("touches", "schedule_reason", "TEXT DEFAULT ''"),
@@ -1293,14 +1388,52 @@ impl Db {
                )",
             params![now()],
         )?;
+        conn.execute(
+            "UPDATE market_segments SET status='retired',updated_at=?1
+             WHERE lower(brand)='wapahki' AND key IN (
+               'ontario_food_case_palletizing',
+               'ontario_warehouse_case_handling',
+               'ontario_manufacturing_machine_tending'
+             )",
+            params![now()],
+        )?;
+        // Wapahki's pre-lineage campaign is historical audit data, not a
+        // coherent campaign. Archive every stale sequence regardless of its
+        // former lifecycle label and cancel only work that has not been sent.
+        // Sent touches and replies remain immutable and queryable.
+        conn.execute(
+            "UPDATE sequences SET status='archived'
+             WHERE lower(brand)='wapahki' AND COALESCE(copy_policy_hash,'')<>?1",
+            params![current_copy_policy_hash()],
+        )?;
+        conn.execute(
+            "UPDATE touches SET status='cancelled',
+                    error='Archived Wapahki pre-lineage outreach; regenerate from current evidence.'
+             WHERE status IN ('draft','scheduled') AND EXISTS (
+               SELECT 1 FROM sequences s
+               WHERE s.id=touches.sequence_id AND s.status='archived'
+                 AND lower(s.brand)='wapahki'
+             )",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE touches SET status='blocked',review_passes=0,
+                    error='Archived Wapahki pre-lineage outreach; regenerate from current evidence.'
+             WHERE status IN ('writing','reviewing') AND EXISTS (
+               SELECT 1 FROM sequences s
+               WHERE s.id=touches.sequence_id AND s.status='archived'
+                 AND lower(s.brand)='wapahki'
+             )",
+            [],
+        )?;
+
         // A copy-policy cutover is an execution stop, not merely a dashboard
-        // filter. Preserve stale rows for audit while pausing every old active
-        // sequence. Drafts must be retired too: leaving them active makes an
-        // obsolete reviewer score look current even when nothing was scheduled.
+        // filter. Preserve stale non-Wapahki rows for audit while pausing every
+        // old active sequence. Hashes are identities, not ordered versions.
         conn.execute(
             "UPDATE sequences SET status='paused'
-             WHERE status='active' AND copy_policy_version<?1",
-            params![CURRENT_COPY_POLICY_VERSION],
+             WHERE status='active' AND COALESCE(copy_policy_hash,'')<>?1",
+            params![current_copy_policy_hash()],
         )?;
         conn.execute(
             "UPDATE touches SET status='cancelled',
@@ -1308,9 +1441,9 @@ impl Db {
              WHERE status IN ('draft','scheduled') AND EXISTS (
                SELECT 1 FROM sequences s
                WHERE s.id=touches.sequence_id AND s.status='paused'
-                 AND s.copy_policy_version<?1
+                 AND COALESCE(s.copy_policy_hash,'')<>?1
              )",
-            params![CURRENT_COPY_POLICY_VERSION],
+            params![current_copy_policy_hash()],
         )?;
         // A provider interruption could leave an old-policy checkpoint in
         // `building` forever. It is neither a current draft nor useful active
@@ -1321,14 +1454,14 @@ impl Db {
              WHERE status IN ('writing','reviewing') AND EXISTS (
                SELECT 1 FROM sequences s
                WHERE s.id=touches.sequence_id AND s.status='building'
-                 AND s.copy_policy_version<?1
+                 AND COALESCE(s.copy_policy_hash,'')<>?1
              )",
-            params![CURRENT_COPY_POLICY_VERSION],
+            params![current_copy_policy_hash()],
         )?;
         conn.execute(
             "UPDATE sequences SET status='rejected'
-             WHERE status='building' AND copy_policy_version<?1",
-            params![CURRENT_COPY_POLICY_VERSION],
+             WHERE status='building' AND COALESCE(copy_policy_hash,'')<>?1",
+            params![current_copy_policy_hash()],
         )?;
         // Databases predating opportunity-level thread enforcement may contain
         // more than one active sequence for the same facility/use case. Keep
@@ -1657,20 +1790,28 @@ impl Db {
             .into_iter()
             .filter(|observation| {
                 observation.person_id.is_empty()
-                    && !observation.source_url.trim().is_empty()
+                    && credible_source_url(&observation.source_url)
                     && !observation.evidence.trim().is_empty()
                     && assessment
                         .matched_signal_keys
                         .contains(&observation.definition_key)
             })
             .collect::<Vec<_>>();
-        let task_or_decision = if !lead.hypothesis.trim().is_empty() {
-            lead.hypothesis.clone()
-        } else if !assessment.symptom.trim().is_empty() {
-            assessment.symptom.clone()
-        } else {
-            "Unresolved operating task or decision".into()
-        };
+        let task_or_decision = observations
+            .iter()
+            .find(|observation| {
+                matches!(
+                    observation.definition_key.as_str(),
+                    "account.bounded_repetitive_task"
+                        | "account.specific_recurring_decision"
+                        | "account.outage_sensitive_decision"
+                )
+            })
+            .map(|observation| observation.evidence.clone())
+            .filter(|task| !task.trim().is_empty())
+            .or_else(|| (!assessment.symptom.trim().is_empty()).then(|| assessment.symptom.clone()))
+            .or_else(|| (!lead.hypothesis.trim().is_empty()).then(|| lead.hypothesis.clone()))
+            .unwrap_or_else(|| "Unresolved operating task or decision".into());
         let mut gaps = assessment.evidence_gaps.clone();
         if observations.is_empty() {
             gaps.push(
@@ -1684,10 +1825,12 @@ impl Db {
                         market_account_id: account.id.clone(),
                         name: facility_label(&lead, &observation.evidence),
                         facility_type: facility_type_from_evidence(&observation.evidence).into(),
-                        city: ontario_site_from_text(&observation.evidence)
+                        city: canadian_site_from_text(&observation.evidence)
                             .unwrap_or_default()
                             .into(),
-                        region: "Ontario".into(),
+                        region: canadian_region_from_text(&observation.evidence)
+                            .unwrap_or_default()
+                            .into(),
                         country: "Canada".into(),
                         source_url: observation.source_url.clone(),
                         source_excerpt: observation.evidence.clone(),
@@ -1783,7 +1926,19 @@ impl Db {
             ..Default::default()
         };
         let opportunity_id = self.upsert_sales_opportunity(&opportunity)?;
-        let claims = observations
+        let people = self
+            .list_people(Some(&assessment.brand), None)?
+            .into_iter()
+            .filter(|person| person.lead_id == assessment.lead_id)
+            .collect::<Vec<_>>();
+        let facility = if opportunity.facility_id.is_empty() {
+            None
+        } else {
+            self.list_facilities(Some(&opportunity.market_account_id))?
+                .into_iter()
+                .find(|facility| facility.id == opportunity.facility_id)
+        };
+        let mut claims = observations
             .into_iter()
             .map(|observation| EvidenceClaim {
                 sales_opportunity_id: opportunity_id.clone(),
@@ -1801,18 +1956,74 @@ impl Db {
                 ..Default::default()
             })
             .collect::<Vec<_>>();
-        self.replace_evidence_claims(&opportunity_id, &claims)?;
-        for person in self
-            .list_people(Some(&assessment.brand), None)?
-            .into_iter()
-            .filter(|person| person.lead_id == assessment.lead_id)
+        if assessment.brand.eq_ignore_ascii_case("wapahki") {
+            if let Some(facility) = facility.as_ref() {
+                claims.extend(people.iter().filter_map(|person| {
+                    wapahki_contact_facility_claim(
+                        person,
+                        &lead,
+                        facility,
+                        &opportunity_id,
+                        &task_key,
+                    )
+                }));
+            }
+        }
+        let claim_ids = self.replace_evidence_claims(&opportunity_id, &claims)?;
+        let active_claims = claims.iter().zip(claim_ids.iter()).collect::<Vec<_>>();
+        let task_claim_id = active_claims
+            .iter()
+            .find(|(claim, _)| claim.claim_type == "account.bounded_repetitive_task")
+            .map(|(_, id)| (*id).clone())
+            .unwrap_or_default();
+        let economic_claim_id = active_claims
+            .iter()
+            .find(|(claim, _)| claim.claim_type == "account.manual_task_economic_pressure")
+            .map(|(_, id)| (*id).clone())
+            .unwrap_or_default();
         {
+            let conn = self.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE sales_opportunities
+                 SET task_claim_id=?2,economic_claim_id=?3,updated_at=?4 WHERE id=?1",
+                params![opportunity_id, task_claim_id, economic_claim_id, now()],
+            )?;
+        }
+        let persisted_claims =
+            self.list_evidence_claims(Some(&opportunity_id), Some(&assessment.brand))?;
+        for person in people {
             let role = stakeholder_role(&person.title, &person.vantage);
+            let contact_facility_evidence_id = active_claims
+                .iter()
+                .find(|(claim, _)| {
+                    claim.claim_type == "contact.facility_employment"
+                        && claim.source_locator == format!("person:{}", person.id)
+                })
+                .map(|(_, id)| (*id).clone())
+                .unwrap_or_default();
+            let direct_claim_ids = if assessment.brand.eq_ignore_ascii_case("wapahki")
+                && !task_claim_id.is_empty()
+                && !contact_facility_evidence_id.is_empty()
+                && wapahki_physical_workflow_title(&person.title)
+            {
+                vec![task_claim_id.clone(), contact_facility_evidence_id.clone()]
+            } else if !assessment.brand.eq_ignore_ascii_case("wapahki") {
+                direct_role_claim_ids(&person.title, &opportunity, &persisted_claims)
+            } else {
+                Vec::new()
+            };
             self.upsert_opportunity_stakeholder(&OpportunityStakeholder {
                 sales_opportunity_id: opportunity_id.clone(),
                 person_id: person.id,
                 role: role.clone(),
                 relationship_to_task: person.why_them,
+                role_fit: if direct_claim_ids.is_empty() {
+                    inferred_role_fit(&person.title, &person.vantage).into()
+                } else {
+                    "direct".into()
+                },
+                evidence_claim_ids: direct_claim_ids,
+                contact_facility_evidence_id,
                 can_observe: person.can_observe,
                 can_decide: stakeholder_decision_scope(&role).into(),
                 priority: stakeholder_priority(&role),
@@ -1821,7 +2032,41 @@ impl Db {
                 ..Default::default()
             })?;
         }
+        // Re-research can downgrade an opportunity that already has drafts
+        // written under earlier, stronger-looking evidence. Those drafts must
+        // not linger as pending work: the delivery gate would refuse them one
+        // confusing send at a time, and a reviewer approving "due today" rows
+        // has no reason to re-check the opportunity's evidence state.
+        if evidence_status == "research_required" {
+            self.quarantine_open_outreach_for_opportunity(
+                &opportunity_id,
+                "evidence was downgraded to research_required after re-research; the draft no longer has a supported premise",
+            )?;
+        }
         Ok(opportunity_id)
+    }
+
+    /// Cancel open (unsent) touches and pause sequences attributed to an
+    /// opportunity whose evidence no longer authorizes outreach. Sent touches
+    /// and terminal sequence states are never rewritten.
+    pub fn quarantine_open_outreach_for_opportunity(
+        &self,
+        sales_opportunity_id: &str,
+        reason: &str,
+    ) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let cancelled = conn.execute(
+            "UPDATE touches SET status='cancelled', error=?2
+             WHERE status IN ('draft','scheduled')
+               AND sequence_id IN (SELECT id FROM sequences WHERE sales_opportunity_id=?1)",
+            params![sales_opportunity_id, reason],
+        )?;
+        conn.execute(
+            "UPDATE sequences SET status='paused'
+             WHERE sales_opportunity_id=?1 AND status IN ('active','building','draft')",
+            params![sales_opportunity_id],
+        )?;
+        Ok(cancelled)
     }
 
     pub fn list_market_segments(&self, brand: Option<&str>) -> Result<Vec<MarketSegment>> {
@@ -1931,6 +2176,12 @@ impl Db {
             || facility.source_excerpt.trim().is_empty()
         {
             anyhow::bail!("facility requires account, name, exact source URL, and excerpt");
+        }
+        if !credible_source_url(&facility.source_url) {
+            anyhow::bail!(
+                "facility source ({:?}) is not a fetchable URL; a site may not be created from an unverifiable source",
+                facility.source_url.trim()
+            );
         }
         let conn = self.conn.lock().unwrap();
         let existing: Option<String> = conn
@@ -2145,10 +2396,10 @@ impl Db {
         if !existed {
             conn.execute(
                 "INSERT INTO sales_opportunities
-             (id,identity_key,task_key,brand,market_account_id,lead_id,segment_id,facility_id,play_id,kind,title,
+             (id,identity_key,task_key,brand,market_account_id,lead_id,segment_id,facility_id,task_claim_id,economic_claim_id,play_id,kind,title,
               task_or_decision,mechanism,consequence,system_concept,proof_offer,evidence_status,
               evidence_tier,fit_score,status,evidence_gaps,created_at,updated_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?22)",
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?24)",
                 params![
                     id,
                     identity_key,
@@ -2158,6 +2409,8 @@ impl Db {
                     opportunity.lead_id,
                     opportunity.segment_id,
                     opportunity.facility_id,
+                    opportunity.task_claim_id,
+                    opportunity.economic_claim_id,
                     opportunity.play_id,
                     opportunity.kind,
                     opportunity.title,
@@ -2180,10 +2433,10 @@ impl Db {
         conn.execute(
             "UPDATE sales_opportunities SET
               identity_key=?2,task_key=?3,market_account_id=?4,segment_id=?5,
-              facility_id=?6,kind=?7,title=?8,task_or_decision=?9,mechanism=?10,
-              consequence=?11,system_concept=?12,proof_offer=?13,evidence_status=?14,
-              evidence_tier=?15,fit_score=?16,status=?17,evidence_gaps=?18,
-              play_id=?19,updated_at=?20 WHERE id=?1",
+              facility_id=?6,task_claim_id=?7,economic_claim_id=?8,kind=?9,title=?10,
+              task_or_decision=?11,mechanism=?12,consequence=?13,system_concept=?14,
+              proof_offer=?15,evidence_status=?16,evidence_tier=?17,fit_score=?18,
+              status=?19,evidence_gaps=?20,play_id=?21,updated_at=?22 WHERE id=?1",
             params![
                 id,
                 identity_key,
@@ -2191,6 +2444,8 @@ impl Db {
                 opportunity.market_account_id,
                 opportunity.segment_id,
                 opportunity.facility_id,
+                opportunity.task_claim_id,
+                opportunity.economic_claim_id,
                 opportunity.kind,
                 opportunity.title,
                 opportunity.task_or_decision,
@@ -2273,6 +2528,30 @@ impl Db {
         )
         .optional()
         .map_err(Into::into)
+    }
+
+    /// Persist the deterministic commercial priority computed from current
+    /// evidence. Components are stored whole so the CRM can always show *why*
+    /// an account sits in a lane rather than an opaque number.
+    pub fn update_opportunity_priority(
+        &self,
+        opportunity_id: &str,
+        priority: &crate::priority::CommercialPriority,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE sales_opportunities SET priority_lane=?2,priority_score=?3,
+             priority_components=?4,outage_segment_key=?5,updated_at=?6 WHERE id=?1",
+            params![
+                opportunity_id,
+                priority.lane,
+                priority.score,
+                serde_json::to_string(priority).unwrap_or_default(),
+                priority.segment_key,
+                now(),
+            ],
+        )?;
+        Ok(())
     }
 
     /// Append a new current commercial assessment and supersede the previous
@@ -2684,6 +2963,60 @@ impl Db {
             anyhow::bail!("opportunity stakeholder requires opportunity, person, and role");
         }
         let conn = self.conn.lock().unwrap();
+        let role_fit = normalize_role_fit(&stakeholder.role_fit);
+        if role_fit == "direct" {
+            if stakeholder.evidence_claim_ids.is_empty() {
+                anyhow::bail!(
+                    "direct opportunity role fit requires opportunity-specific evidence claim ids"
+                );
+            }
+            for claim_id in &stakeholder.evidence_claim_ids {
+                let valid: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM evidence_claims
+                     WHERE id=?1 AND sales_opportunity_id=?2
+                       AND status IN ('observed','verified')",
+                    params![claim_id, stakeholder.sales_opportunity_id],
+                    |row| row.get(0),
+                )?;
+                if valid == 0 {
+                    anyhow::bail!(
+                        "direct role-fit evidence claim {claim_id} is not active on this opportunity"
+                    );
+                }
+            }
+            let wapahki: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM sales_opportunities
+                 WHERE id=?1 AND lower(brand)='wapahki'",
+                params![stakeholder.sales_opportunity_id],
+                |row| row.get(0),
+            )?;
+            let valid_contact_link: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM evidence_claims c
+                 JOIN sales_opportunities o ON o.id=c.sales_opportunity_id
+                 WHERE c.id=?1 AND c.sales_opportunity_id=?2
+                   AND c.claim_type='contact.facility_employment'
+                   AND c.facility_id=o.facility_id AND c.task_key=o.task_key
+                   AND c.source_locator=?3
+                   AND c.status IN ('observed','verified')",
+                params![
+                    stakeholder.contact_facility_evidence_id,
+                    stakeholder.sales_opportunity_id,
+                    format!("person:{}", stakeholder.person_id)
+                ],
+                |row| row.get(0),
+            )?;
+            if wapahki != 0
+                && (stakeholder.contact_facility_evidence_id.trim().is_empty()
+                    || !stakeholder
+                        .evidence_claim_ids
+                        .contains(&stakeholder.contact_facility_evidence_id)
+                    || valid_contact_link == 0)
+            {
+                anyhow::bail!(
+                    "direct role fit requires current evidence linking this person to the exact facility"
+                );
+            }
+        }
         let existing: Option<String> = conn
             .query_row(
                 "SELECT id FROM opportunity_stakeholders
@@ -2702,11 +3035,13 @@ impl Db {
         let timestamp = now();
         conn.execute(
             "INSERT INTO opportunity_stakeholders
-             (id,sales_opportunity_id,person_id,role,relationship_to_task,can_observe,
-              can_decide,priority,active_thread,status,source,created_at,updated_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,0,?9,?10,?11,?11)
+             (id,sales_opportunity_id,person_id,role,relationship_to_task,role_fit,
+              evidence_claim_ids,contact_facility_evidence_id,can_observe,can_decide,priority,active_thread,status,source,created_at,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,0,?12,?13,?14,?14)
              ON CONFLICT(sales_opportunity_id,person_id) DO UPDATE SET
               role=excluded.role,relationship_to_task=excluded.relationship_to_task,
+              role_fit=excluded.role_fit,evidence_claim_ids=excluded.evidence_claim_ids,
+              contact_facility_evidence_id=excluded.contact_facility_evidence_id,
               can_observe=excluded.can_observe,can_decide=excluded.can_decide,
               priority=excluded.priority,status=excluded.status,source=excluded.source,
               updated_at=excluded.updated_at",
@@ -2716,6 +3051,9 @@ impl Db {
                 stakeholder.person_id,
                 stakeholder.role,
                 stakeholder.relationship_to_task,
+                role_fit,
+                js(&stakeholder.evidence_claim_ids),
+                stakeholder.contact_facility_evidence_id,
                 stakeholder.can_observe,
                 stakeholder.can_decide,
                 stakeholder.priority.max(0),
@@ -2814,6 +3152,43 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    pub fn person_employment_block_reason(&self, person: &Person) -> Result<Option<String>> {
+        let Some(lead) = self.get_lead(&person.lead_id)? else {
+            return Ok(Some("recipient account record is missing".into()));
+        };
+        if lead.apollo_org_id.trim().is_empty()
+            || person.apollo_org_id.trim().is_empty()
+            || person.apollo_org_id != lead.apollo_org_id
+        {
+            return Ok(Some(
+                "Apollo person organization id does not match the target account organization id"
+                    .into(),
+            ));
+        }
+        let domain = canonical_domain(&lead.domain);
+        let shared_domain = !domain.is_empty()
+            && self
+                .list_leads(None)?
+                .into_iter()
+                .filter(|candidate| canonical_domain(&candidate.domain) == domain)
+                .map(|candidate| candidate.apollo_org_id)
+                .filter(|id| !id.trim().is_empty())
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                > 1;
+        if shared_domain
+            && (person.employer_verification != "official"
+                || person.employer_source_url.trim().is_empty()
+                || canonical_domain(&person.employer_source_url) != domain)
+        {
+            return Ok(Some(
+                "shared employer domain requires an official page confirming this person's agency or business unit"
+                    .into(),
+            ));
+        }
+        Ok(None)
+    }
+
     // --- People ------------------------------------------------------------
 
     /// Insert or update a person, keyed on (brand, apollo_person_id). Returns id.
@@ -2830,16 +3205,20 @@ impl Db {
         let id = existing.unwrap_or_else(|| Uuid::new_v4().to_string());
         conn.execute(
             "INSERT INTO people (id,lead_id,brand,apollo_person_id,first_name,last_name,name,title,\
+             apollo_org_id,employer_name,employer_verification,employer_source_url,\
              vantage,can_observe,why_them,primary_contact,route_to,linkedin_url,email,email_status,\
              phone,status,enriched_at,created_at,updated_at) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25) \
              ON CONFLICT(brand,apollo_person_id) DO UPDATE SET \
-             lead_id=?2,first_name=?5,last_name=?6,name=?7,title=?8,vantage=?9,can_observe=?10,\
-             why_them=?11,primary_contact=?12,route_to=?13,linkedin_url=?14,email=?15,email_status=?16,\
-             phone=?17,status=?18,enriched_at=?19,updated_at=?21",
+             lead_id=?2,first_name=?5,last_name=?6,name=?7,title=?8,apollo_org_id=?9,\
+             employer_name=?10,employer_verification=?11,employer_source_url=?12,vantage=?13,can_observe=?14,\
+             why_them=?15,primary_contact=?16,route_to=?17,linkedin_url=?18,email=?19,email_status=?20,\
+             phone=?21,status=?22,enriched_at=?23,updated_at=?25",
             params![
                 id, p.lead_id, p.brand, p.apollo_person_id, p.first_name, p.last_name, p.name,
-                p.title, p.vantage, p.can_observe, p.why_them, p.primary, p.route_to, p.linkedin_url,
+                p.title, p.apollo_org_id, p.employer_name,
+                status_or(&p.employer_verification, "unverified"), p.employer_source_url,
+                p.vantage, p.can_observe, p.why_them, p.primary, p.route_to, p.linkedin_url,
                 p.email, status_or(&p.email_status, "unknown"), p.phone, status_or(&p.status, "new"),
                 p.enriched_at, now, now,
             ],
@@ -2871,7 +3250,7 @@ impl Db {
                     source_name: "contact_research".into(),
                     evidence,
                     confidence: 0.70,
-                    status: "observed".into(),
+                    status: "inferred".into(),
                     ..Default::default()
                 },
             );
@@ -2896,13 +3275,40 @@ impl Db {
             .optional()?;
         if let Some(opportunity_id) = opportunity_id {
             let role = stakeholder_role(&p.title, &p.vantage);
+            let opportunity = conn.query_row(
+                "SELECT * FROM sales_opportunities WHERE id=?1",
+                params![opportunity_id],
+                |row| Ok(row_to_sales_opportunity(row)),
+            )?;
+            let claims = {
+                let mut statement = conn.prepare(
+                    "SELECT * FROM evidence_claims WHERE sales_opportunity_id=?1
+                     AND status IN ('observed','verified')",
+                )?;
+                let claims = statement
+                    .query_map(params![opportunity_id], |row| {
+                        Ok(row_to_evidence_claim(row))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                claims
+            };
+            let direct_claim_ids = direct_role_claim_ids(&p.title, &opportunity, &claims);
+            let role_fit = if direct_claim_ids.is_empty() {
+                inferred_role_fit(&p.title, &p.vantage)
+            } else {
+                "direct"
+            };
             conn.execute(
                 "INSERT INTO opportunity_stakeholders
-                 (id,sales_opportunity_id,person_id,role,relationship_to_task,can_observe,
-                  can_decide,priority,active_thread,status,source,created_at,updated_at)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,0,'mapped','contact_research',?9,?9)
+                 (id,sales_opportunity_id,person_id,role,relationship_to_task,role_fit,
+                  evidence_claim_ids,can_observe,can_decide,priority,active_thread,status,source,created_at,updated_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,0,'mapped','contact_inference',?11,?11)
                  ON CONFLICT(sales_opportunity_id,person_id) DO UPDATE SET
                   role=excluded.role,relationship_to_task=excluded.relationship_to_task,
+                  role_fit=CASE WHEN opportunity_stakeholders.role_fit='direct'
+                    THEN opportunity_stakeholders.role_fit ELSE excluded.role_fit END,
+                  evidence_claim_ids=CASE WHEN opportunity_stakeholders.role_fit='direct'
+                    THEN opportunity_stakeholders.evidence_claim_ids ELSE excluded.evidence_claim_ids END,
                   can_observe=excluded.can_observe,can_decide=excluded.can_decide,
                   priority=excluded.priority,updated_at=excluded.updated_at",
                 params![
@@ -2911,6 +3317,8 @@ impl Db {
                     id,
                     role,
                     p.why_them,
+                    role_fit,
+                    js(&direct_claim_ids),
                     p.can_observe,
                     stakeholder_decision_scope(&role),
                     stakeholder_priority(&role),
@@ -3096,16 +3504,22 @@ impl Db {
             s.id.clone()
         };
         let copy_policy_version = if s.copy_policy_version <= 0 {
-            CURRENT_COPY_POLICY_VERSION
+            current_copy_policy_version()
         } else {
             s.copy_policy_version
+        };
+        let copy_policy_hash = if s.copy_policy_hash.trim().is_empty() {
+            current_copy_policy_hash()
+        } else {
+            s.copy_policy_hash.as_str()
         };
         conn.execute(
             "INSERT INTO sequences (id,person_id,lead_id,brand,thesis,applied_principles,\
              play_id,play_version,experiment_id,experiment_arm,experiment_assignment_id,\
-             signal_observation_ids,gtm_state,copy_policy_version,generation_backend,generation_model,\
-             sales_opportunity_id,status,current_stage,created_at) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+             signal_observation_ids,gtm_state,copy_policy_version,copy_policy_hash,generation_backend,generation_model,\
+             sales_opportunity_id,task_key,evidence_claim_ids,facility_id,task_claim_id,economic_claim_id,\
+             contact_facility_evidence_id,status,current_stage,created_at) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27)",
             params![
                 id,
                 s.person_id,
@@ -3121,9 +3535,16 @@ impl Db {
                 js(&s.signal_observation_ids),
                 s.gtm_state,
                 copy_policy_version,
+                copy_policy_hash,
                 s.generation_backend,
                 s.generation_model,
                 s.sales_opportunity_id,
+                s.task_key,
+                js(&s.evidence_claim_ids),
+                s.facility_id,
+                s.task_claim_id,
+                s.economic_claim_id,
+                s.contact_facility_evidence_id,
                 status_or(&s.status, "active"),
                 s.current_stage,
                 now()
@@ -3144,6 +3565,22 @@ impl Db {
             .query_row(
                 "SELECT * FROM sequences WHERE id=?1",
                 params![sequence_id],
+                |row| Ok(row_to_sequence(row)),
+            )
+            .optional()?)
+    }
+
+    /// Most recent sequence attempt for a person, including held, rejected,
+    /// stopped, and active rows. The execution pipeline deliberately ignores
+    /// non-active attempts; the CRM sequence-review surface uses this read-only
+    /// lookup to show Andrew exactly what was written and why it was held.
+    pub fn latest_sequence_attempt_for_person(&self, person_id: &str) -> Result<Option<Sequence>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT * FROM sequences WHERE person_id=?1
+                 ORDER BY created_at DESC,rowid DESC LIMIT 1",
+                params![person_id],
                 |row| Ok(row_to_sequence(row)),
             )
             .optional()?)
@@ -3196,7 +3633,7 @@ impl Db {
         {
             let mut stmt = tx.prepare(
                 "UPDATE touches SET due_at=?2,recipient_timezone=?3,scheduled_rule=?4,
-                 schedule_reason=?5 WHERE id=?1 AND status='scheduled'",
+                 schedule_reason=?5 WHERE id=?1 AND status IN ('scheduled','draft')",
             )?;
             for update in updates {
                 stmt.execute(params![
@@ -3368,11 +3805,13 @@ impl Db {
             }
         }
         let promoted = tx.execute(
-            "UPDATE sequences SET status='active',applied_principles=?2,copy_policy_version=?3 WHERE id=?1 AND status='building'",
+            "UPDATE sequences SET status='active',applied_principles=?2,copy_policy_version=?3,
+             copy_policy_hash=?4 WHERE id=?1 AND status='building'",
             params![
                 sequence_id,
                 js(applied_principles),
-                CURRENT_COPY_POLICY_VERSION
+                current_copy_policy_version(),
+                current_copy_policy_hash()
             ],
         )?;
         if promoted == 0 {
@@ -3488,7 +3927,7 @@ impl Db {
              ORDER BY CASE WHEN t.stage>1 THEN 0 ELSE 1 END, t.due_at ASC LIMIT ?4",
         )?;
         let rows = stmt.query_map(
-            params![now(), brand, CURRENT_COPY_POLICY_VERSION, limit],
+            params![now(), brand, current_copy_policy_version(), limit],
             |r| Ok(row_to_touch(r)),
         )?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -3513,7 +3952,7 @@ impl Db {
                AND p.status NOT IN ('replied','unsubscribed','bounced','suppressed')
              ORDER BY s.created_at ASC,t.stage ASC,t.id ASC",
         )?;
-        let rows = stmt.query_map(params![brand, CURRENT_COPY_POLICY_VERSION], |r| {
+        let rows = stmt.query_map(params![brand, current_copy_policy_version()], |r| {
             Ok(row_to_touch(r))
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -3537,7 +3976,7 @@ impl Db {
                      AND os.person_id=s.person_id AND os.active_thread=1
                  ))
              )",
-            params![id, CURRENT_COPY_POLICY_VERSION],
+            params![id, current_copy_policy_version()],
         )? == 1)
     }
 
@@ -3591,7 +4030,7 @@ impl Db {
              AND lower(t.channel) IN ('email','linkedin_or_email')
              AND (t.status='sent' OR (t.status='scheduled'
                   AND s.status='active' AND s.copy_policy_version=?4))",
-            params![brand, start, end, CURRENT_COPY_POLICY_VERSION],
+            params![brand, start, end, current_copy_policy_version()],
             |r| r.get(0),
         )?;
         let opportunities: i64 = conn.query_row(
@@ -3703,7 +4142,7 @@ impl Db {
                    AND s.copy_policy_version=?2
                )
              )",
-            params![lead_id, CURRENT_COPY_POLICY_VERSION],
+            params![lead_id, current_copy_policy_version()],
             |r| r.get(0),
         )?;
         Ok(n.max(0) as usize)
@@ -3894,7 +4333,7 @@ impl Db {
                  ORDER BY t.due_at ASC LIMIT ?2",
             )?;
             let rows = stmt.query_map(
-                params![brand, limit as i64, CURRENT_COPY_POLICY_VERSION],
+                params![brand, limit as i64, current_copy_policy_version()],
                 |row| {
                     Ok(CalendarEntry {
                         brand: brand.to_string(),
@@ -4038,7 +4477,7 @@ impl Db {
                  )) \
              ) \
              AND (?1 IS NULL OR brand=?1) AND (?2 IS NULL OR person_id=?2)",
-            params![brand, person_id, CURRENT_COPY_POLICY_VERSION],
+            params![brand, person_id, current_copy_policy_version()],
             |row| row.get(0),
         )?;
         Ok(n.max(0) as usize)
@@ -4068,7 +4507,7 @@ impl Db {
                  ))
              ) \
              AND (?1 IS NULL OR brand=?1) AND (?2 IS NULL OR person_id=?2)",
-            params![brand, person_id, CURRENT_COPY_POLICY_VERSION],
+            params![brand, person_id, current_copy_policy_version()],
         )?;
         Ok(n)
     }
@@ -4080,7 +4519,7 @@ impl Db {
                 "SELECT id FROM sequences WHERE person_id=?1 AND status='active'
                  ORDER BY CASE WHEN copy_policy_version=?2 THEN 0 ELSE 1 END,
                           created_at DESC LIMIT 1",
-                params![person_id, CURRENT_COPY_POLICY_VERSION],
+                params![person_id, current_copy_policy_version()],
                 |r| r.get(0),
             )
             .optional()?)
@@ -4117,7 +4556,7 @@ impl Db {
                           OR trim(t.body)='Writing draft…')
                  )
              )",
-            params![person_id, CURRENT_COPY_POLICY_VERSION, expected_touches],
+            params![person_id, current_copy_policy_version(), expected_touches],
             |row| row.get(0),
         )?;
         Ok(exists == 1)
@@ -4134,7 +4573,7 @@ impl Db {
                 SELECT 1 FROM sequences
                 WHERE person_id=?1 AND copy_policy_version=?2
             )",
-            params![person_id, CURRENT_COPY_POLICY_VERSION],
+            params![person_id, current_copy_policy_version()],
             |row| row.get(0),
         )?;
         Ok(exists == 1)
@@ -4169,7 +4608,7 @@ impl Db {
                    AND (COALESCE(t.review_passes,0)<>1 OR trim(t.body)=''
                         OR trim(t.body)='Writing draft…')
                )",
-            params![lead_id, CURRENT_COPY_POLICY_VERSION, expected_touches],
+            params![lead_id, current_copy_policy_version(), expected_touches],
             |row| row.get(0),
         )?;
         Ok(count.max(0) as usize)
@@ -6849,6 +7288,8 @@ fn row_to_sales_opportunity(r: &Row) -> SalesOpportunity {
         lead_id: g(r, "lead_id"),
         segment_id: g(r, "segment_id"),
         facility_id: g(r, "facility_id"),
+        task_claim_id: g(r, "task_claim_id"),
+        economic_claim_id: g(r, "economic_claim_id"),
         play_id: g(r, "play_id"),
         kind: g(r, "kind"),
         title: g(r, "title"),
@@ -6862,6 +7303,10 @@ fn row_to_sales_opportunity(r: &Row) -> SalesOpportunity {
         fit_score: r.get("fit_score").unwrap_or(0),
         status: g(r, "status"),
         evidence_gaps: jd(&g(r, "evidence_gaps")),
+        priority_lane: g(r, "priority_lane"),
+        priority_score: r.get("priority_score").unwrap_or(0),
+        priority_components: g(r, "priority_components"),
+        outage_segment_key: g(r, "outage_segment_key"),
         created_at: g(r, "created_at"),
         updated_at: g(r, "updated_at"),
     };
@@ -6984,6 +7429,9 @@ fn row_to_opportunity_stakeholder(r: &Row) -> OpportunityStakeholder {
         person_id: g(r, "person_id"),
         role: g(r, "role"),
         relationship_to_task: g(r, "relationship_to_task"),
+        role_fit: normalize_role_fit(&g(r, "role_fit")).into(),
+        evidence_claim_ids: jd(&g(r, "evidence_claim_ids")),
+        contact_facility_evidence_id: g(r, "contact_facility_evidence_id"),
         can_observe: g(r, "can_observe"),
         can_decide: g(r, "can_decide"),
         priority: r.get("priority").unwrap_or(100),
@@ -7005,6 +7453,10 @@ fn row_to_person(r: &Row) -> Person {
         last_name: g(r, "last_name"),
         name: g(r, "name"),
         title: g(r, "title"),
+        apollo_org_id: g(r, "apollo_org_id"),
+        employer_name: g(r, "employer_name"),
+        employer_verification: g(r, "employer_verification"),
+        employer_source_url: g(r, "employer_source_url"),
         location: g(r, "location"),
         timezone: g(r, "timezone"),
         vantage: g(r, "vantage"),
@@ -7040,9 +7492,16 @@ fn row_to_sequence(r: &Row) -> Sequence {
         signal_observation_ids: jd(&g(r, "signal_observation_ids")),
         gtm_state: g(r, "gtm_state"),
         copy_policy_version: r.get("copy_policy_version").unwrap_or(0),
+        copy_policy_hash: g(r, "copy_policy_hash"),
         generation_backend: g(r, "generation_backend"),
         generation_model: g(r, "generation_model"),
         sales_opportunity_id: g(r, "sales_opportunity_id"),
+        task_key: g(r, "task_key"),
+        evidence_claim_ids: jd(&g(r, "evidence_claim_ids")),
+        facility_id: g(r, "facility_id"),
+        task_claim_id: g(r, "task_claim_id"),
+        economic_claim_id: g(r, "economic_claim_id"),
+        contact_facility_evidence_id: g(r, "contact_facility_evidence_id"),
         status: g(r, "status"),
         current_stage: r.get("current_stage").unwrap_or(0),
         created_at: g(r, "created_at"),
@@ -7685,6 +8144,17 @@ fn record_signal_observation_conn(
     if definition.evidence_required && observation.evidence.trim().is_empty() {
         anyhow::bail!("signal {} requires source-backed evidence", definition.key);
     }
+    // A fabricated source is worse than a missing one: prose such as "not
+    // provided in account payload" has previously been stored as a source_url
+    // and later cited as claim and facility lineage. Reject it at the write
+    // boundary; a genuinely unknown source must stay the empty string.
+    if !observation.source_url.trim().is_empty() && !credible_source_url(&observation.source_url) {
+        anyhow::bail!(
+            "signal {} cites a non-URL source ({:?}); leave source_url empty when the source is unknown",
+            definition.key,
+            observation.source_url.trim()
+        );
+    }
     let has_entity = match definition.entity_type.as_str() {
         "account" => !observation.lead_id.trim().is_empty(),
         "person" => !observation.person_id.trim().is_empty(),
@@ -7964,24 +8434,63 @@ fn enforce_sales_opportunity_boundaries(opportunity: &mut SalesOpportunity) {
 }
 
 fn evidence_names_operating_site(evidence: &str) -> bool {
-    ontario_site_from_text(evidence).is_some()
+    canadian_site_from_text(evidence).is_some()
 }
 
-/// Resolve an Ontario city only when the source also supplies the province.
+/// Evidence provenance must be a fetchable page. Model output has previously
+/// filled `source_url` with prose such as "not provided in account payload",
+/// which then flowed into evidence claims and even facilities at 0.9
+/// confidence. An unknown source must stay empty; empty sources are filtered
+/// out of claims, facilities, and outreach authorization instead of
+/// masquerading as lineage.
+pub(crate) fn credible_source_url(url: &str) -> bool {
+    let url = url.trim();
+    let Some(rest) = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    host.contains('.')
+        && !host.starts_with('.')
+        && !url.contains(char::is_whitespace)
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':'))
+}
+
+/// Resolve a Canadian city only when the source also supplies the province.
 /// A bare city-name substring is insufficient: notably, `London` must never
 /// turn a UK job page into a Canadian facility.
-pub(crate) fn ontario_site_from_text(evidence: &str) -> Option<&'static str> {
+pub(crate) fn canadian_site_from_text(evidence: &str) -> Option<&'static str> {
     let text = evidence.to_ascii_lowercase();
-    ONTARIO_SITE_NAMES.iter().copied().find(|city| {
+    CANADIAN_SITE_NAMES.iter().copied().find(|city| {
         let city = city.to_ascii_lowercase();
-        [
-            format!("{city}, on"),
-            format!("{city}, ontario"),
-            format!("{city} ontario"),
-            format!("{city}, ca on"),
-        ]
-        .iter()
-        .any(|pattern| text.contains(pattern))
+        CANADIAN_REGIONS.iter().any(|(region, abbreviation)| {
+            let region = region.to_ascii_lowercase();
+            let abbreviation = abbreviation.to_ascii_lowercase();
+            [
+                format!("{city}, {abbreviation}"),
+                format!("{city}, {region}"),
+                format!("{city} {region}"),
+                format!("{city}, ca {abbreviation}"),
+            ]
+            .iter()
+            .any(|pattern| text.contains(pattern))
+        })
+    })
+}
+
+fn canadian_region_from_text(evidence: &str) -> Option<&'static str> {
+    let text = evidence.to_ascii_lowercase();
+    CANADIAN_REGIONS.iter().find_map(|(region, abbreviation)| {
+        let region_lower = region.to_ascii_lowercase();
+        let abbreviation_lower = abbreviation.to_ascii_lowercase();
+        (text.contains(&region_lower)
+            || text.contains(&format!(", {abbreviation_lower}"))
+            || text.contains(&format!(" ca {abbreviation_lower}")))
+        .then_some(*region)
     })
 }
 
@@ -8023,14 +8532,29 @@ fn facility_type_from_evidence(evidence: &str) -> &'static str {
 }
 
 fn facility_label(lead: &Lead, evidence: &str) -> String {
-    if let Some(city) = ontario_site_from_text(evidence) {
+    if let Some(city) = canadian_site_from_text(evidence) {
         format!("{} operating site", city)
     } else {
         format!("{} site documented in task source", lead.name.trim())
     }
 }
 
-const ONTARIO_SITE_NAMES: &[&str] = &[
+const CANADIAN_REGIONS: &[(&str, &str)] = &[
+    ("Alberta", "AB"),
+    ("British Columbia", "BC"),
+    ("Manitoba", "MB"),
+    ("New Brunswick", "NB"),
+    ("Newfoundland and Labrador", "NL"),
+    ("Nova Scotia", "NS"),
+    ("Ontario", "ON"),
+    ("Prince Edward Island", "PE"),
+    ("Quebec", "QC"),
+    ("Saskatchewan", "SK"),
+];
+
+const CANADIAN_SITE_NAMES: &[&str] = &[
+    "Abbotsford",
+    "Airdrie",
     "Barrie",
     "Belleville",
     "Brampton",
@@ -8063,6 +8587,32 @@ const ONTARIO_SITE_NAMES: &[&str] = &[
     "Vaughan",
     "Waterloo",
     "Windsor",
+    "Burnaby",
+    "Calgary",
+    "Charlottetown",
+    "Dartmouth",
+    "Delta",
+    "Edmonton",
+    "Fredericton",
+    "Halifax",
+    "Laval",
+    "Lethbridge",
+    "Longueuil",
+    "Moncton",
+    "Montreal",
+    "Nanaimo",
+    "Quebec City",
+    "Red Deer",
+    "Regina",
+    "Richmond",
+    "Saint John",
+    "Saskatoon",
+    "St. John's",
+    "Surrey",
+    "Trois-Rivières",
+    "Vancouver",
+    "Victoria",
+    "Winnipeg",
 ];
 
 fn choose_segment_id(brand: &str, context: &str, segments: &[MarketSegment]) -> String {
@@ -8078,14 +8628,14 @@ fn choose_segment_id(brand: &str, context: &str, segments: &[MarketSegment]) -> 
         .iter()
         .any(|term| text.contains(term))
         {
-            "ontario_warehouse_case_handling"
+            "canada_warehouse_case_handling"
         } else if ["food", "beverage", "pack", "case", "tray", "pallet"]
             .iter()
             .any(|term| text.contains(term))
         {
-            "ontario_food_case_palletizing"
+            "canada_food_case_palletizing"
         } else {
-            "ontario_manufacturing_machine_tending"
+            "canada_manufacturing_machine_tending"
         }
     } else if brand.eq_ignore_ascii_case("gnk") {
         if [
@@ -8175,6 +8725,170 @@ fn stakeholder_role(title: &str, vantage: &str) -> String {
         "router"
     }
     .into()
+}
+
+fn normalize_role_fit(role_fit: &str) -> &'static str {
+    match role_fit.trim().to_ascii_lowercase().as_str() {
+        "direct" => "direct",
+        "router" => "router",
+        "unrelated" => "unrelated",
+        _ => "adjacent",
+    }
+}
+
+/// Titles and model-assigned vantage can identify a plausible route, but they
+/// cannot prove ownership of one opportunity. That distinction is persisted so
+/// model inference can never silently become outreach authorization.
+fn inferred_role_fit(title: &str, vantage: &str) -> &'static str {
+    if crate::response_design::is_route_only_contact(title, vantage) {
+        "router"
+    } else {
+        "adjacent"
+    }
+}
+
+fn direct_role_claim_ids(
+    title: &str,
+    opportunity: &SalesOpportunity,
+    claims: &[EvidenceClaim],
+) -> Vec<String> {
+    let generic = [
+        "chief",
+        "director",
+        "executive",
+        "head",
+        "lead",
+        "manager",
+        "officer",
+        "operations",
+        "senior",
+        "supervisor",
+        "vice",
+        "president",
+    ];
+    let title_terms = title
+        .to_ascii_lowercase()
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|term| term.len() >= 4 && !generic.contains(term))
+        .map(ToString::to_string)
+        .collect::<std::collections::HashSet<_>>();
+    if title_terms.is_empty() {
+        return Vec::new();
+    }
+    let opportunity_text = format!(
+        "{} {} {}",
+        opportunity.title, opportunity.task_or_decision, opportunity.mechanism
+    )
+    .to_ascii_lowercase();
+    let title_matches_task = title_terms
+        .iter()
+        .any(|term| opportunity_text.contains(term));
+    if !title_matches_task {
+        return Vec::new();
+    }
+    claims
+        .iter()
+        .filter(|claim| {
+            claim.task_key == opportunity.task_key
+                && matches!(claim.status.as_str(), "observed" | "verified")
+                && title_terms.iter().any(|term| {
+                    claim.claim_text.to_ascii_lowercase().contains(term)
+                        || claim.source_excerpt.to_ascii_lowercase().contains(term)
+                })
+        })
+        .map(|claim| claim.id.clone())
+        .collect()
+}
+
+/// Convert provider person data into a facility link only when the current
+/// employer id, a person-level source, the exact facility city, and a physical
+/// operations title all agree. Province-only records such as "Ontario,
+/// Canada" deliberately fail this check.
+fn wapahki_contact_facility_claim(
+    person: &Person,
+    lead: &Lead,
+    facility: &Facility,
+    sales_opportunity_id: &str,
+    task_key: &str,
+) -> Option<EvidenceClaim> {
+    if facility.id.trim().is_empty()
+        || facility.city.trim().is_empty()
+        || person.apollo_org_id.trim().is_empty()
+        || person.apollo_org_id != lead.apollo_org_id
+        || !matches!(
+            person
+                .employer_verification
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "apollo" | "official"
+        )
+        || person.linkedin_url.trim().is_empty()
+        || !wapahki_physical_workflow_title(&person.title)
+    {
+        return None;
+    }
+    let location = normalize_identity_text(&person.location);
+    let city = normalize_identity_text(&facility.city);
+    let region = normalize_identity_text(&facility.region);
+    let country = normalize_identity_text(&facility.country);
+    let exact_city = !city.is_empty() && format!(" {location} ").contains(&format!(" {city} "));
+    let correct_region = (!region.is_empty()
+        && format!(" {location} ").contains(&format!(" {region} ")))
+        || (!country.is_empty() && format!(" {location} ").contains(&format!(" {country} ")));
+    if !exact_city || !correct_region {
+        return None;
+    }
+    let employer = if person.employer_name.trim().is_empty() {
+        lead.name.trim()
+    } else {
+        person.employer_name.trim()
+    };
+    let excerpt = format!(
+        "The current-employment record identifies {} as {} at {} and lists the person's location as {}.",
+        person.name.trim(),
+        person.title.trim(),
+        employer,
+        person.location.trim()
+    );
+    Some(EvidenceClaim {
+        sales_opportunity_id: sales_opportunity_id.into(),
+        brand: "wapahki".into(),
+        lead_id: lead.id.clone(),
+        facility_id: facility.id.clone(),
+        task_key: task_key.into(),
+        claim_type: "contact.facility_employment".into(),
+        claim_text: excerpt.clone(),
+        source_url: person.linkedin_url.clone(),
+        source_title: "Current employer and location record".into(),
+        source_excerpt: excerpt,
+        source_locator: format!("person:{}", person.id),
+        lineage_key: format!("contact-facility:{}:{}", person.id, facility.id),
+        confidence: 0.8,
+        status: "observed".into(),
+        ..Default::default()
+    })
+}
+
+pub(crate) fn wapahki_physical_workflow_title(title: &str) -> bool {
+    let title = format!(" {} ", normalize_identity_text(title));
+    [
+        " plant ",
+        " production ",
+        " manufacturing ",
+        " packaging ",
+        " warehouse ",
+        " distribution ",
+        " fulfillment ",
+        " operations ",
+        " process engineering ",
+        " industrial engineering ",
+        " continuous improvement ",
+        " maintenance ",
+        " automation ",
+    ]
+    .iter()
+    .any(|term| title.contains(term))
 }
 
 fn stakeholder_priority(role: &str) -> i64 {
@@ -8718,6 +9432,8 @@ CREATE TABLE IF NOT EXISTS people (
     brand TEXT NOT NULL,
     apollo_person_id TEXT NOT NULL,
     first_name TEXT, last_name TEXT, name TEXT, title TEXT,
+    apollo_org_id TEXT DEFAULT '', employer_name TEXT DEFAULT '',
+    employer_verification TEXT DEFAULT 'unverified', employer_source_url TEXT DEFAULT '',
     location TEXT DEFAULT '', timezone TEXT DEFAULT '',
     vantage TEXT, can_observe TEXT, why_them TEXT,
     primary_contact INTEGER DEFAULT 0, route_to TEXT, linkedin_url TEXT,
@@ -8745,9 +9461,13 @@ CREATE TABLE IF NOT EXISTS sequences (
     thesis TEXT,
     applied_principles TEXT DEFAULT '[]',
     copy_policy_version INTEGER DEFAULT 0,
+    copy_policy_hash TEXT DEFAULT '',
     generation_backend TEXT DEFAULT '',
     generation_model TEXT DEFAULT '',
     sales_opportunity_id TEXT DEFAULT '',
+    task_key TEXT DEFAULT '', evidence_claim_ids TEXT DEFAULT '[]',
+    facility_id TEXT DEFAULT '', task_claim_id TEXT DEFAULT '',
+    economic_claim_id TEXT DEFAULT '', contact_facility_evidence_id TEXT DEFAULT '',
     status TEXT DEFAULT 'active',
     current_stage INTEGER DEFAULT 0,
     created_at TEXT
@@ -9040,6 +9760,8 @@ CREATE TABLE IF NOT EXISTS sales_opportunities (
     lead_id TEXT NOT NULL,
     segment_id TEXT DEFAULT '',
     facility_id TEXT DEFAULT '',
+    task_claim_id TEXT DEFAULT '',
+    economic_claim_id TEXT DEFAULT '',
     play_id TEXT NOT NULL,
     kind TEXT NOT NULL,
     title TEXT NOT NULL,
@@ -9053,6 +9775,10 @@ CREATE TABLE IF NOT EXISTS sales_opportunities (
     fit_score INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'research',
     evidence_gaps TEXT NOT NULL DEFAULT '[]',
+    priority_lane TEXT DEFAULT '',
+    priority_score INTEGER DEFAULT 0,
+    priority_components TEXT DEFAULT '',
+    outage_segment_key TEXT DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     FOREIGN KEY(market_account_id) REFERENCES market_accounts(id),
@@ -9156,6 +9882,9 @@ CREATE TABLE IF NOT EXISTS opportunity_stakeholders (
     person_id TEXT NOT NULL,
     role TEXT NOT NULL,
     relationship_to_task TEXT DEFAULT '',
+    role_fit TEXT NOT NULL DEFAULT 'adjacent',
+    evidence_claim_ids TEXT DEFAULT '[]',
+    contact_facility_evidence_id TEXT DEFAULT '',
     can_observe TEXT DEFAULT '',
     can_decide TEXT DEFAULT '',
     priority INTEGER NOT NULL DEFAULT 100,
@@ -9445,12 +10174,12 @@ CREATE INDEX IF NOT EXISTS idx_jobs_claim ON jobs(status, next_run_at, priority)
 #[cfg(test)]
 mod tests {
     use super::{
-        all_declared_sources_exhausted, evidence_names_operating_site,
+        all_declared_sources_exhausted, current_copy_policy_version, evidence_names_operating_site,
         facility_observation_for_task, AccountPlayAssessment, ApplicationBrief,
         CommercialAssessment, CommercialEvent, ConversationMessage, CustomerDevelopmentRecord, Db,
         EvidenceClaim, GtmExperiment, GtmOutcome, Job, Lead, Mailbox, Meeting, Opportunity,
         OpportunityContact, OpportunityStakeholder, OpportunityTouch, Person, SalesOpportunity,
-        Sequence, SignalObservation, Touch, CURRENT_COPY_POLICY_VERSION,
+        Sequence, SignalObservation, Touch,
     };
     use chrono::{TimeZone, Utc};
     use uuid::Uuid;
@@ -9552,7 +10281,8 @@ mod tests {
                 person_id: "stale-policy-person".into(),
                 lead_id: "stale-policy-lead".into(),
                 brand: "gnk".into(),
-                copy_policy_version: CURRENT_COPY_POLICY_VERSION - 1,
+                copy_policy_version: current_copy_policy_version() - 1,
+                copy_policy_hash: "stale-policy-hash".into(),
                 status: "active".into(),
                 ..Default::default()
             })
@@ -9574,7 +10304,8 @@ mod tests {
                 person_id: "stale-policy-draft-person".into(),
                 lead_id: "stale-policy-draft-lead".into(),
                 brand: "wapahki".into(),
-                copy_policy_version: CURRENT_COPY_POLICY_VERSION - 1,
+                copy_policy_version: current_copy_policy_version() - 1,
+                copy_policy_hash: "stale-policy-hash".into(),
                 status: "active".into(),
                 ..Default::default()
             })
@@ -9596,7 +10327,8 @@ mod tests {
                 person_id: "stale-policy-building-person".into(),
                 lead_id: "stale-policy-building-lead".into(),
                 brand: "outagehub".into(),
-                copy_policy_version: CURRENT_COPY_POLICY_VERSION - 1,
+                copy_policy_version: current_copy_policy_version() - 1,
+                copy_policy_hash: "stale-policy-hash".into(),
                 status: "building".into(),
                 ..Default::default()
             })
@@ -9628,7 +10360,7 @@ mod tests {
             .sequence_gtm_attribution(&draft_sequence_id)
             .expect("draft sequence query")
             .expect("stale draft sequence");
-        assert_eq!(draft_sequence.status, "paused");
+        assert_eq!(draft_sequence.status, "archived");
         let draft_touches = reopened
             .list_touches_for_sequence(&draft_sequence_id)
             .expect("draft touch query");
@@ -9693,7 +10425,7 @@ mod tests {
             .list_market_segments(Some("wapahki"))
             .unwrap()
             .into_iter()
-            .find(|segment| segment.key == "ontario_food_case_palletizing")
+            .find(|segment| segment.key == "canada_food_case_palletizing")
             .expect("default segment");
         segment.estimated_total = 500;
         segment.accounts_discovered = 17;
@@ -10918,14 +11650,14 @@ mod tests {
                 "INSERT INTO sequences
                    (id,person_id,lead_id,brand,copy_policy_version,status,created_at)
                  VALUES ('sequence-claim','person-claim','lead-claim','gnk',?1,'active','now')",
-                rusqlite::params![CURRENT_COPY_POLICY_VERSION],
+                rusqlite::params![current_copy_policy_version()],
             )
             .expect("seed current sequence");
             conn.execute(
                 "INSERT INTO sequences
                    (id,person_id,lead_id,brand,copy_policy_version,status,created_at)
                  VALUES ('sequence-stale','person-claim','lead-stale','gnk',?1,'active','now')",
-                rusqlite::params![CURRENT_COPY_POLICY_VERSION - 1],
+                rusqlite::params![current_copy_policy_version() - 1],
             )
             .expect("seed stale sequence");
             conn.execute_batch(
@@ -11239,7 +11971,7 @@ mod tests {
                 lead_id: lead_id.clone(),
                 brand: "gnk".into(),
                 status: "active".into(),
-                copy_policy_version: CURRENT_COPY_POLICY_VERSION,
+                copy_policy_version: current_copy_policy_version(),
                 ..Default::default()
             })
             .expect("insert current sequence");
@@ -11268,7 +12000,7 @@ mod tests {
                 lead_id: lead_id.clone(),
                 brand: "gnk".into(),
                 status: "active".into(),
-                copy_policy_version: CURRENT_COPY_POLICY_VERSION - 1,
+                copy_policy_version: current_copy_policy_version() - 1,
                 ..Default::default()
             })
             .expect("insert stale sequence");
@@ -11406,8 +12138,8 @@ mod tests {
             .current_gtm_play("outagehub")
             .expect("load current play")
             .expect("seeded outagehub play");
-        assert_eq!(play.version, 13);
-        assert_eq!(play.minimum_signal_matches, 4);
+        assert_eq!(play.version, 14);
+        assert_eq!(play.minimum_signal_matches, 5);
         assert!(play
             .required_signal_keys
             .contains(&"account.historical_location_outage_match".to_string()));
@@ -11510,7 +12242,7 @@ mod tests {
                 experiment_arm: first.arm.clone(),
                 experiment_assignment_id: first.id.clone(),
                 signal_observation_ids: vec!["signal-1".into()],
-                copy_policy_version: CURRENT_COPY_POLICY_VERSION,
+                copy_policy_version: current_copy_policy_version(),
                 generation_backend: "codex".into(),
                 generation_model: "gpt-5.6-terra".into(),
                 status: "active".into(),
@@ -11554,7 +12286,7 @@ mod tests {
             account_hypothesis: "A sourced operating hypothesis".into(),
             play_version: 7,
             experiment_arm: first.arm,
-            copy_policy_version: CURRENT_COPY_POLICY_VERSION,
+            copy_policy_version: current_copy_policy_version(),
             generation_backend: "codex".into(),
             generation_model: "gpt-5.6-terra".into(),
             fingerprint: "attribution-roundtrip".into(),
@@ -11782,7 +12514,7 @@ mod tests {
                 lead_id: lead_id.clone(),
                 brand: "outagehub".into(),
                 sales_opportunity_id: opportunity_id.clone(),
-                copy_policy_version: CURRENT_COPY_POLICY_VERSION,
+                copy_policy_version: current_copy_policy_version(),
                 status: "building".into(),
                 ..Default::default()
             })
@@ -11799,7 +12531,7 @@ mod tests {
                 lead_id: lead_id.clone(),
                 brand: "outagehub".into(),
                 sales_opportunity_id: opportunity_id.clone(),
-                copy_policy_version: CURRENT_COPY_POLICY_VERSION,
+                copy_policy_version: current_copy_policy_version(),
                 status: "building".into(),
                 ..Default::default()
             })
@@ -11852,7 +12584,7 @@ mod tests {
                 lead_id: lead_id.clone(),
                 brand: "outagehub".into(),
                 status: "active".into(),
-                copy_policy_version: CURRENT_COPY_POLICY_VERSION,
+                copy_policy_version: current_copy_policy_version(),
                 ..Default::default()
             })
             .expect("insert sequence");

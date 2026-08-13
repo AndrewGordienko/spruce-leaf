@@ -163,6 +163,7 @@ async fn plan_account(
                 n_touches,
                 run.critique,
                 None,
+                None,
                 &reviewer_knowledge,
                 None,
                 None,

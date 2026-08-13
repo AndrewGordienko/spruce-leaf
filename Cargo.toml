@@ -39,3 +39,7 @@ imap = "2"
 native-tls = "0.2"
 # Gmail API body payloads are URL-safe base64.
 base64 = "0.22"
+sha2 = "0.10"
+
+[build-dependencies]
+sha2 = "0.10"

@@ -220,11 +220,12 @@ fn signal_label(key: &str) -> &str {
         "account.expensive_recurring_workflow" => "a recurring workflow with material consequence",
         "account.cross_system_reconciliation" => "people reconciling records across systems",
         "account.reachable_workflow_owner" => "a reachable workflow owner",
+        "account.outage_sensitive_exposure" => "a source-verified outage-sensitive footprint",
         "account.outage_sensitive_decision" => "an outage-sensitive operating decision",
         "account.distributed_locations" => "distributed locations",
         "account.operated_ev_charging_network" => "an operated Canadian EV charging network",
         "account.historical_location_outage_match" => {
-            "a verified charging-location / utility-outage match"
+            "a verified operating-address / utility-outage match"
         }
         "account.existing_operational_system" => "an existing operational workflow surface",
         "account.specific_recurring_decision" => "a specific recurring decision",

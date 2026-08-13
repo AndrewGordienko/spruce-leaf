@@ -670,7 +670,7 @@ mod tests {
         assert!(outagehub_copy.contains("one-email discovery test"));
         assert!(outagehub_copy.contains("two-email evidence sequence"));
         let wapahki = playbooks.get("wapahki").expect("wapahki");
-        assert_eq!((wapahki.min_words, wapahki.max_words), (100, 180));
+        assert_eq!((wapahki.min_words, wapahki.max_words), (75, 110));
         for phrase in [
             "repeatable packing or handling step",
             "where variation enters",

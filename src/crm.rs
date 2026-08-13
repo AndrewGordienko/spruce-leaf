@@ -223,6 +223,7 @@ pub fn open(path: impl AsRef<FsPath>) -> Result<SharedStore> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Surface {
     Pipeline,
+    Review,
     Sponsorship,
     Strategy,
     Gtm,
@@ -320,9 +321,7 @@ fn ready_execution_person(db: &SharedDb, person: &Person) -> Result<Option<Execu
     };
     let current_policy = db
         .sequence_gtm_attribution(&sequence_id)?
-        .is_some_and(|sequence| {
-            sequence.copy_policy_version == crate::db::CURRENT_COPY_POLICY_VERSION
-        });
+        .is_some_and(|sequence| sequence.copy_policy_hash == crate::db::current_copy_policy_hash());
     if !current_policy {
         return Ok(None);
     }
@@ -542,6 +541,8 @@ pub fn router(
         .route("/favicon.svg", get(favicon))
         .route("/b/:brand", get(brand_index))
         .route("/b/outagehub/sponsorship", get(outagehub_sponsorship_index))
+        .route("/review", get(sequence_review_index))
+        .route("/review/:brand", get(sequence_review_brand))
         .route("/strategy", get(strategy_hub))
         .route("/strategy/:brand", get(strategy_brand))
         .route("/gtm", get(gtm_hub))
@@ -766,6 +767,22 @@ async fn outagehub_sponsorship_index(State(state): State<WebState>) -> Html<Stri
         audit.as_ref(),
         &counts,
     ))
+}
+
+async fn sequence_review_index(State(state): State<WebState>) -> Html<String> {
+    let counts = brand_tab_counts(&state.db);
+    Html(render_sequence_review_page(&state.db, None, &counts))
+}
+
+async fn sequence_review_brand(
+    State(state): State<WebState>,
+    Path(brand): Path<String>,
+) -> impl IntoResponse {
+    let Some(meta) = brand_meta(&brand) else {
+        return (StatusCode::NOT_FOUND, format!("unknown brand '{brand}'")).into_response();
+    };
+    let counts = brand_tab_counts(&state.db);
+    Html(render_sequence_review_page(&state.db, Some(meta), &counts)).into_response()
 }
 
 /// Portfolio strategy board: what each business is trying to do and the shared
@@ -1949,6 +1966,198 @@ fn render_sponsorship_page(
     b
 }
 
+/// Read-only workshop view over the first ten locally stored people per brand.
+/// Unlike the execution pipeline, this intentionally includes rejected and
+/// held attempts. It never makes them approvable or deliverable; it exists so
+/// the operator can inspect the actual seven-touch candidate and the exact QA
+/// or evidence reason that kept it out of production.
+fn sequence_review_accounts(
+    db: &SharedDb,
+    brand: &str,
+    limit: usize,
+) -> Result<Vec<ExecutionAccount>> {
+    let people = db.list_people(Some(brand), Some("verified"))?;
+    let opportunities = db.list_sales_opportunities(Some(brand), None)?;
+    let mut rows = Vec::<(bool, u8, ExecutionAccount)>::new();
+
+    for lead in db.list_leads(Some(brand))? {
+        let state = opportunities
+            .iter()
+            .filter(|opportunity| opportunity.lead_id == lead.id)
+            .map(|opportunity| opportunity.evidence_status.as_str())
+            .min_by_key(|state| match *state {
+                "action_ready" => 0,
+                "discovery_ready" => 1,
+                _ => 2,
+            })
+            .unwrap_or("research_required");
+        let state_rank = match state {
+            "action_ready" => 0,
+            "discovery_ready" => 1,
+            _ => 2,
+        };
+        let gaps = opportunities
+            .iter()
+            .filter(|opportunity| opportunity.lead_id == lead.id)
+            .flat_map(|opportunity| opportunity.evidence_gaps.iter())
+            .filter(|gap| !gap.trim().is_empty())
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut candidates = people
+            .iter()
+            .filter(|person| person.lead_id == lead.id)
+            .filter_map(|person| {
+                let sequence = db
+                    .latest_sequence_attempt_for_person(&person.id)
+                    .ok()
+                    .flatten();
+                let attempted = sequence.as_ref().is_some_and(|sequence| {
+                    sequence.copy_policy_version == crate::db::current_copy_policy_version()
+                });
+                Some((
+                    person.clone(),
+                    sequence,
+                    attempted,
+                    crate::response_design::contact_priority(
+                        &person.title,
+                        &person.vantage,
+                        person.primary,
+                    ),
+                ))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            right
+                .2
+                .cmp(&left.2)
+                .then_with(|| right.3.cmp(&left.3))
+                .then_with(|| left.0.name.cmp(&right.0.name))
+        });
+        let Some((mut person, sequence, attempted, _)) = candidates.into_iter().next() else {
+            continue;
+        };
+        let (touches, attempt_status) = if let Some(sequence) = sequence {
+            (db.list_touches_for_sequence(&sequence.id)?, sequence.status)
+        } else {
+            (Vec::new(), "not_generated".to_string())
+        };
+        person.status = if attempt_status == "active" {
+            "reviewed".into()
+        } else {
+            attempt_status.clone()
+        };
+        let evidence_note = if gaps.is_empty() {
+            format!("Evidence state: {state}. Sequence attempt: {attempt_status}.")
+        } else {
+            format!(
+                "Evidence state: {state}. Sequence attempt: {attempt_status}. Blocking evidence: {}",
+                gaps.join(" · ")
+            )
+        };
+        person.why_them = if person.why_them.trim().is_empty() {
+            evidence_note
+        } else {
+            format!("{} {}", person.why_them.trim(), evidence_note)
+        };
+        rows.push((
+            attempted,
+            state_rank,
+            ExecutionAccount {
+                lead,
+                people: vec![ExecutionPerson {
+                    person,
+                    touches,
+                    applied_principles: Vec::new(),
+                }],
+            },
+        ));
+    }
+
+    rows.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.lead.name.cmp(&right.2.lead.name))
+    });
+    Ok(rows
+        .into_iter()
+        .take(limit)
+        .map(|(_, _, account)| account)
+        .collect())
+}
+
+fn render_sequence_review_page(
+    db: &SharedDb,
+    brand: Option<&BrandMeta>,
+    counts: &[(&'static BrandMeta, usize)],
+) -> String {
+    let mut b = page_head("Sequence Review · Sales CRM");
+    render_topbar(&mut b, brand.map(|meta| meta.key), Surface::Review, counts);
+    let selected = brand.map_or_else(|| BRANDS.iter().collect::<Vec<_>>(), |meta| vec![meta]);
+    let mut groups = Vec::new();
+    for meta in selected {
+        groups.push((
+            meta,
+            sequence_review_accounts(db, meta.key, 10).unwrap_or_default(),
+        ));
+    }
+    let people = groups
+        .iter()
+        .flat_map(|(_, accounts)| accounts)
+        .map(|account| account.people.len())
+        .sum::<usize>();
+    let attempts = groups
+        .iter()
+        .flat_map(|(_, accounts)| accounts)
+        .flat_map(|account| &account.people)
+        .filter(|entry| !entry.touches.is_empty())
+        .count();
+    let complete = groups
+        .iter()
+        .flat_map(|(_, accounts)| accounts)
+        .flat_map(|account| &account.people)
+        .filter(|entry| {
+            entry.touches.len() == 7
+                && entry
+                    .touches
+                    .iter()
+                    .all(|touch| !touch.body.trim().is_empty() && touch.body != "Writing draft…")
+        })
+        .count();
+    let ready = groups
+        .iter()
+        .flat_map(|(_, accounts)| accounts)
+        .flat_map(|account| &account.people)
+        .filter(|entry| {
+            entry.person.status == "reviewed" && complete_reviewed_sequence(&entry.touches)
+        })
+        .count();
+    render_subbar(
+        &mut b,
+        brand.map_or("Sequence review", |meta| meta.name),
+        "Ten locally cached people per business. Full seven-touch attempts are visible even when QA rejected them; research holds remain blank. Nothing on this page can be approved or sent.",
+        &[
+            (people.to_string(), "cached people shown"),
+            (attempts.to_string(), "copy attempts"),
+            (complete.to_string(), "complete T1–T7 drafts"),
+            (ready.to_string(), "production-ready"),
+        ],
+    );
+    b.push_str("<main class=\"sheet-scroll sequence-review\">");
+    for (meta, accounts) in groups {
+        b.push_str(&format!(
+            "<section class=\"review-group\"><div class=\"section-title\"><h2>{}</h2><p>Blocked cells show the saved copy and its exact QA finding. Empty cells mean evidence did not authorize writing.</p></div>",
+            esc(meta.name)
+        ));
+        render_people_sheet_stages(&mut b, &accounts, Some(7));
+        b.push_str("</section>");
+    }
+    b.push_str("</main></div></body></html>");
+    b
+}
+
 fn render_sponsorship_table(b: &mut String, opportunities: &[ExecutionOpportunity]) {
     let mut rows = opportunities
         .iter()
@@ -2245,8 +2454,13 @@ fn render_topbar(
         Some(brand) => format!("/gtm/{brand}"),
         None => "/gtm".to_string(),
     };
+    let review_href = match active {
+        Some(brand) => format!("/review/{brand}"),
+        None => "/review".to_string(),
+    };
     b.push_str(&format!(
         "<a class=\"surface-tab{}\" href=\"{}\">Pipeline</a>\
+         <a class=\"surface-tab{}\" href=\"{}\">Sequence Review</a>\
          <a class=\"surface-tab{}\" href=\"{}\">Strategy</a>\
          <a class=\"surface-tab{}\" href=\"{}\">GTM Lab</a>",
         if surface == Surface::Pipeline {
@@ -2255,6 +2469,12 @@ fn render_topbar(
             ""
         },
         esc(&pipeline_href),
+        if surface == Surface::Review {
+            " active"
+        } else {
+            ""
+        },
+        esc(&review_href),
         if surface == Surface::Strategy {
             " active"
         } else {
@@ -2281,6 +2501,7 @@ fn render_topbar(
     b.push_str("</nav><nav class=\"biz-tabs\">");
     let all_total: usize = counts.iter().map(|(_, contacts)| contacts).sum();
     let all_href = match surface {
+        Surface::Review => "/review",
         Surface::Strategy => "/strategy",
         Surface::Gtm => "/gtm",
         Surface::Sponsorship => "/",
@@ -2294,6 +2515,7 @@ fn render_topbar(
     ));
     for (meta, contacts) in counts {
         let href = match surface {
+            Surface::Review => format!("/review/{}", meta.key),
             Surface::Strategy => format!("/strategy/{}", meta.key),
             Surface::Gtm => format!("/gtm/{}", meta.key),
             Surface::Sponsorship => format!("/b/{}", meta.key),
@@ -4099,14 +4321,24 @@ fn render_execution(b: &mut String, dashboard: &ExecutionDashboard) {
 }
 
 fn render_people_sheet(b: &mut String, accounts: &[ExecutionAccount]) {
-    let max_stage = accounts
-        .iter()
-        .flat_map(|account| &account.people)
-        .flat_map(|entry| &entry.touches)
-        .map(|touch| touch.stage)
-        .max()
-        .unwrap_or(4)
-        .clamp(4, 7);
+    render_people_sheet_stages(b, accounts, None);
+}
+
+fn render_people_sheet_stages(
+    b: &mut String,
+    accounts: &[ExecutionAccount],
+    forced_stages: Option<i64>,
+) {
+    let max_stage = forced_stages.unwrap_or_else(|| {
+        accounts
+            .iter()
+            .flat_map(|account| &account.people)
+            .flat_map(|entry| &entry.touches)
+            .map(|touch| touch.stage)
+            .max()
+            .unwrap_or(4)
+            .clamp(4, 7)
+    });
     b.push_str("<div class=\"desktop-pipeline\">");
     render_sheet_head(b, max_stage);
 
@@ -6062,6 +6294,9 @@ mod tests {
                 apollo_person_id: "person-1".into(),
                 name: "Alex Rivera".into(),
                 title: "Operations Director".into(),
+                apollo_org_id: "org-1".into(),
+                employer_name: "Real Logistics".into(),
+                employer_verification: "apollo".into(),
                 vantage: "process_owner".into(),
                 linkedin_url: "https://www.linkedin.com/in/alex-rivera".into(),
                 linkedin_status: "requested".into(),
@@ -6122,11 +6357,17 @@ mod tests {
             ..Default::default()
         })
         .expect("record current assessment");
-        let sales_opportunity_id = db
+        let sales_opportunity = db
             .best_sales_opportunity("gnk", &lead_id, &play.id)
             .expect("opportunity query")
-            .expect("materialized sales opportunity")
-            .id;
+            .expect("materialized sales opportunity");
+        let sales_opportunity_id = sales_opportunity.id.clone();
+        let evidence_claim_ids = db
+            .list_evidence_claims(Some(&sales_opportunity_id), Some("gnk"))
+            .expect("opportunity claims")
+            .into_iter()
+            .map(|claim| claim.id)
+            .collect::<Vec<_>>();
         let sequence_id = db
             .create_sequence(&Sequence {
                 person_id: person_id.clone(),
@@ -6135,8 +6376,10 @@ mod tests {
                 play_id: play.id,
                 play_version: play.version,
                 sales_opportunity_id: sales_opportunity_id.clone(),
+                task_key: sales_opportunity.task_key.clone(),
+                evidence_claim_ids: evidence_claim_ids.clone(),
                 gtm_state: "action_ready".into(),
-                copy_policy_version: crate::db::CURRENT_COPY_POLICY_VERSION,
+                copy_policy_version: crate::db::current_copy_policy_version(),
                 status: "active".into(),
                 ..Default::default()
             })
@@ -6145,6 +6388,8 @@ mod tests {
             sales_opportunity_id: sales_opportunity_id.clone(),
             person_id: person_id.clone(),
             role: "process_owner".into(),
+            role_fit: "direct".into(),
+            evidence_claim_ids,
             status: "mapped".into(),
             ..Default::default()
         })
@@ -6292,7 +6537,7 @@ mod tests {
                 person_id: person_id.clone(),
                 lead_id: lead_id.clone(),
                 brand: "gnk".into(),
-                copy_policy_version: crate::db::CURRENT_COPY_POLICY_VERSION,
+                copy_policy_version: crate::db::current_copy_policy_version(),
                 status: "active".into(),
                 ..Default::default()
             })

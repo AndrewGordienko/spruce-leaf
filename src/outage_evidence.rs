@@ -1,9 +1,10 @@
-//! Build account-safe OutageHub evidence by intersecting public Canadian EV
-//! charging locations with historical OutageHub utility polygons.
+//! Build account-safe OutageHub evidence by intersecting verified Canadian
+//! operating locations with historical OutageHub utility polygons.
 //!
-//! The result is research evidence, never charger-status evidence: a match says
-//! only that a public charging location fell inside a utility's reported outage
-//! area at a recorded time.
+//! Locations may come from the public Canadian EV station feed or a verified
+//! address inventory for properties, laboratories, warehouses, towers, stores,
+//! residences, plants, and other operated sites. The result is outside utility
+//! context, never proof of private site or asset status.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -19,8 +20,16 @@ use serde::{Deserialize, Serialize};
 const STATION_LOCATOR_URL: &str = "https://natural-resources.canada.ca/energy-efficiency/transportation-energy-efficiency/electric-charging-alternative-fuelling-stationslocator-map";
 const STATION_API_URL: &str = "https://developer.nlr.gov/api/alt-fuel-stations/v1.json";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LocationOutageMatch {
+    #[serde(default)]
+    pub location_id: String,
+    #[serde(default)]
+    pub company: String,
+    #[serde(default)]
+    pub domain: String,
+    #[serde(default)]
+    pub location_kind: String,
     pub station_id: i64,
     pub station_name: String,
     pub network: String,
@@ -53,9 +62,18 @@ struct StationPayload {
     fuel_stations: Vec<Station>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct Station {
+    #[serde(default)]
     id: i64,
+    #[serde(default)]
+    location_id: String,
+    #[serde(default)]
+    company: String,
+    #[serde(default)]
+    domain: String,
+    #[serde(default = "default_location_kind")]
+    location_kind: String,
     #[serde(default)]
     station_name: String,
     #[serde(default)]
@@ -68,6 +86,12 @@ struct Station {
     state: String,
     latitude: f64,
     longitude: f64,
+    #[serde(default)]
+    source_url: String,
+}
+
+fn default_location_kind() -> String {
+    "operating location".into()
 }
 
 #[derive(Debug, Deserialize)]
@@ -124,7 +148,55 @@ type Point = (f64, f64); // longitude, latitude
 type Polygon = Vec<Vec<Point>>; // first ring is the exterior; the rest are holes
 
 pub async fn build_report(archive: &Path, output: &Path) -> Result<MatchReport> {
-    let stations = fetch_ontario_stations().await?;
+    let stations = fetch_canadian_stations().await?;
+    build_report_from_locations(archive, output, stations, STATION_LOCATOR_URL)
+}
+
+/// Match an operator-supplied JSON array of verified Canadian locations. Every
+/// row must include `company`, `domain`, `location_kind`, `station_name`,
+/// `street_address`, `city`, `state`, `latitude`, `longitude`, and a public
+/// `source_url`. Coordinates make the polygon result reproducible; the address
+/// and source establish that it belongs to the operator rather than a customer.
+pub fn build_verified_location_report(
+    archive: &Path,
+    locations: &Path,
+    output: &Path,
+) -> Result<MatchReport> {
+    let file = File::open(locations)
+        .with_context(|| format!("open verified locations {}", locations.display()))?;
+    let mut rows = serde_json::from_reader::<_, Vec<Station>>(BufReader::new(file))
+        .context("parse verified location JSON")?;
+    for (index, row) in rows.iter_mut().enumerate() {
+        if row.location_id.trim().is_empty() {
+            row.location_id = format!("verified-location-{}", index + 1);
+        }
+        if row.company.trim().is_empty()
+            || row.domain.trim().is_empty()
+            || row.station_name.trim().is_empty()
+            || row.street_address.trim().is_empty()
+            || row.source_url.trim().is_empty()
+        {
+            anyhow::bail!(
+                "verified location row {} must name company, domain, station_name, street_address, and source_url",
+                index + 1
+            );
+        }
+        if !(41.0..=84.0).contains(&row.latitude) || !(-142.0..=-52.0).contains(&row.longitude) {
+            anyhow::bail!(
+                "verified location row {} has coordinates outside Canada",
+                index + 1
+            );
+        }
+    }
+    build_report_from_locations(archive, output, rows, &locations.display().to_string())
+}
+
+fn build_report_from_locations(
+    archive: &Path,
+    output: &Path,
+    stations: Vec<Station>,
+    location_source: &str,
+) -> Result<MatchReport> {
     let index = StationIndex::new(stations);
     let mut matches = Vec::new();
     let mut matched_station_ids = HashSet::new();
@@ -148,9 +220,9 @@ pub async fn build_report(archive: &Path, output: &Path) -> Result<MatchReport> 
     });
     let report = MatchReport {
         generated_at: Utc::now().to_rfc3339(),
-        station_source_url: STATION_LOCATOR_URL.into(),
+        station_source_url: location_source.into(),
         outage_archive: archive.display().to_string(),
-        interpretation_boundary: "A match means the public station coordinate fell inside a utility-reported outage polygon at the recorded time. It does not establish charger status, private telemetry, incident cause, or the operator's internal workflow.".into(),
+        interpretation_boundary: "A match means a source-verified operating-location coordinate fell inside a utility-reported outage polygon at the recorded time. It does not establish private site or asset status, telemetry, incident cause, or the operator's internal workflow.".into(),
         matches,
     };
     if let Some(parent) = output.parent() {
@@ -188,16 +260,18 @@ pub fn evidence_for_company(report_path: &Path, company: &str, domain: &str) -> 
             let location = format_location(matched);
             [
                 format!(
-                    "[{}] NRCan's public station locator lists station {} ({}) at {}, on the {} network.",
+                    "[{}] A verified source lists {} {} {} at {}{}.",
                     matched.station_source_url,
-                    matched.station_id,
+                    if matched.company.trim().is_empty() { company } else { &matched.company },
+                    if matched.location_kind.trim().is_empty() { "operating location" } else { &matched.location_kind },
                     matched.station_name,
                     location,
-                    matched.network
+                    if matched.network.trim().is_empty() { String::new() } else { format!(", on the {} network", matched.network) }
                 ),
                 format!(
-                    "[{}] Completed historical geospatial result: the public charging station at {} fell inside {}'s reported utility outage area beginning {}. This is outside utility context only, not evidence of charger status or cause.",
+                    "[{}] Completed historical geospatial result: the verified {} at {} fell inside {}'s reported utility outage area beginning {}. This is outside utility context only, not evidence of private site or asset status or cause.",
                     matched.outage_source_url,
+                    if matched.location_kind.trim().is_empty() { "operating location" } else { &matched.location_kind },
                     location,
                     matched.utility_provider,
                     matched.outage_start_utc
@@ -208,8 +282,22 @@ pub fn evidence_for_company(report_path: &Path, company: &str, domain: &str) -> 
 }
 
 fn company_matches_network(company_key: &str, domain: &str, matched: &LocationOutageMatch) -> bool {
+    let matched_company = normalize(&matched.company);
+    let matched_domain = matched
+        .domain
+        .trim()
+        .trim_start_matches("www.")
+        .to_ascii_lowercase();
+    if (!matched_company.is_empty()
+        && (company_key.contains(&matched_company) || matched_company.contains(company_key)))
+        || (!matched_domain.is_empty()
+            && (domain == matched_domain || domain.ends_with(&format!(".{matched_domain}"))))
+    {
+        return true;
+    }
     let network = normalize(&matched.network);
-    if network != "nonnetworked"
+    if !network.is_empty()
+        && network != "nonnetworked"
         && (company_key.contains(&network)
             || network.contains(company_key)
             || network_domain_alias(&network)
@@ -248,7 +336,7 @@ fn network_domain_alias(network: &str) -> &'static [&'static str] {
     }
 }
 
-async fn fetch_ontario_stations() -> Result<Vec<Station>> {
+async fn fetch_canadian_stations() -> Result<Vec<Station>> {
     let http = reqwest::Client::builder()
         .user_agent("spruce-leaf/0.1 evidence research")
         .build()?;
@@ -271,7 +359,6 @@ async fn fetch_ontario_stations() -> Result<Vec<Station>> {
         .query(&[
             ("api_key", api_key.as_str()),
             ("country", "CA"),
-            ("state", "ON"),
             ("fuel_type", "ELEC"),
             ("access", "public"),
             ("status", "E"),
@@ -282,7 +369,16 @@ async fn fetch_ontario_stations() -> Result<Vec<Station>> {
         .error_for_status()?
         .json::<StationPayload>()
         .await?;
-    Ok(payload.fuel_stations)
+    Ok(payload
+        .fuel_stations
+        .into_iter()
+        .map(|mut station| {
+            station.location_id = format!("nrcan-ev-{}", station.id);
+            station.location_kind = "public charging location".into();
+            station.source_url = STATION_LOCATOR_URL.into();
+            station
+        })
+        .collect())
 }
 
 fn extract_public_api_key(page: &str) -> Option<String> {
@@ -299,7 +395,7 @@ fn extract_public_api_key(page: &str) -> Option<String> {
 struct ArchiveSeed<'a> {
     index: &'a StationIndex,
     matches: &'a mut Vec<LocationOutageMatch>,
-    matched_station_ids: &'a mut HashSet<i64>,
+    matched_station_ids: &'a mut HashSet<String>,
 }
 
 impl<'de> DeserializeSeed<'de> for ArchiveSeed<'_> {
@@ -320,7 +416,7 @@ impl<'de> DeserializeSeed<'de> for ArchiveSeed<'_> {
 struct ArchiveVisitor<'a> {
     index: &'a StationIndex,
     matches: &'a mut Vec<LocationOutageMatch>,
-    matched_station_ids: &'a mut HashSet<i64>,
+    matched_station_ids: &'a mut HashSet<String>,
 }
 
 impl<'de> Visitor<'de> for ArchiveVisitor<'_> {
@@ -357,7 +453,7 @@ impl<'de> Visitor<'de> for ArchiveVisitor<'_> {
 struct OutagesSeed<'a> {
     index: &'a StationIndex,
     matches: &'a mut Vec<LocationOutageMatch>,
-    matched_station_ids: &'a mut HashSet<i64>,
+    matched_station_ids: &'a mut HashSet<String>,
 }
 
 impl<'de> DeserializeSeed<'de> for OutagesSeed<'_> {
@@ -378,7 +474,7 @@ impl<'de> DeserializeSeed<'de> for OutagesSeed<'_> {
 struct OutagesVisitor<'a> {
     index: &'a StationIndex,
     matches: &'a mut Vec<LocationOutageMatch>,
-    matched_station_ids: &'a mut HashSet<i64>,
+    matched_station_ids: &'a mut HashSet<String>,
 }
 
 impl<'de> Visitor<'de> for OutagesVisitor<'_> {
@@ -402,13 +498,34 @@ impl<'de> Visitor<'de> for OutagesVisitor<'_> {
             };
             for station_index in self.index.candidates(bounds) {
                 let station = &self.index.stations[station_index];
-                if self.matched_station_ids.contains(&station.id)
+                let location_identity = if !station.location_id.trim().is_empty() {
+                    station.location_id.clone()
+                } else if station.id != 0 {
+                    format!("station-id:{}", station.id)
+                } else {
+                    format!(
+                        "{}|{}|{:.6}|{:.6}",
+                        station.company,
+                        station.street_address,
+                        station.latitude,
+                        station.longitude
+                    )
+                };
+                if self.matched_station_ids.contains(&location_identity)
                     || !point_in_polygons((station.longitude, station.latitude), &polygons)
                 {
                     continue;
                 }
-                self.matched_station_ids.insert(station.id);
+                self.matched_station_ids.insert(location_identity);
                 self.matches.push(LocationOutageMatch {
+                    location_id: if station.location_id.trim().is_empty() {
+                        station.id.to_string()
+                    } else {
+                        station.location_id.clone()
+                    },
+                    company: station.company.clone(),
+                    domain: station.domain.clone(),
+                    location_kind: station.location_kind.clone(),
                     station_id: station.id,
                     station_name: station.station_name.clone(),
                     network: station.ev_network.clone(),
@@ -424,7 +541,11 @@ impl<'de> Visitor<'de> for OutagesVisitor<'_> {
                     outage_start_utc: DateTime::<Utc>::from_timestamp(outage.start_ts, 0)
                         .map(|value| value.to_rfc3339())
                         .unwrap_or_else(|| outage.start_ts.to_string()),
-                    station_source_url: STATION_LOCATOR_URL.into(),
+                    station_source_url: if station.source_url.trim().is_empty() {
+                        STATION_LOCATOR_URL.into()
+                    } else {
+                        station.source_url.clone()
+                    },
                     outage_source_url: format!("https://api.outagehub.ca/v1/outages/{}", outage.id),
                 });
             }
@@ -571,8 +692,8 @@ fn format_location(matched: &LocationOutageMatch) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        company_matches_network, extract_public_api_key, parse_wkt, point_in_polygons,
-        LocationOutageMatch,
+        build_report_from_locations, company_matches_network, extract_public_api_key, parse_wkt,
+        point_in_polygons, LocationOutageMatch, Station,
     };
 
     #[test]
@@ -596,6 +717,10 @@ mod tests {
     #[test]
     fn maps_known_networks_to_their_company_domains() {
         let matched = LocationOutageMatch {
+            location_id: "nrcan-ev-1".into(),
+            company: String::new(),
+            domain: String::new(),
+            location_kind: "public charging location".into(),
             station_id: 1,
             network: "SWTCH".into(),
             station_name: "Apartment charger".into(),
@@ -622,5 +747,70 @@ mod tests {
             "unrelated.com",
             &matched
         ));
+    }
+
+    #[test]
+    fn maps_generic_verified_properties_to_the_operator() {
+        let matched = LocationOutageMatch {
+            location_id: "dynacare-lab-1".into(),
+            company: "Dynacare".into(),
+            domain: "dynacare.ca".into(),
+            location_kind: "laboratory".into(),
+            station_name: "Toronto laboratory".into(),
+            ..Default::default()
+        };
+        assert!(company_matches_network("dynacare", "dynacare.ca", &matched));
+        assert!(!company_matches_network(
+            "anotheroperator",
+            "example.ca",
+            &matched
+        ));
+    }
+
+    #[test]
+    fn generic_locations_with_provider_default_ids_are_matched_independently() {
+        let run = uuid::Uuid::new_v4();
+        let archive = std::env::temp_dir().join(format!("outage-archive-{run}.json"));
+        let output = std::env::temp_dir().join(format!("outage-report-{run}.json"));
+        serde_json::to_writer(
+            std::fs::File::create(&archive).unwrap(),
+            &serde_json::json!({
+                "outages": [{
+                    "id": 1,
+                    "provider": "Test Utility",
+                    "polygon": "POLYGON((-80 43,-78 43,-78 45,-80 45,-80 43))",
+                    "startTs": 1786636800,
+                    "endTs": 1786640400
+                }]
+            }),
+        )
+        .unwrap();
+        let station = |location_id: &str, name: &str, latitude: f64, longitude: f64| Station {
+            location_id: location_id.into(),
+            company: "Dynacare".into(),
+            domain: "dynacare.ca".into(),
+            location_kind: "laboratory".into(),
+            station_name: name.into(),
+            street_address: format!("{name} address"),
+            city: "Toronto".into(),
+            state: "Ontario".into(),
+            latitude,
+            longitude,
+            source_url: "https://dynacare.ca/locations".into(),
+            ..Default::default()
+        };
+        let report = build_report_from_locations(
+            &archive,
+            &output,
+            vec![
+                station("dynacare-lab-1", "Lab one", 43.7, -79.4),
+                station("dynacare-lab-2", "Lab two", 44.0, -79.0),
+            ],
+            "https://dynacare.ca/locations",
+        )
+        .unwrap();
+        assert_eq!(report.matches.len(), 2);
+        let _ = std::fs::remove_file(archive);
+        let _ = std::fs::remove_file(output);
     }
 }

@@ -48,8 +48,8 @@ impl ResponseContract {
     }
 }
 
-pub(crate) fn for_person(person: &Person) -> ResponseContract {
-    for_title_and_vantage(&person.title, &person.vantage)
+pub(crate) fn for_person_for_brand(brand: &str, person: &Person) -> ResponseContract {
+    for_title_and_vantage_for_brand(brand, &person.title, &person.vantage)
 }
 
 /// Return the outreach vantage we can safely use after checking the title.
@@ -128,6 +128,19 @@ pub(crate) fn requires_confirmed_problem(title: &str, vantage: &str) -> bool {
 
 pub(crate) fn for_title_and_vantage(title: &str, vantage: &str) -> ResponseContract {
     contract(classify(title, vantage))
+}
+
+pub(crate) fn for_title_and_vantage_for_brand(
+    brand: &str,
+    title: &str,
+    vantage: &str,
+) -> ResponseContract {
+    let class = classify(title, vantage);
+    if brand.eq_ignore_ascii_case("wapahki") {
+        wapahki_contract(class)
+    } else {
+        contract(class)
+    }
 }
 
 fn classify(title: &str, vantage: &str) -> RoleClass {
@@ -373,6 +386,60 @@ fn contract(class: RoleClass) -> ResponseContract {
             question_shape: "Ask only which role or person owns the named decision.",
             ask_shape: "One routing reply.",
             reactance_guard: "Do not ask for a meeting, a workflow assessment, internal data, or multiple possible actions.",
+        },
+    }
+}
+
+fn wapahki_contract(class: RoleClass) -> ResponseContract {
+    match class {
+        RoleClass::Operator | RoleClass::FrontlineLeader | RoleClass::ProcessOwner => {
+            ResponseContract {
+                role_class: class,
+                label: match class {
+                    RoleClass::Operator => "operator",
+                    RoleClass::FrontlineLeader => "frontline_leader",
+                    _ => "process_owner",
+                },
+                question_shape: "Name the sourced physical task and ask one missing operating boundary the recipient can answer from memory; never ask them to find an automation use case.",
+                ask_shape: "One email answer first; offer to apply the completed fit screen and earn any conversation from the reply.",
+                reactance_guard: "Do not imply the task is manual, costly, unsafe, or suitable for robotics beyond the cited evidence. Do not ask for a call in the first touch.",
+            }
+        }
+        RoleClass::OperationalExecutive | RoleClass::EnterpriseExecutive => ResponseContract {
+            role_class: class,
+            label: if class == RoleClass::OperationalExecutive {
+                "operational_executive"
+            } else {
+                "enterprise_executive"
+            },
+            question_shape: "Name the exact facility and sourced physical task, then ask one answerable boundary or request one precise internal route.",
+            ask_shape: "One answer or route by email first; no meeting request before relevance is confirmed.",
+            reactance_guard: "Do not ask the executive to inspect the plant, locate a repetitive task, or infer project priority from title alone.",
+        },
+        RoleClass::EconomicLeader => ResponseContract {
+            role_class: class,
+            label: "economic_leader",
+            question_shape: "Only after the facility task and operating consequence are sourced, ask one question about the stated operating threshold or route to the plant owner.",
+            ask_shape: "One answer or route by email; discuss payback only after a floor-level owner confirms the task.",
+            reactance_guard: "Do not import write-off, recovery, reconciliation, budget, savings, or authority language from another business.",
+        },
+        RoleClass::TechnicalEvaluator => ResponseContract {
+            role_class: class,
+            label: "technical_evaluator",
+            question_shape: "Ask one feasibility boundary for the named physical task, such as changeover, intervention, rate, or safety, only when the person is linked to the facility.",
+            ask_shape: "One technical clarification by email; offer the fit screen, not an evaluation meeting.",
+            reactance_guard: "Do not ask for a design review, site data, or a call before the operating task is confirmed.",
+        },
+        RoleClass::CommercialRouter | RoleClass::Router => ResponseContract {
+            role_class: class,
+            label: if class == RoleClass::CommercialRouter {
+                "commercial_router"
+            } else {
+                "router"
+            },
+            question_shape: "Ask only which facility-linked role owns the named physical task.",
+            ask_shape: "One internal name or role by email.",
+            reactance_guard: "Do not ask the router to find a task, validate plant mechanics, or arrange a meeting.",
         },
     }
 }

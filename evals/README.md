@@ -14,3 +14,9 @@ verified evidence.
 `style-guide-rubric.md` records the cross-case human judgment standard used to
 interpret those comparisons. It likewise must never be treated as prospect
 evidence or pasted into production copy.
+
+Every new Wapahki case should include `expected_sendable_a` and
+`expected_sendable_b`. Pairwise preference answers “which is better”; these
+absolute labels answer the separate and more important question “may this be
+sent unchanged?” The promotion command requires double-blind consistency and
+does not replace human approval.
