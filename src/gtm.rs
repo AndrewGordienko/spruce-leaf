@@ -2124,4 +2124,198 @@ mod tests {
         assert!(!brief.contains("EXPERIMENT"));
         assert!(!brief.contains("KILL CONDITION"));
     }
+
+    #[test]
+    fn fabricated_source_urls_are_rejected_at_the_observation_boundary() {
+        let path = std::env::temp_dir().join(format!(
+            "spruce-source-url-test-{}.sqlite",
+            Uuid::new_v4()
+        ));
+        let db = Arc::new(Db::open(&path).expect("open temp db"));
+        seed_defaults(&db).expect("seed GTM defaults");
+        let lead_id = db
+            .upsert_lead(&Lead {
+                brand: "wapahki".into(),
+                apollo_org_id: "org-source-url".into(),
+                name: "Example Plant".into(),
+                ..Default::default()
+            })
+            .expect("lead");
+        let fabricated = db.record_signal_observation(&crate::db::SignalObservation {
+            definition_key: "account.bounded_repetitive_task".into(),
+            brand: "wapahki".into(),
+            lead_id: lead_id.clone(),
+            evidence: "Operators palletize cases at the Trenton, Ontario plant.".into(),
+            source_url: "not provided in account payload".into(),
+            confidence: 0.9,
+            ..Default::default()
+        });
+        let message = fabricated
+            .expect_err("prose masquerading as a source URL must be rejected")
+            .to_string();
+        assert!(message.contains("non-URL source"), "unexpected error: {message}");
+        db.record_signal_observation(&crate::db::SignalObservation {
+            definition_key: "account.bounded_repetitive_task".into(),
+            brand: "wapahki".into(),
+            lead_id,
+            evidence: "Operators palletize cases at the Trenton, Ontario plant.".into(),
+            source_url: "https://example.com/jobs/packaging-operator".into(),
+            confidence: 0.9,
+            ..Default::default()
+        })
+        .expect("a URL-backed observation still persists");
+        remove_temp_db(&path);
+    }
+
+    #[test]
+    fn wapahki_single_discovery_email_is_limited_to_workflow_titles_with_url_backed_tasks() {
+        let opportunity = crate::db::SalesOpportunity {
+            task_key: "task-1".into(),
+            facility_id: "facility-1".into(),
+            evidence_status: "discovery_ready".into(),
+            ..Default::default()
+        };
+        let adjacent = crate::db::OpportunityStakeholder {
+            role_fit: "adjacent".into(),
+            ..Default::default()
+        };
+        let supervisor = Person {
+            title: "Production Supervisor".into(),
+            ..Default::default()
+        };
+        let claims = vec![crate::db::EvidenceClaim {
+            claim_type: "account.bounded_repetitive_task".into(),
+            task_key: "task-1".into(),
+            status: "observed".into(),
+            source_url: "https://example.com/jobs/palletizer".into(),
+            ..Default::default()
+        }];
+        assert!(super::wapahki_discovery_touch_block_reason(
+            &opportunity,
+            &adjacent,
+            &supervisor,
+            &claims
+        )
+        .is_none());
+
+        // Corporate revenue/finance titles never receive the cold discovery
+        // email; they wait for a confirmed task.
+        for title in ["Chief Revenue Officer", "Vice President Finance"] {
+            let executive = Person {
+                title: title.into(),
+                ..Default::default()
+            };
+            let reason = super::wapahki_discovery_touch_block_reason(
+                &opportunity,
+                &adjacent,
+                &executive,
+                &claims,
+            )
+            .expect("corporate title must be blocked");
+            assert!(
+                reason.contains("not close to the physical workflow"),
+                "unexpected reason for {title}: {reason}"
+            );
+        }
+
+        let no_facility = crate::db::SalesOpportunity {
+            task_key: "task-1".into(),
+            evidence_status: "discovery_ready".into(),
+            ..Default::default()
+        };
+        assert!(super::wapahki_discovery_touch_block_reason(
+            &no_facility,
+            &adjacent,
+            &supervisor,
+            &claims
+        )
+        .is_some());
+
+        let research = crate::db::SalesOpportunity {
+            task_key: "task-1".into(),
+            facility_id: "facility-1".into(),
+            evidence_status: "research_required".into(),
+            ..Default::default()
+        };
+        assert!(super::wapahki_discovery_touch_block_reason(
+            &research,
+            &adjacent,
+            &supervisor,
+            &claims
+        )
+        .expect("research-required stays in research")
+        .contains("does not authorize outreach"));
+
+        let fabricated_claims = vec![crate::db::EvidenceClaim {
+            claim_type: "account.bounded_repetitive_task".into(),
+            task_key: "task-1".into(),
+            status: "observed".into(),
+            source_url: "not provided in account payload".into(),
+            ..Default::default()
+        }];
+        assert!(super::wapahki_discovery_touch_block_reason(
+            &opportunity,
+            &adjacent,
+            &supervisor,
+            &fabricated_claims
+        )
+        .expect("a fabricated source cannot back the discovery premise")
+        .contains("URL-backed"));
+
+        let router = crate::db::OpportunityStakeholder {
+            role_fit: "router".into(),
+            ..Default::default()
+        };
+        assert!(super::wapahki_discovery_touch_block_reason(
+            &opportunity,
+            &router,
+            &supervisor,
+            &claims
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn evidence_downgrade_quarantines_open_drafts() {
+        let path = std::env::temp_dir().join(format!(
+            "spruce-quarantine-test-{}.sqlite",
+            Uuid::new_v4()
+        ));
+        let db = Arc::new(Db::open(&path).expect("open temp db"));
+        let sequence_id = db
+            .create_sequence(&crate::db::Sequence {
+                id: "quarantine-sequence".into(),
+                person_id: "person-q".into(),
+                lead_id: "lead-q".into(),
+                brand: "wapahki".into(),
+                sales_opportunity_id: "opp-q".into(),
+                status: "active".into(),
+                ..Default::default()
+            })
+            .expect("sequence");
+        db.insert_touch(&crate::db::Touch {
+            id: "quarantine-touch".into(),
+            sequence_id: sequence_id.clone(),
+            person_id: "person-q".into(),
+            lead_id: "lead-q".into(),
+            brand: "wapahki".into(),
+            stage: 1,
+            status: "draft".into(),
+            ..Default::default()
+        })
+        .expect("draft touch");
+        let cancelled = db
+            .quarantine_open_outreach_for_opportunity("opp-q", "evidence downgraded to research")
+            .expect("quarantine");
+        assert_eq!(cancelled, 1);
+        let touches = db.list_touches_for_sequence(&sequence_id).expect("touches");
+        assert_eq!(touches[0].status, "cancelled");
+        assert!(touches[0].error.contains("evidence downgraded"));
+        let sequence = db
+            .sequence_gtm_attribution(&sequence_id)
+            .expect("sequence query")
+            .expect("sequence row");
+        assert_eq!(sequence.status, "paused");
+        remove_temp_db(&path);
+    }
 }
