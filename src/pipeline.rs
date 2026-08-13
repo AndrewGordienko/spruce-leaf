@@ -162,6 +162,7 @@ async fn plan_account(
                 &mut sequence,
                 n_touches,
                 run.critique,
+                None,
                 &reviewer_knowledge,
                 None,
                 None,

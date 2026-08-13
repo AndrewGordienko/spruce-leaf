@@ -1587,7 +1587,7 @@ async fn write_account_sequences(
     };
     let writer_knowledge = knowledge.writer.block.clone();
     let brand_trigger_contract = brand_trigger_contract(&pb.key, n);
-    let t1_contract = "T1 CONTRACT: Write a complete founder note inside the configured word band. Explain why this person, name one recognizable problem and plausible consequence, state one concrete and evidence-safe seller contribution, and offer one natural response path. For a discovery-ready account, the one direct operating answer is the sole CTA; do not add a call before the missing term is confirmed. A correction may be useful, but Andrew's desire for one is never the recipient's reason to answer. When the operator requested a supported operating decision or response, preserve it in T1; never broaden it into a generic workflow interview such as `what takes the most time`, `what happens today`, or `how do you handle this`. Hold rather than manufacture any missing account foundation.";
+    let t1_contract = "T1 CONTRACT: Write a complete founder note inside the configured word band. Explain why this person, name one recognizable problem and plausible consequence, state one concrete and evidence-safe seller contribution, and offer one natural response path. For a discovery-ready account, the one direct operating answer is the sole CTA; do not add a call before the missing term is confirmed. A correction may be useful, but Andrew's desire for one is never the recipient's reason to answer. When the operator requested a supported operating decision or response, preserve it in T1; never broaden it into a generic workflow interview such as `what takes the most time`, `what happens today`, or `how do you handle this`. Keep every attributed claim faithful to its exact source: never replace a source's generic noun with a more specific noun learned from another URL. If a job posting says `finished products` and the company page separately names the product, retain `finished products` when describing the posting or state the two facts in separate sentences. The subject is also a factual claim: never put the unconfirmed term being asked about—such as `manual`, `staffed by hand`, a guessed system, or a presumed consequence—into it. Start with the one most salient exact observation in ordinary spoken language; do not inventory every sourced duty or use evidence-audit phrases such as `company-attributed posting`. Put Andrew's practical reason for the recipient to answer before the final question. Hold rather than manufacture any missing account foundation.";
     let writer_instructions = format!(
         r#"Write one {n}-touch no-reply sequence for each recipient. {planning_contract}
 
@@ -1920,8 +1920,12 @@ async fn review_person_copy(
         seller_context
     );
     let council_knowledge = format!(
-        "{}\n\nVERIFIED SELLER CONTEXT (may validate Andrew's own evidence or give-back; never treat it as a fact about the recipient):\n{}",
-        knowledge.council.block, seller_context
+        "{}\n\n{}\n\nVERIFIED SELLER CONTEXT (may validate Andrew's own evidence or give-back; never treat it as a fact about the recipient):\n{}",
+        knowledge.council.block,
+        gtm_context
+            .map(GtmActionContext::copy_prompt_block)
+            .unwrap_or_else(|| "COPY DECISION STATE: unavailable".into()),
+        seller_context
     );
 
     person_progress("checking deterministic copy rules");
@@ -1934,6 +1938,7 @@ async fn review_person_copy(
         &mut sequence,
         n,
         critique,
+        gtm_context,
         &reviewer_knowledge,
         Some(&person_progress),
         Some(db),
@@ -1958,8 +1963,16 @@ async fn review_person_copy(
     }
     person_progress("running final sendability gate");
     scrub_ai_punctuation(&mut sequence);
-    let issues =
-        account_sequence_quality_issues(pb, shared, account, &sequence, &reviews, n, critique);
+    let issues = account_sequence_quality_issues(
+        pb,
+        shared,
+        account,
+        &sequence,
+        &reviews,
+        n,
+        critique,
+        gtm_context,
+    );
     if !issues.is_empty() {
         return Err(anyhow!("sendability gate: {}", issues.join("; ")));
     }
@@ -1999,6 +2012,7 @@ pub(crate) async fn review_and_edit_sequence_lean(
     sequence: &mut CopySequence,
     expected_touches: usize,
     critique: bool,
+    gtm_context: Option<&GtmActionContext>,
     knowledge: &str,
     progress: Option<&(dyn Fn(&str) + Send + Sync)>,
     research_db: Option<&SharedDb>,
@@ -2014,6 +2028,7 @@ pub(crate) async fn review_and_edit_sequence_lean(
         &[],
         expected_touches,
         false,
+        gtm_context,
     );
     if !critique {
         if deterministic.is_empty() {
@@ -2089,6 +2104,7 @@ pub(crate) async fn review_and_edit_sequence_lean(
                 &[],
                 expected_touches,
                 false,
+                gtm_context,
             );
             if let Some(error) = apply_error {
                 deterministic.push(error);
@@ -2240,6 +2256,7 @@ pub(crate) async fn review_and_edit_sequence_lean(
                 &[],
                 expected_touches,
                 false,
+                gtm_context,
             );
             if deterministic.is_empty() {
                 break;
@@ -3392,7 +3409,7 @@ async fn request_copy_review_with_tier(
     let stage_contract = format!(
         "SCHEMA CONTRACT: first grade the entire sequence for coherence, relevance, repetition, and whether a sensible recipient has a reason to answer. Then return exactly one review object for every stage 1 through {expected_touches}, even when only a subset needs repair. A sequence passes only at 85+ with no unresolved sequence issues. For an unnamed stage that does not need editing, preserve it with empty revised fields."
     );
-    let sendability_contract = "INDEPENDENT SENDABILITY: Judge the words as a skeptical recipient, not as a checker of the writer's requested structure. No generation template, diagnostic-question shape, or factual correction is presumptively sendable. T1 needs a verified trigger, recognizable problem, plausible consequence, concrete seller contribution, and a role-relevant reason to answer through a natural conversation or email path. In a one-touch discovery note, one direct operating answer by email is itself a complete response path; do not require a call before the missing term is confirmed. Compare the actual T1 ask with the private desired response and operating decision in review knowledge. Fail or repair copy that replaces a specific supported decision with a broad workflow-interview question such as `what takes the most time`, `what happens today`, or `how do you handle this`. Curiosity is not recipient value. Never require or invent collateral. When verified seller context explicitly permits Andrew to apply an existing fit screen to this exact sourced task and return a free first-pass blocker view, that is a concrete recipient benefit; preserve it during repair and judge whether the wording makes the no-site-visit, rule-out value clear. Do not demand a second give-back. Later touches must add evidence, a useful distinction, an honest objection answer, route, or close rather than paraphrase.";
+    let sendability_contract = "INDEPENDENT SENDABILITY: Judge the words as a skeptical recipient, not as a checker of the writer's requested structure. No generation template, diagnostic-question shape, or factual correction is presumptively sendable. T1 needs a verified trigger, recognizable problem, plausible consequence, concrete seller contribution, and a role-relevant reason to answer through a natural conversation or email path. In a one-touch discovery note, one direct operating answer by email is itself a complete response path; do not require a call before the missing term is confirmed. Compare the actual T1 ask with the private desired response and operating decision in review knowledge. Fail or repair copy that replaces a specific supported decision with a broad workflow-interview question such as `what takes the most time`, `what happens today`, or `how do you handle this`. Enforce source-level attribution, not merely account-level truth: a detail supported somewhere in the account corpus cannot be attributed to a different posting, page, or guide. Never turn a source's generic `finished products` into a named product from another URL. Keep separately sourced facts in separate sentences or preserve the exact generic noun. Apply the same evidence standard to the subject: it cannot assert the missing term the body is asking the recipient to confirm, including `manual`, `staffed by hand`, a guessed system, or an unproved consequence. Curiosity is not recipient value. Never require or invent collateral. When verified seller context explicitly permits Andrew to apply an existing fit screen to this exact sourced task and return a free first-pass blocker view, that is a concrete recipient benefit; preserve it during repair and judge whether the wording makes the no-site-visit, rule-out value clear. Do not demand a second give-back. Later touches must add evidence, a useful distinction, an honest objection answer, route, or close rather than paraphrase.";
     let user = format!(
         "{task}\n\n{stage_contract}\n{sendability_contract}\nCHANNEL: linkedin_request has no subject; linkedin_or_email must work as either a DM or a complete email fallback. A LinkedIn request must give a concrete operating reason to connect, not praise the recipient's remit, background, perspective, or work.\nINBOX TEST: grade T1's subject and first two lines before the rest. A subject that merely labels the category (`utility status`, `power alarms`, `claim evidence`, `decision trail`, `automation question`) fails even if relevant. Require a plain 3-9 word phrase naming the operating event, decision, object, or consequence that makes this exact email worth opening. No clickbait. Reject internal-memo prose such as `make this decision consequential`, `the distinction I have in mind`, and `the practical difference is`; Andrew must be able to say every line naturally aloud.\nEVIDENCE: the verified facts below are exhaustive. The hypothesis is not fact. Never invent an internal event, system, practice, consequence, or ownership claim.\n\nSIGNATURE: {signature}\nVERIFIED FACTS: {facts}\nHYPOTHESIS, NOT FACT: {hypothesis}\nRECIPIENT: {name} ({title}, {vantage})\nLIKELY ACCESS, INTERNAL ONLY: {can_observe}\nROLE RESPONSE CONTRACT (private; test role fit, reply cost, and face risk without inventing personality):\n{role_contract}\nDETERMINISTIC FINDINGS: {deterministic}\n\nCURRENT SEQUENCE:\n{sequence}\n\nRELEVANT REVIEW KNOWLEDGE:\n{knowledge}",
         task = task,
@@ -4287,6 +4304,240 @@ fn unsupported_account_task_noun_issues(
     issues
 }
 
+fn evidence_words(text: &str) -> Vec<String> {
+    text.to_ascii_lowercase()
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn source_attribution_issues(
+    account: &CopyAccount,
+    context: Option<&GtmActionContext>,
+    sequence: &CopySequence,
+) -> Vec<String> {
+    let Some(context) = context else {
+        return Vec::new();
+    };
+    let mut grouped = HashMap::<String, String>::new();
+    for claim in context.evidence_claims.iter().filter(|claim| {
+        matches!(claim.status.as_str(), "observed" | "verified")
+            && !claim.source_url.trim().is_empty()
+            && !claim.source_excerpt.trim().is_empty()
+    }) {
+        let entry = grouped.entry(claim.source_url.clone()).or_default();
+        if !entry.is_empty() {
+            entry.push(' ');
+        }
+        entry.push_str(&claim.source_excerpt);
+    }
+    if grouped.len() < 2 {
+        return Vec::new();
+    }
+
+    let stopwords = [
+        "about", "after", "also", "and", "are", "at", "before", "but", "by", "company", "for",
+        "from", "has", "have", "in", "into", "its", "lists", "of", "on", "or", "our", "role",
+        "same", "states", "that", "the", "their", "this", "to", "up", "with", "your",
+    ];
+    let account_words = evidence_words(&account.name)
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let mut source_rows = grouped.into_iter().collect::<Vec<_>>();
+    source_rows.sort_by(|left, right| left.0.cmp(&right.0));
+    let sources = source_rows
+        .into_iter()
+        .map(|(url, excerpt)| {
+            let words = evidence_words(&excerpt);
+            let meaningful = words
+                .iter()
+                .filter(|word| {
+                    word.len() >= 3
+                        && !stopwords.contains(&word.as_str())
+                        && !account_words.contains(word.as_str())
+                })
+                .cloned()
+                .collect::<HashSet<_>>();
+            let phrases = words
+                .windows(2)
+                .filter_map(|pair| {
+                    let left = pair[0].as_str();
+                    let right = pair[1].as_str();
+                    let meaningful_pair = left.len() >= 3
+                        && right.len() >= 3
+                        && !stopwords.contains(&left)
+                        && !stopwords.contains(&right)
+                        && !(account_words.contains(left) && account_words.contains(right));
+                    meaningful_pair.then(|| format!("{left} {right}"))
+                })
+                .flat_map(|phrase| {
+                    let singular = phrase
+                        .split_whitespace()
+                        .map(|word| {
+                            if word.len() > 3 && word.ends_with('s') && !word.ends_with("ss") {
+                                &word[..word.len() - 1]
+                            } else {
+                                word
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    [phrase, singular]
+                })
+                .collect::<HashSet<_>>();
+            (url, excerpt, meaningful, phrases)
+        })
+        .collect::<Vec<_>>();
+
+    let attribution_markers = [
+        " posting ",
+        " posting:",
+        " job ",
+        " careers page",
+        " website ",
+        " site ",
+        " page ",
+        " guide ",
+        " release ",
+        " lists ",
+        " describes ",
+        " requires ",
+    ];
+    let mut issues = Vec::new();
+    for touch in &sequence.touches {
+        let mut chunks = vec![("subject", touch.subject.as_str())];
+        chunks.extend(
+            touch
+                .body
+                .split(['.', '?', '!', '\n'])
+                .map(|sentence| ("body", sentence)),
+        );
+        for (field, chunk) in chunks {
+            let normalized = format!(" {} ", evidence_words(chunk).join(" "));
+            if normalized.trim().is_empty() {
+                continue;
+            }
+            let chunk_words = evidence_words(chunk).into_iter().collect::<HashSet<_>>();
+            let scored = sources
+                .iter()
+                .enumerate()
+                .map(|(index, (_, _, words, _))| (index, words.intersection(&chunk_words).count()))
+                .collect::<Vec<_>>();
+            let Some((primary_index, primary_score)) =
+                scored.iter().max_by_key(|(_, score)| *score).copied()
+            else {
+                continue;
+            };
+            let attributed = attribution_markers
+                .iter()
+                .any(|marker| normalized.contains(marker));
+            if primary_score < 2 && !(field == "subject" && primary_score > 0) && !attributed {
+                continue;
+            }
+
+            let (_, primary_excerpt, _, _) = &sources[primary_index];
+            let primary_normalized = evidence_words(primary_excerpt).join(" ");
+            if field == "subject" {
+                let primary_phrases = &sources[primary_index].3;
+                let has_primary_phrase = primary_phrases
+                    .iter()
+                    .any(|phrase| normalized.contains(&format!(" {phrase} ")));
+                let foreign_word = sources
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| *index != primary_index)
+                    .flat_map(|(_, (_, _, words, _))| words.iter())
+                    .find(|word| {
+                        chunk_words.contains(word.as_str())
+                            && !sources[primary_index].2.contains(word.as_str())
+                    });
+                if has_primary_phrase {
+                    if let Some(word) = foreign_word {
+                        issues.push(format!(
+                            "stage {} subject fuses `{word}` with a different source-specific phrase; use a subject supported by one source rather than manufacturing a cross-source task",
+                            touch.stage
+                        ));
+                        continue;
+                    }
+                }
+            }
+            let foreign_phrase = sources
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != primary_index)
+                .flat_map(|(_, (_, _, _, phrases))| phrases.iter())
+                .find(|phrase| {
+                    normalized.contains(&format!(" {phrase} "))
+                        && !primary_normalized.contains(phrase.as_str())
+                });
+            if let Some(phrase) = foreign_phrase {
+                issues.push(format!(
+                    "stage {} {field} combines source-specific `{phrase}` with a different source's claim; keep each URL's wording separate and do not strengthen a generic source noun with another page",
+                    touch.stage
+                ));
+            }
+        }
+    }
+    issues.sort();
+    issues.dedup();
+    issues
+}
+
+fn unconfirmed_subject_claim_issues(
+    pb: &Playbook,
+    account: &CopyAccount,
+    context: Option<&GtmActionContext>,
+    sequence: &CopySequence,
+) -> Vec<String> {
+    if !pb.key.eq_ignore_ascii_case("wapahki") {
+        return Vec::new();
+    }
+    let evidence = context
+        .map(|context| {
+            context
+                .evidence_claims
+                .iter()
+                .filter(|claim| matches!(claim.status.as_str(), "observed" | "verified"))
+                .map(|claim| claim.source_excerpt.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|evidence| !evidence.trim().is_empty())
+        .unwrap_or_else(|| account.observed_facts.join(" "))
+        .to_ascii_lowercase();
+    let assertions = [
+        ("manual", ["manual", "manually"].as_slice()),
+        ("staffed by hand", ["staffed by hand"].as_slice()),
+        (
+            "packed by hand",
+            ["packed by hand", "hand-packed", "hand packed"].as_slice(),
+        ),
+        (
+            "loaded by hand",
+            ["loaded by hand", "hand-loaded", "hand loaded"].as_slice(),
+        ),
+    ];
+    let mut issues = Vec::new();
+    for touch in &sequence.touches {
+        let subject = touch.subject.to_ascii_lowercase();
+        for (label, variants) in assertions {
+            if variants.iter().any(|variant| subject.contains(variant))
+                && !variants.iter().any(|variant| evidence.contains(variant))
+            {
+                issues.push(format!(
+                    "stage {} subject asserts unconfirmed `{label}` status; keep the missing operating term in the body question and use only a sourced event, object, or burden in the subject",
+                    touch.stage
+                ));
+            }
+        }
+    }
+    issues.sort();
+    issues.dedup();
+    issues
+}
+
+#[allow(clippy::too_many_arguments)]
 fn account_sequence_quality_issues(
     pb: &Playbook,
     shared: &Shared,
@@ -4295,10 +4546,18 @@ fn account_sequence_quality_issues(
     reviews: &[TouchReview],
     expected_touches: usize,
     critique: bool,
+    gtm_context: Option<&GtmActionContext>,
 ) -> Vec<String> {
     let mut issues =
         sequence_quality_issues(pb, shared, sequence, reviews, expected_touches, critique);
     issues.extend(unsupported_account_task_noun_issues(pb, account, sequence));
+    issues.extend(source_attribution_issues(account, gtm_context, sequence));
+    issues.extend(unconfirmed_subject_claim_issues(
+        pb,
+        account,
+        gtm_context,
+        sequence,
+    ));
     issues.sort();
     issues.dedup();
     issues
@@ -5204,8 +5463,9 @@ mod tests {
         mentions_outreach_asset, names_historical_outage_result, narrates_internal_copy_logic,
         normalize_dashes, normalize_principle_ids, normalize_thread_subjects, provisional_channel,
         provisional_day_offset, select_people_for_planning, sequence_quality_issues,
-        supported_touch_count, supported_touch_count_for_brand, touch_question_limit,
-        touch_word_band, unsupported_account_task_noun_issues, wapahki_names_operating_consequence,
+        source_attribution_issues, supported_touch_count, supported_touch_count_for_brand,
+        touch_question_limit, touch_word_band, unconfirmed_subject_claim_issues,
+        unsupported_account_task_noun_issues, wapahki_names_operating_consequence,
         word_set_similarity, CopyAccount, CopySequence, CopyTouch, EditDoc, EditReview,
         PlanProgressRecipient, PlanProgressUpdate, TouchReview,
     };
@@ -5221,7 +5481,10 @@ mod tests {
         assert_eq!(supported_touch_count_for_brand("outagehub", 7), 2);
     }
     use crate::business::Businesses;
-    use crate::db::{Db, Lead, Person, Sequence, Touch, CURRENT_COPY_POLICY_VERSION};
+    use crate::db::{
+        Db, EvidenceClaim, Lead, Person, Sequence, Touch, CURRENT_COPY_POLICY_VERSION,
+    };
+    use crate::gtm::GtmActionContext;
     use crate::playbook::Playbooks;
 
     #[test]
@@ -5722,6 +5985,116 @@ mod tests {
         supported.observed_facts =
             vec!["The plant describes a tray-filling and case-loading station.".into()];
         assert!(unsupported_account_task_noun_issues(pb, &supported, &sequence).is_empty());
+    }
+
+    #[test]
+    fn source_attribution_cannot_strengthen_a_job_posting_with_another_page() {
+        let account = CopyAccount {
+            name: "New World Friction".into(),
+            industry: "manufacturing".into(),
+            hq: "Cambridge, Ontario".into(),
+            observed_facts: Vec::new(),
+            inferences: Vec::new(),
+            hypothesis: String::new(),
+            mechanism: String::new(),
+            consequence_metric: String::new(),
+            signals: Vec::new(),
+            system_concept: String::new(),
+            hard_buyer_question: String::new(),
+            kill_condition: String::new(),
+            magnitude_note: String::new(),
+            applied_principles: Vec::new(),
+        };
+        let context = GtmActionContext {
+            evidence_claims: vec![
+                EvidenceClaim {
+                    source_url: "https://jobs.example/new-world-line-end".into(),
+                    source_excerpt: "The Cambridge Packaging Line End Operator posting requires packaging, labeling, and palletizing finished products, plus verification and changeovers.".into(),
+                    status: "observed".into(),
+                    ..EvidenceClaim::default()
+                },
+                EvidenceClaim {
+                    source_url: "https://newworldfriction.example/".into(),
+                    source_excerpt: "New World Friction manufactures private-label brake pads in Cambridge, Ontario.".into(),
+                    status: "verified".into(),
+                    ..EvidenceClaim::default()
+                },
+            ],
+            ..GtmActionContext::default()
+        };
+        let bad = CopySequence {
+            touches: vec![CopyTouch {
+                stage: 1,
+                day_offset: 0,
+                channel: "email".into(),
+                subject: "Finished brake-pad pack-out".into(),
+                body: "Hi Anil,\n\nYour Cambridge posting lists packaging, labeling, and palletizing finished brake pads.\n\nAndrew".into(),
+                purpose: String::new(),
+                goal: String::new(),
+            }],
+            applied_principles: Vec::new(),
+        };
+        let issues = source_attribution_issues(&account, Some(&context), &bad);
+        assert!(issues.iter().any(|issue| issue.contains("stage 1 body")));
+        assert!(issues.iter().any(|issue| issue.contains("stage 1 subject")));
+
+        let safe = CopySequence {
+            touches: vec![CopyTouch {
+                stage: 1,
+                day_offset: 0,
+                channel: "email".into(),
+                subject: "Cambridge line-end handling".into(),
+                body: "Hi Anil,\n\nNew World Friction says it manufactures private-label brake pads in Cambridge. Your Packaging Line End Operator posting separately lists packaging, labeling, and palletizing finished products.\n\nAndrew".into(),
+                purpose: String::new(),
+                goal: String::new(),
+            }],
+            applied_principles: Vec::new(),
+        };
+        assert!(source_attribution_issues(&account, Some(&context), &safe).is_empty());
+    }
+
+    #[test]
+    fn wapahki_subject_cannot_assert_the_missing_manual_status() {
+        let playbooks = Playbooks::load("playbooks").expect("load playbooks");
+        let pb = playbooks.get("wapahki").expect("wapahki playbook");
+        let account = CopyAccount {
+            name: "New World Friction".into(),
+            industry: "manufacturing".into(),
+            hq: "Cambridge, Ontario".into(),
+            observed_facts: vec!["The role lifts materials up to 50 lb.".into()],
+            inferences: Vec::new(),
+            hypothesis: "Line-end packaging may remain manual.".into(),
+            mechanism: String::new(),
+            consequence_metric: String::new(),
+            signals: Vec::new(),
+            system_concept: String::new(),
+            hard_buyer_question: String::new(),
+            kill_condition: String::new(),
+            magnitude_note: String::new(),
+            applied_principles: Vec::new(),
+        };
+        let sequence = CopySequence {
+            touches: vec![CopyTouch {
+                stage: 1,
+                day_offset: 0,
+                channel: "email".into(),
+                subject: "Manual line-end packaging work".into(),
+                body: "Hi Anil,\n\nIs that line-end work still manual?\n\nAndrew".into(),
+                purpose: String::new(),
+                goal: String::new(),
+            }],
+            applied_principles: Vec::new(),
+        };
+        assert!(!unconfirmed_subject_claim_issues(pb, &account, None, &sequence).is_empty());
+
+        let safe = CopySequence {
+            touches: vec![CopyTouch {
+                subject: "50-lb line-end handling".into(),
+                ..sequence.touches[0].clone()
+            }],
+            applied_principles: Vec::new(),
+        };
+        assert!(unconfirmed_subject_claim_issues(pb, &account, None, &safe).is_empty());
     }
 
     #[test]

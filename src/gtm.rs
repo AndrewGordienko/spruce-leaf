@@ -424,7 +424,7 @@ impl GtmActionContext {
             _ => "The account does not yet have enough sourced evidence for a multi-touch sequence. Hold it for research or use one manual routing note; do not manufacture discovery questions or explain a proof, integration, pilot, or product.",
         };
         format!(
-            "COPY DECISION STATE: {state}\nOPPORTUNITY: {opportunity}\nPERMITTED ACTION: {action}\nATOMIC SOURCE CLAIMS:\n{evidence}\nTreat everything else as a question, not account reality.",
+            "COPY DECISION STATE: {state}\nOPPORTUNITY: {opportunity}\nPERMITTED ACTION: {action}\nATOMIC SOURCE CLAIMS:\n{evidence}\nSOURCE-FAITHFUL ATTRIBUTION: each bullet is an independent claim from its own URL. Never strengthen one source with a noun or detail found only in another source. If a job posting says `finished products` and a separate company page names the product, keep those as separate sentences or retain the posting's exact generic wording; never say the posting named that product. Treat everything else as a question, not account reality.",
             state = self.state,
             opportunity = opportunity,
             evidence = if evidence.is_empty() {
