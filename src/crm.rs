@@ -2014,7 +2014,8 @@ fn render_sponsorship_table(b: &mut String, opportunities: &[ExecutionOpportunit
             email = esc(&contact.email),
             email_status = esc(&contact.email_status),
             route = if crate::opportunity::sponsorship_contact_is_direct(contact) {
-                "direct mailbox"
+                crate::opportunity::sponsorship_budget_authority(&contact.title)
+                    .unwrap_or("direct mailbox; authority unconfirmed")
             } else {
                 "shared routing inbox"
             },

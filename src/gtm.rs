@@ -471,6 +471,14 @@ pub fn recipient_sequence_block_reason(
     person: &Person,
 ) -> Result<Option<String>> {
     if brand.eq_ignore_ascii_case("outagehub")
+        && db.has_open_sponsorship_outreach_for_lead(brand, lead_id)?
+    {
+        return Ok(Some(
+            "account has an unresolved OutageHub sponsorship thread; resolve that relationship before opening a separate API-customer ask"
+                .into(),
+        ));
+    }
+    if brand.eq_ignore_ascii_case("outagehub")
         && !outagehub_workflow_contact(&person.title, &person.vantage)
     {
         return Ok(Some(

@@ -294,6 +294,19 @@ sponsor_independence = [
   "Sponsorship does not make the sponsor a utility-data partner.",
   "Sponsorship does not create an SLA, official outage-verification service, or mission-critical guarantee.",
 ]
+relationship_rules = [
+  "Never run a sponsorship ask and an API sales ask to the same organization at the same time.",
+  "If an organization has an active commercial evaluation or sales thread, keep it in the customer lane and hold sponsorship outreach.",
+  "A sponsor may later become an API customer only through a separate commercial decision, scope, agreement, and price after the sponsorship conversation is resolved.",
+  "Never imply that sponsorship prepays, discounts, or obligates a future API contract unless a signed agreement says so.",
+  "If the primary reason to approach the organization is its own operational need for the API, use the customer motion rather than asking for support.",
+]
+budget_authority_rules = [
+  "Prefer a founder, owner, CEO, president, general manager, CFO, COO, or managing partner at a smaller company as an executive approver.",
+  "Prefer a partnerships, sponsorship, community-investment, community-relations, corporate-affairs, or senior marketing leader as the programme owner or budget router.",
+  "A coordinator, adviser, business-development contact, or general marketing manager may route the request but must not be described as the budget owner.",
+  "A title is evidence of routing proximity only. The opening question confirms ownership, amount, timing, and process.",
+]
 prohibited_claims = [
   "Do not claim complete Canadian utility coverage.",
   "Do not call OutageHub Canada's official outage source.",
@@ -310,9 +323,10 @@ email_structure = [
   "State that the goal is to make Canada safer by reducing blind spots created by fragmented utility reporting.",
   "Say the friends funded development themselves and that conversations with federal and regional government representatives, Electricity Canada, news organizations, and others helped refine the platform. Never imply endorsement.",
   "Say the team is actively working to close its first customers and is seeking short-term support to keep the service online while it does.",
-  "Give one exact source-backed paragraph connecting the recipient company to OutageHub or its sponsorship route.",
-  "State that a $10,000 founding sponsorship provides runway for servers and continued development.",
-  "Offer founding-sponsor recognition, API access, and quarterly coverage briefings. Where relevant, offer to explore a concrete way OutageHub could support or work with the company.",
+  "Begin the company-specific paragraph with 'I saw' and one exact source-backed fact, then explain concretely how OutageHub data could complement the organization's work or communities.",
+  "Use a natural transition from that operating overlap into the sponsorship request before naming the amount.",
+  "State that OutageHub is looking for one CAD $10,000 founding sponsor and that it provides runway for servers and continued development.",
+  "Offer founding-sponsor recognition, API access, and a company-relevant coverage briefing or bounded exploration. Do not imply that sponsorship is a customer contract.",
   "End with one natural question asking for a short discussion or the most appropriate evidenced next step.",
   "Close with Thanks, Andrew Gordienko, Founder, OutageHub, and https://outagehub.ca.",
 ]
@@ -326,11 +340,12 @@ voice = [
   "Do not write a seven-touch sales sequence.",
   "One initial email and one evidence-adding follow-up only.",
 ]
-min_words = 175
-max_words = 220
+min_words = 165
+max_words = 230
 default_touches = 2
 doctrine = """
-This is a commercial founding sponsorship, not a grant request, donation,
+This is a paid commercial founding sponsorship, not a grant request, charitable
+donation, tax-receiptable gift,
 investment, server-bill appeal, repayment for old work, or request to finance an
 unbuilt idea. The immediate goal is one paid CAD $10,000 sponsorship. Prioritize
 smaller Canadian companies in generator/backup power, grid/utility software,
@@ -340,9 +355,12 @@ marketing director, or partnerships lead can plausibly approve or route the ask
 quickly. Hold government, major utilities, and large corporations for later.
 Lead with Andrew's human founder story, explain what is already operating and
 that the team funded the past year themselves, use one exact source-backed reason
-the organization is relevant, and state CAD $10,000 directly. Use the approved
+the organization is relevant, explain a concrete sponsor-side use before the ask,
+and state CAD $10,000 directly. Use the approved
 founder template as the campaign skeleton while keeping the company connection
-specific. Ask exactly one natural discussion-or-next-step question. Never invent
+specific. Never run the sponsorship and API-customer motions concurrently for
+one organization; a later API sale must be a separate commercial decision. Ask
+exactly one natural discussion-or-next-step question. Never invent
 a budget, operating period, infrastructure-cost breakdown, dynamic metric,
 endorsement, partnership, user, customer, SLA, or private site status. Only a
 named person with a verified direct email may receive a draft. Use one active
@@ -375,6 +393,6 @@ budget_evidence_terms = ["data licensing", "commercial data", "data partnership"
 
 [[sponsorship.routes]]
 recipient_kind = "cloud_or_infrastructure_vendor"
-action = "Ask directly whether the paid CAD $10,000 founding sponsorship can fit a partnerships, community-investment, or innovation budget; if another person owns it, ask for routing in the same question."
-target_roles = ["Founder", "Co-Founder", "Owner", "CEO", "Chief Executive Officer", "President", "General Manager", "COO", "Chief Operating Officer", "Managing Partner", "Chief of Staff", "Marketing", "Marketing Director", "Director of Marketing", "Head of Marketing", "Brand Marketing Manager", "Marketing Manager", "Partnerships", "Cloud Partnerships", "Business Development", "Community", "Sponsorship", "Innovation", "Communications", "Public Relations", "PR Contact"]
+action = "Ask the named person directly whether they would be open to a short sponsorship discussion or, when a sourced sponsorship form exists, whether that form is the best next step."
+target_roles = ["Founder", "Co-Founder", "Owner", "CEO", "Chief Executive Officer", "President", "General Manager", "COO", "Chief Operating Officer", "VP Operations", "Vice President Operations", "Managing Partner", "Chief of Staff", "Marketing", "Marketing Director", "Director of Marketing", "Head of Marketing", "Brand Marketing Manager", "Marketing Manager", "Partnerships", "Cloud Partnerships", "Business Development", "Community", "Sponsorship", "Innovation", "Communications", "Public Relations", "PR Contact"]
 budget_evidence_terms = ["sponsorship", "sponsor", "platinum partner", "silver partner", "corporate partner", "community investment", "community support", "support the local community", "regularly support local", "innovation program", "marketing budget", "joint marketing", "mdf"]

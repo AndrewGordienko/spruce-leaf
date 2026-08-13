@@ -1246,16 +1246,8 @@ pub fn supported_touch_count(requested: usize) -> usize {
     }
 }
 
-pub fn supported_touch_count_for_brand(brand: &str, requested: usize) -> usize {
-    if brand.eq_ignore_ascii_case("outagehub") {
-        if requested <= 1 {
-            1
-        } else {
-            2
-        }
-    } else {
-        supported_touch_count(requested)
-    }
+pub fn supported_touch_count_for_brand(_brand: &str, requested: usize) -> usize {
+    supported_touch_count(requested)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1844,8 +1836,10 @@ pub(crate) fn brand_trigger_contract(brand: &str, touches: usize) -> &'static st
         "WAPAHKI FOUNDER-RESEARCHER CONTRACT: Multi-touch copy requires one source-supported physical task, credible economic pressure, and a reachable owner. T1 is a natural founder/researcher note with Andrew's University of Toronto and Automata context, one Wapahki contribution, and a short call-or-email response path. Follow-ups advance the same task."
     } else if brand == "outagehub" && touches == 2 {
         "OUTAGEHUB TWO-EMAIL EVIDENCE CONTRACT: This cadence is for distributed Canadian operators with one exact outage-time decision, a nearby operations recipient, and a completed location-specific historical utility match. T1 explains OutageHub's location-matched Canadian utility API, frames one evidence-safe consequence, and offers a natural short conversation or email path. T2 contributes the verified location and timestamp without claiming private site or asset status. Do not prescribe a universal dark-site/equipment-ticket binary."
-    } else if brand == "outagehub" {
+    } else if brand == "outagehub" && touches == 1 {
         "OUTAGEHUB PRECISE FIRST-TOUCH CONTRACT: Target an operator with distributed Canadian locations and one evidenced outage-time diagnosis, dispatch, escalation, continuity, prioritization, or communication decision. T1 names the account-specific decision and explains in plain language that OutageHub supplies location-matched Canadian utility reports through an API. Honor the supplied copy decision state: discovery-ready copy asks for one direct operating answer by email and stops; action-ready copy may offer a short conversation with an email alternative. A completed historical match may be mentioned only with its full date including year or exact timestamp and its outside-context boundary; it is not required for this first discovery touch. Never make a historical match sound current, claim private site status, or reuse a universal dark-site/ticket binary."
+    } else if brand == "outagehub" {
+        "OUTAGEHUB SEVEN-STEP REVIEW CONTRACT: This full sequence is action-ready only. T1 names the exact account-specific outage-time decision and OutageHub's location-matched Canadian utility API contribution. Each later step must add a distinct decision-useful angle, such as the outside-context boundary, a verified historical result when one exists, coverage/completeness, a bounded workflow example, implementation evaluation, or a useful final resource. Never invent a historical match, claim private site status, stretch one fact across seven notes, or repeat a universal dark-site/ticket binary. Use the standard seven-step channel and question rules; this is held for human review unless separately approved."
     } else {
         ""
     }
@@ -5647,7 +5641,7 @@ mod tests {
         assert_eq!(supported_touch_count(2), 2);
         assert_eq!(supported_touch_count(1), 1);
         assert_eq!(supported_touch_count_for_brand("outagehub", 1), 1);
-        assert_eq!(supported_touch_count_for_brand("outagehub", 7), 2);
+        assert_eq!(supported_touch_count_for_brand("outagehub", 7), 7);
     }
     use crate::business::Businesses;
     use crate::db::{

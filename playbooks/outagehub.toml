@@ -44,10 +44,11 @@ vantage_notes = [
 
 requirements = [
   "For a one-email discovery test, research must establish a distributed Canadian operating footprint, one specific outage-time decision, and a reachable workflow owner. A completed historical match upgrades the account to easy priority but is not required for the first question.",
-  "A two-email evidence sequence requires a completed historical location-to-utility-event match; T2 cannot exist without the real location and timestamp.",
+  "A two-email evidence sequence requires a completed historical location-to-utility-event match; T2 cannot present a match without the real location and timestamp.",
   "T1 contains one account-specific diagnosis, dispatch, escalation, continuity, prioritization, or communication moment and a plausible consequence. Do not prescribe a universal dark-site, ticket, dispatch, or internal-system binary.",
   "T1 names OutageHub and explains its location-matched Canadian utility signal in one plain clause, then offers a short conversation with an email answer as the easier path.",
-  "When present, T2 contributes the completed historical result: the verified location, utility-reported event, and actual timestamp. Offer the evidence or ask one adjacent factual question; do not restate T1.",
+  "When present, a later touch may contribute the completed historical result: the verified location, utility-reported event, and actual timestamp. Without a match, later touches must add another source-supported decision-useful angle rather than implying one exists.",
+  "Action-ready accounts may carry a seven-step review sequence. Each step must contribute a distinct useful angle and follow the shared channel/question cadence; discovery-ready accounts still receive one touch only.",
   "Public utility data is outside confirmation, not proof of charger status and not a replacement for telemetry. State that boundary naturally at most once across the two emails.",
   "Write like an operator discussing site diagnosis. Do not expose phrases such as account file, research, source material, external context, reported interruption, or operational action.",
 ]
@@ -92,10 +93,11 @@ name OutageHub's location-matched Canadian utility API. Offer a short
 conversation with an email answer as the easier path. Never reuse a universal
 site-goes-dark or equipment-ticket fork.
 
-When an easy account receives T2, it earns its existence with evidence: the
-verified location, utility-reported event, and actual timestamp. Explain what
-the API would have shown without claiming the private asset lost power. No real
-match means no T2, not no market.
+When an action-ready account receives a full review sequence, every later step
+must earn its existence with a distinct supported angle. A verified location,
+utility-reported event, and timestamp can anchor one touch. Other touches may
+cover the outside-context boundary, provider completeness, a bounded workflow
+example, or an evaluation path. No real match means no historical claim.
 """
 
 doctrine = """

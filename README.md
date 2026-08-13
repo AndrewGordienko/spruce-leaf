@@ -195,6 +195,13 @@ GNK_DAILY_CAP=30
 COMPLIANCE_ADDRESS=123 Example Street, London, UK
 ```
 
+Apollo organization searches, people searches, organization enrichment, and
+paid person/email reveals are cached locally under `.spruce/apollo-cache/`.
+Successful email reveals are reused for up to one year; people and organization
+lookups use shorter freshness windows. The durable SQLite CRM is checked before
+Apollo, so a matching verified local person is reused without another provider
+call. Set `APOLLO_CACHE_BYPASS=1` only for an intentional live refresh.
+
 Use the corresponding `WAPAHKI_` or `OUTAGEHUB_` prefix for other brands.
 Mailbox caps are a second deliverability guardrail. The hard business-wide cap,
 IANA timezones, recipient-local windows, and named industry/title timing rules

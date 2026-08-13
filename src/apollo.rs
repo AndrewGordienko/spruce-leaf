@@ -20,6 +20,10 @@ use anyhow::{anyhow, bail, Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
+use std::time::Duration;
 
 const BASE: &str = "https://api.apollo.io/api/v1";
 
@@ -250,6 +254,9 @@ impl Apollo {
     }
 
     async fn post(&self, path: &str, body: Value) -> Result<Value> {
+        if let Some(cached) = read_cached_response(path, &body) {
+            return Ok(cached);
+        }
         // Retry transient rate-limit (429) and 5xx responses with exponential
         // backoff so a bulk pass (hundreds of reveals) rides out Apollo's rate
         // limits instead of failing mid-run. Honors Retry-After when present.
@@ -292,6 +299,7 @@ impl Apollo {
             let mut value: Value = serde_json::from_str(&text)
                 .with_context(|| format!("parsing Apollo {path} response"))?;
             strip_nulls(&mut value);
+            write_cached_response(path, &body, &value);
             return Ok(value);
         }
     }
@@ -410,9 +418,86 @@ impl Apollo {
     }
 }
 
+fn cache_ttl(path: &str) -> Duration {
+    let days = match path {
+        // Email reveals consume credits. Preserve a successful identity result
+        // for a year; callers still verify the address before it becomes usable.
+        "/people/match" => 365,
+        "/mixed_people/api_search" | "/organizations/enrich" => 30,
+        _ => 7,
+    };
+    Duration::from_secs(days * 24 * 60 * 60)
+}
+
+fn apollo_cache_path(path: &str, body: &Value) -> PathBuf {
+    let mut hasher = DefaultHasher::new();
+    "apollo-cache-v1".hash(&mut hasher);
+    path.hash(&mut hasher);
+    serde_json::to_string(body)
+        .unwrap_or_default()
+        .hash(&mut hasher);
+    let directory = std::env::var("APOLLO_CACHE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(".spruce/apollo-cache"));
+    directory.join(format!("{:016x}.json", hasher.finish()))
+}
+
+fn apollo_cache_enabled() -> bool {
+    !std::env::var("APOLLO_CACHE_BYPASS")
+        .ok()
+        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "yes"))
+}
+
+fn read_cached_response(path: &str, body: &Value) -> Option<Value> {
+    if !apollo_cache_enabled() {
+        return None;
+    }
+    let cache_path = apollo_cache_path(path, body);
+    let metadata = std::fs::metadata(&cache_path).ok()?;
+    if metadata.modified().ok()?.elapsed().ok()? > cache_ttl(path) {
+        return None;
+    }
+    let mut value = serde_json::from_slice::<Value>(&std::fs::read(cache_path).ok()?).ok()?;
+    strip_nulls(&mut value);
+    Some(value)
+}
+
+fn write_cached_response(path: &str, body: &Value, response: &Value) {
+    if !apollo_cache_enabled() {
+        return;
+    }
+    let cache_path = apollo_cache_path(path, body);
+    let Some(parent) = cache_path.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let temporary = cache_path.with_extension(format!("{}.tmp", std::process::id()));
+    let Ok(bytes) = serde_json::to_vec(response) else {
+        return;
+    };
+    if std::fs::write(&temporary, bytes).is_ok() {
+        let _ = std::fs::rename(temporary, cache_path);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn apollo_cache_keys_are_stable_and_request_specific() {
+        let first = apollo_cache_path("/people/match", &serde_json::json!({"id":"person-1"}));
+        let again = apollo_cache_path("/people/match", &serde_json::json!({"id":"person-1"}));
+        let second = apollo_cache_path("/people/match", &serde_json::json!({"id":"person-2"}));
+        assert_eq!(first, again);
+        assert_ne!(first, second);
+        assert_eq!(
+            first.extension().and_then(|value| value.to_str()),
+            Some("json")
+        );
+    }
 
     #[test]
     fn null_string_and_vec_fields_deserialize_to_defaults() {

@@ -335,6 +335,16 @@ pub struct SponsorshipProfile {
     pub permitted_sponsor_benefits: Vec<String>,
     #[serde(default)]
     pub sponsor_independence: Vec<String>,
+    /// Portfolio boundary between a sponsorship conversation and the ordinary
+    /// API sales motion. A sponsor may later become a customer, but the two
+    /// asks must never run concurrently or be represented as the same deal.
+    #[serde(default)]
+    pub relationship_rules: Vec<String>,
+    /// Human-readable rules for distinguishing a likely approver from a useful
+    /// internal router. Titles remain routing evidence, never proof that money
+    /// is currently available.
+    #[serde(default)]
+    pub budget_authority_rules: Vec<String>,
     #[serde(default)]
     pub prohibited_claims: Vec<String>,
     #[serde(default)]

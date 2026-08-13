@@ -4971,6 +4971,45 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Keep the sponsorship and API-customer motions from making concurrent
+    /// asks to the same organization. A later customer relationship is valid,
+    /// but only after the sponsorship thread has been resolved separately.
+    pub fn has_open_sponsorship_outreach_for_lead(
+        &self,
+        brand: &str,
+        lead_id: &str,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM leads l
+                 JOIN opportunities o
+                   ON lower(trim(o.funder_domain))=lower(trim(l.domain))
+                  AND o.brand=l.brand AND o.kind='sponsorship'
+                 JOIN opportunity_touches t ON t.opportunity_id=o.id
+                 WHERE l.id=?2 AND l.brand=?1
+                   AND t.status IN ('draft','approved','scheduled','sending')
+             )",
+            params![brand, lead_id],
+            |row| row.get::<_, i64>(0),
+        )? != 0)
+    }
+
+    pub fn has_active_sales_outreach_for_domain(&self, brand: &str, domain: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM leads l
+                 JOIN sequences s ON s.lead_id=l.id AND s.brand=l.brand
+                 JOIN touches t ON t.sequence_id=s.id
+                 WHERE l.brand=?1 AND lower(trim(l.domain))=lower(trim(?2))
+                   AND t.status IN ('draft','approved','scheduled','sending')
+             )",
+            params![brand, domain],
+            |row| row.get::<_, i64>(0),
+        )? != 0)
+    }
+
     pub fn delete_unsent_opportunity_touches(&self, contact_id: &str) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
         Ok(conn.execute(
