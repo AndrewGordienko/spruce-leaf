@@ -26,6 +26,12 @@ pub struct Funnel {
     pub opportunity_contacts: usize,
     pub opportunity_contacts_verified: usize,
     pub funding_touches_sent: i64,
+    pub cash_collected_month_cents: i64,
+    pub expected_30d_cash_cents: i64,
+    pub expected_90d_cash_cents: i64,
+    pub expected_180d_cash_cents: i64,
+    pub commercially_assessed: usize,
+    pub stalled_without_dated_next_action: usize,
 }
 
 impl Funnel {
@@ -63,6 +69,7 @@ pub fn funnel(db: &SharedDb, brand: Option<&str>) -> Result<Funnel> {
         .find(|(kind, _)| kind == "funding_outreach_sent")
         .map(|(_, count)| *count)
         .unwrap_or(0);
+    let commercial = db.commercial_forecast(brand)?;
 
     let count =
         |pred: &dyn Fn(&crate::db::Person) -> bool| people.iter().filter(|p| pred(p)).count();
@@ -103,6 +110,12 @@ pub fn funnel(db: &SharedDb, brand: Option<&str>) -> Result<Funnel> {
             .filter(|contact| contact.email_status == "verified")
             .count(),
         funding_touches_sent: funding_sent,
+        cash_collected_month_cents: commercial.cash_collected_month_cents,
+        expected_30d_cash_cents: commercial.expected_30d_cash_cents,
+        expected_90d_cash_cents: commercial.expected_90d_cash_cents,
+        expected_180d_cash_cents: commercial.expected_180d_cash_cents,
+        commercially_assessed: commercial.assessed_opportunities,
+        stalled_without_dated_next_action: commercial.stalled_without_dated_next_action,
     })
 }
 
@@ -122,7 +135,14 @@ pub fn render(f: &Funnel) -> String {
          \u{2022} shortlisted       {shortlisted}\n\
          \u{2022} active pursuits   {active}\n\
          \u{2022} funder contacts   {funding_contacts} ({funding_verified} verified)\n\
-         \u{2022} funding emails    {funding_sent}",
+         \u{2022} funding emails    {funding_sent}\n\
+         commercial operating view\n\
+         \u{2022} cash this month   {cash_month}\n\
+         \u{2022} expected 30d cash {cash_30d}\n\
+         \u{2022} expected 90d cash {cash_90d}\n\
+         \u{2022} expected 180d     {cash_180d}\n\
+         \u{2022} assessed deals    {assessed}\n\
+         \u{2022} stalled/no date   {stalled}",
         brand = f.brand,
         leads = f.leads,
         people = f.people,
@@ -139,5 +159,17 @@ pub fn render(f: &Funnel) -> String {
         funding_contacts = f.opportunity_contacts,
         funding_verified = f.opportunity_contacts_verified,
         funding_sent = f.funding_touches_sent,
+        cash_month = money(f.cash_collected_month_cents),
+        cash_30d = money(f.expected_30d_cash_cents),
+        cash_90d = money(f.expected_90d_cash_cents),
+        cash_180d = money(f.expected_180d_cash_cents),
+        assessed = f.commercially_assessed,
+        stalled = f.stalled_without_dated_next_action,
     )
+}
+
+fn money(cents: i64) -> String {
+    let sign = if cents < 0 { "-" } else { "" };
+    let cents = cents.saturating_abs();
+    format!("{sign}CAD ${}.{:02}", cents / 100, cents % 100)
 }

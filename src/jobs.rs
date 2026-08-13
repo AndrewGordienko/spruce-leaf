@@ -20,6 +20,7 @@
 //! lease/retry state stays in SQLite, so killing the process during a model or
 //! Apollo call is recoverable rather than silently losing the work.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,6 +28,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::apollo::Apollo;
+use crate::business::BusinessProfile;
 use crate::business::Businesses;
 use crate::db::{Job, SharedDb};
 use crate::engine::Engine;
@@ -335,6 +337,13 @@ async fn execute(
             } else {
                 payload.touches.clamp(1, 12)
             };
+            let (commercially_eligible_people, commercial_reason) =
+                commercial_autopilot_people(db, business)?;
+            if commercially_eligible_people.is_empty() {
+                return Ok(format!(
+                    "0 people planned; commercial portfolio held automatic drafting: {commercial_reason}"
+                ));
+            }
             let lib = library.read().await.clone();
             let s = outreach::plan_pending(
                 db,
@@ -355,18 +364,89 @@ async fn execute(
                         .max_active_contacts_per_account
                         .clamp(1, 2),
                 ),
-                None,
+                Some(&commercially_eligible_people),
                 (!payload.outcome.trim().is_empty()).then_some(payload.outcome.trim()),
                 None,
             )
             .await?;
             Ok(format!(
-                "{} people planned, {} scheduled, {} drafts",
-                s.people_planned, s.touches_scheduled, s.touches_drafted
+                "{} people planned, {} scheduled, {} drafts; {}",
+                s.people_planned, s.touches_scheduled, s.touches_drafted, commercial_reason
             ))
         }
         other => anyhow::bail!("unsupported job kind '{other}'"),
     }
+}
+
+/// Commercial authorization for the automatic planner. Market mapping and
+/// research keep running across the whole universe, but automatic drafting is
+/// restricted to founder-assessed opportunities. When expected cash-now
+/// coverage is unknown or below policy, core and strategic pursuits pause.
+fn commercial_autopilot_people(
+    db: &SharedDb,
+    business: &BusinessProfile,
+) -> Result<(HashSet<String>, String)> {
+    let forecast = db.commercial_forecast(Some(&business.key))?;
+    let coverage = forecast.cash_now_pipeline_coverage;
+    let slow_lanes_open = coverage
+        .is_some_and(|coverage| coverage >= business.commercial.minimum_cash_now_pipeline_coverage);
+    let mut assessments = db.list_commercial_assessments(Some(&business.key))?;
+    assessments.retain(|assessment| {
+        !matches!(assessment.sales_stage.as_str(), "won" | "lost")
+            && business
+                .commercial_offer(&assessment.offer_key)
+                .is_some_and(|offer| offer.lane == assessment.commercial_lane)
+    });
+
+    let mut eligible_opportunities = assessments
+        .iter()
+        .filter(|assessment| assessment.commercial_lane == "cash_now")
+        .map(|assessment| assessment.sales_opportunity_id.clone())
+        .collect::<HashSet<_>>();
+    if slow_lanes_open {
+        eligible_opportunities.extend(
+            assessments
+                .iter()
+                .filter(|assessment| assessment.commercial_lane == "core")
+                .map(|assessment| assessment.sales_opportunity_id.clone()),
+        );
+        eligible_opportunities.extend(
+            assessments
+                .iter()
+                .filter(|assessment| {
+                    assessment.commercial_lane == "strategic" && assessment.sales_stage != "mapped"
+                })
+                .take(business.commercial.max_active_strategic)
+                .map(|assessment| assessment.sales_opportunity_id.clone()),
+        );
+    }
+
+    let people = db
+        .list_opportunity_stakeholders(None, Some(&business.key))?
+        .into_iter()
+        .filter(|stakeholder| {
+            stakeholder.status != "held"
+                && eligible_opportunities.contains(&stakeholder.sales_opportunity_id)
+        })
+        .map(|stakeholder| stakeholder.person_id)
+        .collect::<HashSet<_>>();
+    let reason = if slow_lanes_open {
+        format!(
+            "cash-now coverage {:.2}× meets {:.2}× policy; cash-now/core and at most {} active strategic pursuits are open",
+            coverage.unwrap_or_default(),
+            business.commercial.minimum_cash_now_pipeline_coverage,
+            business.commercial.max_active_strategic,
+        )
+    } else {
+        format!(
+            "cash-now coverage {} is below {:.2}× policy; core/strategic automatic drafting is paused",
+            coverage
+                .map(|value| format!("{value:.2}×"))
+                .unwrap_or_else(|| "unknown".into()),
+            business.commercial.minimum_cash_now_pipeline_coverage,
+        )
+    };
+    Ok((people, reason))
 }
 
 /// Continuously schedule and drain the discovery funnel for every configured
@@ -492,5 +572,89 @@ mod tests {
         ] {
             let _ = std::fs::remove_file(p);
         }
+    }
+
+    #[test]
+    fn automatic_planning_pauses_slow_lanes_when_cash_coverage_is_unknown() {
+        let db = crate::db::Db::open(":memory:").expect("open db");
+        let businesses = Businesses::load("businesses").expect("load businesses");
+        let business = businesses.get("gnk").expect("gnk profile");
+        let lead_id = db
+            .upsert_lead(&crate::db::Lead {
+                brand: "gnk".into(),
+                apollo_org_id: "commercial-job-account".into(),
+                name: "Example Systems".into(),
+                ..Default::default()
+            })
+            .expect("lead");
+        let market_account_id = db
+            .market_account_for_lead(&lead_id)
+            .expect("market account query")
+            .expect("market account")
+            .id;
+        let play_id = db
+            .current_gtm_play("gnk")
+            .expect("play query")
+            .expect("play")
+            .id;
+        let opportunity_id = db
+            .upsert_sales_opportunity(&crate::db::SalesOpportunity {
+                brand: "gnk".into(),
+                market_account_id,
+                lead_id: lead_id.clone(),
+                play_id,
+                kind: "workflow".into(),
+                title: "Backend risk".into(),
+                task_or_decision: "Resolve production reliability incidents".into(),
+                evidence_status: "action_ready".into(),
+                evidence_tier: "action_ready".into(),
+                ..Default::default()
+            })
+            .expect("opportunity");
+        let person_id = db
+            .upsert_person(&crate::db::Person {
+                lead_id,
+                brand: "gnk".into(),
+                apollo_person_id: "commercial-job-person".into(),
+                name: "Casey Chen".into(),
+                title: "VP Engineering".into(),
+                email: "casey@example.test".into(),
+                email_status: "verified".into(),
+                status: "verified".into(),
+                ..Default::default()
+            })
+            .expect("person");
+        db.upsert_commercial_assessment(&crate::db::CommercialAssessment {
+            sales_opportunity_id: opportunity_id.clone(),
+            brand: "gnk".into(),
+            commercial_lane: "core".into(),
+            offer_key: "managed_platform_expansion".into(),
+            sales_stage: "mapped".into(),
+            assessment_source: "manual_crm".into(),
+            assessment_confidence: "unknown".into(),
+            ..Default::default()
+        })
+        .expect("core assessment");
+        let (held, reason) = commercial_autopilot_people(&db, business).expect("commercial gate");
+        assert!(held.is_empty());
+        assert!(reason.contains("core/strategic automatic drafting is paused"));
+
+        db.upsert_commercial_assessment(&crate::db::CommercialAssessment {
+            sales_opportunity_id: opportunity_id,
+            brand: "gnk".into(),
+            commercial_lane: "cash_now".into(),
+            offer_key: "backend_risk_stabilization_sprint".into(),
+            sales_stage: "mapped".into(),
+            expected_upfront_cash_cents: Some(4_000_000),
+            close_probability_bps: Some(5_000),
+            days_to_first_cash: Some(30),
+            estimate_basis: vec!["Founder-selected governed offer and stage prior.".into()],
+            assessment_source: "manual_crm".into(),
+            assessment_confidence: "hypothesis".into(),
+            ..Default::default()
+        })
+        .expect("cash-now assessment");
+        let (open, _) = commercial_autopilot_people(&db, business).expect("commercial gate");
+        assert!(open.contains(&person_id));
     }
 }

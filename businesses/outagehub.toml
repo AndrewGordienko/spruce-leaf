@@ -35,6 +35,80 @@ constraints = [
   "Never describe a repayable contribution, tax credit, loan, procurement, or challenge prize as a grant.",
 ]
 
+[commercial]
+currency = "CAD"
+cash_constrained_below_runway_months = 6
+max_active_strategic = 3
+minimum_cash_now_pipeline_coverage = 3.0
+
+[commercial.cash_constrained_allocation]
+cash_now_share_bps = 7000
+core_share_bps = 2000
+strategic_share_bps = 1000
+
+[commercial.stable_allocation]
+cash_now_share_bps = 5000
+core_share_bps = 3500
+strategic_share_bps = 1500
+
+[[commercial.offers]]
+key = "historical_location_replay"
+name = "Historical Location Replay"
+lane = "cash_now"
+description = "A bounded, no-integration comparison of supplied or public Canadian locations/incidents with historical utility outage records, including timestamps, providers, data limits, and what the API would have returned."
+price_min_cents = 200000
+price_max_cents = 1500000
+delivery_days_min = 5
+delivery_days_max = 20
+payment_structure = "Paid upfront; exact price and cash timing remain unknown until the location set and buyer agree scope."
+estimate_confidence = "hypothesis"
+estimate_basis = [
+  "Founder pricing hypothesis of CAD $2,000–$15,000 for a bounded historical replay; not a proven market price or recorded transaction.",
+]
+requires = [
+  "A named outage-sensitive decision and operational owner.",
+  "A bounded location or incident set with permission to analyze it.",
+]
+success_criteria = ["The buyer can decide whether external utility context changes the named workflow enough to justify API evaluation."]
+exclusions = [
+  "Claiming private site status from public outage data.",
+  "Open-ended free custom analysis.",
+]
+
+[[commercial.offers]]
+key = "api_evaluation"
+name = "API Evaluation"
+lane = "core"
+description = "A limited API or webhook evaluation tied to one existing incident, dispatch, NOC, or service workflow and an explicit recurring subscription path."
+price_min_cents = 750000
+price_max_cents = 3000000
+delivery_days_min = 30
+delivery_days_max = 120
+payment_structure = "Paid implementation/evaluation milestones with a defined subscription conversion gate."
+estimate_confidence = "hypothesis"
+estimate_basis = [
+  "Founder implementation-value hypothesis of CAD $7,500–$30,000; not yet validated by a recorded buyer payment.",
+]
+requires = [
+  "A historical replay or equivalent evidence that utility context changes a specific decision.",
+  "A workflow owner, technical evaluator, success measure, and subscription path.",
+]
+success_criteria = ["The evaluation records whether and where external outage context improves the target workflow."]
+exclusions = ["An integration without a named operational decision or recurring commercial path."]
+
+[[commercial.offers]]
+key = "enterprise_embedded_outage_data"
+name = "Enterprise or Embedded Outage Data"
+lane = "strategic"
+description = "A larger embedded or enterprise subscription pursued only with sponsorship, security/legal ownership, procurement timing, and a paid first phase."
+payment_structure = "Paid discovery/evaluation precedes custom enterprise work; final value remains unknown until buyer scope exists."
+requires = [
+  "A champion and executive or commercial sponsor.",
+  "A compelling event, security path, procurement route, and paid first phase.",
+]
+success_criteria = ["A contracted recurring subscription with explicit workflow, coverage, and expansion gates."]
+exclusions = ["Free custom pilots and speculative enterprise integrations."]
+
 [account_limits]
 max_new_contacts_per_account_per_day = 10
 max_active_contacts_per_account = 0

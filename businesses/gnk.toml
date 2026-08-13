@@ -25,6 +25,81 @@ constraints = [
   "Do not invent savings, internal systems, or urgency.",
 ]
 
+[commercial]
+currency = "CAD"
+cash_constrained_below_runway_months = 6
+max_active_strategic = 3
+minimum_cash_now_pipeline_coverage = 3.0
+
+[commercial.cash_constrained_allocation]
+cash_now_share_bps = 7000
+core_share_bps = 2000
+strategic_share_bps = 1000
+
+[commercial.stable_allocation]
+cash_now_share_bps = 5000
+core_share_bps = 3500
+strategic_share_bps = 1500
+
+[[commercial.offers]]
+key = "backend_risk_stabilization_sprint"
+name = "Backend Risk and Stabilization Sprint"
+lane = "cash_now"
+description = "A bounded four-week paid wedge that maps one operationally expensive backend risk, stabilizes the narrow failure surface, and leaves measurable before/after evidence plus a sequenced expansion plan."
+price_min_cents = 4000000
+price_max_cents = 6000000
+delivery_days_min = 20
+delivery_days_max = 30
+payment_structure = "A paid, bounded sprint; exact deposit and milestone terms must be agreed with the buyer before the forecast records upfront cash."
+estimate_confidence = "hypothesis"
+estimate_basis = [
+  "Founder operating hypothesis: approximately CAD $40k–$60k for a four-week senior delivery sprint; not yet validated by a recorded buyer payment.",
+]
+requires = [
+  "A concrete backend/platform/reliability workflow and measurable failure or delay boundary.",
+  "A direct operational sponsor and a plausible budget owner.",
+  "A narrow scope that can begin without open-ended enterprise transformation.",
+]
+success_criteria = [
+  "The agreed risk or workflow boundary is measurably stabilized or disproved.",
+  "The buyer receives an evidence-backed expansion or stop recommendation.",
+]
+exclusions = [
+  "Unpaid speculative architecture work.",
+  "Open-ended staff augmentation.",
+]
+
+[[commercial.offers]]
+key = "managed_platform_expansion"
+name = "Managed Platform Expansion"
+lane = "core"
+description = "A paid 90-day expansion from a validated sprint into adjacent workflows, reliability ownership, and a recurring senior software/AI delivery relationship."
+delivery_days_min = 60
+delivery_days_max = 120
+payment_structure = "Paid milestones with a recurring engagement path; price remains unknown until a buyer validates scope."
+requires = [
+  "A passed paid sprint or equivalent buyer-validated technical boundary.",
+  "Named operational and technical sponsors.",
+  "A measurable expansion path.",
+]
+success_criteria = ["A repeatable managed scope with agreed service and business measures."]
+exclusions = ["Treating a cold reply or meeting as proof of budget."]
+
+[[commercial.offers]]
+key = "strategic_system_transformation"
+name = "Strategic System Transformation"
+lane = "strategic"
+description = "A larger multi-stakeholder programme pursued only with a champion, executive sponsor, compelling event, procurement route, and paid first phase."
+payment_structure = "Every strategic pursuit begins with a bounded paid phase; no open-ended free discovery."
+requires = [
+  "A real champion and executive sponsor.",
+  "A compelling event or dated business deadline.",
+  "A mapped security, legal, and procurement route.",
+  "A bounded paid first phase.",
+]
+success_criteria = ["The first paid phase produces an explicit expand, redesign, or stop decision."]
+exclusions = ["Unfunded enterprise discovery and indefinite nurture without a dated next commitment."]
+
 [account_limits]
 max_new_contacts_per_account_per_day = 10
 max_active_contacts_per_account = 0

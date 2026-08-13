@@ -414,7 +414,7 @@ impl GtmActionContext {
                     } else {
                         &opportunity.facility_id
                     },
-                    opportunity.priority_tier,
+                    opportunity.evidence_tier,
                 )
             },
         );

@@ -38,6 +38,96 @@ pub struct BusinessProfile {
     pub calendar: OutreachCalendar,
     #[serde(default)]
     pub account_limits: AccountLimits,
+    /// Founder-capacity and cash-allocation policy. Evidence readiness remains
+    /// an independent GTM concern; this section says which paid offer and
+    /// commercial lane deserves attention once an opportunity is understood.
+    #[serde(default)]
+    pub commercial: CommercialPolicy,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CommercialPolicy {
+    #[serde(default = "default_currency")]
+    pub currency: String,
+    #[serde(default = "default_cash_constrained_runway_months")]
+    pub cash_constrained_below_runway_months: u32,
+    #[serde(default)]
+    pub cash_constrained_allocation: CommercialAllocation,
+    #[serde(default = "default_stable_allocation")]
+    pub stable_allocation: CommercialAllocation,
+    #[serde(default = "default_max_active_strategic")]
+    pub max_active_strategic: usize,
+    #[serde(default = "default_pipeline_coverage")]
+    pub minimum_cash_now_pipeline_coverage: f64,
+    #[serde(default)]
+    pub offers: Vec<CommercialOffer>,
+}
+
+impl Default for CommercialPolicy {
+    fn default() -> Self {
+        Self {
+            currency: default_currency(),
+            cash_constrained_below_runway_months: default_cash_constrained_runway_months(),
+            cash_constrained_allocation: CommercialAllocation::default(),
+            stable_allocation: default_stable_allocation(),
+            max_active_strategic: default_max_active_strategic(),
+            minimum_cash_now_pipeline_coverage: default_pipeline_coverage(),
+            offers: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CommercialAllocation {
+    #[serde(default = "default_cash_now_share_bps")]
+    pub cash_now_share_bps: u32,
+    #[serde(default = "default_core_share_bps")]
+    pub core_share_bps: u32,
+    #[serde(default = "default_strategic_share_bps")]
+    pub strategic_share_bps: u32,
+}
+
+impl Default for CommercialAllocation {
+    fn default() -> Self {
+        Self {
+            cash_now_share_bps: default_cash_now_share_bps(),
+            core_share_bps: default_core_share_bps(),
+            strategic_share_bps: default_strategic_share_bps(),
+        }
+    }
+}
+
+/// A governed offer definition, not a forecast. Optional money/timing fields
+/// remain absent until the founder has an explicit pricing hypothesis or buyer
+/// evidence; zero is never used as shorthand for unknown.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct CommercialOffer {
+    pub key: String,
+    pub name: String,
+    /// cash_now | core | strategic
+    pub lane: String,
+    pub description: String,
+    #[serde(default)]
+    pub price_min_cents: Option<i64>,
+    #[serde(default)]
+    pub price_max_cents: Option<i64>,
+    #[serde(default)]
+    pub delivery_days_min: Option<u32>,
+    #[serde(default)]
+    pub delivery_days_max: Option<u32>,
+    #[serde(default)]
+    pub payment_structure: String,
+    /// hypothesis | buyer_validated | transaction_validated
+    #[serde(default)]
+    pub estimate_confidence: String,
+    #[serde(default)]
+    pub estimate_basis: Vec<String>,
+    #[serde(default)]
+    pub requires: Vec<String>,
+    #[serde(default)]
+    pub success_criteria: Vec<String>,
+    #[serde(default)]
+    pub exclusions: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -283,6 +373,42 @@ fn default_learning_min_samples() -> usize {
     20
 }
 
+fn default_currency() -> String {
+    "CAD".into()
+}
+
+fn default_cash_constrained_runway_months() -> u32 {
+    6
+}
+
+fn default_cash_now_share_bps() -> u32 {
+    7000
+}
+
+fn default_core_share_bps() -> u32 {
+    2000
+}
+
+fn default_strategic_share_bps() -> u32 {
+    1000
+}
+
+fn default_stable_allocation() -> CommercialAllocation {
+    CommercialAllocation {
+        cash_now_share_bps: 5000,
+        core_share_bps: 3500,
+        strategic_share_bps: 1500,
+    }
+}
+
+fn default_max_active_strategic() -> usize {
+    3
+}
+
+fn default_pipeline_coverage() -> f64 {
+    3.0
+}
+
 pub struct Businesses {
     profiles: BTreeMap<String, BusinessProfile>,
 }
@@ -353,6 +479,23 @@ impl BusinessProfile {
             .ok_or_else(|| anyhow!("{} has no funding profile", self.name))
     }
 
+    pub fn commercial_offer(&self, key: &str) -> Option<&CommercialOffer> {
+        self.commercial.offers.iter().find(|offer| offer.key == key)
+    }
+
+    /// Unknown runway takes the conservative cash-constrained allocation. A
+    /// founder must explicitly record sufficient runway before strategic work
+    /// receives the stable-business share.
+    pub fn commercial_allocation(&self, runway_months: Option<f64>) -> &CommercialAllocation {
+        if runway_months.is_some_and(|months| {
+            months >= self.commercial.cash_constrained_below_runway_months as f64
+        }) {
+            &self.commercial.stable_allocation
+        } else {
+            &self.commercial.cash_constrained_allocation
+        }
+    }
+
     pub fn agent_summary(&self) -> String {
         let motions = self
             .motions
@@ -380,6 +523,20 @@ impl BusinessProfile {
             summary.push_str(&format!(
                 " Hard constraints: {}",
                 self.constraints.join(" ")
+            ));
+        }
+        if !self.commercial.offers.is_empty() {
+            summary.push_str(&format!(
+                " Commercial offers: {}. Unknown runway uses the cash-constrained {}% / {}% / {}% cash-now/core/strategic allocation.",
+                self.commercial
+                    .offers
+                    .iter()
+                    .map(|offer| format!("{} ({})", offer.key, offer.lane))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                self.commercial.cash_constrained_allocation.cash_now_share_bps / 100,
+                self.commercial.cash_constrained_allocation.core_share_bps / 100,
+                self.commercial.cash_constrained_allocation.strategic_share_bps / 100,
             ));
         }
         summary
@@ -478,6 +635,7 @@ fn validate(profile: &BusinessProfile) -> Result<()> {
             return Err(anyhow!("duplicate discovery evidence id '{}'", evidence.id));
         }
     }
+    validate_commercial_policy(profile)?;
     if profile.has_motion("funding") {
         let funding = profile
             .funding
@@ -507,6 +665,85 @@ fn validate(profile: &BusinessProfile) -> Result<()> {
         }
     }
     validate_calendar(&profile.calendar)?;
+    Ok(())
+}
+
+fn validate_commercial_policy(profile: &BusinessProfile) -> Result<()> {
+    let commercial = &profile.commercial;
+    if commercial.currency.trim().is_empty() {
+        return Err(anyhow!("commercial.currency is required"));
+    }
+    for (label, allocation) in [
+        (
+            "cash_constrained_allocation",
+            &commercial.cash_constrained_allocation,
+        ),
+        ("stable_allocation", &commercial.stable_allocation),
+    ] {
+        let total = allocation.cash_now_share_bps
+            + allocation.core_share_bps
+            + allocation.strategic_share_bps;
+        if total != 10_000 {
+            return Err(anyhow!(
+                "commercial.{label} must total 10000 basis points, got {total}"
+            ));
+        }
+    }
+    if commercial.minimum_cash_now_pipeline_coverage < 0.0 {
+        return Err(anyhow!(
+            "commercial.minimum_cash_now_pipeline_coverage cannot be negative"
+        ));
+    }
+    let mut offer_keys = std::collections::HashSet::new();
+    for offer in &commercial.offers {
+        if offer.key.trim().is_empty()
+            || offer.name.trim().is_empty()
+            || offer.description.trim().is_empty()
+        {
+            return Err(anyhow!(
+                "commercial offers require key, name, and description"
+            ));
+        }
+        if !offer_keys.insert(offer.key.trim()) {
+            return Err(anyhow!("duplicate commercial offer key '{}'", offer.key));
+        }
+        if !matches!(offer.lane.as_str(), "cash_now" | "core" | "strategic") {
+            return Err(anyhow!(
+                "commercial offer '{}' has unsupported lane '{}'",
+                offer.key,
+                offer.lane
+            ));
+        }
+        if let (Some(min), Some(max)) = (offer.price_min_cents, offer.price_max_cents) {
+            if min < 0 || max < min {
+                return Err(anyhow!(
+                    "commercial offer '{}' has an invalid price range",
+                    offer.key
+                ));
+            }
+        }
+        if offer.price_min_cents.is_some() || offer.price_max_cents.is_some() {
+            if offer.estimate_confidence.trim().is_empty() || offer.estimate_basis.is_empty() {
+                return Err(anyhow!(
+                    "priced commercial offer '{}' requires confidence and estimate_basis",
+                    offer.key
+                ));
+            }
+        }
+        if let (Some(min), Some(max)) = (offer.delivery_days_min, offer.delivery_days_max) {
+            if min == 0 || max < min {
+                return Err(anyhow!(
+                    "commercial offer '{}' has an invalid delivery window",
+                    offer.key
+                ));
+            }
+        }
+    }
+    if profile.has_motion("sales") && commercial.offers.is_empty() {
+        return Err(anyhow!(
+            "sales motion requires at least one [[commercial.offers]]"
+        ));
+    }
     Ok(())
 }
 
@@ -610,6 +847,29 @@ mod tests {
             .is_empty());
         let wapahki = businesses.get("wapahki").unwrap();
         assert_eq!(wapahki.discovery_evidence.len(), 2);
+        assert_eq!(wapahki.commercial.offers.len(), 3);
+        assert_eq!(
+            wapahki
+                .commercial_offer("paid_task_feasibility_sprint")
+                .unwrap()
+                .lane,
+            "cash_now"
+        );
+        assert_eq!(
+            wapahki.commercial_allocation(Some(2.0)).cash_now_share_bps,
+            7_000
+        );
+        assert_eq!(
+            wapahki.commercial_allocation(Some(8.0)).cash_now_share_bps,
+            6_000
+        );
+        for key in ["gnk", "outagehub", "wapahki"] {
+            let profile = businesses.get(key).unwrap();
+            assert_eq!(profile.commercial.offers.len(), 3);
+            assert!(profile
+                .commercial_offer(&profile.commercial.offers[0].key)
+                .is_some());
+        }
         let context = wapahki.operating_context();
         assert!(context.contains("Founder discovery evidence"));
         assert!(context.contains("NOT proof about a candidate account"));

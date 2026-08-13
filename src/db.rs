@@ -446,11 +446,138 @@ pub struct SalesOpportunity {
     pub system_concept: String,
     pub proof_offer: String,
     pub evidence_status: String,
-    pub priority_tier: String,
+    /// Outreach-safety/readiness only. This is intentionally not a revenue or
+    /// closing priority; commercial allocation lives in CommercialAssessment.
+    #[serde(alias = "priority_tier")]
+    pub evidence_tier: String,
     pub fit_score: i64,
     pub status: String,
     pub evidence_gaps: Vec<String>,
     pub created_at: String,
+    pub updated_at: String,
+}
+
+/// A versioned founder-owned commercial judgment for one concrete sales
+/// opportunity. Optional numbers are SQL NULL when unknown; callers must never
+/// turn absence into zero, a model estimate, or buyer-facing fact.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CommercialAssessment {
+    pub id: String,
+    pub sales_opportunity_id: String,
+    pub brand: String,
+    pub version: i64,
+    /// unassessed | cash_now | core | strategic | parked
+    pub commercial_lane: String,
+    pub offer_key: String,
+    /// mapped | contacted | discovery | scoped | proposal | procurement |
+    /// paid_pilot | won | lost
+    pub sales_stage: String,
+    pub expected_contract_value_cents: Option<i64>,
+    pub expected_upfront_cash_cents: Option<i64>,
+    pub cash_collectable_within_90d_cents: Option<i64>,
+    pub expected_arr_cents: Option<i64>,
+    pub estimated_12m_gross_profit_cents: Option<i64>,
+    pub days_to_first_cash: Option<i64>,
+    pub close_probability_bps: Option<i64>,
+    pub sales_hours_remaining: Option<i64>,
+    pub estimated_founder_hours: Option<i64>,
+    pub delivery_hours: Option<i64>,
+    pub unpaid_delivery_hours: Option<i64>,
+    pub gross_margin_bps: Option<i64>,
+    pub procurement_complexity: String,
+    pub integration_complexity: String,
+    pub delivery_risk: String,
+    pub current_trigger: String,
+    pub buyer_access: String,
+    pub budget_path: String,
+    pub budget_owner_status: String,
+    pub champion_status: String,
+    pub champion_strength: String,
+    pub executive_sponsor_status: String,
+    pub compelling_event: String,
+    pub payment_structure: String,
+    pub next_commitment: String,
+    pub next_action: String,
+    pub next_action_due_at: String,
+    pub target_close_date: String,
+    pub stalled_reason: String,
+    pub estimate_basis: Vec<String>,
+    pub assessment_source: String,
+    pub assessment_confidence: String,
+    /// current | superseded
+    pub lifecycle: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl CommercialAssessment {
+    /// Expected cash inside a horizon, only when cash, probability, and timing
+    /// are all explicitly known. Integer arithmetic keeps forecasts stable.
+    pub fn expected_cash_within_days(&self, horizon_days: i64) -> Option<i64> {
+        let cash = self
+            .cash_collectable_within_90d_cents
+            .or(self.expected_upfront_cash_cents)?;
+        let probability = self.close_probability_bps?;
+        let days = self.days_to_first_cash?;
+        if cash < 0 || !(0..=10_000).contains(&probability) || days < 0 || horizon_days <= 0 {
+            return None;
+        }
+        let timing_bps = if days <= horizon_days || days == 0 {
+            10_000
+        } else {
+            (horizon_days.saturating_mul(10_000) / days).clamp(0, 10_000)
+        };
+        Some(cash.saturating_mul(probability).saturating_mul(timing_bps) / 100_000_000)
+    }
+}
+
+/// Append-only commercial truth. Money stages are authorized by invoice or
+/// payment events, never by an LLM interpreting a friendly reply.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CommercialEvent {
+    pub id: String,
+    pub sales_opportunity_id: String,
+    pub brand: String,
+    pub kind: String,
+    pub amount_cents: Option<i64>,
+    pub currency: String,
+    pub occurred_at: String,
+    pub source: String,
+    pub external_ref: String,
+    pub detail: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CommercialForecast {
+    pub brand: String,
+    pub cash_collected_month_cents: i64,
+    pub monthly_cash_need_cents: Option<i64>,
+    pub runway_months: Option<f64>,
+    pub expected_30d_cash_cents: i64,
+    pub expected_90d_cash_cents: i64,
+    pub expected_180d_cash_cents: i64,
+    pub cash_now_expected_90d_cents: i64,
+    /// Expected cash-now pipeline divided by the next 90 days of cash need.
+    /// None means the founder has not recorded a cash requirement; unknown is
+    /// never displayed as zero coverage.
+    pub cash_now_pipeline_coverage: Option<f64>,
+    pub assessed_opportunities: usize,
+    pub cash_now_opportunities: usize,
+    pub core_opportunities: usize,
+    pub strategic_opportunities: usize,
+    pub stalled_without_dated_next_action: usize,
+}
+
+/// Founder-entered operating constraints. These values govern portfolio
+/// allocation but never enter buyer-facing copy or originate from a model.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CommercialOperatingState {
+    pub brand: String,
+    pub runway_months: Option<f64>,
+    pub monthly_cash_need_cents: Option<i64>,
+    pub source: String,
+    pub as_of: String,
     pub updated_at: String,
 }
 
@@ -612,6 +739,7 @@ pub struct CustomerDevelopmentRecord {
     pub id: String,
     pub brand: String,
     pub lead_id: String,
+    pub sales_opportunity_id: String,
     pub person_id: String,
     pub conversation_id: String,
     pub stage: String,
@@ -957,6 +1085,13 @@ impl Db {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(SCHEMA)
             .context("running SQLite migrations")?;
+        if !column_exists(&conn, "customer_development", "sales_opportunity_id")? {
+            migrate_customer_development_to_opportunities(&conn)?;
+        }
+        let migrate_sales_evidence_tier =
+            !column_exists(&conn, "sales_opportunities", "evidence_tier")?;
+        let migrate_membership_evidence_tier =
+            !column_exists(&conn, "brand_account_memberships", "evidence_tier")?;
         for (table, column, definition) in [
             ("leads", "timezone", "TEXT DEFAULT ''"),
             ("people", "location", "TEXT DEFAULT ''"),
@@ -976,6 +1111,64 @@ impl Db {
             ("sequences", "sales_opportunity_id", "TEXT DEFAULT ''"),
             ("sales_opportunities", "identity_key", "TEXT DEFAULT ''"),
             ("sales_opportunities", "task_key", "TEXT DEFAULT ''"),
+            (
+                "sales_opportunities",
+                "evidence_tier",
+                "TEXT NOT NULL DEFAULT 'research_required'",
+            ),
+            (
+                "brand_account_memberships",
+                "evidence_tier",
+                "TEXT NOT NULL DEFAULT 'research_required'",
+            ),
+            (
+                "commercial_assessments",
+                "cash_collectable_within_90d_cents",
+                "INTEGER",
+            ),
+            ("commercial_assessments", "expected_arr_cents", "INTEGER"),
+            (
+                "commercial_assessments",
+                "estimated_12m_gross_profit_cents",
+                "INTEGER",
+            ),
+            (
+                "commercial_assessments",
+                "estimated_founder_hours",
+                "INTEGER",
+            ),
+            ("commercial_assessments", "unpaid_delivery_hours", "INTEGER"),
+            (
+                "commercial_assessments",
+                "integration_complexity",
+                "TEXT DEFAULT 'unknown'",
+            ),
+            (
+                "commercial_assessments",
+                "current_trigger",
+                "TEXT DEFAULT ''",
+            ),
+            ("commercial_assessments", "budget_path", "TEXT DEFAULT ''"),
+            (
+                "commercial_assessments",
+                "champion_strength",
+                "TEXT DEFAULT 'unknown'",
+            ),
+            (
+                "commercial_assessments",
+                "executive_sponsor_status",
+                "TEXT DEFAULT 'unknown'",
+            ),
+            (
+                "commercial_assessments",
+                "next_commitment",
+                "TEXT DEFAULT ''",
+            ),
+            (
+                "commercial_assessments",
+                "stalled_reason",
+                "TEXT DEFAULT ''",
+            ),
             ("evidence_claims", "task_key", "TEXT DEFAULT ''"),
             ("touches", "recipient_timezone", "TEXT DEFAULT ''"),
             ("touches", "scheduled_rule", "TEXT DEFAULT ''"),
@@ -1004,9 +1197,36 @@ impl Db {
         ] {
             ensure_column(&conn, table, column, definition)?;
         }
+        if migrate_sales_evidence_tier
+            && column_exists(&conn, "sales_opportunities", "priority_tier")?
+        {
+            conn.execute(
+                "UPDATE sales_opportunities SET evidence_tier=CASE priority_tier
+                   WHEN 'easy' THEN 'action_ready'
+                   WHEN 'medium' THEN 'discovery_ready'
+                   ELSE 'research_required' END",
+                [],
+            )?;
+        }
+        if migrate_membership_evidence_tier
+            && column_exists(&conn, "brand_account_memberships", "priority_tier")?
+        {
+            conn.execute(
+                "UPDATE brand_account_memberships SET evidence_tier=CASE priority_tier
+                   WHEN 'easy' THEN 'action_ready'
+                   WHEN 'medium' THEN 'discovery_ready'
+                   ELSE 'research_required' END",
+                [],
+            )?;
+        }
         conn.execute_batch(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_sales_opportunities_identity
              ON sales_opportunities(identity_key) WHERE identity_key<>'';
+             CREATE INDEX IF NOT EXISTS idx_sales_opportunities_brand_evidence
+             ON sales_opportunities(brand,evidence_tier,fit_score DESC);
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_customer_development_opportunity
+             ON customer_development(sales_opportunity_id)
+             WHERE sales_opportunity_id IS NOT NULL AND sales_opportunity_id<>'';
              CREATE INDEX IF NOT EXISTS idx_evidence_claims_scope
              ON evidence_claims(sales_opportunity_id,facility_id,task_key,status);",
         )?;
@@ -1185,8 +1405,8 @@ impl Db {
         let membership_id = Uuid::new_v4().to_string();
         conn.execute(
             "INSERT INTO brand_account_memberships
-             (id,market_account_id,brand,lead_id,status,priority_tier,created_at,updated_at)
-             VALUES (?1,?2,?3,?4,?5,'hard',?6,?6)
+             (id,market_account_id,brand,lead_id,status,evidence_tier,created_at,updated_at)
+             VALUES (?1,?2,?3,?4,?5,'research_required',?6,?6)
              ON CONFLICT(market_account_id,brand) DO UPDATE SET
               lead_id=excluded.lead_id,status=excluded.status,updated_at=excluded.updated_at",
             params![
@@ -1436,11 +1656,6 @@ impl Db {
             !observations.is_empty(),
             !facility_id.is_empty(),
         );
-        let priority_tier = match evidence_status {
-            "action_ready" => "easy",
-            "discovery_ready" => "medium",
-            _ => "hard",
-        };
         let segment_id = choose_segment_id(
             &assessment.brand,
             &format!(
@@ -1501,7 +1716,7 @@ impl Db {
             system_concept: lead.system_concept.clone(),
             proof_offer: assessment.proof_fit.clone(),
             evidence_status: evidence_status.into(),
-            priority_tier: priority_tier.into(),
+            evidence_tier: evidence_status.into(),
             fit_score: assessment.fit_score,
             status: if evidence_status == "research_required" {
                 "research".into()
@@ -1803,7 +2018,7 @@ impl Db {
                 "INSERT INTO sales_opportunities
              (id,identity_key,task_key,brand,market_account_id,lead_id,segment_id,facility_id,play_id,kind,title,
               task_or_decision,mechanism,consequence,system_concept,proof_offer,evidence_status,
-              priority_tier,fit_score,status,evidence_gaps,created_at,updated_at)
+              evidence_tier,fit_score,status,evidence_gaps,created_at,updated_at)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?22)",
                 params![
                     id,
@@ -1823,7 +2038,7 @@ impl Db {
                     opportunity.system_concept,
                     opportunity.proof_offer,
                     status_or(&opportunity.evidence_status, "research_required"),
-                    status_or(&opportunity.priority_tier, "hard"),
+                    status_or(&opportunity.evidence_tier, "research_required"),
                     opportunity.fit_score.clamp(0, 100),
                     status_or(&opportunity.status, "research"),
                     js(&opportunity.evidence_gaps),
@@ -1838,7 +2053,7 @@ impl Db {
               identity_key=?2,task_key=?3,market_account_id=?4,segment_id=?5,
               facility_id=?6,kind=?7,title=?8,task_or_decision=?9,mechanism=?10,
               consequence=?11,system_concept=?12,proof_offer=?13,evidence_status=?14,
-              priority_tier=?15,fit_score=?16,status=?17,evidence_gaps=?18,
+              evidence_tier=?15,fit_score=?16,status=?17,evidence_gaps=?18,
               updated_at=?19 WHERE id=?1",
             params![
                 id,
@@ -1855,7 +2070,7 @@ impl Db {
                 opportunity.system_concept,
                 opportunity.proof_offer,
                 status_or(&opportunity.evidence_status, "research_required"),
-                status_or(&opportunity.priority_tier, "hard"),
+                status_or(&opportunity.evidence_tier, "research_required"),
                 opportunity.fit_score.clamp(0, 100),
                 status_or(&opportunity.status, "research"),
                 js(&opportunity.evidence_gaps),
@@ -1863,12 +2078,12 @@ impl Db {
             ],
         )?;
         conn.execute(
-            "UPDATE brand_account_memberships SET priority_tier=?3,status=?4,updated_at=?5
+            "UPDATE brand_account_memberships SET evidence_tier=?3,status=?4,updated_at=?5
              WHERE brand=?1 AND lead_id=?2",
             params![
                 opportunity.brand,
                 opportunity.lead_id,
-                status_or(&opportunity.priority_tier, "hard"),
+                status_or(&opportunity.evidence_tier, "research_required"),
                 status_or(&opportunity.status, "research"),
                 timestamp,
             ],
@@ -1894,7 +2109,7 @@ impl Db {
         let mut stmt = conn.prepare(
             "SELECT * FROM sales_opportunities
              WHERE (?1 IS NULL OR brand=?1) AND (?2 IS NULL OR lead_id=?2)
-             ORDER BY CASE priority_tier WHEN 'easy' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
+             ORDER BY CASE evidence_tier WHEN 'action_ready' THEN 0 WHEN 'discovery_ready' THEN 1 ELSE 2 END,
                       fit_score DESC,updated_at DESC",
         )?;
         let rows = stmt.query_map(params![brand, lead_id], |row| {
@@ -1913,10 +2128,349 @@ impl Db {
         conn.query_row(
             "SELECT * FROM sales_opportunities
              WHERE brand=?1 AND lead_id=?2 AND play_id=?3 AND status<>'rejected'
-             ORDER BY CASE priority_tier WHEN 'easy' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
+             ORDER BY CASE evidence_tier WHEN 'action_ready' THEN 0 WHEN 'discovery_ready' THEN 1 ELSE 2 END,
                       fit_score DESC,updated_at DESC LIMIT 1",
             params![brand, lead_id, play_id],
             |row| Ok(row_to_sales_opportunity(row)),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Append a new current commercial assessment and supersede the previous
+    /// snapshot atomically. This never fabricates missing money/timing fields;
+    /// callers pass SQL NULL through Rust Option for every unknown.
+    pub fn upsert_commercial_assessment(
+        &self,
+        assessment: &CommercialAssessment,
+    ) -> Result<String> {
+        validate_commercial_assessment(assessment)?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let opportunity_brand: Option<String> = tx
+            .query_row(
+                "SELECT brand FROM sales_opportunities WHERE id=?1 AND status<>'rejected'",
+                params![assessment.sales_opportunity_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if opportunity_brand.as_deref() != Some(assessment.brand.as_str()) {
+            anyhow::bail!("commercial assessment must match an existing opportunity and brand");
+        }
+        if matches!(assessment.sales_stage.as_str(), "paid_pilot" | "won") {
+            let payment_kinds: &[&str] = if assessment.sales_stage == "won" {
+                &["contract_won"]
+            } else {
+                &["deposit_paid", "pilot_paid", "cash_collected"]
+            };
+            let placeholders = payment_kinds
+                .iter()
+                .map(|kind| format!("'{}'", kind.replace('\'', "''")))
+                .collect::<Vec<_>>()
+                .join(",");
+            let paid: i64 = tx.query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM commercial_events
+                     WHERE sales_opportunity_id=?1 AND kind IN ({placeholders})"
+                ),
+                params![assessment.sales_opportunity_id],
+                |row| row.get(0),
+            )?;
+            if paid == 0 {
+                anyhow::bail!(
+                    "sales stage '{}' requires a recorded commercial payment or contract event",
+                    assessment.sales_stage
+                );
+            }
+        }
+        let version: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(version),0)+1 FROM commercial_assessments
+             WHERE sales_opportunity_id=?1",
+            params![assessment.sales_opportunity_id],
+            |row| row.get(0),
+        )?;
+        let timestamp = now();
+        tx.execute(
+            "UPDATE commercial_assessments SET lifecycle='superseded',updated_at=?2
+             WHERE sales_opportunity_id=?1 AND lifecycle='current'",
+            params![assessment.sales_opportunity_id, timestamp],
+        )?;
+        let id = if assessment.id.trim().is_empty() {
+            Uuid::new_v4().to_string()
+        } else {
+            assessment.id.clone()
+        };
+        tx.execute(
+            "INSERT INTO commercial_assessments
+             (id,sales_opportunity_id,brand,version,commercial_lane,offer_key,sales_stage,
+              expected_contract_value_cents,expected_upfront_cash_cents,
+              cash_collectable_within_90d_cents,expected_arr_cents,
+              estimated_12m_gross_profit_cents,days_to_first_cash,close_probability_bps,
+              sales_hours_remaining,estimated_founder_hours,delivery_hours,
+              unpaid_delivery_hours,gross_margin_bps,procurement_complexity,
+              integration_complexity,delivery_risk,current_trigger,buyer_access,budget_path,
+              budget_owner_status,champion_status,champion_strength,executive_sponsor_status,
+              compelling_event,payment_structure,next_commitment,next_action,next_action_due_at,
+              target_close_date,stalled_reason,estimate_basis,assessment_source,assessment_confidence,
+              lifecycle,created_at,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,
+                     ?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,
+                     ?30,?31,?32,?33,?34,?35,?36,?37,?38,?39,'current',?40,?40)",
+            params![
+                id,
+                assessment.sales_opportunity_id,
+                assessment.brand,
+                version,
+                status_or(&assessment.commercial_lane, "unassessed"),
+                assessment.offer_key,
+                status_or(&assessment.sales_stage, "mapped"),
+                assessment.expected_contract_value_cents,
+                assessment.expected_upfront_cash_cents,
+                assessment.cash_collectable_within_90d_cents,
+                assessment.expected_arr_cents,
+                assessment.estimated_12m_gross_profit_cents,
+                assessment.days_to_first_cash,
+                assessment.close_probability_bps,
+                assessment.sales_hours_remaining,
+                assessment.estimated_founder_hours,
+                assessment.delivery_hours,
+                assessment.unpaid_delivery_hours,
+                assessment.gross_margin_bps,
+                status_or(&assessment.procurement_complexity, "unknown"),
+                status_or(&assessment.integration_complexity, "unknown"),
+                status_or(&assessment.delivery_risk, "unknown"),
+                assessment.current_trigger,
+                status_or(&assessment.buyer_access, "unknown"),
+                assessment.budget_path,
+                status_or(&assessment.budget_owner_status, "unknown"),
+                status_or(&assessment.champion_status, "unknown"),
+                status_or(&assessment.champion_strength, "unknown"),
+                status_or(&assessment.executive_sponsor_status, "unknown"),
+                assessment.compelling_event,
+                assessment.payment_structure,
+                assessment.next_commitment,
+                assessment.next_action,
+                assessment.next_action_due_at,
+                assessment.target_close_date,
+                assessment.stalled_reason,
+                js(&assessment.estimate_basis),
+                status_or(&assessment.assessment_source, "manual"),
+                status_or(&assessment.assessment_confidence, "unknown"),
+                timestamp,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// Lane-first commercial queue. This deliberately does not collapse a
+    /// survival portfolio into one whale-biased score.
+    pub fn list_commercial_assessments(
+        &self,
+        brand: Option<&str>,
+    ) -> Result<Vec<CommercialAssessment>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT * FROM commercial_assessments
+             WHERE lifecycle='current' AND (?1 IS NULL OR brand=?1)
+             ORDER BY CASE commercial_lane
+               WHEN 'cash_now' THEN 0 WHEN 'core' THEN 1 WHEN 'strategic' THEN 2
+               WHEN 'parked' THEN 4 ELSE 3 END,
+               CASE WHEN next_action_due_at<>'' AND next_action_due_at<=?2 THEN 0 ELSE 1 END,
+               CASE WHEN days_to_first_cash IS NULL THEN 1 ELSE 0 END,
+               days_to_first_cash ASC,updated_at DESC",
+        )?;
+        let rows = stmt.query_map(params![brand, now()], |row| {
+            Ok(row_to_commercial_assessment(row))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn record_commercial_event(&self, event: &CommercialEvent) -> Result<String> {
+        validate_commercial_event(event)?;
+        let conn = self.conn.lock().unwrap();
+        let opportunity_brand: Option<String> = conn
+            .query_row(
+                "SELECT brand FROM sales_opportunities WHERE id=?1",
+                params![event.sales_opportunity_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if opportunity_brand.as_deref() != Some(event.brand.as_str()) {
+            anyhow::bail!("commercial event must match an existing opportunity and brand");
+        }
+        if !event.external_ref.trim().is_empty() {
+            let existing: Option<String> = conn
+                .query_row(
+                    "SELECT id FROM commercial_events WHERE brand=?1 AND external_ref=?2",
+                    params![event.brand, event.external_ref],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(id) = existing {
+                return Ok(id);
+            }
+        }
+        let id = if event.id.trim().is_empty() {
+            Uuid::new_v4().to_string()
+        } else {
+            event.id.clone()
+        };
+        conn.execute(
+            "INSERT INTO commercial_events
+             (id,sales_opportunity_id,brand,kind,amount_cents,currency,occurred_at,
+              source,external_ref,detail,created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            params![
+                id,
+                event.sales_opportunity_id,
+                event.brand,
+                event.kind,
+                event.amount_cents,
+                status_or(&event.currency, "CAD"),
+                status_or(&event.occurred_at, &now()),
+                event.source,
+                event.external_ref,
+                event.detail,
+                now(),
+            ],
+        )?;
+        Ok(id)
+    }
+
+    pub fn list_commercial_events(
+        &self,
+        brand: Option<&str>,
+        sales_opportunity_id: Option<&str>,
+    ) -> Result<Vec<CommercialEvent>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT * FROM commercial_events
+             WHERE (?1 IS NULL OR brand=?1)
+               AND (?2 IS NULL OR sales_opportunity_id=?2)
+             ORDER BY occurred_at DESC,created_at DESC",
+        )?;
+        let rows = stmt.query_map(params![brand, sales_opportunity_id], |row| {
+            Ok(row_to_commercial_event(row))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn commercial_forecast(&self, brand: Option<&str>) -> Result<CommercialForecast> {
+        let assessments = self.list_commercial_assessments(brand)?;
+        let events = self.list_commercial_events(brand, None)?;
+        let operating_state = match brand {
+            Some(brand) => self.commercial_operating_state(brand)?,
+            None => None,
+        };
+        let month = Utc::now().format("%Y-%m").to_string();
+        let cash_now_expected_90d_cents = assessments
+            .iter()
+            .filter(|assessment| assessment.commercial_lane == "cash_now")
+            .filter_map(|assessment| assessment.expected_cash_within_days(90))
+            .sum::<i64>();
+        let monthly_cash_need_cents = operating_state
+            .as_ref()
+            .and_then(|state| state.monthly_cash_need_cents);
+        Ok(CommercialForecast {
+            brand: brand.unwrap_or("all").to_string(),
+            cash_collected_month_cents: events
+                .iter()
+                .filter(|event| {
+                    event.kind == "cash_collected" && event.occurred_at.starts_with(&month)
+                })
+                .filter_map(|event| event.amount_cents)
+                .sum(),
+            monthly_cash_need_cents,
+            runway_months: operating_state
+                .as_ref()
+                .and_then(|state| state.runway_months),
+            expected_30d_cash_cents: assessments
+                .iter()
+                .filter_map(|assessment| assessment.expected_cash_within_days(30))
+                .sum(),
+            expected_90d_cash_cents: assessments
+                .iter()
+                .filter_map(|assessment| assessment.expected_cash_within_days(90))
+                .sum(),
+            expected_180d_cash_cents: assessments
+                .iter()
+                .filter_map(|assessment| assessment.expected_cash_within_days(180))
+                .sum(),
+            cash_now_expected_90d_cents,
+            cash_now_pipeline_coverage: monthly_cash_need_cents.and_then(|monthly_need| {
+                (monthly_need > 0)
+                    .then_some(cash_now_expected_90d_cents as f64 / (monthly_need * 3) as f64)
+            }),
+            assessed_opportunities: assessments.len(),
+            cash_now_opportunities: assessments
+                .iter()
+                .filter(|assessment| assessment.commercial_lane == "cash_now")
+                .count(),
+            core_opportunities: assessments
+                .iter()
+                .filter(|assessment| assessment.commercial_lane == "core")
+                .count(),
+            strategic_opportunities: assessments
+                .iter()
+                .filter(|assessment| assessment.commercial_lane == "strategic")
+                .count(),
+            stalled_without_dated_next_action: assessments
+                .iter()
+                .filter(|assessment| {
+                    !matches!(assessment.sales_stage.as_str(), "won" | "lost")
+                        && (assessment.next_action.trim().is_empty()
+                            || assessment.next_action_due_at.trim().is_empty())
+                })
+                .count(),
+        })
+    }
+
+    pub fn upsert_commercial_operating_state(
+        &self,
+        state: &CommercialOperatingState,
+    ) -> Result<()> {
+        validate_commercial_operating_state(state)?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO commercial_operating_state
+             (brand,runway_months,monthly_cash_need_cents,source,as_of,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6)
+             ON CONFLICT(brand) DO UPDATE SET runway_months=excluded.runway_months,
+               monthly_cash_need_cents=excluded.monthly_cash_need_cents,
+               source=excluded.source,as_of=excluded.as_of,updated_at=excluded.updated_at",
+            params![
+                state.brand,
+                state.runway_months,
+                state.monthly_cash_need_cents,
+                state.source,
+                status_or(&state.as_of, &now_date()),
+                now(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn commercial_operating_state(
+        &self,
+        brand: &str,
+    ) -> Result<Option<CommercialOperatingState>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT * FROM commercial_operating_state WHERE brand=?1",
+            params![brand],
+            |row| {
+                Ok(CommercialOperatingState {
+                    brand: g(row, "brand"),
+                    runway_months: row.get::<_, Option<f64>>("runway_months").unwrap_or(None),
+                    monthly_cash_need_cents: row
+                        .get::<_, Option<i64>>("monthly_cash_need_cents")
+                        .unwrap_or(None),
+                    source: g(row, "source"),
+                    as_of: g(row, "as_of"),
+                    updated_at: g(row, "updated_at"),
+                })
+            },
         )
         .optional()
         .map_err(Into::into)
@@ -2190,7 +2744,7 @@ impl Db {
                    AND gp.lifecycle IN ('proven','testing')
                  ORDER BY CASE gp.lifecycle WHEN 'proven' THEN 0 ELSE 1 END,
                           gp.version DESC,
-                          CASE o.priority_tier WHEN 'easy' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
+                          CASE o.evidence_tier WHEN 'action_ready' THEN 0 WHEN 'discovery_ready' THEN 1 ELSE 2 END,
                           o.fit_score DESC,o.updated_at DESC LIMIT 1",
                 params![p.brand, p.lead_id],
                 |row| row.get(0),
@@ -5676,14 +6230,48 @@ impl Db {
         &self,
         record: &CustomerDevelopmentRecord,
     ) -> Result<String> {
-        if record.brand.trim().is_empty() || record.lead_id.trim().is_empty() {
-            anyhow::bail!("customer development requires brand and lead_id");
+        if record.brand.trim().is_empty()
+            || record.lead_id.trim().is_empty()
+            || record.sales_opportunity_id.trim().is_empty()
+        {
+            anyhow::bail!("customer development requires brand, lead, and sales opportunity");
         }
         let conn = self.conn.lock().unwrap();
+        let opportunity_scope: Option<(String, String)> = conn
+            .query_row(
+                "SELECT brand,lead_id FROM sales_opportunities WHERE id=?1",
+                params![record.sales_opportunity_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if opportunity_scope.as_ref() != Some(&(record.brand.clone(), record.lead_id.clone())) {
+            anyhow::bail!("customer development scope does not match its sales opportunity");
+        }
+        let commitment = crate::gtm::normalize_commitment_kind(&record.commitment_kind);
+        if matches!(commitment, "paid_pilot" | "deployment") {
+            let required_kind = if commitment == "deployment" {
+                "contract_won"
+            } else {
+                "pilot_paid"
+            };
+            let truth_events: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM commercial_events
+                 WHERE sales_opportunity_id=?1 AND kind=?2",
+                params![record.sales_opportunity_id, required_kind],
+                |row| row.get(0),
+            )?;
+            if truth_events == 0 {
+                anyhow::bail!(
+                    "commitment '{}' requires a recorded '{}' commercial event",
+                    commitment,
+                    required_kind
+                );
+            }
+        }
         let existing: Option<String> = conn
             .query_row(
-                "SELECT id FROM customer_development WHERE brand=?1 AND lead_id=?2",
-                params![record.brand, record.lead_id],
+                "SELECT id FROM customer_development WHERE sales_opportunity_id=?1",
+                params![record.sales_opportunity_id],
                 |row| row.get(0),
             )
             .optional()?;
@@ -5697,14 +6285,15 @@ impl Db {
         let timestamp = now();
         conn.execute(
             "INSERT INTO customer_development
-             (id,brand,lead_id,person_id,conversation_id,stage,problem,task_scope,site,
+             (id,brand,lead_id,sales_opportunity_id,person_id,conversation_id,stage,problem,task_scope,site,
               current_workflow,why_manual,variations,exceptions,evidence,economics,
               success_criteria,stop_condition,stakeholders,commitment_kind,commitment_detail,
               quantity,commercial_case,timeline,loi_conditions,next_action,engaged_at,source,
               created_at,updated_at)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,
-                     ?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?28)
-             ON CONFLICT(brand,lead_id) DO UPDATE SET
+                     ?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?29)
+             ON CONFLICT(id) DO UPDATE SET
+              sales_opportunity_id=excluded.sales_opportunity_id,
               person_id=excluded.person_id,conversation_id=excluded.conversation_id,
               stage=excluded.stage,problem=excluded.problem,task_scope=excluded.task_scope,
               site=excluded.site,current_workflow=excluded.current_workflow,
@@ -5722,6 +6311,7 @@ impl Db {
                 id,
                 record.brand,
                 record.lead_id,
+                record.sales_opportunity_id,
                 record.person_id,
                 record.conversation_id,
                 status_or(&record.stage, "hypothesis"),
@@ -5759,8 +6349,23 @@ impl Db {
     ) -> Result<Option<CustomerDevelopmentRecord>> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT * FROM customer_development WHERE brand=?1 AND lead_id=?2",
+            "SELECT * FROM customer_development WHERE brand=?1 AND lead_id=?2
+             ORDER BY updated_at DESC LIMIT 1",
             params![brand, lead_id],
+            |row| Ok(row_to_customer_development(row)),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn customer_development_for_opportunity(
+        &self,
+        sales_opportunity_id: &str,
+    ) -> Result<Option<CustomerDevelopmentRecord>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT * FROM customer_development WHERE sales_opportunity_id=?1 LIMIT 1",
+            params![sales_opportunity_id],
             |row| Ok(row_to_customer_development(row)),
         )
         .optional()
@@ -6012,7 +6617,7 @@ fn row_to_sales_opportunity(r: &Row) -> SalesOpportunity {
         system_concept: g(r, "system_concept"),
         proof_offer: g(r, "proof_offer"),
         evidence_status: g(r, "evidence_status"),
-        priority_tier: g(r, "priority_tier"),
+        evidence_tier: g(r, "evidence_tier"),
         fit_score: r.get("fit_score").unwrap_or(0),
         status: g(r, "status"),
         evidence_gaps: jd(&g(r, "evidence_gaps")),
@@ -6021,6 +6626,89 @@ fn row_to_sales_opportunity(r: &Row) -> SalesOpportunity {
     };
     enforce_sales_opportunity_boundaries(&mut opportunity);
     opportunity
+}
+
+fn row_to_commercial_assessment(r: &Row) -> CommercialAssessment {
+    CommercialAssessment {
+        id: g(r, "id"),
+        sales_opportunity_id: g(r, "sales_opportunity_id"),
+        brand: g(r, "brand"),
+        version: r.get("version").unwrap_or(0),
+        commercial_lane: g(r, "commercial_lane"),
+        offer_key: g(r, "offer_key"),
+        sales_stage: g(r, "sales_stage"),
+        expected_contract_value_cents: r
+            .get::<_, Option<i64>>("expected_contract_value_cents")
+            .unwrap_or(None),
+        expected_upfront_cash_cents: r
+            .get::<_, Option<i64>>("expected_upfront_cash_cents")
+            .unwrap_or(None),
+        cash_collectable_within_90d_cents: r
+            .get::<_, Option<i64>>("cash_collectable_within_90d_cents")
+            .unwrap_or(None),
+        expected_arr_cents: r
+            .get::<_, Option<i64>>("expected_arr_cents")
+            .unwrap_or(None),
+        estimated_12m_gross_profit_cents: r
+            .get::<_, Option<i64>>("estimated_12m_gross_profit_cents")
+            .unwrap_or(None),
+        days_to_first_cash: r
+            .get::<_, Option<i64>>("days_to_first_cash")
+            .unwrap_or(None),
+        close_probability_bps: r
+            .get::<_, Option<i64>>("close_probability_bps")
+            .unwrap_or(None),
+        sales_hours_remaining: r
+            .get::<_, Option<i64>>("sales_hours_remaining")
+            .unwrap_or(None),
+        estimated_founder_hours: r
+            .get::<_, Option<i64>>("estimated_founder_hours")
+            .unwrap_or(None),
+        delivery_hours: r.get::<_, Option<i64>>("delivery_hours").unwrap_or(None),
+        unpaid_delivery_hours: r
+            .get::<_, Option<i64>>("unpaid_delivery_hours")
+            .unwrap_or(None),
+        gross_margin_bps: r.get::<_, Option<i64>>("gross_margin_bps").unwrap_or(None),
+        procurement_complexity: g(r, "procurement_complexity"),
+        integration_complexity: g(r, "integration_complexity"),
+        delivery_risk: g(r, "delivery_risk"),
+        current_trigger: g(r, "current_trigger"),
+        buyer_access: g(r, "buyer_access"),
+        budget_path: g(r, "budget_path"),
+        budget_owner_status: g(r, "budget_owner_status"),
+        champion_status: g(r, "champion_status"),
+        champion_strength: g(r, "champion_strength"),
+        executive_sponsor_status: g(r, "executive_sponsor_status"),
+        compelling_event: g(r, "compelling_event"),
+        payment_structure: g(r, "payment_structure"),
+        next_commitment: g(r, "next_commitment"),
+        next_action: g(r, "next_action"),
+        next_action_due_at: g(r, "next_action_due_at"),
+        target_close_date: g(r, "target_close_date"),
+        stalled_reason: g(r, "stalled_reason"),
+        estimate_basis: jd(&g(r, "estimate_basis")),
+        assessment_source: g(r, "assessment_source"),
+        assessment_confidence: g(r, "assessment_confidence"),
+        lifecycle: g(r, "lifecycle"),
+        created_at: g(r, "created_at"),
+        updated_at: g(r, "updated_at"),
+    }
+}
+
+fn row_to_commercial_event(r: &Row) -> CommercialEvent {
+    CommercialEvent {
+        id: g(r, "id"),
+        sales_opportunity_id: g(r, "sales_opportunity_id"),
+        brand: g(r, "brand"),
+        kind: g(r, "kind"),
+        amount_cents: r.get::<_, Option<i64>>("amount_cents").unwrap_or(None),
+        currency: g(r, "currency"),
+        occurred_at: g(r, "occurred_at"),
+        source: g(r, "source"),
+        external_ref: g(r, "external_ref"),
+        detail: g(r, "detail"),
+        created_at: g(r, "created_at"),
+    }
 }
 
 fn row_to_evidence_claim(r: &Row) -> EvidenceClaim {
@@ -6322,6 +7010,7 @@ fn row_to_customer_development(r: &Row) -> CustomerDevelopmentRecord {
         id: g(r, "id"),
         brand: g(r, "brand"),
         lead_id: g(r, "lead_id"),
+        sales_opportunity_id: g(r, "sales_opportunity_id"),
         person_id: g(r, "person_id"),
         conversation_id: g(r, "conversation_id"),
         stage: g(r, "stage"),
@@ -6966,7 +7655,7 @@ fn enforce_sales_opportunity_boundaries(opportunity: &mut SalesOpportunity) {
         return;
     }
     opportunity.evidence_status = "research_required".into();
-    opportunity.priority_tier = "hard".into();
+    opportunity.evidence_tier = "research_required".into();
     if opportunity.status != "rejected" {
         opportunity.status = "research".into();
     }
@@ -7221,6 +7910,195 @@ fn stakeholder_decision_scope(role: &str) -> &'static str {
     }
 }
 
+fn validate_commercial_assessment(assessment: &CommercialAssessment) -> Result<()> {
+    if assessment.sales_opportunity_id.trim().is_empty() || assessment.brand.trim().is_empty() {
+        anyhow::bail!("commercial assessment requires opportunity and brand");
+    }
+    if !matches!(
+        assessment.commercial_lane.trim(),
+        "unassessed" | "cash_now" | "core" | "strategic" | "parked"
+    ) {
+        anyhow::bail!("unsupported commercial lane '{}'; use unassessed, cash_now, core, strategic, or parked", assessment.commercial_lane);
+    }
+    if !matches!(
+        assessment.sales_stage.trim(),
+        "mapped"
+            | "contacted"
+            | "discovery"
+            | "scoped"
+            | "proposal"
+            | "procurement"
+            | "paid_pilot"
+            | "won"
+            | "lost"
+    ) {
+        anyhow::bail!(
+            "unsupported commercial sales stage '{}';",
+            assessment.sales_stage
+        );
+    }
+    for (label, value) in [
+        (
+            "expected_contract_value_cents",
+            assessment.expected_contract_value_cents,
+        ),
+        (
+            "expected_upfront_cash_cents",
+            assessment.expected_upfront_cash_cents,
+        ),
+        (
+            "cash_collectable_within_90d_cents",
+            assessment.cash_collectable_within_90d_cents,
+        ),
+        ("expected_arr_cents", assessment.expected_arr_cents),
+        (
+            "estimated_12m_gross_profit_cents",
+            assessment.estimated_12m_gross_profit_cents,
+        ),
+        ("days_to_first_cash", assessment.days_to_first_cash),
+        ("sales_hours_remaining", assessment.sales_hours_remaining),
+        (
+            "estimated_founder_hours",
+            assessment.estimated_founder_hours,
+        ),
+        ("delivery_hours", assessment.delivery_hours),
+        ("unpaid_delivery_hours", assessment.unpaid_delivery_hours),
+    ] {
+        if value.is_some_and(|value| value < 0) {
+            anyhow::bail!("{label} cannot be negative");
+        }
+    }
+    for (label, value) in [
+        ("close_probability_bps", assessment.close_probability_bps),
+        ("gross_margin_bps", assessment.gross_margin_bps),
+    ] {
+        if value.is_some_and(|value| !(0..=10_000).contains(&value)) {
+            anyhow::bail!("{label} must be between 0 and 10000 basis points");
+        }
+    }
+    let has_estimate = assessment.expected_contract_value_cents.is_some()
+        || assessment.expected_upfront_cash_cents.is_some()
+        || assessment.cash_collectable_within_90d_cents.is_some()
+        || assessment.expected_arr_cents.is_some()
+        || assessment.estimated_12m_gross_profit_cents.is_some()
+        || assessment.days_to_first_cash.is_some()
+        || assessment.close_probability_bps.is_some()
+        || assessment.sales_hours_remaining.is_some()
+        || assessment.estimated_founder_hours.is_some()
+        || assessment.delivery_hours.is_some()
+        || assessment.unpaid_delivery_hours.is_some()
+        || assessment.gross_margin_bps.is_some();
+    if has_estimate
+        && (assessment.estimate_basis.is_empty()
+            || assessment.assessment_source.trim().is_empty()
+            || assessment.assessment_confidence.trim().is_empty()
+            || assessment.assessment_confidence == "unknown")
+    {
+        anyhow::bail!(
+            "commercial estimates require explicit basis, source, and non-unknown confidence"
+        );
+    }
+    let source = assessment.assessment_source.to_ascii_lowercase();
+    if source.contains("model") || source.contains("llm") || source.contains("generated") {
+        anyhow::bail!("a model-generated assessment cannot authorize commercial estimates");
+    }
+    if assessment.commercial_lane == "strategic"
+        && assessment.sales_stage != "lost"
+        && assessment.sales_stage != "mapped"
+    {
+        let missing_gate = assessment.champion_status.trim().is_empty()
+            || assessment.champion_status == "unknown"
+            || assessment.champion_strength.trim().is_empty()
+            || assessment.champion_strength == "unknown"
+            || assessment.executive_sponsor_status.trim().is_empty()
+            || assessment.executive_sponsor_status == "unknown"
+            || assessment.compelling_event.trim().is_empty()
+            || assessment.budget_path.trim().is_empty()
+            || assessment.procurement_complexity.trim().is_empty()
+            || assessment.procurement_complexity == "unknown"
+            || assessment.payment_structure.trim().is_empty();
+        if missing_gate {
+            anyhow::bail!(
+                "an active strategic pursuit requires a champion, executive sponsor, compelling event, procurement path, and paid-phase structure"
+            );
+        }
+        if assessment.estimated_founder_hours.is_none() {
+            anyhow::bail!("an active strategic pursuit requires a bounded founder-hours estimate");
+        }
+    }
+    if !matches!(assessment.sales_stage.as_str(), "mapped" | "won" | "lost")
+        && (assessment.next_commitment.trim().is_empty()
+            || assessment.next_action_due_at.trim().is_empty())
+        && assessment.stalled_reason.trim().is_empty()
+    {
+        anyhow::bail!(
+            "an active commercial stage requires a dated next commitment or an explicit stalled reason"
+        );
+    }
+    Ok(())
+}
+
+fn validate_commercial_event(event: &CommercialEvent) -> Result<()> {
+    if event.sales_opportunity_id.trim().is_empty()
+        || event.brand.trim().is_empty()
+        || event.kind.trim().is_empty()
+        || event.source.trim().is_empty()
+    {
+        anyhow::bail!("commercial event requires opportunity, brand, kind, and source");
+    }
+    if !matches!(
+        event.kind.as_str(),
+        "proposal_issued"
+            | "deposit_requested"
+            | "deposit_paid"
+            | "pilot_paid"
+            | "contract_won"
+            | "cash_collected"
+            | "contract_lost"
+            | "refund_issued"
+    ) {
+        anyhow::bail!("unsupported commercial event kind '{}';", event.kind);
+    }
+    if event.amount_cents.is_some_and(|amount| amount < 0) {
+        anyhow::bail!("commercial event amount cannot be negative");
+    }
+    if matches!(
+        event.kind.as_str(),
+        "deposit_paid" | "pilot_paid" | "cash_collected" | "refund_issued"
+    ) && event.amount_cents.is_none_or(|amount| amount <= 0)
+    {
+        anyhow::bail!("payment and refund events require a positive amount");
+    }
+    let source = event.source.to_ascii_lowercase();
+    if source.contains("model") || source.contains("llm") || source.contains("generated") {
+        anyhow::bail!("a model cannot create a commercial truth event");
+    }
+    Ok(())
+}
+
+fn validate_commercial_operating_state(state: &CommercialOperatingState) -> Result<()> {
+    if state.brand.trim().is_empty() || state.source.trim().is_empty() {
+        anyhow::bail!("commercial operating state requires brand and source");
+    }
+    let source = state.source.to_ascii_lowercase();
+    if source.contains("model") || source.contains("llm") || source.contains("generated") {
+        anyhow::bail!("a model cannot set runway or cash requirements");
+    }
+    if state
+        .runway_months
+        .is_some_and(|months| !months.is_finite() || months < 0.0)
+    {
+        anyhow::bail!("runway months must be a non-negative finite number");
+    }
+    if state
+        .monthly_cash_need_cents
+        .is_some_and(|amount| amount < 0)
+    {
+        anyhow::bail!("monthly cash need cannot be negative");
+    }
+    Ok(())
+}
+
 fn source_domain(raw: &str) -> String {
     canonical_domain(raw)
         .split(':')
@@ -7330,16 +8208,93 @@ fn normalize_linkedin_status(status: &str) -> &'static str {
     }
 }
 
-fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str) -> Result<()> {
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let names = stmt
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    if !names.iter().any(|name| name == column) {
+    Ok(names.iter().any(|name| name == column))
+}
+
+fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str) -> Result<()> {
+    if !column_exists(conn, table, column)? {
         conn.execute_batch(&format!(
             "ALTER TABLE {table} ADD COLUMN {column} {definition}"
         ))?;
     }
+    Ok(())
+}
+
+fn migrate_customer_development_to_opportunities(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "BEGIN IMMEDIATE;
+         ALTER TABLE customer_development RENAME TO customer_development_account_legacy;
+         CREATE TABLE customer_development (
+           id TEXT PRIMARY KEY,
+           brand TEXT NOT NULL,
+           lead_id TEXT NOT NULL,
+           sales_opportunity_id TEXT,
+           person_id TEXT DEFAULT '',
+           conversation_id TEXT DEFAULT '',
+           stage TEXT NOT NULL DEFAULT 'hypothesis',
+           problem TEXT DEFAULT '',
+           task_scope TEXT DEFAULT '',
+           site TEXT DEFAULT '',
+           current_workflow TEXT DEFAULT '',
+           why_manual TEXT DEFAULT '',
+           variations TEXT DEFAULT '[]',
+           exceptions TEXT DEFAULT '[]',
+           evidence TEXT DEFAULT '[]',
+           economics TEXT DEFAULT '',
+           success_criteria TEXT DEFAULT '',
+           stop_condition TEXT DEFAULT '',
+           stakeholders TEXT DEFAULT '[]',
+           commitment_kind TEXT NOT NULL DEFAULT 'none',
+           commitment_detail TEXT DEFAULT '',
+           quantity TEXT DEFAULT '',
+           commercial_case TEXT DEFAULT '',
+           timeline TEXT DEFAULT '',
+           loi_conditions TEXT DEFAULT '',
+           next_action TEXT DEFAULT '',
+           engaged_at TEXT DEFAULT '',
+           source TEXT NOT NULL DEFAULT 'manual_crm',
+           created_at TEXT NOT NULL,
+           updated_at TEXT NOT NULL,
+           FOREIGN KEY(lead_id) REFERENCES leads(id),
+           FOREIGN KEY(sales_opportunity_id) REFERENCES sales_opportunities(id)
+         );
+         INSERT INTO customer_development (
+           id,brand,lead_id,sales_opportunity_id,person_id,conversation_id,stage,
+           problem,task_scope,site,current_workflow,why_manual,variations,exceptions,
+           evidence,economics,success_criteria,stop_condition,stakeholders,
+           commitment_kind,commitment_detail,quantity,commercial_case,timeline,
+           loi_conditions,next_action,engaged_at,source,created_at,updated_at
+         )
+         SELECT legacy.id,legacy.brand,legacy.lead_id,
+           (SELECT o.id FROM sales_opportunities o
+            WHERE o.brand=legacy.brand AND o.lead_id=legacy.lead_id
+              AND o.status<>'rejected'
+            ORDER BY CASE o.evidence_status
+              WHEN 'action_ready' THEN 0 WHEN 'discovery_ready' THEN 1 ELSE 2 END,
+              o.fit_score DESC,o.updated_at DESC LIMIT 1),
+           legacy.person_id,legacy.conversation_id,legacy.stage,legacy.problem,
+           legacy.task_scope,legacy.site,legacy.current_workflow,legacy.why_manual,
+           legacy.variations,legacy.exceptions,legacy.evidence,legacy.economics,
+           legacy.success_criteria,legacy.stop_condition,legacy.stakeholders,
+           legacy.commitment_kind,legacy.commitment_detail,legacy.quantity,
+           legacy.commercial_case,legacy.timeline,legacy.loi_conditions,
+           legacy.next_action,legacy.engaged_at,legacy.source,legacy.created_at,
+           legacy.updated_at
+         FROM customer_development_account_legacy legacy;
+         DROP TABLE customer_development_account_legacy;
+         CREATE INDEX idx_customer_development_stage
+           ON customer_development(brand,stage,updated_at);
+         CREATE UNIQUE INDEX idx_customer_development_opportunity
+           ON customer_development(sales_opportunity_id)
+           WHERE sales_opportunity_id IS NOT NULL AND sales_opportunity_id<>'';
+         COMMIT;",
+    )
+    .context("migrating customer development from account to opportunity scope")?;
     Ok(())
 }
 
@@ -7610,7 +8565,7 @@ CREATE TABLE IF NOT EXISTS brand_account_memberships (
     brand TEXT NOT NULL,
     lead_id TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'research',
-    priority_tier TEXT NOT NULL DEFAULT 'hard',
+    evidence_tier TEXT NOT NULL DEFAULT 'research_required',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE(market_account_id,brand),
@@ -7703,7 +8658,7 @@ CREATE TABLE IF NOT EXISTS sales_opportunities (
     system_concept TEXT DEFAULT '',
     proof_offer TEXT DEFAULT '',
     evidence_status TEXT NOT NULL DEFAULT 'research_required',
-    priority_tier TEXT NOT NULL DEFAULT 'hard',
+    evidence_tier TEXT NOT NULL DEFAULT 'research_required',
     fit_score INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'research',
     evidence_gaps TEXT NOT NULL DEFAULT '[]',
@@ -7712,6 +8667,74 @@ CREATE TABLE IF NOT EXISTS sales_opportunities (
     UNIQUE(identity_key),
     FOREIGN KEY(market_account_id) REFERENCES market_accounts(id),
     FOREIGN KEY(lead_id) REFERENCES leads(id)
+);
+CREATE TABLE IF NOT EXISTS commercial_assessments (
+    id TEXT PRIMARY KEY,
+    sales_opportunity_id TEXT NOT NULL,
+    brand TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    commercial_lane TEXT NOT NULL DEFAULT 'unassessed',
+    offer_key TEXT DEFAULT '',
+    sales_stage TEXT NOT NULL DEFAULT 'mapped',
+    expected_contract_value_cents INTEGER,
+    expected_upfront_cash_cents INTEGER,
+    cash_collectable_within_90d_cents INTEGER,
+    expected_arr_cents INTEGER,
+    estimated_12m_gross_profit_cents INTEGER,
+    days_to_first_cash INTEGER,
+    close_probability_bps INTEGER,
+    sales_hours_remaining INTEGER,
+    estimated_founder_hours INTEGER,
+    delivery_hours INTEGER,
+    unpaid_delivery_hours INTEGER,
+    gross_margin_bps INTEGER,
+    procurement_complexity TEXT DEFAULT 'unknown',
+    integration_complexity TEXT DEFAULT 'unknown',
+    delivery_risk TEXT DEFAULT 'unknown',
+    current_trigger TEXT DEFAULT '',
+    buyer_access TEXT DEFAULT 'unknown',
+    budget_path TEXT DEFAULT '',
+    budget_owner_status TEXT DEFAULT 'unknown',
+    champion_status TEXT DEFAULT 'unknown',
+    champion_strength TEXT DEFAULT 'unknown',
+    executive_sponsor_status TEXT DEFAULT 'unknown',
+    compelling_event TEXT DEFAULT '',
+    payment_structure TEXT DEFAULT '',
+    next_commitment TEXT DEFAULT '',
+    next_action TEXT DEFAULT '',
+    next_action_due_at TEXT DEFAULT '',
+    target_close_date TEXT DEFAULT '',
+    stalled_reason TEXT DEFAULT '',
+    estimate_basis TEXT NOT NULL DEFAULT '[]',
+    assessment_source TEXT NOT NULL DEFAULT 'manual',
+    assessment_confidence TEXT NOT NULL DEFAULT 'unknown',
+    lifecycle TEXT NOT NULL DEFAULT 'current',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(sales_opportunity_id,version),
+    FOREIGN KEY(sales_opportunity_id) REFERENCES sales_opportunities(id)
+);
+CREATE TABLE IF NOT EXISTS commercial_events (
+    id TEXT PRIMARY KEY,
+    sales_opportunity_id TEXT NOT NULL,
+    brand TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    amount_cents INTEGER,
+    currency TEXT NOT NULL DEFAULT 'CAD',
+    occurred_at TEXT NOT NULL,
+    source TEXT NOT NULL,
+    external_ref TEXT DEFAULT '',
+    detail TEXT DEFAULT '',
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(sales_opportunity_id) REFERENCES sales_opportunities(id)
+);
+CREATE TABLE IF NOT EXISTS commercial_operating_state (
+    brand TEXT PRIMARY KEY,
+    runway_months REAL,
+    monthly_cash_need_cents INTEGER,
+    source TEXT NOT NULL,
+    as_of TEXT NOT NULL,
+    updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS evidence_claims (
     id TEXT PRIMARY KEY,
@@ -7757,8 +8780,6 @@ CREATE TABLE IF NOT EXISTS opportunity_stakeholders (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_cold_thread_per_sales_opportunity
 ON opportunity_stakeholders(sales_opportunity_id) WHERE active_thread=1;
-CREATE INDEX IF NOT EXISTS idx_sales_opportunities_brand_priority
-ON sales_opportunities(brand,priority_tier,fit_score DESC);
 CREATE INDEX IF NOT EXISTS idx_market_segment_accounts_account
 ON market_segment_accounts(market_account_id,segment_id);
 CREATE INDEX IF NOT EXISTS idx_evidence_claims_opportunity_type
@@ -7862,6 +8883,7 @@ CREATE TABLE IF NOT EXISTS customer_development (
     id TEXT PRIMARY KEY,
     brand TEXT NOT NULL,
     lead_id TEXT NOT NULL,
+    sales_opportunity_id TEXT,
     person_id TEXT DEFAULT '',
     conversation_id TEXT DEFAULT '',
     stage TEXT NOT NULL DEFAULT 'hypothesis',
@@ -7888,8 +8910,8 @@ CREATE TABLE IF NOT EXISTS customer_development (
     source TEXT NOT NULL DEFAULT 'manual_crm',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    UNIQUE(brand,lead_id),
-    FOREIGN KEY(lead_id) REFERENCES leads(id)
+    FOREIGN KEY(lead_id) REFERENCES leads(id),
+    FOREIGN KEY(sales_opportunity_id) REFERENCES sales_opportunities(id)
 );
 CREATE TABLE IF NOT EXISTS opportunities (
     id TEXT PRIMARY KEY,
@@ -7995,6 +9017,14 @@ CREATE INDEX IF NOT EXISTS idx_proof_briefs_brand
     ON proof_briefs(brand,status,updated_at);
 CREATE INDEX IF NOT EXISTS idx_customer_development_stage
     ON customer_development(brand,stage,updated_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_commercial_assessment_current
+    ON commercial_assessments(sales_opportunity_id) WHERE lifecycle='current';
+CREATE INDEX IF NOT EXISTS idx_commercial_assessment_queue
+    ON commercial_assessments(brand,lifecycle,commercial_lane,sales_stage,next_action_due_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_commercial_events_external_ref
+    ON commercial_events(brand,external_ref) WHERE external_ref<>'';
+CREATE INDEX IF NOT EXISTS idx_commercial_events_opportunity
+    ON commercial_events(sales_opportunity_id,occurred_at,kind);
 CREATE INDEX IF NOT EXISTS idx_replies_msgid ON replies(message_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_conversations_sequence
     ON conversations(sequence_id) WHERE sequence_id IS NOT NULL AND sequence_id<>'';
@@ -8027,10 +9057,10 @@ mod tests {
     use super::{
         all_declared_sources_exhausted, evidence_names_operating_site,
         facility_observation_for_task, AccountPlayAssessment, ApplicationBrief,
-        ConversationMessage, CustomerDevelopmentRecord, Db, EvidenceClaim, GtmExperiment,
-        GtmOutcome, Job, Lead, Mailbox, Meeting, Opportunity, OpportunityContact,
-        OpportunityStakeholder, OpportunityTouch, Person, SalesOpportunity, Sequence,
-        SignalObservation, Touch, CURRENT_COPY_POLICY_VERSION,
+        CommercialAssessment, CommercialEvent, ConversationMessage, CustomerDevelopmentRecord, Db,
+        EvidenceClaim, GtmExperiment, GtmOutcome, Job, Lead, Mailbox, Meeting, Opportunity,
+        OpportunityContact, OpportunityStakeholder, OpportunityTouch, Person, SalesOpportunity,
+        Sequence, SignalObservation, Touch, CURRENT_COPY_POLICY_VERSION,
     };
     use chrono::{TimeZone, Utc};
     use uuid::Uuid;
@@ -8071,13 +9101,13 @@ mod tests {
         let mut opportunity = SalesOpportunity {
             brand: "wapahki".into(),
             evidence_status: "discovery_ready".into(),
-            priority_tier: "medium".into(),
+            evidence_tier: "discovery_ready".into(),
             status: "mapped".into(),
             ..Default::default()
         };
         super::enforce_sales_opportunity_boundaries(&mut opportunity);
         assert_eq!(opportunity.evidence_status, "research_required");
-        assert_eq!(opportunity.priority_tier, "hard");
+        assert_eq!(opportunity.evidence_tier, "research_required");
         assert_eq!(opportunity.status, "research");
         assert!(opportunity
             .evidence_gaps
@@ -8803,7 +9833,7 @@ mod tests {
     }
 
     #[test]
-    fn customer_development_round_trips_and_updates_per_account() {
+    fn customer_development_round_trips_per_opportunity_without_collapsing_tasks() {
         let db = Db::open(":memory:").expect("open memory db");
         let lead_id = db
             .upsert_lead(&Lead {
@@ -8813,10 +9843,45 @@ mod tests {
                 ..Default::default()
             })
             .expect("insert lead");
+        let market_account_id = db
+            .market_account_for_lead(&lead_id)
+            .expect("market account query")
+            .expect("market account")
+            .id;
+        let play_id = db
+            .current_gtm_play("wapahki")
+            .expect("play query")
+            .expect("current play")
+            .id;
+        let case_opportunity = db
+            .upsert_sales_opportunity(&SalesOpportunity {
+                brand: "wapahki".into(),
+                market_account_id: market_account_id.clone(),
+                lead_id: lead_id.clone(),
+                play_id: play_id.clone(),
+                kind: "physical_task".into(),
+                title: "Case handling".into(),
+                task_or_decision: "Move finished cases from conveyor to pallet".into(),
+                ..Default::default()
+            })
+            .expect("case opportunity");
+        let packing_opportunity = db
+            .upsert_sales_opportunity(&SalesOpportunity {
+                brand: "wapahki".into(),
+                market_account_id,
+                lead_id: lead_id.clone(),
+                play_id,
+                kind: "physical_task".into(),
+                title: "Tray packing".into(),
+                task_or_decision: "Load sealed product into retail trays".into(),
+                ..Default::default()
+            })
+            .expect("packing opportunity");
         let id = db
             .upsert_customer_development(&CustomerDevelopmentRecord {
                 brand: "wapahki".into(),
                 lead_id: lead_id.clone(),
+                sales_opportunity_id: case_opportunity.clone(),
                 stage: "task_mapped".into(),
                 problem: "Manual case handling".into(),
                 task_scope: "Conveyor to pallet".into(),
@@ -8826,7 +9891,7 @@ mod tests {
             })
             .expect("insert discovery");
         let stored = db
-            .customer_development_for_lead("wapahki", &lead_id)
+            .customer_development_for_opportunity(&case_opportunity)
             .expect("read discovery")
             .expect("record exists");
         assert_eq!(stored.id, id);
@@ -8837,6 +9902,7 @@ mod tests {
                 id: id.clone(),
                 brand: "wapahki".into(),
                 lead_id: lead_id.clone(),
+                sales_opportunity_id: case_opportunity.clone(),
                 stage: "evaluation_agreed".into(),
                 problem: stored.problem,
                 commitment_kind: "evaluation_agreed".into(),
@@ -8845,12 +9911,178 @@ mod tests {
             })
             .expect("update discovery");
         assert_eq!(updated_id, id);
+        db.upsert_customer_development(&CustomerDevelopmentRecord {
+            brand: "wapahki".into(),
+            lead_id: lead_id.clone(),
+            sales_opportunity_id: packing_opportunity,
+            stage: "hypothesis".into(),
+            task_scope: "Retail tray loading".into(),
+            ..Default::default()
+        })
+        .expect("insert second task discovery");
         let rows = db
             .list_customer_development(Some("wapahki"))
             .expect("list discovery");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].stage, "evaluation_agreed");
-        assert_eq!(rows[0].commitment_kind, "evaluation_agreed");
+        assert_eq!(rows.len(), 2);
+        let updated = rows
+            .iter()
+            .find(|row| row.sales_opportunity_id == case_opportunity)
+            .expect("updated case task");
+        assert_eq!(updated.stage, "evaluation_agreed");
+        assert_eq!(updated.commitment_kind, "evaluation_agreed");
+    }
+
+    #[test]
+    fn commercial_assessments_are_versioned_unknown_safe_and_payment_gated() {
+        let db = Db::open(":memory:").expect("open memory db");
+        let lead_id = db
+            .upsert_lead(&Lead {
+                brand: "outagehub".into(),
+                apollo_org_id: "commercial-assessment-account".into(),
+                name: "Regional Charge Operator".into(),
+                domain: "regional-charge.example".into(),
+                ..Default::default()
+            })
+            .expect("insert lead");
+        let market_account_id = db
+            .market_account_for_lead(&lead_id)
+            .expect("account query")
+            .expect("market account")
+            .id;
+        let play_id = db
+            .current_gtm_play("outagehub")
+            .expect("play query")
+            .expect("current play")
+            .id;
+        let opportunity_id = db
+            .upsert_sales_opportunity(&SalesOpportunity {
+                brand: "outagehub".into(),
+                market_account_id,
+                lead_id: lead_id.clone(),
+                play_id,
+                kind: "outage_decision".into(),
+                title: "EV incident attribution".into(),
+                task_or_decision: "Triage charging incidents with utility context".into(),
+                evidence_status: "action_ready".into(),
+                evidence_tier: "action_ready".into(),
+                ..Default::default()
+            })
+            .expect("insert opportunity");
+
+        let unknowns = CommercialAssessment {
+            sales_opportunity_id: opportunity_id.clone(),
+            brand: "outagehub".into(),
+            commercial_lane: "strategic".into(),
+            offer_key: "enterprise_embedded_outage_data".into(),
+            sales_stage: "mapped".into(),
+            assessment_source: "manual_crm".into(),
+            assessment_confidence: "unknown".into(),
+            ..Default::default()
+        };
+        db.upsert_commercial_assessment(&unknowns)
+            .expect("unknown numbers remain valid unknowns");
+        let forecast = db
+            .commercial_forecast(Some("outagehub"))
+            .expect("unknown forecast");
+        assert_eq!(forecast.expected_30d_cash_cents, 0);
+        assert_eq!(forecast.strategic_opportunities, 1);
+
+        let unsupported = CommercialAssessment {
+            expected_upfront_cash_cents: Some(1_000_000),
+            close_probability_bps: Some(5_000),
+            days_to_first_cash: Some(60),
+            ..unknowns.clone()
+        };
+        assert!(db
+            .upsert_commercial_assessment(&unsupported)
+            .expect_err("numbers need a human basis")
+            .to_string()
+            .contains("explicit basis"));
+
+        let supported = CommercialAssessment {
+            commercial_lane: "cash_now".into(),
+            offer_key: "historical_location_replay".into(),
+            expected_upfront_cash_cents: Some(1_000_000),
+            close_probability_bps: Some(5_000),
+            days_to_first_cash: Some(60),
+            estimate_basis: vec!["Founder-selected offer midpoint and stage prior.".into()],
+            assessment_confidence: "hypothesis".into(),
+            next_action: "Confirm the incident sample owner.".into(),
+            next_action_due_at: "2026-08-20".into(),
+            ..unknowns.clone()
+        };
+        db.upsert_commercial_assessment(&supported)
+            .expect("supported commercial estimate");
+        let assessments = db
+            .list_commercial_assessments(Some("outagehub"))
+            .expect("commercial queue");
+        assert_eq!(assessments.len(), 1);
+        assert_eq!(assessments[0].version, 2);
+        assert_eq!(assessments[0].commercial_lane, "cash_now");
+        let forecast = db
+            .commercial_forecast(Some("outagehub"))
+            .expect("cash forecast");
+        assert_eq!(forecast.expected_30d_cash_cents, 250_000);
+        assert_eq!(forecast.expected_90d_cash_cents, 500_000);
+
+        let paid_stage = CommercialAssessment {
+            sales_stage: "paid_pilot".into(),
+            next_commitment: "Complete the paid replay and review results.".into(),
+            ..supported.clone()
+        };
+        assert!(db
+            .upsert_commercial_assessment(&paid_stage)
+            .expect_err("model state is not payment truth")
+            .to_string()
+            .contains("payment or contract event"));
+        assert!(db
+            .record_commercial_event(&CommercialEvent {
+                sales_opportunity_id: opportunity_id.clone(),
+                brand: "outagehub".into(),
+                kind: "pilot_paid".into(),
+                amount_cents: Some(1_000_000),
+                source: "llm_generated".into(),
+                ..Default::default()
+            })
+            .expect_err("a model cannot create payment truth")
+            .to_string()
+            .contains("model cannot"));
+        let event_id = db
+            .record_commercial_event(&CommercialEvent {
+                sales_opportunity_id: opportunity_id.clone(),
+                brand: "outagehub".into(),
+                kind: "pilot_paid".into(),
+                amount_cents: Some(1_000_000),
+                currency: "CAD".into(),
+                occurred_at: "2026-08-12T12:00:00Z".into(),
+                source: "manual_invoice_reconciliation".into(),
+                external_ref: "invoice-OH-001".into(),
+                detail: "Pilot invoice recorded as paid.".into(),
+                ..Default::default()
+            })
+            .expect("record real payment event");
+        let duplicate_id = db
+            .record_commercial_event(&CommercialEvent {
+                sales_opportunity_id: opportunity_id.clone(),
+                brand: "outagehub".into(),
+                kind: "pilot_paid".into(),
+                amount_cents: Some(1_000_000),
+                source: "manual_invoice_reconciliation".into(),
+                external_ref: "invoice-OH-001".into(),
+                ..Default::default()
+            })
+            .expect("payment reference is idempotent");
+        assert_eq!(duplicate_id, event_id);
+        db.upsert_commercial_assessment(&paid_stage)
+            .expect("payment event unlocks paid stage");
+        db.upsert_customer_development(&CustomerDevelopmentRecord {
+            brand: "outagehub".into(),
+            lead_id,
+            sales_opportunity_id: opportunity_id,
+            commitment_kind: "paid_pilot".into(),
+            ..Default::default()
+        })
+        .expect("customer stage can now use payment truth");
     }
 
     #[test]

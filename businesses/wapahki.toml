@@ -40,6 +40,77 @@ constraints = [
   "The automation-fit screen may be offered as a useful give-back. Never imply it proves feasibility or gate access to it behind a meeting.",
 ]
 
+[commercial]
+currency = "CAD"
+cash_constrained_below_runway_months = 6
+max_active_strategic = 3
+minimum_cash_now_pipeline_coverage = 3.0
+
+[commercial.cash_constrained_allocation]
+cash_now_share_bps = 7000
+core_share_bps = 2500
+strategic_share_bps = 500
+
+[commercial.stable_allocation]
+cash_now_share_bps = 6000
+core_share_bps = 3000
+strategic_share_bps = 1000
+
+[[commercial.offers]]
+key = "paid_task_feasibility_sprint"
+name = "Paid Task-Feasibility Sprint"
+lane = "cash_now"
+description = "A 5–10 business-day task and exception map, measured baseline, blocker analysis, automation boundary, rough economic model, and go/no-go recommendation for one named facility task."
+price_min_cents = 250000
+price_max_cents = 750000
+delivery_days_min = 5
+delivery_days_max = 10
+payment_structure = "Paid or deposit-backed before work begins; exact upfront cash remains unknown until agreed with the buyer."
+estimate_confidence = "hypothesis"
+estimate_basis = [
+  "Founder pricing hypothesis of CAD $2,500–$7,500 for a bounded feasibility sprint; not a proven market price or recorded transaction.",
+]
+requires = [
+  "One named facility, physical task, object/motion boundary, and operational owner.",
+  "Access to enough video, counts, samples, or observation to avoid inventing the baseline.",
+]
+success_criteria = [
+  "A documented automate, partially automate, redesign, or stop recommendation.",
+  "An explicit list of exceptions, safety/quality boundaries, and missing measurements.",
+]
+exclusions = [
+  "Claiming cell feasibility or ROI before measurements.",
+  "Free custom engineering beyond the existing first-pass automation-fit screen.",
+]
+
+[[commercial.offers]]
+key = "bounded_robotics_proof"
+name = "Bounded Robotics Proof or Pilot"
+lane = "core"
+description = "A milestone-funded lab, video/data, or site proof for one stable task core with explicit pass/fail criteria and retained human exception handling."
+delivery_days_min = 30
+delivery_days_max = 180
+payment_structure = "Milestone-funded; price remains unknown until task evidence and buyer scope exist."
+requires = [
+  "A passed feasibility sprint or equivalent measured task package.",
+  "Named success criteria, stop conditions, sponsor, site, and operator access.",
+]
+success_criteria = ["The proof establishes whether a bounded repeatable task core merits deployment."]
+exclusions = ["Unpaid open-ended prototyping."]
+
+[[commercial.offers]]
+key = "cell_deployment_and_expansion"
+name = "Cell Deployment and Expansion"
+lane = "strategic"
+description = "A production cell, integration, RaaS, and multi-cell expansion pursued only after paid evidence and a mapped procurement path."
+payment_structure = "Paid deployment milestones; commercial terms remain unknown until a real task and site are validated."
+requires = [
+  "A passed paid proof or pilot.",
+  "A sponsor, economic buyer, safety/quality owners, procurement route, and deployment conditions.",
+]
+success_criteria = ["A contracted deployment with defined acceptance, support, and expansion gates."]
+exclusions = ["Selling an unproven finished robot or guaranteeing savings."]
+
 [[discovery_evidence]]
 id = "wapahki-call-factory-packing-01"
 recorded_at = "2026-08-08"

@@ -67,7 +67,8 @@ struct Decision {
     task_exceptions: Vec<String>,
     task_economics: String,
     /// none | evaluation_agreed | design_partner | loi_candidate |
-    /// conditional_loi | paid_pilot | deployment
+    /// conditional_loi. Paid/deployment truth is recorded only through the
+    /// append-only commercial event ledger, never inferred from reply prose.
     commitment_kind: String,
     commitment_detail: String,
     loi_terms: String,
@@ -139,8 +140,15 @@ pub async fn handle_inbound(
     }
 
     let lead = db.get_lead(&conversation.lead_id)?;
-    let customer_development =
-        db.customer_development_for_lead(&conversation.brand, &conversation.lead_id)?;
+    let sales_opportunity_id = db
+        .sequence_gtm_attribution(&conversation.sequence_id)?
+        .map(|sequence| sequence.sales_opportunity_id)
+        .unwrap_or_default();
+    let customer_development = if sales_opportunity_id.is_empty() {
+        None
+    } else {
+        db.customer_development_for_opportunity(&sales_opportunity_id)?
+    };
     let pb = playbooks.get(&conversation.brand)?;
     let history = db.list_conversation_messages(&conversation.id)?;
     let sent_slots = db.sent_offered_slots(&conversation.id)?;
@@ -410,11 +418,19 @@ fn record_customer_development_reply(
     person: &Person,
     decision: &Decision,
 ) -> Result<()> {
+    let sales_opportunity_id = db
+        .sequence_gtm_attribution(&conversation.sequence_id)?
+        .map(|sequence| sequence.sales_opportunity_id)
+        .unwrap_or_default();
+    if sales_opportunity_id.is_empty() {
+        return Ok(());
+    }
     let mut record = db
-        .customer_development_for_lead(&conversation.brand, &conversation.lead_id)?
+        .customer_development_for_opportunity(&sales_opportunity_id)?
         .unwrap_or_else(|| CustomerDevelopmentRecord {
             brand: conversation.brand.clone(),
             lead_id: conversation.lead_id.clone(),
+            sales_opportunity_id: sales_opportunity_id.clone(),
             ..Default::default()
         });
     let prior_stage = crate::gtm::customer_development_stage(&record).to_string();
@@ -441,7 +457,13 @@ fn record_customer_development_reply(
         &mut record.stakeholders,
         &[format!("{} — {}", person.name, person.title)],
     );
-    let commitment = crate::gtm::normalize_commitment_kind(&decision.commitment_kind);
+    let mut commitment = crate::gtm::normalize_commitment_kind(&decision.commitment_kind);
+    // A reply classifier may extract buying intent, but it cannot create
+    // payment or deployment truth. Those stages unlock only through the
+    // append-only commercial event ledger (invoice/payment/contract evidence).
+    if matches!(commitment, "paid_pilot" | "deployment") {
+        commitment = "none";
+    }
     if commitment != "none" {
         record.commitment_kind = commitment.into();
     } else if record.commitment_kind.is_empty() {
@@ -734,7 +756,7 @@ async fn decide(
     available: &[CalendarSlot],
 ) -> Result<Decision> {
     let customer_development_rules = if pb.key == "wapahki" {
-        " For Wapahki, use customer-development discipline: ask about actual past/current behaviour, not hypothetical enthusiasm. Extract task_scope (one object/motion/handoff), why_still_manual, task_variations, task_exceptions, and task_economics only from explicit first-hand evidence. commitment_kind must be none unless the prospect explicitly commits the corresponding currency: an agreed evaluation, ongoing design-partner access, material LOI terms, written conditional intent, payment for a pilot, or deployment. Move only one rung: reply/correction -> task map -> shared sketch/video/SKU data/site observation -> agreed evaluation -> design partner -> LOI candidate -> conditional LOI -> paid pilot -> deployment. Never turn politeness, a meeting, or model confidence into a higher stage."
+        " For Wapahki, use customer-development discipline: ask about actual past/current behaviour, not hypothetical enthusiasm. Extract task_scope (one object/motion/handoff), why_still_manual, task_variations, task_exceptions, and task_economics only from explicit first-hand evidence. commitment_kind must be none unless the prospect explicitly commits the corresponding non-cash currency: an agreed evaluation, ongoing design-partner access, material LOI terms, or written conditional intent. A reply classifier must never declare a paid pilot or deployment; payment and contract stages require separate invoice/payment truth in the commercial event ledger. Move only one rung: reply/correction -> task map -> shared sketch/video/SKU data/site observation -> agreed evaluation -> design partner -> LOI candidate -> conditional LOI. Never turn politeness, a meeting, or model confidence into a higher stage."
     } else {
         ""
     };
@@ -907,7 +929,7 @@ fn schema() -> Value {
             ,"task_variations": {"type":"array","items":{"type":"string"}}
             ,"task_exceptions": {"type":"array","items":{"type":"string"}}
             ,"task_economics": {"type":"string"}
-            ,"commitment_kind": {"type":"string","enum":["none","evaluation_agreed","design_partner","loi_candidate","conditional_loi","paid_pilot","deployment"]}
+            ,"commitment_kind": {"type":"string","enum":["none","evaluation_agreed","design_partner","loi_candidate","conditional_loi"]}
             ,"commitment_detail": {"type":"string"}
             ,"loi_terms": {"type":"string"}
             ,"next_commitment": {"type":"string"}

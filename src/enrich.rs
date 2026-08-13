@@ -459,9 +459,9 @@ fn current_opportunity_enrichment_order(db: &SharedDb, brand: Option<&str>) -> R
             .filter(|opportunity| opportunity.play_id == play.id)
             .filter(|opportunity| opportunity.status != "rejected")
         {
-            let tier = match opportunity.priority_tier.as_str() {
-                "easy" => 0,
-                "medium" => 1,
+            let tier = match opportunity.evidence_tier.as_str() {
+                "action_ready" => 0,
+                "discovery_ready" => 1,
                 _ => 2,
             };
             let mut roster = db

@@ -32,7 +32,8 @@ use tokio::sync::RwLock;
 
 use crate::business::{BusinessProfile, Businesses};
 use crate::db::{
-    AccountPlayAssessment, ApplicationBrief, CoverageRun, CustomerDevelopmentRecord, Event,
+    AccountPlayAssessment, ApplicationBrief, CommercialAssessment, CommercialEvent,
+    CommercialForecast, CommercialOperatingState, CoverageRun, CustomerDevelopmentRecord, Event,
     EvidenceClaim, Facility, GtmExperiment, GtmOutcome, GtmPlay, Lead, Mailbox, MarketAccount,
     MarketSegment, Meeting, Opportunity, OpportunityContact, OpportunityStakeholder,
     OpportunityTouch, Person, ProofBrief, SalesOpportunity, SharedDb, SignalDefinition,
@@ -240,7 +241,8 @@ struct ExecutionDashboard {
     funnel: Funnel,
     accounts: Vec<ExecutionAccount>,
     mapped_contacts: usize,
-    customer_development_accounts: Vec<Lead>,
+    leads: Vec<Lead>,
+    sales_opportunities: Vec<SalesOpportunity>,
     opportunities: Vec<ExecutionOpportunity>,
     meetings: Vec<Meeting>,
     mailboxes: Vec<PublicMailbox>,
@@ -258,6 +260,9 @@ struct GtmSnapshot {
     sales_opportunities: Vec<SalesOpportunity>,
     evidence_claims: Vec<EvidenceClaim>,
     opportunity_stakeholders: Vec<OpportunityStakeholder>,
+    commercial_assessments: Vec<CommercialAssessment>,
+    commercial_events: Vec<CommercialEvent>,
+    commercial_forecast: CommercialForecast,
     people: Vec<Person>,
     definitions: Vec<SignalDefinition>,
     observations: Vec<SignalObservation>,
@@ -375,9 +380,9 @@ fn execution_dashboard(db: &SharedDb, brand: Option<&str>) -> Result<ExecutionDa
         .iter()
         .map(|person| person.id.as_str())
         .collect::<std::collections::HashSet<_>>();
-    let customer_development_accounts = db.list_leads(brand)?;
+    let leads = db.list_leads(brand)?;
     let mut accounts = Vec::new();
-    for lead in customer_development_accounts.iter().cloned() {
+    for lead in leads.iter().cloned() {
         let mut account_people = Vec::new();
         for person in people.iter().filter(|p| p.lead_id == lead.id) {
             if let Some(entry) = ready_execution_person(db, person)? {
@@ -420,7 +425,8 @@ fn execution_dashboard(db: &SharedDb, brand: Option<&str>) -> Result<ExecutionDa
         funnel: metrics::funnel(db, brand)?,
         accounts,
         mapped_contacts,
-        customer_development_accounts,
+        leads,
+        sales_opportunities: db.list_sales_opportunities(brand, None)?,
         opportunities,
         meetings: db.list_meetings(brand)?,
         mailboxes: db
@@ -460,6 +466,9 @@ fn gtm_snapshot(db: &SharedDb, brand: Option<&str>) -> Result<GtmSnapshot> {
         sales_opportunities: db.list_sales_opportunities(brand, None)?,
         evidence_claims: db.list_evidence_claims(None, brand)?,
         opportunity_stakeholders: db.list_opportunity_stakeholders(None, brand)?,
+        commercial_assessments: db.list_commercial_assessments(brand)?,
+        commercial_events: db.list_commercial_events(brand, None)?,
+        commercial_forecast: db.commercial_forecast(brand)?,
         people: db.list_people(brand, None)?,
         definitions: db.list_signal_definitions(brand)?,
         observations: db.list_signal_observations(brand, 250)?,
@@ -528,6 +537,12 @@ pub fn router(
             post(evaluate_gtm_experiment),
         )
         .route("/gtm/proof/:id/:status", post(set_gtm_proof_status))
+        .route("/commercial-assessment", post(save_commercial_assessment))
+        .route("/commercial-event", post(save_commercial_event))
+        .route(
+            "/commercial-operating-state",
+            post(save_commercial_operating_state),
+        )
         .route("/customer-development", post(save_customer_development))
         .route("/stage/:contact/:stage/:status", post(set_stage))
         .route("/execution/approve/:person", post(approve_execution))
@@ -816,7 +831,7 @@ async fn strategy_api(State(state): State<WebState>) -> impl IntoResponse {
 async fn gtm_hub(State(state): State<WebState>) -> impl IntoResponse {
     let counts = brand_tab_counts(&state.db);
     match gtm_snapshot(&state.db, None) {
-        Ok(snapshot) => Html(render_gtm_lab(None, &counts, &snapshot)).into_response(),
+        Ok(snapshot) => Html(render_gtm_lab(None, &counts, &snapshot, None)).into_response(),
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("failed to read GTM Lab: {error:#}"),
@@ -831,7 +846,13 @@ async fn gtm_brand(State(state): State<WebState>, Path(brand): Path<String>) -> 
     };
     let counts = brand_tab_counts(&state.db);
     match gtm_snapshot(&state.db, Some(meta.key)) {
-        Ok(snapshot) => Html(render_gtm_lab(Some(meta), &counts, &snapshot)).into_response(),
+        Ok(snapshot) => Html(render_gtm_lab(
+            Some(meta),
+            &counts,
+            &snapshot,
+            state.businesses.get(meta.key).ok(),
+        ))
+        .into_response(),
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("failed to read GTM Lab: {error:#}"),
@@ -1038,10 +1059,282 @@ async fn set_gtm_proof_status(
     }
 }
 
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct CommercialAssessmentForm {
+    brand: String,
+    sales_opportunity_id: String,
+    commercial_lane: String,
+    offer_key: String,
+    sales_stage: String,
+    expected_contract_value_cad: String,
+    expected_upfront_cash_cad: String,
+    cash_collectable_within_90d_cad: String,
+    expected_arr_cad: String,
+    estimated_12m_gross_profit_cad: String,
+    days_to_first_cash: String,
+    close_probability_percent: String,
+    sales_hours_remaining: String,
+    estimated_founder_hours: String,
+    delivery_hours: String,
+    unpaid_delivery_hours: String,
+    gross_margin_percent: String,
+    procurement_complexity: String,
+    integration_complexity: String,
+    delivery_risk: String,
+    current_trigger: String,
+    buyer_access: String,
+    budget_path: String,
+    budget_owner_status: String,
+    champion_status: String,
+    champion_strength: String,
+    executive_sponsor_status: String,
+    compelling_event: String,
+    payment_structure: String,
+    next_commitment: String,
+    next_action: String,
+    next_action_due_at: String,
+    target_close_date: String,
+    stalled_reason: String,
+    estimate_basis: String,
+    assessment_confidence: String,
+}
+
+async fn save_commercial_assessment(
+    State(state): State<WebState>,
+    Form(form): Form<CommercialAssessmentForm>,
+) -> impl IntoResponse {
+    let profile = match state.businesses.get(&form.brand) {
+        Ok(profile) => profile,
+        Err(error) => return (StatusCode::BAD_REQUEST, format!("{error:#}")).into_response(),
+    };
+    if !form.offer_key.trim().is_empty() {
+        let Some(offer) = profile.commercial_offer(form.offer_key.trim()) else {
+            return (
+                StatusCode::BAD_REQUEST,
+                "offer is not defined for this business",
+            )
+                .into_response();
+        };
+        if offer.lane != form.commercial_lane {
+            return (
+                StatusCode::BAD_REQUEST,
+                "offer lane does not match the selected commercial lane",
+            )
+                .into_response();
+        }
+    }
+    let parsed = (|| -> Result<CommercialAssessment> {
+        Ok(CommercialAssessment {
+            sales_opportunity_id: form.sales_opportunity_id.trim().into(),
+            brand: form.brand.trim().into(),
+            commercial_lane: form.commercial_lane.trim().into(),
+            offer_key: form.offer_key.trim().into(),
+            sales_stage: form.sales_stage.trim().into(),
+            expected_contract_value_cents: parse_optional_cad(&form.expected_contract_value_cad)?,
+            expected_upfront_cash_cents: parse_optional_cad(&form.expected_upfront_cash_cad)?,
+            cash_collectable_within_90d_cents: parse_optional_cad(
+                &form.cash_collectable_within_90d_cad,
+            )?,
+            expected_arr_cents: parse_optional_cad(&form.expected_arr_cad)?,
+            estimated_12m_gross_profit_cents: parse_optional_cad(
+                &form.estimated_12m_gross_profit_cad,
+            )?,
+            days_to_first_cash: parse_optional_i64("days_to_first_cash", &form.days_to_first_cash)?,
+            close_probability_bps: parse_optional_percent_bps(
+                "close_probability_percent",
+                &form.close_probability_percent,
+            )?,
+            sales_hours_remaining: parse_optional_i64(
+                "sales_hours_remaining",
+                &form.sales_hours_remaining,
+            )?,
+            estimated_founder_hours: parse_optional_i64(
+                "estimated_founder_hours",
+                &form.estimated_founder_hours,
+            )?,
+            delivery_hours: parse_optional_i64("delivery_hours", &form.delivery_hours)?,
+            unpaid_delivery_hours: parse_optional_i64(
+                "unpaid_delivery_hours",
+                &form.unpaid_delivery_hours,
+            )?,
+            gross_margin_bps: parse_optional_percent_bps(
+                "gross_margin_percent",
+                &form.gross_margin_percent,
+            )?,
+            procurement_complexity: form.procurement_complexity.trim().into(),
+            integration_complexity: form.integration_complexity.trim().into(),
+            delivery_risk: form.delivery_risk.trim().into(),
+            current_trigger: form.current_trigger.trim().into(),
+            buyer_access: form.buyer_access.trim().into(),
+            budget_path: form.budget_path.trim().into(),
+            budget_owner_status: form.budget_owner_status.trim().into(),
+            champion_status: form.champion_status.trim().into(),
+            champion_strength: form.champion_strength.trim().into(),
+            executive_sponsor_status: form.executive_sponsor_status.trim().into(),
+            compelling_event: form.compelling_event.trim().into(),
+            payment_structure: form.payment_structure.trim().into(),
+            next_commitment: form.next_commitment.trim().into(),
+            next_action: form.next_action.trim().into(),
+            next_action_due_at: form.next_action_due_at.trim().into(),
+            target_close_date: form.target_close_date.trim().into(),
+            stalled_reason: form.stalled_reason.trim().into(),
+            estimate_basis: form_list(&form.estimate_basis),
+            assessment_source: "manual_crm".into(),
+            assessment_confidence: form.assessment_confidence.trim().into(),
+            ..Default::default()
+        })
+    })();
+    match parsed.and_then(|assessment| state.db.upsert_commercial_assessment(&assessment)) {
+        Ok(_) => Redirect::to(&format!("/gtm/{}", form.brand)).into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, format!("{error:#}")).into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct CommercialEventForm {
+    brand: String,
+    sales_opportunity_id: String,
+    kind: String,
+    amount_cad: String,
+    occurred_at: String,
+    external_ref: String,
+    detail: String,
+}
+
+async fn save_commercial_event(
+    State(state): State<WebState>,
+    Form(form): Form<CommercialEventForm>,
+) -> impl IntoResponse {
+    let amount_cents = match parse_optional_cad(&form.amount_cad) {
+        Ok(amount) => amount,
+        Err(error) => return (StatusCode::BAD_REQUEST, format!("{error:#}")).into_response(),
+    };
+    let event = CommercialEvent {
+        sales_opportunity_id: form.sales_opportunity_id.trim().into(),
+        brand: form.brand.trim().into(),
+        kind: form.kind.trim().into(),
+        amount_cents,
+        currency: "CAD".into(),
+        occurred_at: form.occurred_at.trim().into(),
+        source: "manual_crm".into(),
+        external_ref: form.external_ref.trim().into(),
+        detail: form.detail.trim().into(),
+        ..Default::default()
+    };
+    match state.db.record_commercial_event(&event) {
+        Ok(_) => Redirect::to(&format!("/gtm/{}", form.brand)).into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, format!("{error:#}")).into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct CommercialOperatingStateForm {
+    brand: String,
+    runway_months: String,
+    monthly_cash_need_cad: String,
+    as_of: String,
+}
+
+async fn save_commercial_operating_state(
+    State(state): State<WebState>,
+    Form(form): Form<CommercialOperatingStateForm>,
+) -> impl IntoResponse {
+    let parsed = (|| -> Result<CommercialOperatingState> {
+        Ok(CommercialOperatingState {
+            brand: form.brand.trim().into(),
+            runway_months: parse_optional_f64("runway_months", &form.runway_months)?,
+            monthly_cash_need_cents: parse_optional_cad(&form.monthly_cash_need_cad)?,
+            source: "manual_crm".into(),
+            as_of: form.as_of.trim().into(),
+            ..Default::default()
+        })
+    })();
+    match parsed.and_then(|operating| {
+        state.db.upsert_commercial_operating_state(&operating)?;
+        Ok(())
+    }) {
+        Ok(()) => Redirect::to(&format!("/gtm/{}", form.brand)).into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, format!("{error:#}")).into_response(),
+    }
+}
+
+fn parse_optional_i64(label: &str, raw: &str) -> Result<Option<i64>> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    raw.parse::<i64>()
+        .map(Some)
+        .with_context(|| format!("{label} must be a whole number"))
+}
+
+fn parse_optional_f64(label: &str, raw: &str) -> Result<Option<f64>> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let value = raw
+        .parse::<f64>()
+        .with_context(|| format!("{label} must be a number"))?;
+    if !value.is_finite() || value < 0.0 {
+        anyhow::bail!("{label} must be a non-negative finite number");
+    }
+    Ok(Some(value))
+}
+
+fn parse_optional_percent_bps(label: &str, raw: &str) -> Result<Option<i64>> {
+    let raw = raw.trim().trim_end_matches('%').trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let percent = raw
+        .parse::<f64>()
+        .with_context(|| format!("{label} must be a percentage"))?;
+    if !(0.0..=100.0).contains(&percent) {
+        anyhow::bail!("{label} must be between 0 and 100");
+    }
+    Ok(Some((percent * 100.0).round() as i64))
+}
+
+fn parse_optional_cad(raw: &str) -> Result<Option<i64>> {
+    let normalized = raw
+        .trim()
+        .trim_start_matches("CAD")
+        .trim()
+        .trim_start_matches('$')
+        .replace(',', "");
+    if normalized.is_empty() {
+        return Ok(None);
+    }
+    let negative = normalized.starts_with('-');
+    let normalized = normalized.trim_start_matches(['+', '-']);
+    let mut parts = normalized.split('.');
+    let dollars = parts
+        .next()
+        .unwrap_or("")
+        .parse::<i64>()
+        .context("CAD amount must contain whole dollars")?;
+    let cents = match parts.next() {
+        None | Some("") => 0,
+        Some(fraction) if fraction.len() == 1 => fraction.parse::<i64>()? * 10,
+        Some(fraction) if fraction.len() == 2 => fraction.parse::<i64>()?,
+        Some(_) => anyhow::bail!("CAD amount may have at most two decimal places"),
+    };
+    if parts.next().is_some() {
+        anyhow::bail!("CAD amount has too many decimal points");
+    }
+    let value = dollars.saturating_mul(100).saturating_add(cents);
+    Ok(Some(if negative { -value } else { value }))
+}
+
 #[derive(Debug, Deserialize)]
 struct CustomerDevelopmentForm {
     brand: String,
     lead_id: String,
+    sales_opportunity_id: String,
     #[serde(default)]
     engaged: Option<String>,
     problem: String,
@@ -1075,22 +1368,31 @@ async fn save_customer_development(
         .ok()
         .flatten()
         .is_some_and(|lead| lead.brand == form.brand);
-    if !lead_matches_brand {
+    let opportunity_matches_scope = state
+        .db
+        .list_sales_opportunities(Some(&form.brand), Some(&form.lead_id))
+        .is_ok_and(|opportunities| {
+            opportunities
+                .iter()
+                .any(|opportunity| opportunity.id == form.sales_opportunity_id)
+        });
+    if !lead_matches_brand || !opportunity_matches_scope {
         return (
             StatusCode::BAD_REQUEST,
-            "account does not belong to this brand",
+            "account/opportunity does not belong to this brand",
         )
             .into_response();
     }
 
     let mut record = state
         .db
-        .customer_development_for_lead(&form.brand, &form.lead_id)
+        .customer_development_for_opportunity(&form.sales_opportunity_id)
         .ok()
         .flatten()
         .unwrap_or_else(|| CustomerDevelopmentRecord {
             brand: form.brand.clone(),
             lead_id: form.lead_id.clone(),
+            sales_opportunity_id: form.sales_opportunity_id.clone(),
             ..Default::default()
         });
     let prior_stage = crate::gtm::customer_development_stage(&record).to_string();
@@ -1495,11 +1797,11 @@ fn render_outcome_strip(b: &mut String, dashboard: &ExecutionDashboard, brand: O
 }
 
 fn render_customer_development(b: &mut String, dashboard: &ExecutionDashboard) {
-    let stage_for_lead = |lead_id: &str| {
+    let stage_for_opportunity = |sales_opportunity_id: &str| {
         dashboard
             .customer_development
             .iter()
-            .find(|record| record.lead_id == lead_id)
+            .find(|record| record.sales_opportunity_id == sales_opportunity_id)
             .map(crate::gtm::customer_development_stage)
             .unwrap_or("hypothesis")
     };
@@ -1512,9 +1814,9 @@ fn render_customer_development(b: &mut String, dashboard: &ExecutionDashboard) {
     );
     for stage in crate::gtm::CUSTOMER_DEVELOPMENT_STAGES {
         let count = dashboard
-            .customer_development_accounts
+            .sales_opportunities
             .iter()
-            .filter(|lead| stage_for_lead(&lead.id) == stage.key)
+            .filter(|opportunity| stage_for_opportunity(&opportunity.id) == stage.key)
             .count();
         b.push_str(&format!(
             "<div class=\"customer-dev-rung\"><strong>{}</strong><span>{}</span></div>",
@@ -1524,17 +1826,24 @@ fn render_customer_development(b: &mut String, dashboard: &ExecutionDashboard) {
     }
     b.push_str("</div><div class=\"customer-dev-accounts\">");
 
-    for lead in &dashboard.customer_development_accounts {
+    for opportunity in &dashboard.sales_opportunities {
+        let account_name = dashboard
+            .leads
+            .iter()
+            .find(|lead| lead.id == opportunity.lead_id)
+            .map(|lead| lead.name.as_str())
+            .unwrap_or("Unknown account");
         let fallback = CustomerDevelopmentRecord {
-            brand: lead.brand.clone(),
-            lead_id: lead.id.clone(),
+            brand: opportunity.brand.clone(),
+            lead_id: opportunity.lead_id.clone(),
+            sales_opportunity_id: opportunity.id.clone(),
             commitment_kind: "none".into(),
             ..Default::default()
         };
         let record = dashboard
             .customer_development
             .iter()
-            .find(|record| record.lead_id == lead.id)
+            .find(|record| record.sales_opportunity_id == opportunity.id)
             .unwrap_or(&fallback);
         let stage = crate::gtm::customer_development_stage_info(record);
         let missing = crate::gtm::customer_development_missing(record);
@@ -1553,7 +1862,7 @@ fn render_customer_development(b: &mut String, dashboard: &ExecutionDashboard) {
              <div><b>Next commitment</b><p>{}</p></div><div><b>Still missing</b><p>{}</p></div></div>",
             esc(stage.key),
             esc(stage.label),
-            esc(&lead.name),
+            esc(account_name),
             esc(&updated_label),
             esc(if record.next_action.trim().is_empty() {
                 stage.next_commitment
@@ -1566,7 +1875,7 @@ fn render_customer_development(b: &mut String, dashboard: &ExecutionDashboard) {
         ));
         b.push_str(&format!(
             "<form method=\"post\" action=\"/customer-development\" class=\"customer-dev-form\">\
-             <input type=\"hidden\" name=\"brand\" value=\"{}\"><input type=\"hidden\" name=\"lead_id\" value=\"{}\">\
+             <input type=\"hidden\" name=\"brand\" value=\"{}\"><input type=\"hidden\" name=\"lead_id\" value=\"{}\"><input type=\"hidden\" name=\"sales_opportunity_id\" value=\"{}\">\
              <label class=\"customer-dev-check\"><input type=\"checkbox\" name=\"engaged\" value=\"yes\" {}> Human reply, correction, referral, or discovery conversation recorded</label>\
              <label>Prospect-confirmed problem<textarea name=\"problem\" placeholder=\"Their words, not our inference\">{}</textarea></label>\
              <label>Bounded task / motion<textarea name=\"task_scope\" placeholder=\"Object, from where, to where\">{}</textarea></label>\
@@ -1582,6 +1891,7 @@ fn render_customer_development(b: &mut String, dashboard: &ExecutionDashboard) {
              <label>Next concrete action<textarea name=\"next_action\" placeholder=\"Owner + action + date\">{}</textarea></label>",
             esc(&record.brand),
             esc(&record.lead_id),
+            esc(&record.sales_opportunity_id),
             if record.engaged_at.is_empty() { "" } else { "checked" },
             esc(&record.problem),
             esc(&record.task_scope),
@@ -1615,7 +1925,7 @@ fn render_customer_development(b: &mut String, dashboard: &ExecutionDashboard) {
             esc(&record.commitment_detail),
         ));
     }
-    if dashboard.customer_development_accounts.is_empty() {
+    if dashboard.sales_opportunities.is_empty() {
         b.push_str(
             "<div class=\"customer-dev-empty\"><strong>No Wapahki accounts yet</strong><span>Source a small set of plants around one concrete task hypothesis. Each account will start at Hypothesis; replies and saved evidence move it forward.</span></div>",
         );
@@ -2571,6 +2881,7 @@ fn render_gtm_lab(
     active: Option<&BrandMeta>,
     counts: &[(&'static BrandMeta, usize)],
     snapshot: &GtmSnapshot,
+    profile: Option<&BusinessProfile>,
 ) -> String {
     let brand_name = active.map(|meta| meta.name).unwrap_or("Portfolio");
     let mut b = page_head(&format!("{brand_name} · GTM Lab"));
@@ -2669,6 +2980,157 @@ fn render_gtm_lab(
     }
     b.push_str("</tbody></table></div></section>");
 
+    let forecast = &snapshot.commercial_forecast;
+    let cash_need = forecast
+        .monthly_cash_need_cents
+        .map(format_cad)
+        .unwrap_or_else(|| "unknown".into());
+    let coverage = forecast
+        .cash_now_pipeline_coverage
+        .map(|coverage| format!("{coverage:.2}×"))
+        .unwrap_or_else(|| "unknown".into());
+    b.push_str(&format!(
+        "<section class=\"gtm-panel\"><div class=\"strategy-panel-head\"><div><h2>Commercial operating queue</h2><p>Evidence readiness answers whether outreach is defensible. This separate lane-first queue protects cash and founder capacity; unknown estimates remain unknown.</p></div></div><div class=\"outcome-strip\"><div class=\"outcome-card\"><b>{}</b><span>cash collected this month</span></div><div class=\"outcome-card\"><b>{}</b><span>expected 30-day cash</span></div><div class=\"outcome-card\"><b>{}</b><span>expected 90-day cash</span></div><div class=\"outcome-card\"><b>{}</b><span>expected 180-day cash</span></div><div class=\"outcome-card\"><b>{}</b><span>monthly cash need</span></div><div class=\"outcome-card\"><b>{}</b><span>cash-now 90d coverage</span></div><div class=\"outcome-card\"><b>{}</b><span>stalled / no dated action</span></div></div><div class=\"gtm-card-grid\">",
+        format_cad(forecast.cash_collected_month_cents),
+        format_cad(forecast.expected_30d_cash_cents),
+        format_cad(forecast.expected_90d_cash_cents),
+        format_cad(forecast.expected_180d_cash_cents),
+        esc(&cash_need),
+        esc(&coverage),
+        forecast.stalled_without_dated_next_action,
+    ));
+    for assessment in &snapshot.commercial_assessments {
+        let opportunity = snapshot
+            .sales_opportunities
+            .iter()
+            .find(|opportunity| opportunity.id == assessment.sales_opportunity_id);
+        let account = opportunity
+            .and_then(|opportunity| lead_names.get(opportunity.lead_id.as_str()).copied())
+            .unwrap_or("Unknown account");
+        let opportunity_title = opportunity
+            .map(|opportunity| opportunity.title.as_str())
+            .unwrap_or("Unknown opportunity");
+        let evidence_tier = opportunity
+            .map(|opportunity| opportunity.evidence_tier.as_str())
+            .unwrap_or("unknown");
+        let expected_cash = assessment
+            .expected_upfront_cash_cents
+            .map(format_cad)
+            .unwrap_or_else(|| "unknown".into());
+        let close_probability = assessment
+            .close_probability_bps
+            .map(|bps| format!("{:.1}%", bps as f64 / 100.0))
+            .unwrap_or_else(|| "unknown".into());
+        let days_to_cash = assessment
+            .days_to_first_cash
+            .map(|days| format!("{days} days"))
+            .unwrap_or_else(|| "unknown".into());
+        let event_count = snapshot
+            .commercial_events
+            .iter()
+            .filter(|event| event.sales_opportunity_id == assessment.sales_opportunity_id)
+            .count();
+        b.push_str(&format!(
+            "<article class=\"gtm-card\"><div class=\"gtm-card-head\"><div><span class=\"strategy-kicker\">{} · evidence {}</span><h3>{}</h3></div><span class=\"gtm-status\">{}</span></div><p><b>Account:</b> {}</p><p><b>Offer:</b> {}</p><p><b>Upfront cash / probability / timing:</b> {} · {} · {}</p><p><b>Next action:</b> {} {}</p><p class=\"gtm-meta\">{} truth events · assessment v{} · source: {} · confidence: {}</p></article>",
+            esc(&assessment.commercial_lane),
+            esc(evidence_tier),
+            esc(opportunity_title),
+            esc(&assessment.sales_stage),
+            esc(account),
+            esc(if assessment.offer_key.is_empty() { "unselected" } else { &assessment.offer_key }),
+            esc(&expected_cash),
+            esc(&close_probability),
+            esc(&days_to_cash),
+            esc(if assessment.next_action.is_empty() { "not recorded" } else { &assessment.next_action }),
+            esc(&assessment.next_action_due_at),
+            event_count,
+            assessment.version,
+            esc(&assessment.assessment_source),
+            esc(&assessment.assessment_confidence),
+        ));
+    }
+    if snapshot.commercial_assessments.is_empty() {
+        b.push_str("<div class=\"empty\">No opportunity has a founder-reviewed commercial assessment yet. No cash forecast is being inferred from fit or email readiness.</div>");
+    }
+    if let Some(profile) = profile {
+        let allocation = profile.commercial_allocation(forecast.runway_months);
+        b.push_str(&format!(
+            "<div class=\"gtm-proof-shape\"><b>Cash-constrained founder allocation</b><p>{}% cash-now · {}% core · {}% strategic. Unknown runway stays cash-constrained. Strategic pursuits capped at {} and require a champion, compelling event, procurement path, and paid first phase.</p><form method=\"post\" action=\"/commercial-operating-state\" class=\"gtm-form\"><input type=\"hidden\" name=\"brand\" value=\"{}\"><label>Runway months<input name=\"runway_months\" value=\"{}\" placeholder=\"blank = unknown\"></label><label>Monthly cash need (CAD)<input name=\"monthly_cash_need_cad\" value=\"{}\" placeholder=\"blank = unknown\"></label><label>As of<input type=\"date\" name=\"as_of\"></label><button type=\"submit\">Update founder constraints</button></form></div>",
+            allocation.cash_now_share_bps / 100,
+            allocation.core_share_bps / 100,
+            allocation.strategic_share_bps / 100,
+            profile.commercial.max_active_strategic,
+            esc(&profile.key),
+            forecast.runway_months.map(|value| value.to_string()).unwrap_or_default(),
+            optional_cad_input(forecast.monthly_cash_need_cents),
+        ));
+        for opportunity in &snapshot.sales_opportunities {
+            let current = snapshot
+                .commercial_assessments
+                .iter()
+                .find(|assessment| assessment.sales_opportunity_id == opportunity.id)
+                .cloned()
+                .unwrap_or_else(|| CommercialAssessment {
+                    sales_opportunity_id: opportunity.id.clone(),
+                    brand: opportunity.brand.clone(),
+                    commercial_lane: "unassessed".into(),
+                    sales_stage: "mapped".into(),
+                    procurement_complexity: "unknown".into(),
+                    delivery_risk: "unknown".into(),
+                    buyer_access: "unknown".into(),
+                    budget_owner_status: "unknown".into(),
+                    champion_status: "unknown".into(),
+                    assessment_confidence: "unknown".into(),
+                    ..Default::default()
+                });
+            b.push_str(&format!(
+                "<details class=\"gtm-card\"><summary><b>Assess {}</b> · {}</summary><form method=\"post\" action=\"/commercial-assessment\" class=\"gtm-form\"><input type=\"hidden\" name=\"brand\" value=\"{}\"><input type=\"hidden\" name=\"sales_opportunity_id\" value=\"{}\"><label>Commercial lane<select name=\"commercial_lane\">{}</select></label><label>Offer<select name=\"offer_key\">{}</select></label><label>Sales stage<select name=\"sales_stage\">{}</select></label><label>Expected contract value (CAD)<input name=\"expected_contract_value_cad\" value=\"{}\" placeholder=\"blank = unknown\"></label><label>Expected upfront cash (CAD)<input name=\"expected_upfront_cash_cad\" value=\"{}\" placeholder=\"blank = unknown\"></label><label>Cash collectable within 90d (CAD)<input name=\"cash_collectable_within_90d_cad\" value=\"{}\" placeholder=\"blank = unknown\"></label><label>Expected ARR (CAD)<input name=\"expected_arr_cad\" value=\"{}\" placeholder=\"blank = unknown\"></label><label>Estimated 12m gross profit (CAD)<input name=\"estimated_12m_gross_profit_cad\" value=\"{}\" placeholder=\"blank = unknown\"></label><label>Days to first cash<input type=\"number\" min=\"0\" name=\"days_to_first_cash\" value=\"{}\" placeholder=\"unknown\"></label><label>Close probability (%)<input name=\"close_probability_percent\" value=\"{}\" placeholder=\"unknown\"></label><label>Sales hours remaining<input type=\"number\" min=\"0\" name=\"sales_hours_remaining\" value=\"{}\"></label><label>Founder hours total<input type=\"number\" min=\"0\" name=\"estimated_founder_hours\" value=\"{}\"></label><label>Delivery hours<input type=\"number\" min=\"0\" name=\"delivery_hours\" value=\"{}\"></label><label>Unpaid delivery hours<input type=\"number\" min=\"0\" name=\"unpaid_delivery_hours\" value=\"{}\"></label><label>Gross margin (%)<input name=\"gross_margin_percent\" value=\"{}\"></label><label>Procurement complexity<input name=\"procurement_complexity\" value=\"{}\" placeholder=\"unknown / low / medium / high\"></label><label>Integration complexity<input name=\"integration_complexity\" value=\"{}\" placeholder=\"unknown / low / medium / high\"></label><label>Delivery risk<input name=\"delivery_risk\" value=\"{}\" placeholder=\"unknown / low / medium / high\"></label><label class=\"wide\">Current trigger<textarea name=\"current_trigger\">{}</textarea></label><label>Buyer access<input name=\"buyer_access\" value=\"{}\"></label><label class=\"wide\">Budget / procurement path<textarea name=\"budget_path\">{}</textarea></label><label>Budget owner status<input name=\"budget_owner_status\" value=\"{}\"></label><label>Champion status<input name=\"champion_status\" value=\"{}\"></label><label>Champion strength<input name=\"champion_strength\" value=\"{}\"></label><label>Executive sponsor status<input name=\"executive_sponsor_status\" value=\"{}\"></label><label class=\"wide\">Compelling event<textarea name=\"compelling_event\">{}</textarea></label><label class=\"wide\">Payment structure<textarea name=\"payment_structure\">{}</textarea></label><label class=\"wide\">Next buyer commitment<textarea name=\"next_commitment\">{}</textarea></label><label class=\"wide\">Internal next action<textarea name=\"next_action\">{}</textarea></label><label>Next commitment due<input type=\"date\" name=\"next_action_due_at\" value=\"{}\"></label><label>Target close date<input type=\"date\" name=\"target_close_date\" value=\"{}\"></label><label class=\"wide\">Stalled reason<textarea name=\"stalled_reason\" placeholder=\"Required when an active deal has no dated buyer commitment\">{}</textarea></label><label>Estimate confidence<select name=\"assessment_confidence\">{}</select></label><label class=\"wide\">Estimate basis<textarea name=\"estimate_basis\" placeholder=\"One human/offer/buyer basis per line; required for every numeric estimate\">{}</textarea></label><button type=\"submit\">Save versioned assessment</button></form><form method=\"post\" action=\"/commercial-event\" class=\"gtm-form\"><input type=\"hidden\" name=\"brand\" value=\"{}\"><input type=\"hidden\" name=\"sales_opportunity_id\" value=\"{}\"><label>Truth event<select name=\"kind\">{}</select></label><label>Amount (CAD)<input name=\"amount_cad\" placeholder=\"required for payment/cash events\"></label><label>Occurred at<input type=\"datetime-local\" name=\"occurred_at\"></label><label>Invoice/payment/external ref<input name=\"external_ref\"></label><label class=\"wide\">Evidence detail<textarea name=\"detail\" placeholder=\"Record only a real proposal, invoice, payment, win, loss, or refund\"></textarea></label><button type=\"submit\">Append truth event</button></form></details>",
+                esc(&opportunity.title),
+                esc(&opportunity.evidence_tier),
+                esc(&opportunity.brand),
+                esc(&opportunity.id),
+                select_options(&["unassessed", "cash_now", "core", "strategic", "parked"], &current.commercial_lane),
+                commercial_offer_options(profile, &current.offer_key),
+                select_options(&["mapped", "contacted", "discovery", "scoped", "proposal", "procurement", "paid_pilot", "won", "lost"], &current.sales_stage),
+                optional_cad_input(current.expected_contract_value_cents),
+                optional_cad_input(current.expected_upfront_cash_cents),
+                optional_cad_input(current.cash_collectable_within_90d_cents),
+                optional_cad_input(current.expected_arr_cents),
+                optional_cad_input(current.estimated_12m_gross_profit_cents),
+                optional_i64_input(current.days_to_first_cash),
+                optional_bps_input(current.close_probability_bps),
+                optional_i64_input(current.sales_hours_remaining),
+                optional_i64_input(current.estimated_founder_hours),
+                optional_i64_input(current.delivery_hours),
+                optional_i64_input(current.unpaid_delivery_hours),
+                optional_bps_input(current.gross_margin_bps),
+                esc(&current.procurement_complexity),
+                esc(&current.integration_complexity),
+                esc(&current.delivery_risk),
+                esc(&current.current_trigger),
+                esc(&current.buyer_access),
+                esc(&current.budget_path),
+                esc(&current.budget_owner_status),
+                esc(&current.champion_status),
+                esc(&current.champion_strength),
+                esc(&current.executive_sponsor_status),
+                esc(&current.compelling_event),
+                esc(&current.payment_structure),
+                esc(&current.next_commitment),
+                esc(&current.next_action),
+                esc(&current.next_action_due_at),
+                esc(&current.target_close_date),
+                esc(&current.stalled_reason),
+                select_options(&["unknown", "hypothesis", "buyer_validated", "transaction_validated"], &current.assessment_confidence),
+                esc(&current.estimate_basis.join("\n")),
+                esc(&opportunity.brand),
+                esc(&opportunity.id),
+                select_options(&["proposal_issued", "deposit_requested", "deposit_paid", "pilot_paid", "contract_won", "cash_collected", "contract_lost", "refund_issued"], "proposal_issued"),
+            ));
+        }
+    }
+    b.push_str("</div></section>");
+
     b.push_str("<section class=\"gtm-panel\"><div class=\"strategy-panel-head\"><h2>Facility and workflow opportunities</h2><p>The sales object is a facility/task or workflow/decision with atomic evidence and a mapped committee—not a generic company hypothesis.</p></div><div class=\"gtm-card-grid\">");
     for opportunity in &snapshot.sales_opportunities {
         let account = market_names
@@ -2701,7 +3163,7 @@ fn render_gtm_lab(
         b.push_str(&format!(
             "<article class=\"gtm-card\"><div class=\"gtm-card-head\"><div><span class=\"strategy-kicker\">{} · {}</span><h3>{}</h3></div><span class=\"gtm-status {}\">{}</span></div><p><b>Account / facility:</b> {} · {}</p><p><b>Task or decision:</b> {}</p><p><b>Mechanism:</b> {}</p><p><b>Consequence:</b> {}</p><div class=\"gtm-proof-shape\"><b>Proof contribution</b><p>{}</p></div><p class=\"gtm-meta\">{} atomic claims · {} committee roles · active cold thread: {}<br>Gaps: {}</p></article>",
             esc(&opportunity.brand),
-            esc(&opportunity.priority_tier),
+            esc(&opportunity.evidence_tier),
             esc(&opportunity.title),
             esc(&opportunity.evidence_status),
             esc(&opportunity.evidence_status),
@@ -4175,6 +4637,60 @@ fn esc(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
+fn format_cad(cents: i64) -> String {
+    let sign = if cents < 0 { "-" } else { "" };
+    let cents = cents.saturating_abs();
+    format!("{sign}CAD ${}.{:02}", cents / 100, cents % 100)
+}
+
+fn select_options(values: &[&str], current: &str) -> String {
+    values
+        .iter()
+        .map(|value| {
+            format!(
+                "<option value=\"{}\" {}>{}</option>",
+                esc(value),
+                if *value == current { "selected" } else { "" },
+                esc(&value.replace('_', " ")),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn commercial_offer_options(profile: &BusinessProfile, current: &str) -> String {
+    let mut options = format!(
+        "<option value=\"\" {}>unselected</option>",
+        if current.is_empty() { "selected" } else { "" }
+    );
+    for offer in &profile.commercial.offers {
+        options.push_str(&format!(
+            "<option value=\"{}\" {}>{} · {}</option>",
+            esc(&offer.key),
+            if offer.key == current { "selected" } else { "" },
+            esc(&offer.name),
+            esc(&offer.lane.replace('_', " ")),
+        ));
+    }
+    options
+}
+
+fn optional_cad_input(value: Option<i64>) -> String {
+    value
+        .map(|cents| format!("{}.{:02}", cents / 100, cents.saturating_abs() % 100))
+        .unwrap_or_default()
+}
+
+fn optional_i64_input(value: Option<i64>) -> String {
+    value.map(|value| value.to_string()).unwrap_or_default()
+}
+
+fn optional_bps_input(value: Option<i64>) -> String {
+    value
+        .map(|bps| format!("{:.2}", bps as f64 / 100.0))
+        .unwrap_or_default()
+}
+
 fn esc_multiline(s: &str) -> String {
     esc(s).replace('\n', "<br>")
 }
@@ -4853,7 +5369,8 @@ mod tests {
     use crate::business::Businesses;
     use crate::db::{
         AccountPlayAssessment, CustomerDevelopmentRecord, Db, Lead, Mailbox,
-        OpportunityStakeholder, Person, Reply, Sequence, SignalObservation, Touch,
+        OpportunityStakeholder, Person, Reply, SalesOpportunity, Sequence, SignalObservation,
+        Touch,
     };
     use crate::playbook::Playbooks;
     use axum::http::{HeaderMap, HeaderValue};
@@ -5061,7 +5578,7 @@ mod tests {
 
         let snapshot = gtm_snapshot(&db, Some("outagehub")).expect("snapshot");
         let counts = brand_tab_counts(&db);
-        let html = render_gtm_lab(brand_meta("outagehub"), &counts, &snapshot);
+        let html = render_gtm_lab(brand_meta("outagehub"), &counts, &snapshot, None);
 
         assert!(html.contains("Account root-cause ranking"));
         assert!(html.contains("Market coverage ledger"));
@@ -5086,9 +5603,32 @@ mod tests {
                 ..Default::default()
             })
             .expect("insert lead");
+        let market_account_id = db
+            .market_account_for_lead(&lead_id)
+            .expect("account query")
+            .expect("market account")
+            .id;
+        let play_id = db
+            .current_gtm_play("wapahki")
+            .expect("play query")
+            .expect("current play")
+            .id;
+        let sales_opportunity_id = db
+            .upsert_sales_opportunity(&SalesOpportunity {
+                brand: "wapahki".into(),
+                market_account_id,
+                lead_id: lead_id.clone(),
+                play_id,
+                kind: "physical_task".into(),
+                title: "Prepared-food repacking".into(),
+                task_or_decision: "Repack changing prepared-food formats".into(),
+                ..Default::default()
+            })
+            .expect("insert sales opportunity");
         db.upsert_customer_development(&CustomerDevelopmentRecord {
             brand: "wapahki".into(),
             lead_id,
+            sales_opportunity_id,
             problem: "Operators manually repack changing formats.".into(),
             stage: "problem_confirmed".into(),
             engaged_at: "2026-08-08T10:00:00Z".into(),
@@ -5113,7 +5653,7 @@ mod tests {
         assert!(html.contains("Highest explicit commitment"));
 
         let snapshot = gtm_snapshot(&db, Some("wapahki")).expect("snapshot");
-        let gtm = render_gtm_lab(brand_meta("wapahki"), &counts, &snapshot);
+        let gtm = render_gtm_lab(brand_meta("wapahki"), &counts, &snapshot, None);
         assert!(gtm.contains("Customer-development stage gates"));
         assert!(gtm.contains("conditional intent"));
     }
