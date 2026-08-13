@@ -438,6 +438,10 @@ enum Command {
         limit: usize,
     },
 
+    /// Import a JSON/JSONL sponsor-research manifest after re-fetching and
+    /// independently verifying every cited first-party source and contact.
+    ImportSponsorshipResearch { file: PathBuf },
+
     /// Draft one or two independently reviewed sponsorship emails. Always manual.
     PlanSponsorshipOutreach {
         opportunity: String,
@@ -1580,6 +1584,27 @@ fn main() -> Result<()> {
                 summary.skipped_without_budget_evidence,
                 summary.skipped_without_budget_contact,
             );
+            Ok(())
+        }
+
+        Command::ImportSponsorshipResearch { file } => {
+            let businesses = load_businesses(&cli)?;
+            let profile = businesses.get(&cli.brand)?;
+            let summary = rt.block_on(opportunity::import_sponsorship_research(
+                &db,
+                profile,
+                &file,
+            ))?;
+            println!(
+                "\u{2713} sponsorship research re-verified {} row(s): {} imported, {} rejected.",
+                summary.rows_read, summary.imported, summary.rejected,
+            );
+            if !summary.opportunity_ids.is_empty() {
+                println!("  opportunity ids: {}", summary.opportunity_ids.join(", "));
+            }
+            for error in summary.errors {
+                println!("  held: {error}");
+            }
             Ok(())
         }
 

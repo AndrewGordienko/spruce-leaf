@@ -92,6 +92,54 @@ pub struct SponsorshipOutreachOptions<'a> {
     pub touches: usize,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SponsorshipResearchImport {
+    pub organization: String,
+    pub domain: String,
+    #[serde(default)]
+    pub industry: String,
+    #[serde(default)]
+    pub geography: String,
+    pub recipient_kind: String,
+    pub relevance_evidence: SponsorshipSourceEvidence,
+    pub budget_evidence: SponsorshipSourceEvidence,
+    pub contact: SponsorshipResearchContact,
+    pub permitted_benefit: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SponsorshipSourceEvidence {
+    pub source_url: String,
+    pub exact_excerpt: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct SponsorshipResearchContact {
+    #[serde(default)]
+    pub existing_person_id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub email: String,
+    #[serde(default)]
+    pub location: String,
+    #[serde(default)]
+    pub linkedin_url: String,
+    #[serde(default)]
+    pub email_source_url: String,
+}
+
+#[derive(Debug, Default)]
+pub struct SponsorshipImportSummary {
+    pub rows_read: usize,
+    pub imported: usize,
+    pub rejected: usize,
+    pub opportunity_ids: Vec<String>,
+    pub errors: Vec<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 struct Candidate {
     #[serde(default)]
@@ -1195,6 +1243,351 @@ pub fn seed_sponsorships(
     Ok(summary)
 }
 
+/// Import a researched sponsorship manifest and independently re-verify every
+/// fact before it can become an outreach opportunity. The manifest is a work
+/// queue, never trusted evidence: source excerpts must occur on the fetched
+/// pages, route/title rules must match, and a non-CRM email must be published on
+/// the organization's own site with a live mail domain.
+pub async fn import_sponsorship_research(
+    db: &SharedDb,
+    profile: &BusinessProfile,
+    path: &std::path::Path,
+) -> Result<SponsorshipImportSummary> {
+    let sponsorship = profile.sponsorship()?;
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("reading sponsorship research {}", path.display()))?;
+    let rows = if raw.trim_start().starts_with('[') {
+        serde_json::from_str::<Vec<SponsorshipResearchImport>>(&raw)
+            .context("parsing sponsorship research JSON array")?
+    } else {
+        raw.lines()
+            .enumerate()
+            .filter(|(_, line)| !line.trim().is_empty())
+            .map(|(index, line)| {
+                serde_json::from_str::<SponsorshipResearchImport>(line).with_context(|| {
+                    format!("parsing sponsorship research JSONL line {}", index + 1)
+                })
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
+    let research = ResearchClient::from_env()?;
+    let mut page_cache = std::collections::HashMap::<String, String>::new();
+    let mut summary = SponsorshipImportSummary {
+        rows_read: rows.len(),
+        ..Default::default()
+    };
+
+    for row in rows {
+        let result = import_one_sponsorship_candidate(
+            db,
+            profile,
+            sponsorship,
+            &research,
+            &mut page_cache,
+            &row,
+        )
+        .await;
+        match result {
+            Ok(id) => {
+                summary.imported += 1;
+                summary.opportunity_ids.push(id);
+            }
+            Err(error) => {
+                summary.rejected += 1;
+                summary
+                    .errors
+                    .push(format!("{}: {error:#}", row.organization));
+            }
+        }
+    }
+    Ok(summary)
+}
+
+async fn import_one_sponsorship_candidate(
+    db: &SharedDb,
+    profile: &BusinessProfile,
+    sponsorship: &crate::business::SponsorshipProfile,
+    research: &ResearchClient,
+    page_cache: &mut std::collections::HashMap<String, String>,
+    row: &SponsorshipResearchImport,
+) -> Result<String> {
+    if row.organization.trim().is_empty() || row.domain.trim().is_empty() {
+        bail!("named organization and domain are required");
+    }
+    let domain = normalize_domain(row.domain.trim());
+    if domain.is_empty() || !domain.contains('.') {
+        bail!("organization domain is invalid");
+    }
+    let route = sponsorship
+        .routes
+        .iter()
+        .find(|route| route.recipient_kind == row.recipient_kind)
+        .ok_or_else(|| anyhow!("unsupported recipient kind '{}'", row.recipient_kind))?;
+    let inferred_kind = sponsorship_recipient_kind(&row.organization, &row.industry, &domain);
+    if inferred_kind != row.recipient_kind {
+        bail!(
+            "recipient kind '{}' contradicts deterministic organization type '{}'",
+            row.recipient_kind,
+            inferred_kind
+        );
+    }
+    if !sponsorship
+        .permitted_sponsor_benefits
+        .iter()
+        .any(|benefit| benefit == &row.permitted_benefit)
+    {
+        bail!("permitted_benefit must exactly match configured seller truth");
+    }
+
+    for (label, evidence) in [
+        ("organization relevance", &row.relevance_evidence),
+        ("budget/program", &row.budget_evidence),
+    ] {
+        if evidence.source_url.trim().is_empty() || evidence.exact_excerpt.trim().len() < 20 {
+            bail!("{label} evidence requires URL and a substantive exact excerpt");
+        }
+        if label == "organization relevance"
+            && !host_matches_allowed_domain(&evidence.source_url, &domain)
+        {
+            bail!("{label} source must be on {domain} or its subdomain");
+        }
+        let page = read_cached(research, page_cache, &evidence.source_url).await?;
+        if !normalized_contains(&page, &evidence.exact_excerpt) {
+            bail!("{label} excerpt was not found on {}", evidence.source_url);
+        }
+        if label == "budget/program"
+            && !host_matches_allowed_domain(&evidence.source_url, &domain)
+            && !normalized_contains(&page, &row.organization)
+        {
+            bail!("third-party budget/program evidence must explicitly name the organization");
+        }
+    }
+    let budget_excerpt = row.budget_evidence.exact_excerpt.to_ascii_lowercase();
+    if !route
+        .budget_evidence_terms
+        .iter()
+        .any(|term| budget_excerpt.contains(&term.trim().to_ascii_lowercase()))
+    {
+        bail!(
+            "budget/program excerpt contains none of the configured evidence terms for '{}'",
+            route.recipient_kind
+        );
+    }
+    let relevance_excerpt = row.relevance_evidence.exact_excerpt.to_ascii_lowercase();
+    let relevance_terms = [
+        "outage",
+        "power",
+        "electric",
+        "grid",
+        "resilien",
+        "emergency",
+        "critical infrastructure",
+        "utility",
+        "telecom",
+        "charging",
+        "insurance",
+        "climate",
+        "data",
+    ];
+    if !relevance_terms
+        .iter()
+        .any(|term| relevance_excerpt.contains(term))
+    {
+        bail!("relevance excerpt does not establish why OutageHub matters");
+    }
+
+    let (contact, contact_key, contact_source, apollo_person_id) =
+        if !row.contact.existing_person_id.trim().is_empty() {
+            let person = db
+                .get_person(&row.contact.existing_person_id)?
+                .ok_or_else(|| anyhow!("existing CRM person was not found"))?;
+            if person.email_status != "verified" || person.email.trim().is_empty() {
+                bail!("existing CRM person does not have a verified email");
+            }
+            let person_lead = db
+                .get_lead(&person.lead_id)?
+                .ok_or_else(|| anyhow!("existing CRM person's account was not found"))?;
+            if normalize_domain(&person_lead.domain) != domain {
+                bail!("existing CRM person belongs to a different company domain");
+            }
+            if sponsorship_contact_score(&person.title, route).is_none() {
+                bail!("existing CRM person's title does not match the recipient route");
+            }
+            (
+                SponsorshipResearchContact {
+                    name: person.name.clone(),
+                    title: person.title.clone(),
+                    email: person.email.clone(),
+                    location: person.location.clone(),
+                    linkedin_url: person.linkedin_url.clone(),
+                    ..Default::default()
+                },
+                format!("person:{}", person.id),
+                "existing_crm".to_string(),
+                person.apollo_person_id,
+            )
+        } else {
+            if row.contact.name.trim().is_empty()
+                || row.contact.title.trim().is_empty()
+                || row.contact.email.trim().is_empty()
+                || row.contact.email_source_url.trim().is_empty()
+            {
+                bail!("new contact requires name, title, email, and first-party email_source_url");
+            }
+            if sponsorship_contact_score(&row.contact.title, route).is_none() {
+                bail!("new contact title does not match the recipient route");
+            }
+            if !host_matches_allowed_domain(&row.contact.email_source_url, &domain) {
+                bail!("contact source must be on {domain} or its subdomain");
+            }
+            let page = read_cached(research, page_cache, &row.contact.email_source_url).await?;
+            let page_lower = page.to_ascii_lowercase();
+            if !page_lower.contains(&row.contact.email.trim().to_ascii_lowercase())
+                || !normalized_contains(&page, &row.contact.name)
+            {
+                bail!("first-party contact page does not publish the exact name and email");
+            }
+            if !crate::verify::syntax_ok(&row.contact.email)
+                || !crate::verify::has_mx(
+                    row.contact.email.split('@').nth(1).unwrap_or_default(),
+                )
+                .await
+            {
+                bail!("published contact email fails syntax or mail-domain verification");
+            }
+            (
+                row.contact.clone(),
+                format!("first-party:{}", row.contact.email.trim().to_ascii_lowercase()),
+                "first_party_published".to_string(),
+                String::new(),
+            )
+        };
+
+    let canonical_url = format!("https://{domain}");
+    let fingerprint = opportunity_fingerprint(
+        &profile.key,
+        &row.organization,
+        &sponsorship.offer_key,
+        &canonical_url,
+    );
+    let amount = format!("{}.00", sponsorship.ask_amount_cad);
+    let evidence = vec![
+        format!(
+            "organization_relevance: {} — {}",
+            row.relevance_evidence.exact_excerpt, row.relevance_evidence.source_url
+        ),
+        format!(
+            "budget_route_evidence: {} — {}",
+            row.budget_evidence.exact_excerpt, row.budget_evidence.source_url
+        ),
+        format!("recipient_kind: {}", route.recipient_kind),
+        format!("permitted_benefit: {}", row.permitted_benefit),
+    ];
+    let opportunity_id = db.upsert_opportunity(&Opportunity {
+        brand: profile.key.clone(),
+        kind: "sponsorship".into(),
+        fingerprint,
+        source_name: "verified_sponsorship_research".into(),
+        source_url: row.budget_evidence.source_url.clone(),
+        canonical_url,
+        title: sponsorship.offer_name.clone(),
+        funder: row.organization.clone(),
+        funder_domain: domain,
+        summary: format!(
+            "{} has verified first-party relevance and budget/program evidence for the '{}' route.",
+            row.organization, route.recipient_kind
+        ),
+        geography: row.geography.clone(),
+        opportunity_status: "open".into(),
+        funding_type: route.recipient_kind.clone(),
+        amount_min: amount.clone(),
+        amount_max: amount,
+        currency: sponsorship.currency.clone(),
+        cost_share: "No cost share; route-specific sponsorship or infrastructure support.".into(),
+        eligible_activities: sponsorship.permitted_sponsor_benefits.clone(),
+        ineligible_activities: sponsorship.sponsor_independence.clone(),
+        themes: vec![row.industry.clone(), route.recipient_kind.clone()],
+        evidence,
+        documents: vec![
+            row.relevance_evidence.source_url.clone(),
+            row.budget_evidence.source_url.clone(),
+            if row.contact.email_source_url.is_empty() {
+                "existing CRM email verification".into()
+            } else {
+                row.contact.email_source_url.clone()
+            },
+        ],
+        fit_score: 88,
+        fit_status: "strong_fit".into(),
+        fit_reasons: vec![
+            "Named organization.".into(),
+            "Exact first-party budget/program evidence re-fetched and matched.".into(),
+            "Named verified person with a route-matched title.".into(),
+            "Exact first-party reason OutageHub matters re-fetched and matched.".into(),
+            format!("Configured recipient type: {}.", route.recipient_kind),
+            format!("Configured benefit Andrew will provide: {}", row.permitted_benefit),
+        ],
+        blockers: vec![
+            "Exact personal budget ownership, current availability, and procurement remain unconfirmed; the first note may ask only the configured route question."
+                .into(),
+        ],
+        unknowns: vec![
+            "Current budget availability and decision timing.".into(),
+            "Required agreement, procurement, or infrastructure-credit process.".into(),
+        ],
+        next_action: format!("Draft one manual email. {}", route.action),
+        pipeline_status: "shortlisted".into(),
+        raw_snapshot: serde_json::to_string(row).unwrap_or_default(),
+        ..Default::default()
+    })?;
+    db.upsert_opportunity_contact(&OpportunityContact {
+        opportunity_id: opportunity_id.clone(),
+        brand: profile.key.clone(),
+        source: contact_source,
+        contact_key,
+        apollo_person_id,
+        name: contact.name,
+        title: contact.title,
+        location: contact.location,
+        role: route.recipient_kind.clone(),
+        why_them: format!(
+            "The verified title matches the configured '{}' route; exact budget ownership remains the first question.",
+            route.recipient_kind
+        ),
+        primary: true,
+        linkedin_url: contact.linkedin_url,
+        email: contact.email,
+        email_status: "verified".into(),
+        status: "mapped".into(),
+        ..Default::default()
+    })?;
+    Ok(opportunity_id)
+}
+
+async fn read_cached(
+    research: &ResearchClient,
+    cache: &mut std::collections::HashMap<String, String>,
+    url: &str,
+) -> Result<String> {
+    if let Some(page) = cache.get(url) {
+        return Ok(page.clone());
+    }
+    let page = research.read(url).await?;
+    cache.insert(url.to_string(), page.clone());
+    Ok(page)
+}
+
+fn normalized_contains(page: &str, excerpt: &str) -> bool {
+    let normalize = |value: &str| {
+        value
+            .to_ascii_lowercase()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    normalize(page).contains(&normalize(excerpt))
+}
+
 fn canonical_company_url(domain: &str, fallback: &str) -> String {
     let domain = domain.trim().trim_end_matches('/');
     if domain.is_empty() {
@@ -1671,7 +2064,7 @@ async fn write_sponsorship_sequence(
         "recipient": contact,
     });
     let user = format!(
-        "Write {n} founder-led infrastructure-sponsorship email touch(es), never more than two. OutageHub is already built and operating; this is not a grant, donation, investment, or request to finance an unbuilt idea. Touch 1 opens with Andrew's University of Toronto student/few-friends founder story, explains in one sentence that OutageHub already collects and normalizes monitored Canadian utilities' public outage reports into a public map and authenticated API, uses one exact supplied company fact plus the supplied budget-route evidence to explain why this organization and person, states the CAD $10,000 request toward the infrastructure costs keeping provider ingestion, normalization, the database, map, and API operating, names no more than two permitted benefits, and asks exactly one question using the configured recipient-route action. Never claim this person owns the budget. For an association or government recipient, ask for routing/introduction rather than money. For a journalist, ask for the commercial data/product/partnerships/licensing route. For a cloud vendor, ask for CAD $10,000 in credits or direct hosting support. Touch 2, if requested, adds one concrete product-truth, public-interest, or independence detail; never write a generic follow-up. Use plain 3–9 word subjects, day offsets 0 and 6, {min}–{max} words per body, and exactly the signature {signature}. Do not invent a sponsorship period, infrastructure-cost breakdown, live metric, endorsement, partnership, user, customer, SLA, private site status, or complete Canadian coverage. Use conversation claims only in the exact permitted form. Every target-company claim must appear in the exhaustive evidence. Return only the requested structure.\n\nBUSINESS-SPONSORSHIP DOCTRINE:\n{doctrine}\n\nCONTEXT:\n{context}\n\n{core}",
+        "Write {n} founder-led founding-sponsorship email touch(es), never more than two. The immediate commercial objective is one paid CAD $10,000 sponsorship. OutageHub is already built and operating; this is not a grant, donation, investment, server-bill appeal, repayment for prior work, or request to finance an unbuilt idea. Touch 1 opens naturally with Andrew as a U of T student who spent the past year building OutageHub with a few friends, says the team funded development themselves so far, and explains in one sentence that OutageHub already collects and normalizes monitored Canadian utilities' public outage reports into a public map and authenticated API. It then gives one concise, exact, supplied company-specific connection to outage resilience; asks for CAD $10,000 toward team time and infrastructure required to keep OutageHub operating and improve coverage; offers 12 months of founding-sponsor recognition, API access, quarterly coverage/data-quality briefings, and inclusion in the eventual annual impact report; and says the sponsorship would not influence the data or conclusions. End with exactly one question asking whether it can fit the recipient's partnerships, community-investment, or innovation budget and, in the same question, asking for routing if someone else owns it. Never claim this person owns the budget. Cloud and infrastructure vendors receive the same paid cash sponsorship ask, not a substitute credits request. Touch 2, if requested, adds one concrete product-truth, public-interest, or independence detail; never write a generic follow-up. Use plain 3–9 word subjects, day offsets 0 and 6, {min}–{max} words per body, and exactly the signature {signature}. Twelve months is the recognition period only; do not invent how long the money funds operations, a cost breakdown, live metric, endorsement, partnership, user, customer, SLA, private site status, or complete Canadian coverage. Use conversation claims only in the exact permitted form. Every target-company claim must appear in the exhaustive evidence. Return only the requested structure.\n\nBUSINESS-SPONSORSHIP DOCTRINE:\n{doctrine}\n\nCONTEXT:\n{context}\n\n{core}",
         min = sponsorship.min_words,
         max = sponsorship.max_words,
         doctrine = sponsorship.doctrine,
@@ -1716,11 +2109,11 @@ async fn review_sponsorship_sequence(
         "criteria": [
             "The subject and opening give this exact recipient an accurate reason to read.",
             "Every company claim is supported by the supplied evidence and no budget is presumed.",
-            "Andrew's U of T student/few-friends story is human credibility and never implies institutional endorsement.",
-            "The copy makes clear OutageHub is already operating and asks for CAD $10,000 toward real infrastructure costs without inventing a duration or cost breakdown.",
-            "No more than two configured sponsor benefits create a plausible recipient reason to answer.",
-            "The exact question follows the configured recipient route; only a commercial sponsor is asked directly for cash.",
-            "The sponsor cannot buy control over outage records, completeness scores, provider treatment, or published conclusions.",
+            "Andrew's U of T student/few-friends/past-year story is human credibility and never implies institutional endorsement.",
+            "The copy makes clear OutageHub is already operating, the team funded development themselves, and CAD $10,000 supports continued team time and infrastructure rather than merely a server bill or repayment for old work.",
+            "The configured benefits are stated accurately: 12 months of recognition, API access, quarterly coverage/data-quality briefings, and eventual annual impact-report inclusion.",
+            "The exact question follows the configured recipient route; immediate commercial and cloud/infrastructure targets are asked directly about the paid cash sponsorship.",
+            "The copy explicitly says sponsorship would not influence the data or conclusions.",
             "Touch one asks exactly one low-effort role-matched question.",
             "The note sounds like one founder speaking naturally, not a funding application or mass template."
         ],
@@ -1761,18 +2154,38 @@ fn sponsorship_copy_issues(
         for (needle, label) in [
             ("outagehub", "OutageHub"),
             ("10,000", "the CAD $10,000 price"),
-            (
-                "university of toronto",
-                "Andrew's University of Toronto context",
-            ),
             ("few friends", "the few-friends founder story"),
+            ("past year", "the past-year build commitment"),
+            ("funded", "the team's self-funded development"),
+            ("team time", "the continued team-time use of funds"),
             ("infrastructure", "the infrastructure use of funds"),
             ("map", "the existing public map"),
             ("api", "the existing API"),
+            ("12 months", "the 12-month recognition period"),
+            ("quarterly", "the quarterly briefing benefit"),
+            ("annual", "the eventual annual impact-report benefit"),
+            ("influence", "the sponsor-independence boundary"),
         ] {
             if !lower.contains(needle) {
                 issues.push(format!("sponsorship touch 1 must name {label}"));
             }
+        }
+        if !(lower.contains("u of t") || lower.contains("university of toronto")) {
+            issues.push("sponsorship touch 1 must name Andrew's U of T context".into());
+        }
+        if !(lower.contains("improve") && lower.contains("coverage")) {
+            issues.push("sponsorship touch 1 must connect the ask to improving coverage".into());
+        }
+        if !(lower.contains("data-quality") || lower.contains("data quality")) {
+            issues.push("sponsorship touch 1 must name the data-quality briefing".into());
+        }
+        if !(lower.contains("impact report") || lower.contains("annual report")) {
+            issues.push("sponsorship touch 1 must name eventual impact-report inclusion".into());
+        }
+        if !(lower.contains("someone else")
+            && (lower.contains("point me") || lower.contains("route") || lower.contains("introduc")))
+        {
+            issues.push("sponsorship touch 1 must request routing if someone else owns the budget".into());
         }
         let route_ok = match recipient_kind {
             "commercial_sponsor" => {
@@ -1792,7 +2205,10 @@ fn sponsorship_copy_issues(
                 .iter()
                 .any(|term| lower.contains(term)),
             "cloud_or_infrastructure_vendor" => {
-                lower.contains("credit") || lower.contains("hosting support")
+                lower.contains("budget")
+                    && (lower.contains("fit")
+                        || lower.contains("oversee")
+                        || lower.contains("owns"))
             }
             _ => false,
         };
@@ -1863,11 +2279,11 @@ pub fn prepare_sponsorship_pack(
                 opportunity.funder
             ),
             "Confirm that the named person owns or can route the evidenced budget/program and record the required vendor/procurement path.".into(),
-            "Confirm which one or two permitted sponsor benefits justify the support.".into(),
+            "Confirm the configured recognition, API-access, briefing, and eventual impact-report benefits and who will deliver them.".into(),
         ],
         agreement_checks: vec![
-            "Enter the evidenced sponsorship period, documented infrastructure-cost scope, and payment/support terms; never infer them.".into(),
-            "Name only the selected permitted benefits and their delivery limits.".into(),
+            "Enter the 12-month recognition period, documented team-time/infrastructure scope, and payment/support terms; never infer operating runway.".into(),
+            "Name the configured benefits and their delivery limits.".into(),
             "Preserve OutageHub's control over outage records, completeness scores, provider treatment, and published conclusions.".into(),
             "Define sponsor acknowledgement, API allowance if any, confidentiality, termination, and out-of-scope work.".into(),
             "Record invoice or credit agreement issued, support received, and every promised benefit as commercial truth events.".into(),
@@ -2481,7 +2897,7 @@ mod tests {
 
     #[test]
     fn sponsorship_copy_gate_enforces_founder_story_and_recipient_route() {
-        let body = "Hi Maya,\n\nI’m a University of Toronto student, and I built OutageHub with a few friends. It already collects monitored Canadian utilities’ public outage reports into a public map and API. We are seeking CAD $10,000 toward the infrastructure that keeps ingestion, the database, map, and API operating, with API access and founding-sponsor recognition available. Could this fit a community-investment budget you oversee, or should I speak with someone else?\n\nAndrew Gordienko";
+        let body = "Hi Maya,\n\nI’m a U of T student, and over the past year I built OutageHub with a few friends. It already collects monitored Canadian utilities’ public outage reports into a public map and API, and we funded the development ourselves so far. We are seeking CAD $10,000 toward the team time and infrastructure required to keep it operating and improve coverage. We would provide 12 months of founding-sponsor recognition, API access, quarterly coverage and data-quality briefings, and inclusion in the eventual annual impact report; the sponsorship would not influence the data or our conclusions. Could this fit a community-investment budget, or, if someone else owns that area, would you point me toward them?\n\nAndrew Gordienko";
         assert!(sponsorship_copy_issues(
             "OutageHub infrastructure sponsorship",
             body,
