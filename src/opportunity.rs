@@ -1353,7 +1353,10 @@ async fn import_one_sponsorship_candidate(
         {
             bail!("{label} source must be on {domain} or its subdomain");
         }
-        let page = read_cached(research, page_cache, &evidence.source_url).await?;
+        let mut page = read_cached(research, page_cache, &evidence.source_url).await?;
+        if !normalized_contains(&page, &evidence.exact_excerpt) {
+            page = refresh_cached(research, page_cache, &evidence.source_url).await?;
+        }
         if !normalized_contains(&page, &evidence.exact_excerpt) {
             bail!("{label} excerpt was not found on {}", evidence.source_url);
         }
@@ -1448,7 +1451,15 @@ async fn import_one_sponsorship_candidate(
         }
         let email_source_is_first_party =
             host_matches_allowed_domain(&row.contact.email_source_url, &domain);
-        let email_page = read_cached(research, page_cache, &row.contact.email_source_url).await?;
+        let mut email_page =
+            read_cached(research, page_cache, &row.contact.email_source_url).await?;
+        if !email_page
+            .to_ascii_lowercase()
+            .contains(&row.contact.email.trim().to_ascii_lowercase())
+        {
+            email_page =
+                refresh_cached(research, page_cache, &row.contact.email_source_url).await?;
+        }
         if !email_page
             .to_ascii_lowercase()
             .contains(&row.contact.email.trim().to_ascii_lowercase())
@@ -1460,7 +1471,12 @@ async fn import_one_sponsorship_candidate(
         } else {
             row.contact.person_source_url.as_str()
         };
-        let person_page = read_cached(research, page_cache, person_source_url).await?;
+        let mut person_page = read_cached(research, page_cache, person_source_url).await?;
+        if !normalized_contains(&person_page, &row.contact.name)
+            || !normalized_contains(&person_page, &row.contact.title)
+        {
+            person_page = refresh_cached(research, page_cache, person_source_url).await?;
+        }
         if !normalized_contains(&person_page, &row.contact.name)
             || !normalized_contains(&person_page, &row.contact.title)
         {
@@ -1662,6 +1678,20 @@ async fn read_cached(
     let page = research.read(url).await?;
     cache.insert(url.to_string(), page.clone());
     Ok(page)
+}
+
+/// A successful reader response can still be a temporary bot-check or a thin
+/// client-rendered shell. Retry once before holding a researched candidate;
+/// the exact excerpt/email/name-and-title checks still have to pass on the
+/// newly fetched source text.
+async fn refresh_cached(
+    research: &ResearchClient,
+    cache: &mut std::collections::HashMap<String, String>,
+    url: &str,
+) -> Result<String> {
+    cache.remove(url);
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    read_cached(research, cache, url).await
 }
 
 fn normalized_contains(page: &str, excerpt: &str) -> bool {
