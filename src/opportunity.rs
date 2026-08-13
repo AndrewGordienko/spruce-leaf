@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::apollo::{Apollo, ApolloOrg, OrgFilters, PeopleFilters};
-use crate::business::{BusinessProfile, FundingProfile, OpportunitySource};
+use crate::business::{BusinessProfile, FundingProfile, OpportunitySource, SponsorshipRoute};
 use crate::calendar::{self, TimingContext};
 use crate::db::{ApplicationBrief, Opportunity, OpportunityContact, OpportunityTouch, SharedDb};
 use crate::engine::Engine;
@@ -57,10 +57,39 @@ pub struct FundingPlanSummary {
     pub touches_scheduled: usize,
 }
 
+#[derive(Debug, Default)]
+pub struct SponsorshipSeedSummary {
+    pub accounts_considered: usize,
+    pub opportunities_added: usize,
+    pub opportunities_updated: usize,
+    pub contacts_mapped: usize,
+    pub skipped_without_evidence: usize,
+    pub skipped_without_target_fit: usize,
+    pub skipped_without_budget_evidence: usize,
+    pub skipped_without_budget_contact: usize,
+}
+
+#[derive(Debug, Default)]
+pub struct SponsorshipPack {
+    pub title: String,
+    pub price: String,
+    pub infrastructure_need: String,
+    pub product_truth: Vec<String>,
+    pub sponsor_benefits: Vec<String>,
+    pub independence_terms: Vec<String>,
+    pub buyer_checks: Vec<String>,
+    pub agreement_checks: Vec<String>,
+}
+
 pub struct FundingOutreachOptions<'a> {
     pub opportunity_id: &'a str,
     pub touches: usize,
     pub auto_schedule: bool,
+}
+
+pub struct SponsorshipOutreachOptions<'a> {
+    pub opportunity_id: &'a str,
+    pub touches: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -157,13 +186,13 @@ struct OpportunityEvaluation {
     fit: FitAssessment,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct FundingSequence {
     #[serde(default)]
     touches: Vec<FundingCopyTouch>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 struct FundingCopyTouch {
     stage: i64,
     day_offset: i64,
@@ -175,6 +204,18 @@ struct FundingCopyTouch {
     purpose: String,
     #[serde(default)]
     goal: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SponsorshipReview {
+    passes: bool,
+    score: i64,
+    #[serde(default)]
+    issues: Vec<String>,
+    #[serde(default)]
+    revised_subject: String,
+    #[serde(default)]
+    revised_body: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -913,6 +954,328 @@ pub async fn resolve_contacts(
     Ok(summary)
 }
 
+/// Build commercial sponsorship opportunities from the already-researched
+/// OutageHub market map. Apollo does not define the sponsor universe here:
+/// only accounts with an active, URL-backed outage decision/exposure claim are
+/// admitted, and only existing verified people near a configured sponsor
+/// budget role are mapped. Missing roles remain an explicit research gap.
+pub fn seed_sponsorships(
+    db: &SharedDb,
+    profile: &BusinessProfile,
+    limit: usize,
+) -> Result<SponsorshipSeedSummary> {
+    let sponsorship = profile.sponsorship()?;
+    let mut summary = SponsorshipSeedSummary::default();
+    let mut seen_leads = HashSet::new();
+    let people = db.list_people(None, None)?;
+    let lead_domains = db
+        .list_leads(None)?
+        .into_iter()
+        .map(|lead| (lead.id, lead.domain.trim().to_ascii_lowercase()))
+        .collect::<std::collections::HashMap<_, _>>();
+    let existing_fingerprints = db
+        .list_opportunities(Some(&profile.key), None)?
+        .into_iter()
+        .map(|opportunity| opportunity.fingerprint)
+        .collect::<HashSet<_>>();
+
+    for sales_opportunity in db.list_sales_opportunities(Some(&profile.key), None)? {
+        if summary.opportunities_added + summary.opportunities_updated >= limit.max(1) {
+            break;
+        }
+        if !matches!(
+            sales_opportunity.evidence_tier.as_str(),
+            "action_ready" | "discovery_ready"
+        ) || !seen_leads.insert(sales_opportunity.lead_id.clone())
+        {
+            continue;
+        }
+        summary.accounts_considered += 1;
+        let Some(lead) = db.get_lead(&sales_opportunity.lead_id)? else {
+            continue;
+        };
+        let sponsor_haystack = format!(
+            "{} {} {} {}",
+            lead.name,
+            lead.industry,
+            lead.observed_facts.join(" "),
+            sales_opportunity.task_or_decision
+        )
+        .to_ascii_lowercase();
+        let matched_keywords = sponsorship
+            .target_keywords
+            .iter()
+            .filter(|keyword| sponsor_haystack.contains(&keyword.trim().to_ascii_lowercase()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if matched_keywords.is_empty() {
+            summary.skipped_without_target_fit += 1;
+            continue;
+        }
+        let evidence_claims = db
+            .list_evidence_claims(Some(&sales_opportunity.id), Some(&profile.key))?
+            .into_iter()
+            .filter(|claim| {
+                matches!(claim.status.as_str(), "observed" | "verified")
+                    && !claim.source_url.trim().is_empty()
+                    && !claim.source_excerpt.trim().is_empty()
+            })
+            .collect::<Vec<_>>();
+        if evidence_claims.is_empty() {
+            summary.skipped_without_evidence += 1;
+            continue;
+        }
+        let recipient_kind = sponsorship_recipient_kind(&lead.name, &lead.industry, &lead.domain);
+        let Some(route) = sponsorship
+            .routes
+            .iter()
+            .find(|route| route.recipient_kind == recipient_kind)
+        else {
+            summary.skipped_without_target_fit += 1;
+            continue;
+        };
+        let budget_evidence = evidence_claims
+            .iter()
+            .filter(|claim| {
+                let excerpt = claim.source_excerpt.to_ascii_lowercase();
+                route
+                    .budget_evidence_terms
+                    .iter()
+                    .any(|term| excerpt.contains(&term.trim().to_ascii_lowercase()))
+            })
+            .collect::<Vec<_>>();
+        if budget_evidence.is_empty() {
+            summary.skipped_without_budget_evidence += 1;
+            continue;
+        }
+        let source_url = evidence_claims[0].source_url.clone();
+        let canonical_url = canonical_company_url(&lead.domain, &source_url);
+        let fingerprint = opportunity_fingerprint(
+            &profile.key,
+            &lead.name,
+            &sponsorship.offer_key,
+            &canonical_url,
+        );
+        let was_present = existing_fingerprints.contains(&fingerprint);
+        let mut evidence = evidence_claims
+            .iter()
+            .take(4)
+            .map(|claim| {
+                format!(
+                    "organization_relevance: {} — {}",
+                    claim.source_excerpt, claim.source_url
+                )
+            })
+            .collect::<Vec<_>>();
+        evidence.extend(budget_evidence.iter().take(2).map(|claim| {
+            format!(
+                "budget_route_evidence: {} — {}",
+                claim.source_excerpt, claim.source_url
+            )
+        }));
+        evidence.push(format!("recipient_kind: {}", route.recipient_kind));
+        evidence.push(format!(
+            "permitted_benefit: {}",
+            sponsorship.permitted_sponsor_benefits[0]
+        ));
+        let mut sponsor_people = people
+            .iter()
+            .filter(|person| {
+                lead_domains.get(&person.lead_id).is_some_and(|domain| {
+                    !domain.is_empty() && domain == &lead.domain.trim().to_ascii_lowercase()
+                }) && person.email_status == "verified"
+                    && !person.email.trim().is_empty()
+            })
+            .filter_map(|person| {
+                sponsorship_contact_score(&person.title, route).map(|score| (score, person))
+            })
+            .collect::<Vec<_>>();
+        sponsor_people.sort_by(|left, right| {
+            right
+                .0
+                .cmp(&left.0)
+                .then_with(|| left.1.name.cmp(&right.1.name))
+        });
+        if sponsor_people.is_empty() {
+            summary.skipped_without_budget_contact += 1;
+            continue;
+        }
+        let amount = format!("{}.00", sponsorship.ask_amount_cad);
+        let opportunity = Opportunity {
+            brand: profile.key.clone(),
+            kind: "sponsorship".into(),
+            fingerprint,
+            source_name: "outagehub_market_map".into(),
+            source_url,
+            canonical_url,
+            title: sponsorship.offer_name.clone(),
+            funder: lead.name.clone(),
+            funder_domain: lead.domain.clone(),
+            summary: format!(
+                "{} has separate source-backed relevance to OutageHub and evidence of a route matching '{}'. The named contact is plausible but exact budget ownership remains the first question.",
+                lead.name, route.recipient_kind
+            ),
+            geography: lead.hq.clone(),
+            opportunity_status: "open".into(),
+            funding_type: route.recipient_kind.clone(),
+            amount_min: amount.clone(),
+            amount_max: amount,
+            currency: sponsorship.currency.clone(),
+            cost_share: "No cost share; route-specific commercial sponsorship or infrastructure support.".into(),
+            eligible_activities: sponsorship.permitted_sponsor_benefits.clone(),
+            ineligible_activities: sponsorship.sponsor_independence.clone(),
+            themes: matched_keywords,
+            evidence,
+            fit_score: if sales_opportunity.evidence_tier == "action_ready" {
+                80
+            } else {
+                72
+            },
+            fit_status: "possible_fit".into(),
+            fit_reasons: vec![
+                "A named organization has source-backed relevance to OutageHub.".into(),
+                "A separate source supports a configured sponsorship/budget route.".into(),
+                "A named verified person has a title plausibly connected to that route.".into(),
+                format!("The configured action for this recipient kind is: {}", route.action),
+                format!(
+                    "Andrew is willing to provide: {}",
+                    sponsorship.permitted_sponsor_benefits[0]
+                ),
+            ],
+            blockers: vec![
+                "The named person's exact ownership, available amount, timing, and procurement path remain unconfirmed; touch one may ask only the route-appropriate question."
+                    .into(),
+            ],
+            unknowns: vec![
+                "Whether the named person owns or can route the evidenced budget/program.".into(),
+                "Whether CAD $10,000 or the route-specific infrastructure support is available now.".into(),
+                "Which permitted benefit matters and which agreement or vendor-onboarding steps apply.".into(),
+            ],
+            next_action: format!(
+                "Draft one manual, source-grounded note to the highest-scoring verified contact. {}",
+                route.action
+            ),
+            pipeline_status: "discovered".into(),
+            raw_snapshot: serde_json::to_string(&evidence_claims).unwrap_or_default(),
+            ..Default::default()
+        };
+        let opportunity_id = db.upsert_opportunity(&opportunity)?;
+        if was_present {
+            summary.opportunities_updated += 1;
+        } else {
+            summary.opportunities_added += 1;
+        }
+        for (index, (_, person)) in sponsor_people.into_iter().take(4).enumerate() {
+            db.upsert_opportunity_contact(&OpportunityContact {
+                opportunity_id: opportunity_id.clone(),
+                brand: profile.key.clone(),
+                source: "existing_crm".into(),
+                contact_key: format!("person:{}", person.id),
+                apollo_person_id: person.apollo_person_id.clone(),
+                name: person.name.clone(),
+                title: person.title.clone(),
+                location: person.location.clone(),
+                timezone: person.timezone.clone(),
+                role: route.recipient_kind.clone(),
+                why_them: format!(
+                    "The verified title '{}' matches the configured '{}' route; exact budget ownership is still unconfirmed.",
+                    person.title, route.recipient_kind
+                ),
+                primary: index == 0,
+                linkedin_url: person.linkedin_url.clone(),
+                email: person.email.clone(),
+                email_status: person.email_status.clone(),
+                phone: person.phone.clone(),
+                status: "mapped".into(),
+                ..Default::default()
+            })?;
+            summary.contacts_mapped += 1;
+        }
+    }
+    Ok(summary)
+}
+
+fn canonical_company_url(domain: &str, fallback: &str) -> String {
+    let domain = domain.trim().trim_end_matches('/');
+    if domain.is_empty() {
+        return fallback.trim().trim_end_matches('/').to_string();
+    }
+    if domain.starts_with("http://") || domain.starts_with("https://") {
+        domain.to_string()
+    } else {
+        format!("https://{domain}")
+    }
+}
+
+fn sponsorship_recipient_kind(name: &str, industry: &str, domain: &str) -> &'static str {
+    let haystack = format!("{name} {industry} {domain}").to_ascii_lowercase();
+    if haystack.contains("electricity canada")
+        || ["association", "industry council", "trade group"]
+            .iter()
+            .any(|term| haystack.contains(term))
+    {
+        "electricity_canada_or_industry_association"
+    } else if [
+        "government",
+        "ministry",
+        "municipal",
+        "municipality",
+        "city of ",
+        "province of ",
+    ]
+    .iter()
+    .any(|term| haystack.contains(term))
+    {
+        "government"
+    } else if ["journalism", "newspaper", "news", "media", "broadcast"]
+        .iter()
+        .any(|term| haystack.contains(term))
+    {
+        "journalist"
+    } else if [
+        "cloud",
+        "hosting",
+        "data center",
+        "data centre",
+        "infrastructure as a service",
+    ]
+    .iter()
+    .any(|term| haystack.contains(term))
+    {
+        "cloud_or_infrastructure_vendor"
+    } else {
+        "commercial_sponsor"
+    }
+}
+
+fn sponsorship_contact_score(title: &str, route: &SponsorshipRoute) -> Option<i64> {
+    let title = title.trim().to_ascii_lowercase();
+    let role_match = route
+        .target_roles
+        .iter()
+        .any(|keyword| title.contains(&keyword.trim().to_ascii_lowercase()));
+    if !role_match {
+        return None;
+    }
+    let seniority = if title.contains("chief") || title.contains("founder") {
+        50
+    } else if title.contains("vice president") || title.contains("vp") {
+        40
+    } else if title.contains("head") || title.contains("director") {
+        30
+    } else if title.contains("manager") {
+        20
+    } else {
+        10
+    };
+    let remit = route
+        .target_roles
+        .iter()
+        .filter(|keyword| title.contains(&keyword.trim().to_ascii_lowercase()))
+        .count() as i64;
+    Some(seniority + remit)
+}
+
 pub async fn plan_funding_outreach(
     db: &SharedDb,
     engine: &Engine,
@@ -1080,6 +1443,436 @@ async fn write_funding_sequence(
             funding_sequence_schema(n),
         )
         .await
+}
+
+/// Draft a commercial sponsor conversation. This path is intentionally manual:
+/// it never schedules, never treats a title as proof of budget ownership, and
+/// requires two semantic audits plus deterministic gates before a touch is
+/// marked as a reviewable draft.
+pub async fn plan_sponsorship_outreach(
+    db: &SharedDb,
+    engine: &Engine,
+    profile: &BusinessProfile,
+    playbook: &Playbook,
+    shared: &Shared,
+    options: SponsorshipOutreachOptions<'_>,
+) -> Result<FundingPlanSummary> {
+    let SponsorshipOutreachOptions {
+        opportunity_id,
+        touches,
+    } = options;
+    let sponsorship = profile.sponsorship()?;
+    let opportunity = db
+        .get_opportunity(opportunity_id)?
+        .ok_or_else(|| anyhow!("opportunity '{opportunity_id}' not found"))?;
+    if opportunity.kind != "sponsorship" {
+        bail!(
+            "opportunity '{}' is kind '{}', not sponsorship",
+            opportunity.id,
+            opportunity.kind
+        );
+    }
+    if opportunity.fit_status == "ineligible" {
+        bail!("refusing sponsorship outreach: opportunity is marked ineligible");
+    }
+    let n = touches.clamp(1, sponsorship.default_touches.min(2).max(1));
+    let verified_contacts = db
+        .list_opportunity_contacts(opportunity_id)?
+        .into_iter()
+        .filter(|contact| !contact.email.trim().is_empty() && contact.email_status == "verified")
+        .collect::<Vec<_>>();
+    let selected = verified_contacts
+        .iter()
+        .find(|contact| contact.primary)
+        .or_else(|| verified_contacts.first())
+        .ok_or_else(|| {
+            anyhow!(
+                "no verified sponsorship contact; map a role near innovation, partnerships, resilience, research, strategy, data, product, corporate affairs, sustainability, or founder budget ownership"
+            )
+        })?
+        .clone();
+    if !db.list_opportunity_touches(&selected.id)?.is_empty() {
+        return Ok(FundingPlanSummary::default());
+    }
+
+    let mut sequence = write_sponsorship_sequence(
+        engine,
+        profile,
+        &opportunity,
+        &selected,
+        &playbook.signature,
+        n,
+    )
+    .await?;
+    if sequence.touches.len() != n {
+        bail!(
+            "sponsorship writer returned {} touches; expected {n}",
+            sequence.touches.len()
+        );
+    }
+    sequence.touches.sort_by_key(|touch| touch.stage);
+    let forbidden = playbook.forbidden(shared);
+    let mut semantic_issues = Vec::new();
+    let mut semantic_passes = true;
+    for audit_round in 1..=2 {
+        let review = review_sponsorship_sequence(
+            engine,
+            profile,
+            &opportunity,
+            &selected,
+            &sequence,
+            audit_round == 2,
+        )
+        .await?;
+        if review.passes && review.score >= 85 && review.issues.is_empty() {
+            continue;
+        }
+        semantic_passes = false;
+        semantic_issues.extend(
+            review
+                .issues
+                .iter()
+                .map(|issue| format!("audit {audit_round} ({}/100): {issue}", review.score)),
+        );
+        if review.issues.is_empty() {
+            semantic_issues.push(format!(
+                "audit {audit_round} rejected the sequence at {}/100 without a specific repair",
+                review.score
+            ));
+        }
+        if audit_round == 1
+            && !review.revised_subject.trim().is_empty()
+            && !review.revised_body.trim().is_empty()
+            && sequence.touches.len() == 1
+        {
+            sequence.touches[0].subject = review.revised_subject;
+            sequence.touches[0].body = review.revised_body;
+            semantic_passes = true;
+            semantic_issues.clear();
+            continue;
+        }
+        break;
+    }
+
+    let now = Utc::now();
+    let mut summary = FundingPlanSummary::default();
+    for copy in sequence.touches.into_iter().take(n) {
+        let body = playbook::enforce_signature(&copy.body, &playbook.signature);
+        let mut issues =
+            sponsorship_copy_issues(&copy.subject, &body, copy.stage, &opportunity.funding_type);
+        let lint = playbook::lint(
+            &body,
+            &forbidden,
+            sponsorship.min_words,
+            sponsorship.max_words,
+        );
+        issues.extend(lint.forbidden_hits);
+        if !lint.length_ok {
+            issues.push(format!(
+                "body must contain {}–{} words",
+                sponsorship.min_words, sponsorship.max_words
+            ));
+        }
+        if !semantic_passes {
+            issues.extend(semantic_issues.clone());
+        }
+        issues.sort();
+        issues.dedup();
+        let passes = issues.is_empty();
+        let desired = now + Duration::days(copy.day_offset.max(0));
+        let industry = opportunity
+            .themes
+            .first()
+            .map(String::as_str)
+            .unwrap_or("commercial sponsorship");
+        let stable_key = format!(
+            "sponsorship:{}:{}:{}",
+            opportunity_id, selected.id, copy.stage
+        );
+        let timing = TimingContext {
+            industry,
+            title: &selected.title,
+            vantage: &selected.role,
+            channel: "email",
+            location: if selected.location.is_empty() {
+                &opportunity.geography
+            } else {
+                &selected.location
+            },
+            timezone: &selected.timezone,
+            stable_key: &stable_key,
+        };
+        let slot = calendar::schedule_with_capacity(profile, &timing, desired, |start, end| {
+            db.planned_touch_count_between(&profile.key, start, end)
+        })?;
+        db.insert_opportunity_touch(&OpportunityTouch {
+            opportunity_id: opportunity_id.to_string(),
+            contact_id: selected.id.clone(),
+            brand: profile.key.clone(),
+            stage: copy.stage,
+            day_offset: copy.day_offset,
+            subject: copy.subject,
+            body,
+            purpose: copy.purpose,
+            goal: copy.goal,
+            status: if passes { "draft" } else { "blocked" }.into(),
+            due_at: slot.at.to_rfc3339(),
+            recipient_timezone: slot.recipient_timezone,
+            scheduled_rule: slot.rule,
+            schedule_reason: slot.rationale,
+            review_passes: Some(passes),
+            review_issues: issues,
+            ..Default::default()
+        })?;
+        if passes {
+            summary.touches_drafted += 1;
+        }
+    }
+    summary.contacts_planned = 1;
+    db.set_opportunity_pipeline_status(
+        opportunity_id,
+        if summary.touches_drafted == n {
+            "shortlisted"
+        } else {
+            "discovered"
+        },
+    )?;
+    Ok(summary)
+}
+
+async fn write_sponsorship_sequence(
+    engine: &Engine,
+    profile: &BusinessProfile,
+    opportunity: &Opportunity,
+    contact: &OpportunityContact,
+    signature: &str,
+    n: usize,
+) -> Result<FundingSequence> {
+    let sponsorship = profile.sponsorship()?;
+    let route = sponsorship
+        .routes
+        .iter()
+        .find(|route| route.recipient_kind == opportunity.funding_type)
+        .ok_or_else(|| {
+            anyhow!(
+                "sponsorship opportunity has unsupported recipient kind '{}'",
+                opportunity.funding_type
+            )
+        })?;
+    let context = json!({
+        "business": profile.name,
+        "business_summary": profile.summary,
+        "verified_seller_facts": profile.known_facts,
+        "offer": sponsorship,
+        "recipient_route": route,
+        "target_company": opportunity.funder,
+        "target_company_evidence_is_exhaustive": opportunity.evidence,
+        "unverified_company_terms": opportunity.unknowns,
+        "recipient": contact,
+    });
+    let user = format!(
+        "Write {n} founder-led infrastructure-sponsorship email touch(es), never more than two. OutageHub is already built and operating; this is not a grant, donation, investment, or request to finance an unbuilt idea. Touch 1 opens with Andrew's University of Toronto student/few-friends founder story, explains in one sentence that OutageHub already collects and normalizes monitored Canadian utilities' public outage reports into a public map and authenticated API, uses one exact supplied company fact plus the supplied budget-route evidence to explain why this organization and person, states the CAD $10,000 request toward the infrastructure costs keeping provider ingestion, normalization, the database, map, and API operating, names no more than two permitted benefits, and asks exactly one question using the configured recipient-route action. Never claim this person owns the budget. For an association or government recipient, ask for routing/introduction rather than money. For a journalist, ask for the commercial data/product/partnerships/licensing route. For a cloud vendor, ask for CAD $10,000 in credits or direct hosting support. Touch 2, if requested, adds one concrete product-truth, public-interest, or independence detail; never write a generic follow-up. Use plain 3–9 word subjects, day offsets 0 and 6, {min}–{max} words per body, and exactly the signature {signature}. Do not invent a sponsorship period, infrastructure-cost breakdown, live metric, endorsement, partnership, user, customer, SLA, private site status, or complete Canadian coverage. Use conversation claims only in the exact permitted form. Every target-company claim must appear in the exhaustive evidence. Return only the requested structure.\n\nBUSINESS-SPONSORSHIP DOCTRINE:\n{doctrine}\n\nCONTEXT:\n{context}\n\n{core}",
+        min = sponsorship.min_words,
+        max = sponsorship.max_words,
+        doctrine = sponsorship.doctrine,
+        context = serde_json::to_string_pretty(&context).unwrap_or_default(),
+        core = core_strategy_block("sequence"),
+    );
+    engine
+        .structured_bulk::<FundingSequence>(
+            "opportunity.sponsorship_outreach",
+            "You write evidence-bound founder sponsorship outreach. The recipient must see a bounded commercial deliverable and a reason to answer; never invent budget ownership or sell influence over independent findings.",
+            &user,
+            funding_sequence_schema(n),
+        )
+        .await
+}
+
+async fn review_sponsorship_sequence(
+    engine: &Engine,
+    profile: &BusinessProfile,
+    opportunity: &Opportunity,
+    contact: &OpportunityContact,
+    sequence: &FundingSequence,
+    falsify_clean_result: bool,
+) -> Result<SponsorshipReview> {
+    let sponsorship = profile.sponsorship()?;
+    let route = sponsorship
+        .routes
+        .iter()
+        .find(|route| route.recipient_kind == opportunity.funding_type)
+        .ok_or_else(|| anyhow!("unknown sponsorship recipient route"))?;
+    let prompt = json!({
+        "task": if falsify_clean_result {
+            "A prior reviewer found no material defect. Try to falsify that result without inventing a nitpick."
+        } else {
+            "Judge whether this exact sponsorship outreach is ready unchanged."
+        },
+        "offer": sponsorship,
+        "required_recipient_route": route,
+        "verified_target_company_evidence_is_exhaustive": opportunity.evidence,
+        "recipient": contact,
+        "sequence": sequence,
+        "criteria": [
+            "The subject and opening give this exact recipient an accurate reason to read.",
+            "Every company claim is supported by the supplied evidence and no budget is presumed.",
+            "Andrew's U of T student/few-friends story is human credibility and never implies institutional endorsement.",
+            "The copy makes clear OutageHub is already operating and asks for CAD $10,000 toward real infrastructure costs without inventing a duration or cost breakdown.",
+            "No more than two configured sponsor benefits create a plausible recipient reason to answer.",
+            "The exact question follows the configured recipient route; only a commercial sponsor is asked directly for cash.",
+            "The sponsor cannot buy control over outage records, completeness scores, provider treatment, or published conclusions.",
+            "Touch one asks exactly one low-effort role-matched question.",
+            "The note sounds like one founder speaking naturally, not a funding application or mass template."
+        ],
+        "repair_rule": "If and only if one concise revision can make a single-touch sequence pass without adding unsupported facts, return the complete revised subject and body. Otherwise leave both empty.",
+    });
+    engine
+        .structured_bulk::<SponsorshipReview>(
+            "opportunity.sponsorship_review",
+            "You are an independent skeptical recipient-side reviewer. Compliance with a writer prompt is not sendability. Reject vague relevance, presumed budgets, seller-only value, hidden grant language, invented metrics or cost periods, implied institutional endorsement, the wrong recipient route, or any sale of influence over independent findings.",
+            &serde_json::to_string_pretty(&prompt).unwrap_or_default(),
+            sponsorship_review_schema(),
+        )
+        .await
+}
+
+fn sponsorship_copy_issues(
+    subject: &str,
+    body: &str,
+    stage: i64,
+    recipient_kind: &str,
+) -> Vec<String> {
+    let mut issues = Vec::new();
+    let subject_words = subject.split_whitespace().count();
+    let lower = body.to_ascii_lowercase();
+    if !(3..=9).contains(&subject_words) {
+        issues.push("subject must contain 3–9 words".into());
+    }
+    if lower.contains(" grant") || lower.contains("donation") || lower.contains("keep us running") {
+        issues.push("sponsorship copy must not read as a grant, donation, or runway appeal".into());
+    }
+    if lower.contains("control over") && !lower.contains("no control over") {
+        issues.push("copy must not offer sponsor control over independent findings".into());
+    }
+    if stage == 1 {
+        if body.matches('?').count() != 1 {
+            issues.push("sponsorship touch 1 must ask exactly one question".into());
+        }
+        for (needle, label) in [
+            ("outagehub", "OutageHub"),
+            ("10,000", "the CAD $10,000 price"),
+            (
+                "university of toronto",
+                "Andrew's University of Toronto context",
+            ),
+            ("few friends", "the few-friends founder story"),
+            ("infrastructure", "the infrastructure use of funds"),
+            ("map", "the existing public map"),
+            ("api", "the existing API"),
+        ] {
+            if !lower.contains(needle) {
+                issues.push(format!("sponsorship touch 1 must name {label}"));
+            }
+        }
+        let route_ok = match recipient_kind {
+            "commercial_sponsor" => {
+                lower.contains("budget")
+                    && (lower.contains("fit")
+                        || lower.contains("oversee")
+                        || lower.contains("owns"))
+            }
+            "electricity_canada_or_industry_association" => lower.contains("introduc"),
+            "government" => {
+                lower.contains("route")
+                    || lower.contains("introduc")
+                    || lower.contains("procurement")
+                    || lower.contains("program")
+            }
+            "journalist" => ["commercial", "licensing", "product", "partnership"]
+                .iter()
+                .any(|term| lower.contains(term)),
+            "cloud_or_infrastructure_vendor" => {
+                lower.contains("credit") || lower.contains("hosting support")
+            }
+            _ => false,
+        };
+        if !route_ok {
+            issues.push(format!(
+                "sponsorship touch 1 does not follow recipient route `{recipient_kind}`"
+            ));
+        }
+        if matches!(
+            recipient_kind,
+            "electricity_canada_or_industry_association" | "government" | "journalist"
+        ) && (lower.contains("contribute cad") || lower.contains("contribute $"))
+        {
+            issues.push(format!(
+                "recipient route `{recipient_kind}` must not receive a direct cash ask"
+            ));
+        }
+    } else {
+        if body.matches('?').count() > 1 {
+            issues.push("sponsorship follow-up may ask at most one question".into());
+        }
+        if lower.contains("following up") || lower.contains("just checking") {
+            issues.push("sponsorship follow-up must add decision-useful information".into());
+        }
+    }
+    for phrase in [
+        "complete canadian coverage",
+        "canada's official",
+        "official outage source",
+        "supported by",
+        "partnered with",
+        "approved by",
+        "working with",
+        "backed by",
+        "endorsed by",
+        "tax-deductible",
+        "tax deductible",
+        "will shut down",
+        "revolutionizing critical infrastructure",
+    ] {
+        if lower.contains(phrase) {
+            issues.push(format!(
+                "sponsorship copy contains prohibited claim `{phrase}`"
+            ));
+        }
+    }
+    issues
+}
+
+pub fn prepare_sponsorship_pack(
+    profile: &BusinessProfile,
+    opportunity: &Opportunity,
+) -> Result<SponsorshipPack> {
+    let sponsorship = profile.sponsorship()?;
+    if opportunity.kind != "sponsorship" {
+        bail!("a sponsorship pack requires a sponsorship opportunity");
+    }
+    Ok(SponsorshipPack {
+        title: sponsorship.offer_name.clone(),
+        price: format!("{} {}", sponsorship.currency, sponsorship.ask_amount_cad),
+        infrastructure_need: sponsorship.sponsorship_need.trim().to_string(),
+        product_truth: sponsorship.product_truth.clone(),
+        sponsor_benefits: sponsorship.permitted_sponsor_benefits.clone(),
+        independence_terms: sponsorship.sponsor_independence.clone(),
+        buyer_checks: vec![
+            format!(
+                "Preserve the source proving {} has the route-specific sponsorship, community-investment, resilience, innovation, data-partnership, procurement, licensing, or infrastructure-support program.",
+                opportunity.funder
+            ),
+            "Confirm that the named person owns or can route the evidenced budget/program and record the required vendor/procurement path.".into(),
+            "Confirm which one or two permitted sponsor benefits justify the support.".into(),
+        ],
+        agreement_checks: vec![
+            "Enter the evidenced sponsorship period, documented infrastructure-cost scope, and payment/support terms; never infer them.".into(),
+            "Name only the selected permitted benefits and their delivery limits.".into(),
+            "Preserve OutageHub's control over outage records, completeness scores, provider treatment, and published conclusions.".into(),
+            "Define sponsor acknowledgement, API allowance if any, confidentiality, termination, and out-of-scope work.".into(),
+            "Record invoice or credit agreement issued, support received, and every promised benefit as commercial truth events.".into(),
+        ],
+    })
 }
 
 pub async fn prepare_application(
@@ -1516,6 +2309,20 @@ fn funding_sequence_schema(n: usize) -> Value {
     })
 }
 
+fn sponsorship_review_schema() -> Value {
+    json!({
+        "type":"object","additionalProperties":false,
+        "required":["passes","score","issues","revised_subject","revised_body"],
+        "properties":{
+            "passes":{"type":"boolean"},
+            "score":{"type":"integer","minimum":0,"maximum":100},
+            "issues":string_array("Material sendability defects only."),
+            "revised_subject":{"type":"string"},
+            "revised_body":{"type":"string"}
+        }
+    })
+}
+
 fn application_schema() -> Value {
     json!({
         "type":"object","additionalProperties":false,
@@ -1541,9 +2348,11 @@ fn application_schema() -> Value {
 mod tests {
     use super::{
         best_org_match, dedupe_candidates, domain_from_url, host_matches_allowed_domain,
-        interleave_candidate_batches, opportunity_fingerprint, validated_research_url, Candidate,
+        interleave_candidate_batches, opportunity_fingerprint, sponsorship_contact_score,
+        sponsorship_copy_issues, sponsorship_recipient_kind, validated_research_url, Candidate,
     };
     use crate::apollo::ApolloOrg;
+    use crate::business::SponsorshipRoute;
     use crate::db::Opportunity;
 
     #[test]
@@ -1640,5 +2449,66 @@ mod tests {
             ..Default::default()
         };
         assert!(best_org_match(&opportunity, &[unrelated]).is_none());
+    }
+
+    #[test]
+    fn sponsorship_routes_are_explicit_and_title_bound() {
+        assert_eq!(
+            sponsorship_recipient_kind("Electricity Canada", "association", "electricity.ca"),
+            "electricity_canada_or_industry_association"
+        );
+        assert_eq!(
+            sponsorship_recipient_kind("Daily News", "media", "daily.example"),
+            "journalist"
+        );
+        assert_eq!(
+            sponsorship_recipient_kind("Cloud North", "cloud hosting", "cloud.example"),
+            "cloud_or_infrastructure_vendor"
+        );
+        assert_eq!(
+            sponsorship_recipient_kind("Intact", "insurance", "intact.ca"),
+            "commercial_sponsor"
+        );
+        let route = SponsorshipRoute {
+            recipient_kind: "commercial_sponsor".into(),
+            action: "Ask directly".into(),
+            target_roles: vec!["Community Investment".into(), "Innovation".into()],
+            budget_evidence_terms: vec!["community investment".into()],
+        };
+        assert!(sponsorship_contact_score("Director, Community Investment", &route).is_some());
+        assert!(sponsorship_contact_score("Network Operations Manager", &route).is_none());
+    }
+
+    #[test]
+    fn sponsorship_copy_gate_enforces_founder_story_and_recipient_route() {
+        let body = "Hi Maya,\n\nI’m a University of Toronto student, and I built OutageHub with a few friends. It already collects monitored Canadian utilities’ public outage reports into a public map and API. We are seeking CAD $10,000 toward the infrastructure that keeps ingestion, the database, map, and API operating, with API access and founding-sponsor recognition available. Could this fit a community-investment budget you oversee, or should I speak with someone else?\n\nAndrew Gordienko";
+        assert!(sponsorship_copy_issues(
+            "OutageHub infrastructure sponsorship",
+            body,
+            1,
+            "commercial_sponsor"
+        )
+        .is_empty());
+        let wrong_route = sponsorship_copy_issues(
+            "OutageHub infrastructure sponsorship",
+            body,
+            1,
+            "electricity_canada_or_industry_association",
+        );
+        assert!(wrong_route
+            .iter()
+            .any(|issue| issue.contains("recipient route")));
+        let endorsement = body.replace(
+            "It already collects",
+            "It is endorsed by Electricity Canada and already collects",
+        );
+        assert!(sponsorship_copy_issues(
+            "OutageHub infrastructure sponsorship",
+            &endorsement,
+            1,
+            "commercial_sponsor"
+        )
+        .iter()
+        .any(|issue| issue.contains("endorsed by")));
     }
 }

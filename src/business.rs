@@ -35,6 +35,8 @@ pub struct BusinessProfile {
     #[serde(default)]
     pub funding: Option<FundingProfile>,
     #[serde(default)]
+    pub sponsorship: Option<SponsorshipProfile>,
+    #[serde(default)]
     pub calendar: OutreachCalendar,
     #[serde(default)]
     pub account_limits: AccountLimits,
@@ -294,6 +296,73 @@ pub struct FundingProfile {
     pub doctrine: String,
 }
 
+/// A bounded commercial sponsorship motion. Unlike a grant, the counterparty
+/// buys named infrastructure support and benefits under an invoice/agreement
+/// and receives no control over independent data treatment. This stays separate from `FundingProfile` so a
+/// business cannot accidentally send grant-eligibility copy to a commercial
+/// sponsor or build an application where a sales process is required.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SponsorshipProfile {
+    pub objective: String,
+    pub offer_key: String,
+    pub offer_name: String,
+    pub ask_amount_cad: i64,
+    #[serde(default = "default_currency")]
+    pub currency: String,
+    #[serde(default)]
+    pub primary_goal: String,
+    #[serde(default)]
+    pub target_industries: Vec<String>,
+    #[serde(default)]
+    pub target_keywords: Vec<String>,
+    #[serde(default)]
+    pub preferred_contact_titles: Vec<String>,
+    #[serde(default)]
+    pub founder_story: String,
+    #[serde(default)]
+    pub product_truth: Vec<String>,
+    #[serde(default)]
+    pub dynamic_metrics: Vec<String>,
+    #[serde(default)]
+    pub founder_reported_conversations: Vec<String>,
+    #[serde(default)]
+    pub conversation_claim_rules: Vec<String>,
+    #[serde(default)]
+    pub sponsorship_need: String,
+    #[serde(default)]
+    pub public_interest_case: Vec<String>,
+    #[serde(default)]
+    pub permitted_sponsor_benefits: Vec<String>,
+    #[serde(default)]
+    pub sponsor_independence: Vec<String>,
+    #[serde(default)]
+    pub prohibited_claims: Vec<String>,
+    #[serde(default)]
+    pub email_structure: Vec<String>,
+    #[serde(default)]
+    pub voice: Vec<String>,
+    #[serde(default)]
+    pub routes: Vec<SponsorshipRoute>,
+    #[serde(default = "default_funding_min_words")]
+    pub min_words: usize,
+    #[serde(default = "default_funding_max_words")]
+    pub max_words: usize,
+    #[serde(default = "default_funding_touches")]
+    pub default_touches: usize,
+    #[serde(default)]
+    pub doctrine: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct SponsorshipRoute {
+    pub recipient_kind: String,
+    pub action: String,
+    #[serde(default)]
+    pub target_roles: Vec<String>,
+    #[serde(default)]
+    pub budget_evidence_terms: Vec<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct OpportunitySource {
     pub name: String,
@@ -477,6 +546,18 @@ impl BusinessProfile {
         self.funding
             .as_ref()
             .ok_or_else(|| anyhow!("{} has no funding profile", self.name))
+    }
+
+    pub fn sponsorship(&self) -> Result<&SponsorshipProfile> {
+        if !self.has_motion("sponsorship") {
+            return Err(anyhow!(
+                "{} does not have an enabled sponsorship motion",
+                self.name
+            ));
+        }
+        self.sponsorship
+            .as_ref()
+            .ok_or_else(|| anyhow!("{} has no sponsorship profile", self.name))
     }
 
     pub fn commercial_offer(&self, key: &str) -> Option<&CommercialOffer> {
@@ -664,6 +745,71 @@ fn validate(profile: &BusinessProfile) -> Result<()> {
             }
         }
     }
+    if profile.has_motion("sponsorship") {
+        let sponsorship = profile
+            .sponsorship
+            .as_ref()
+            .ok_or_else(|| anyhow!("sponsorship motion requires a [sponsorship] section"))?;
+        if sponsorship.offer_key.trim().is_empty()
+            || sponsorship.offer_name.trim().is_empty()
+            || sponsorship.objective.trim().is_empty()
+        {
+            return Err(anyhow!(
+                "sponsorship requires objective, offer_key, and offer_name"
+            ));
+        }
+        if sponsorship.ask_amount_cad <= 0 {
+            return Err(anyhow!("sponsorship requires a positive ask_amount_cad"));
+        }
+        if sponsorship.default_touches == 0
+            || sponsorship.default_touches > 2
+            || sponsorship.min_words == 0
+            || sponsorship.max_words < sponsorship.min_words
+        {
+            return Err(anyhow!(
+                "sponsorship permits one or two touches and requires a valid word band"
+            ));
+        }
+        if sponsorship.product_truth.is_empty()
+            || sponsorship.permitted_sponsor_benefits.is_empty()
+            || sponsorship.sponsor_independence.is_empty()
+            || sponsorship.target_keywords.is_empty()
+            || sponsorship.routes.is_empty()
+            || sponsorship.sponsorship_need.trim().is_empty()
+        {
+            return Err(anyhow!(
+                "sponsorship requires target keywords, product truth, sponsor benefits, independence terms, routes, and sponsorship need"
+            ));
+        }
+        let mut route_kinds = std::collections::HashSet::new();
+        for route in &sponsorship.routes {
+            if route.recipient_kind.trim().is_empty()
+                || route.action.trim().is_empty()
+                || route.target_roles.is_empty()
+                || route.budget_evidence_terms.is_empty()
+            {
+                return Err(anyhow!(
+                    "sponsorship routes require recipient_kind, action, target_roles, and budget_evidence_terms"
+                ));
+            }
+            if !route_kinds.insert(route.recipient_kind.trim()) {
+                return Err(anyhow!(
+                    "duplicate sponsorship recipient kind '{}'",
+                    route.recipient_kind
+                ));
+            }
+        }
+        let price_cents = sponsorship.ask_amount_cad.saturating_mul(100);
+        let offer = profile
+            .commercial_offer(&sponsorship.offer_key)
+            .ok_or_else(|| anyhow!("sponsorship offer_key must name a commercial offer"))?;
+        if offer.price_min_cents != Some(price_cents) || offer.price_max_cents != Some(price_cents)
+        {
+            return Err(anyhow!(
+                "sponsorship price must match the exact configured commercial offer price"
+            ));
+        }
+    }
     validate_calendar(&profile.calendar)?;
     Ok(())
 }
@@ -827,7 +973,7 @@ mod tests {
     use super::Businesses;
 
     #[test]
-    fn loads_three_distinct_businesses_and_outagehub_funding() {
+    fn loads_three_distinct_businesses_and_outagehub_sponsorship() {
         let businesses = Businesses::load("businesses").expect("business profiles");
         assert_eq!(businesses.keys(), vec!["gnk", "outagehub", "wapahki"]);
         assert!(businesses.keys().into_iter().all(|key| businesses
@@ -837,14 +983,19 @@ mod tests {
             .max_active_contacts_per_account
             == 0));
         assert!(!businesses.get("gnk").unwrap().has_motion("funding"));
-        assert!(businesses.get("outagehub").unwrap().has_motion("funding"));
-        assert!(!businesses
-            .get("outagehub")
-            .unwrap()
-            .funding()
-            .unwrap()
-            .sources
-            .is_empty());
+        let outagehub = businesses.get("outagehub").unwrap();
+        assert!(!outagehub.has_motion("funding"));
+        assert!(outagehub.has_motion("sponsorship"));
+        let sponsorship = outagehub.sponsorship().unwrap();
+        assert_eq!(sponsorship.ask_amount_cad, 10_000);
+        assert_eq!(sponsorship.routes.len(), 5);
+        assert_eq!(
+            outagehub
+                .commercial_offer("founding_infrastructure_sponsorship")
+                .unwrap()
+                .price_min_cents,
+            Some(1_000_000)
+        );
         let wapahki = businesses.get("wapahki").unwrap();
         assert_eq!(wapahki.discovery_evidence.len(), 2);
         assert_eq!(wapahki.commercial.offers.len(), 3);
@@ -863,13 +1014,14 @@ mod tests {
             wapahki.commercial_allocation(Some(8.0)).cash_now_share_bps,
             6_000
         );
-        for key in ["gnk", "outagehub", "wapahki"] {
+        for key in ["gnk", "wapahki"] {
             let profile = businesses.get(key).unwrap();
             assert_eq!(profile.commercial.offers.len(), 3);
             assert!(profile
                 .commercial_offer(&profile.commercial.offers[0].key)
                 .is_some());
         }
+        assert_eq!(outagehub.commercial.offers.len(), 4);
         let context = wapahki.operating_context();
         assert!(context.contains("Founder discovery evidence"));
         assert!(context.contains("NOT proof about a candidate account"));

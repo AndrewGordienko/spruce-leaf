@@ -3940,6 +3940,14 @@ fn gnk_names_operating_consequence(body: &str) -> bool {
     [
         "settlement",
         "delay",
+        "slow the",
+        "slows the",
+        "slowing the",
+        "takes longer",
+        "wait time",
+        "waiting",
+        "backlog",
+        "rework",
         "recovery",
         "recoveries",
         "write-off",
@@ -4671,6 +4679,16 @@ fn account_sequence_quality_issues(
 ) -> Vec<String> {
     let mut issues =
         sequence_quality_issues(pb, shared, sequence, reviews, expected_touches, critique);
+    if gtm_context.is_some_and(|context| context.state == "discovery_ready") {
+        for touch in &sequence.touches {
+            let question_count = touch.body.matches('?').count();
+            if touch.stage == 1 && question_count != 1 {
+                issues.push(format!(
+                    "discovery-ready stage 1 must ask exactly one decision-sized question by email; found {question_count} question marks"
+                ));
+            }
+        }
+    }
     issues.extend(unsupported_account_task_noun_issues(pb, account, sequence));
     issues.extend(source_attribution_issues(account, gtm_context, sequence));
     issues.extend(unconfirmed_subject_claim_issues(
@@ -5604,21 +5622,21 @@ fn review_edit_schema(n: usize) -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        affected_stages, apply_targeted_repairs, approve_ready_touches, brand_trigger_contract,
-        business_copy_context, copy_research_rule, copy_sentence_count,
-        cross_recipient_similarity_issue, format_progress_status, generic_subject_label,
-        gnk_hedge_moves, has_forced_response_menu, has_natural_response_path,
-        has_stacked_operating_questions, is_email_capable_channel, is_empty_linkedin_praise,
-        is_retreat_or_route_touch, mentions_historical_outage_result, mentions_outreach_asset,
-        names_historical_outage_result, narrates_internal_copy_logic, normalize_dashes,
-        normalize_principle_ids, normalize_thread_subjects, provisional_channel,
-        provisional_day_offset, select_people_for_planning, sequence_quality_issues,
-        source_attribution_issues, supported_touch_count, supported_touch_count_for_brand,
-        touch_question_limit, touch_word_band, unconfirmed_subject_claim_issues,
-        unsupported_account_task_noun_issues, unsupported_subject_number_issues,
-        wapahki_leads_with_generic_facility_fit, wapahki_names_operating_consequence,
-        word_set_similarity, CopyAccount, CopySequence, CopyTouch, EditDoc, EditReview,
-        PlanProgressRecipient, PlanProgressUpdate, TouchReview,
+        account_sequence_quality_issues, affected_stages, apply_targeted_repairs,
+        approve_ready_touches, brand_trigger_contract, business_copy_context, copy_research_rule,
+        copy_sentence_count, cross_recipient_similarity_issue, format_progress_status,
+        generic_subject_label, gnk_hedge_moves, gnk_names_operating_consequence,
+        has_forced_response_menu, has_natural_response_path, has_stacked_operating_questions,
+        is_email_capable_channel, is_empty_linkedin_praise, is_retreat_or_route_touch,
+        mentions_historical_outage_result, mentions_outreach_asset, names_historical_outage_result,
+        narrates_internal_copy_logic, normalize_dashes, normalize_principle_ids,
+        normalize_thread_subjects, provisional_channel, provisional_day_offset,
+        select_people_for_planning, sequence_quality_issues, source_attribution_issues,
+        supported_touch_count, supported_touch_count_for_brand, touch_question_limit,
+        touch_word_band, unconfirmed_subject_claim_issues, unsupported_account_task_noun_issues,
+        unsupported_subject_number_issues, wapahki_leads_with_generic_facility_fit,
+        wapahki_names_operating_consequence, word_set_similarity, CopyAccount, CopySequence,
+        CopyTouch, EditDoc, EditReview, PlanProgressRecipient, PlanProgressUpdate, TouchReview,
     };
 
     #[test]
@@ -5941,6 +5959,63 @@ mod tests {
             issues
                 .iter()
                 .any(|issue| issue.contains("hypothesis caveats")),
+            "issues were {issues:?}"
+        );
+        assert!(gnk_names_operating_consequence(
+            "Does assembling the available case details slow the next-action decision?"
+        ));
+    }
+
+    #[test]
+    fn discovery_ready_first_touch_allows_only_one_operating_question() {
+        let playbooks = Playbooks::load("playbooks").expect("load playbooks");
+        let pb = playbooks.get("gnk").expect("gnk playbook");
+        let account = CopyAccount {
+            name: "SimplexMed".into(),
+            industry: "medical billing".into(),
+            hq: "Houston".into(),
+            observed_facts: vec!["SimplexMed lists EOB analysis and A/R management.".into()],
+            inferences: Vec::new(),
+            hypothesis: "Case details may need assembly before the next action.".into(),
+            mechanism: String::new(),
+            consequence_metric: String::new(),
+            signals: Vec::new(),
+            system_concept: String::new(),
+            hard_buyer_question: String::new(),
+            kill_condition: String::new(),
+            magnitude_note: String::new(),
+            applied_principles: Vec::new(),
+        };
+        let sequence = CopySequence {
+            touches: vec![CopyTouch {
+                stage: 1,
+                day_offset: 0,
+                channel: "email".into(),
+                subject: "Next action after an EOB".into(),
+                body: "Hi Nazir,\n\nSimplexMed lists EOB analysis and A/R management. Does assembling the available claim and payment details slow the next-action decision?\n\nGnK builds focused workflow software around existing tools. What step takes longest?\n\nAndrew".into(),
+                purpose: "test the decision".into(),
+                goal: "earn one answer".into(),
+            }],
+            applied_principles: Vec::new(),
+        };
+        let context = GtmActionContext {
+            state: "discovery_ready".into(),
+            ..GtmActionContext::default()
+        };
+        let issues = account_sequence_quality_issues(
+            pb,
+            &playbooks.shared,
+            &account,
+            &sequence,
+            &[],
+            1,
+            false,
+            Some(&context),
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.contains("exactly one decision-sized question")),
             "issues were {issues:?}"
         );
     }

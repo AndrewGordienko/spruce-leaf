@@ -15,24 +15,22 @@ known_facts = [
 
 unknowns = [
   "Legal incorporated name, incorporation jurisdiction, and incorporation date.",
-  "Full-time employee count, revenue, and financial statements available for an application.",
-  "Current technology-readiness level and documented R&D work plan.",
-  "Available matching funds, prior government assistance, and stacking constraints.",
-  "Quantified Canadian economic benefits, jobs, emissions impact, and customer evidence.",
-  "Committed utility, municipal, academic, or commercial pilot partners.",
+  "Whether a target company has a discretionary sponsorship, resilience, innovation, research, or data budget.",
+  "Which buyer can approve a CAD $10,000 founding sponsorship and what agreement or vendor-onboarding steps they require.",
+  "Which permitted sponsor benefits are valuable enough to fund after seeing the one-page scope.",
 ]
 
 goals = [
   "Reach every credible API customer whose Canadian location-specific decision can improve with normalized utility-outage data; allocate selling time across cash-now replays, core API evaluations, and strategic embedded subscriptions.",
   "Find organizations with an outage-sensitive operational decision where a location-matched external grid signal changes the outcome, and become the API/webhook their existing system (NOC, dispatch, ServiceNow, Salesforce) consumes — not another dashboard.",
-  "Find every credible funding, pilot, challenge, and advisory programme that could advance product development, validation, commercialization, or grid-resilience evidence.",
-  "Build funder relationships and complete strong applications without claiming eligibility that has not been verified.",
+  "Secure one or more CAD $10,000 non-equity sponsors to help keep the already-operating OutageHub ingestion, database, map, and API online.",
 ]
 
 constraints = [
   "Treat public outage information, private alarms, carrier telemetry, internal tickets, and site status as distinct data types.",
-  "Never state that OutageHub is eligible for a programme until every mandatory criterion is evidenced.",
-  "Never describe a repayable contribution, tax credit, loan, procurement, or challenge prize as a grant.",
+  "Never imply that a target has a sponsorship, resilience, innovation, research, or data budget until its buyer confirms one.",
+  "A sponsor receives only agreed benefits and cannot control outage records, completeness scores, provider treatment, or published conclusions.",
+  "Never present sponsorship revenue as a grant, donation, or unrestricted runway money; it is a commercial invoice for agreed infrastructure support and benefits.",
 ]
 
 [commercial]
@@ -50,6 +48,33 @@ strategic_share_bps = 1000
 cash_now_share_bps = 5000
 core_share_bps = 3500
 strategic_share_bps = 1500
+
+[[commercial.offers]]
+key = "founding_infrastructure_sponsorship"
+name = "OutageHub Founding Infrastructure Sponsorship"
+lane = "cash_now"
+description = "A CAD $10,000 non-equity sponsorship toward the real hosting, storage, networking, monitoring, and ingestion costs that keep the already-operating OutageHub map and API online."
+price_min_cents = 1000000
+price_max_cents = 1000000
+payment_structure = "CAD $10,000 invoiced under a one-page sponsorship agreement; the sponsorship period and payment timing remain unknown until a buyer confirms terms."
+estimate_confidence = "hypothesis"
+estimate_basis = [
+  "Founder-selected initial sponsorship ask of CAD $10,000; not yet validated by a recorded buyer payment.",
+]
+requires = [
+  "Source evidence that the organization has a relevant sponsorship, community-investment, resilience, innovation, data-partnership, or infrastructure budget.",
+  "A named person plausibly connected to that budget, a source-backed reason OutageHub matters, the correct recipient route, and one permitted sponsor benefit.",
+]
+success_criteria = [
+  "CAD $10,000 collected against the sponsorship invoice.",
+  "Agreed infrastructure support and sponsor benefits delivered without sponsor control over outage records, completeness scores, provider treatment, or conclusions.",
+]
+exclusions = [
+  "Implying the prospect has a suitable budget before confirmation.",
+  "Inventing how many months the sponsorship buys or a server-cost breakdown.",
+  "Selling influence over outage records, completeness scores, provider treatment, or published conclusions.",
+  "Open-ended custom analysis outside the agreement.",
+]
 
 [[commercial.offers]]
 key = "historical_location_replay"
@@ -136,15 +161,15 @@ preferred_hours = [8, 10, 12]
 rationale = "Explicit test hypothesis: genuine incident-operations roles in continuously operated sectors may review operational messages on weekends. This exception requires both a matching sector and title and must be replaced by observed response data when enough samples exist."
 
 [[calendar.rules]]
-key = "funding_and_public_sector_weekdays"
-industries = ["public funding", "government", "economic development"]
-title_keywords = ["program", "programme", "funding", "advisor", "innovation", "partnership"]
+key = "infrastructure_sponsorship_weekdays"
+industries = ["insurance", "telecommunications", "generator", "ev charging", "emergency management", "resilience"]
+title_keywords = ["innovation", "partnership", "sponsorship", "resilience", "research", "strategy", "data", "product"]
 channels = ["email"]
 weekdays = ["tue", "wed", "thu"]
 window_start = 9
 window_end = 16
 preferred_hours = [9, 11, 14]
-rationale = "Programme and public-sector enquiries remain weekday-only regardless of OutageHub's incident-operations weekend hypothesis."
+rationale = "Commercial sponsorship outreach stays in normal business hours even when incident-operations customer outreach uses a weekend hypothesis."
 
 [[motions]]
 key = "customer_outbound"
@@ -152,108 +177,191 @@ kind = "sales"
 objective = "Find organizations where external utility context can improve a specific outage-time classification or prioritization decision."
 
 [[motions]]
-key = "funding_pipeline"
-kind = "funding"
-objective = "Discover, qualify, pursue, and monitor non-dilutive funding and funded pilot opportunities."
+key = "infrastructure_sponsorship"
+kind = "sponsorship"
+objective = "Secure one or more CAD $10,000 non-equity sponsors to cover documented infrastructure costs required to keep OutageHub operating."
 
 [[motions]]
 key = "pilot_partners"
 kind = "partnership"
 objective = "Find utilities, municipalities, research institutions, and operating partners for evidence-producing pilots."
 
-[funding]
-objective = "Fund product R&D, data coverage, operational validation, commercialization, and Canadian grid-resilience or clean-technology evidence."
-themes = [
-  "electric-grid reliability and resilience",
-  "utility and outage data",
-  "clean technology and energy innovation",
-  "Canadian technology R&D and commercialization",
-  "critical infrastructure and emergency operations",
-  "smart cities, geospatial data, and public-interest data",
-  "applied AI and decision support",
+[sponsorship]
+objective = "Secure one or more CAD $10,000 non-equity sponsors to cover the documented hosting, storage, networking, monitoring, and ingestion costs required to keep OutageHub operating."
+offer_key = "founding_infrastructure_sponsorship"
+offer_name = "OutageHub Founding Infrastructure Sponsorship"
+ask_amount_cad = 10000
+currency = "CAD"
+primary_goal = "Obtain a sponsorship discussion, introduction to the budget owner, or permission to send a one-page sponsorship scope."
+target_industries = [
+  "insurance",
+  "telecommunications",
+  "generator and backup power",
+  "EV charging networks",
+  "emergency management technology",
+  "cloud and infrastructure vendors",
+  "industry associations",
+  "news and data organizations",
 ]
-project_shapes = [
-  "R&D to improve location matching, event normalization, coverage, or evidence quality.",
-  "A bounded pilot with a utility, municipality, research institution, or multi-site operator.",
-  "Validation of whether external outage context changes classification, prioritization, dispatch, or continuity decisions.",
-  "Commercialization, export, or adoption work where the programme explicitly supports those activities.",
+target_keywords = [
+  "insurance",
+  "insurer",
+  "telecom",
+  "wireless",
+  "tower",
+  "generator",
+  "backup power",
+  "ev charging",
+  "charging network",
+  "emergency management",
+  "resilience",
+  "cloud",
+  "hosting",
+  "infrastructure",
+  "news",
+  "media",
+  "association",
 ]
 preferred_contact_titles = [
-  "Program Manager",
-  "Funding Program Officer",
-  "Innovation Advisor",
-  "Industrial Technology Advisor",
-  "Business Development Manager",
-  "Partnerships Manager",
-  "Innovation Manager",
-  "Grid Innovation",
+  "Corporate Partnerships",
+  "Community Investment",
+  "Innovation",
+  "Infrastructure Resilience",
+  "Data Partnerships",
+  "Corporate Affairs",
+  "Founder",
+  "Chief Executive Officer",
+]
+founder_story = """
+Andrew Gordienko is a University of Toronto student. He built OutageHub with a
+few friends after seeing that Canadian power-outage information was fragmented
+across utilities and difficult to use consistently. This is a human credibility
+story, not evidence of institutional affiliation. Never imply that the
+University of Toronto operates, endorses, funds, or formally supports OutageHub.
+"""
+product_truth = [
+  "OutageHub is already built and operating; the sponsorship is not funding an unbuilt idea.",
+  "OutageHub collects and normalizes public outage reports from monitored Canadian utility providers.",
+  "It provides a public interactive map and an authenticated REST API.",
+  "It preserves provider, geographic area, affected-customer count, cause, planned status, start time, and estimated restoration time when the source utility publishes those fields.",
+  "It measures provider-level data completeness and makes limitations visible.",
+  "It can compare reported geographic outage areas with supplied Canadian locations and times.",
+  "Coverage and data completeness vary significantly by provider.",
+  "OutageHub provides outside-in public utility context; it does not know or certify the private status of a specific site.",
+]
+dynamic_metrics = [
+  "Fetch provider count from the live system before using it.",
+  "Fetch tracked-record count from the live system and label exactly what the number measures.",
+  "Fetch current average completeness with its calculation date.",
+  "Never hard-code an old metric into sponsorship copy.",
+]
+founder_reported_conversations = [
+  "Andrew has discussed OutageHub with people in government.",
+  "Andrew has discussed OutageHub with Electricity Canada.",
+  "Electricity Canada conversations included concerns about fair and accurate representation of utility data, and OutageHub made changes in response.",
+  "Andrew has discussed OutageHub and its data with news organizations.",
+]
+conversation_claim_rules = [
+  "These conversations may establish that Andrew has engaged relevant institutions.",
+  "They do not establish endorsement, approval, funding, partnership, customer status, data licensing, or permission.",
+  "Use 'we have spoken with' or 'we have discussed the project with.'",
+  "Never use 'supported by,' 'partnered with,' 'approved by,' 'working with,' 'backed by,' or 'endorsed by' without written evidence for that exact relationship.",
+  "Do not name an individual or describe their reaction unless the CRM contains notes supporting the claim.",
+]
+sponsorship_need = """
+OutageHub needs CAD $10,000 toward the real infrastructure costs that keep its
+provider ingestion, normalization, database, map, and API operating. The writer
+must not invent how many months the money buys, a server-cost breakdown, or an
+operating runway. Use 'toward the infrastructure costs' until an evidenced
+budget and sponsorship period have been entered.
+"""
+public_interest_case = [
+  "Canadian outage information is published through many inconsistent provider systems.",
+  "Maintaining a normalized view makes the information more accessible to operators, researchers, journalists, public-interest organizations, and companies with outage-sensitive locations.",
+  "Provider-level completeness reporting creates visibility into what data exists and what remains unavailable.",
+  "The sponsorship preserves an already operating Canadian data resource.",
+]
+permitted_sponsor_benefits = [
+  "Recognition as a founding infrastructure sponsor on an agreed website or report location.",
+  "Authenticated OutageHub API access under an agreed usage allowance.",
+  "Periodic briefing on Canadian outage-data coverage and completeness.",
+  "The ability to suggest operational questions or use cases for investigation.",
+  "A short sponsorship summary describing what the funding maintained.",
+]
+sponsor_independence = [
+  "A sponsor cannot control outage records, completeness scores, provider treatment, or published conclusions.",
+  "Sponsorship does not make the sponsor a utility-data partner.",
+  "Sponsorship does not create an SLA, official outage-verification service, or mission-critical guarantee.",
+]
+prohibited_claims = [
+  "Do not claim complete Canadian utility coverage.",
+  "Do not call OutageHub Canada's official outage source.",
+  "Do not imply utility, government, Electricity Canada, media, University of Toronto, or Canadian Red Cross endorsement.",
+  "Do not promise exact uptime, latency, refresh intervals, retention, SLA, or universal provider coverage.",
+  "Do not claim that public utility data proves whether a private location has power.",
+  "Do not claim that a sponsor's money creates charitable or tax-deductible treatment.",
+  "Do not invent customers, pilots, users, revenue, media usage, partners, or testimonials.",
+  "Do not use vague claims such as 'revolutionizing critical infrastructure.'",
+]
+email_structure = [
+  "Open with one human sentence: Andrew is a U of T student who built OutageHub with a few friends.",
+  "Explain in one sentence what is already operating.",
+  "Optionally mention relevant conversations using only 'spoken with' or 'discussed.'",
+  "State the CAD $10,000 sponsorship request directly.",
+  "Explain that it supports the infrastructure keeping ingestion, the map, and the API operating.",
+  "Name no more than two sponsor benefits.",
+  "Ask one question appropriate to the configured recipient route.",
+]
+voice = [
+  "Founder-written, ordinary language, concise and specific.",
+  "Sincere without sounding helpless.",
+  "Do not manufacture urgency or say OutageHub will shut down unless that is literally true.",
+  "Do not use 'I found you because.'",
+  "Do not flatter the recipient.",
+  "Do not bury the amount.",
+  "Do not write a seven-touch sales sequence.",
+  "One initial email and one evidence-adding follow-up only.",
 ]
 min_words = 80
-max_words = 170
+max_words = 145
 default_touches = 2
 doctrine = """
-Funding outreach is a pre-application inquiry, not a sales pitch and not a request
-to award money by email. Lead with the named programme and one evidenced criterion.
-Describe one bounded OutageHub project shape, then ask one question that materially
-changes the go/no-go decision: applicant eligibility, eligible activity, project
-fit, intake timing, required partner, or the right advisor. Do not send generic
-seven-touch cadences to public servants. Prefer the programme's published contact;
-use Apollo to find a credible advisor or programme owner only when the official
-route is absent or a relationship is genuinely useful. A formal application,
-budget, work plan, evidence, and portal submission remain separate governed steps.
+This is a commercial infrastructure sponsorship, not a grant request, donation,
+investment, or appeal to finance an unbuilt idea. Lead with Andrew's human founder
+story, explain what is already operating, use one exact source-backed reason this
+organization is relevant, state CAD $10,000 directly, and name no more than two
+permitted benefits. Ask exactly one route-appropriate question. Never invent a
+budget, sponsorship period, infrastructure-cost breakdown, dynamic metric,
+endorsement, partnership, user, customer, SLA, or private site status. Use one
+active cold contact per organization and keep every draft manual until reviewed.
 """
 
-[[funding.sources]]
-name = "Innovation Canada — business support"
-mode = "catalog"
-url = "https://www.canada.ca/en/services/science/innovation/funding.html"
+[[sponsorship.routes]]
+recipient_kind = "commercial_sponsor"
+action = "Ask directly for CAD $10,000."
+target_roles = ["Corporate Partnerships", "Community Investment", "Innovation", "Infrastructure Resilience", "Data Partnerships", "Corporate Affairs", "Founder", "Chief Executive Officer"]
+budget_evidence_terms = ["sponsorship", "community investment", "innovation fund", "resilience budget", "data partnership", "corporate affairs"]
 
-[[funding.sources]]
-name = "Clean Growth Hub"
-mode = "catalog"
-url = "https://ised-isde.canada.ca/site/clean-growth-hub/en"
+[[sponsorship.routes]]
+recipient_kind = "electricity_canada_or_industry_association"
+action = "Ask for an introduction to a member, vendor, or industry sponsor. Do not imply endorsement and do not default to asking the association itself for money."
+target_roles = ["Member Relations", "Partnerships", "Industry Relations", "Innovation", "Corporate Affairs"]
+budget_evidence_terms = ["member sponsorship", "industry sponsorship", "vendor partnership", "partner program"]
 
-[[funding.sources]]
-name = "Ontario funding opportunities"
-mode = "catalog"
-url = "https://www.ontario.ca/page/available-funding-opportunities-ontario-government"
+[[sponsorship.routes]]
+recipient_kind = "government"
+action = "Ask for routing to a suitable private sponsor, procurement route, or program. Do not ask an individual public servant to make a discretionary sponsorship payment."
+target_roles = ["Innovation", "Economic Development", "Procurement", "Partnerships", "Open Data"]
+budget_evidence_terms = ["procurement", "innovation program", "private sponsor", "partnership program", "open data program"]
 
-[[funding.sources]]
-name = "NRC IRAP"
-mode = "program"
-url = "https://nrc.canada.ca/en/support-technology-innovation/financial-support-technology-innovation"
-apollo_organization_name = "National Research Council Canada"
-apollo_domains = ["nrc-cnrc.gc.ca", "nrc.canada.ca"]
+[[sponsorship.routes]]
+recipient_kind = "journalist"
+action = "Do not ask editorial staff to sponsor a data source they may cover. Ask whether their commercial data, product, partnerships, or licensing team would evaluate OutageHub."
+target_roles = ["Data", "Product", "Partnerships", "Licensing", "Commercial"]
+budget_evidence_terms = ["data licensing", "commercial data", "data partnership", "product partnership"]
 
-[[funding.sources]]
-name = "FedDev Ontario funding"
-mode = "catalog"
-url = "https://feddev-ontario.canada.ca/en/funding-southern-ontario"
-apollo_organization_name = "Federal Economic Development Agency for Southern Ontario"
-apollo_domains = ["feddev-ontario.canada.ca"]
-
-[[funding.sources]]
-name = "IESO Grid Innovation Fund"
-mode = "program"
-url = "https://www.ieso.ca/en/Get-Involved/Innovation/Grid-Innovation-Fund/Overview"
-apollo_organization_name = "Independent Electricity System Operator"
-apollo_domains = ["ieso.ca"]
-
-[[funding.sources]]
-name = "Ontario Centre of Innovation"
-mode = "catalog"
-url = "https://www.oc-innovation.ca/programs/"
-apollo_organization_name = "Ontario Centre of Innovation"
-apollo_domains = ["oc-innovation.ca"]
-
-[[funding.sources]]
-name = "Federal and Ontario live-call search"
-mode = "search"
-query = "Canada Ontario open funding call technology grid resilience utility data innovation grant contribution pilot"
-allowed_domains = [
-  "canada.ca",
-  "nrc.canada.ca",
-  "ontario.ca",
-  "ieso.ca",
-  "oc-innovation.ca",
-]
+[[sponsorship.routes]]
+recipient_kind = "cloud_or_infrastructure_vendor"
+action = "Ask for CAD $10,000 of infrastructure credits or direct hosting support rather than unrestricted cash."
+target_roles = ["Startup Program", "Cloud Partnerships", "Developer Relations", "Community", "Sponsorship"]
+budget_evidence_terms = ["startup credits", "cloud credits", "infrastructure credits", "startup program", "sponsorship"]

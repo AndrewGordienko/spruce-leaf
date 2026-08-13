@@ -430,6 +430,23 @@ enum Command {
 
     /// Prepare an evidence-gapped go/no-go brief and application work plan.
     PrepareApplication { opportunity: String },
+
+    /// Build sponsorship opportunities from source-backed OutageHub accounts.
+    /// All six sponsorship qualification gates must pass before a row is created.
+    SeedSponsorships {
+        #[arg(long, default_value_t = 30, value_parser = positive_usize)]
+        limit: usize,
+    },
+
+    /// Draft one or two independently reviewed sponsorship emails. Always manual.
+    PlanSponsorshipOutreach {
+        opportunity: String,
+        #[arg(long, default_value_t = 1, value_parser = positive_usize)]
+        touches: usize,
+    },
+
+    /// Render the governed one-page sponsorship scope/checklist for one target.
+    PrepareSponsorshipPack { opportunity: String },
 }
 
 fn main() -> Result<()> {
@@ -1541,6 +1558,80 @@ fn main() -> Result<()> {
                 brief.project_shape,
                 brief.evidence_needed.join("\n- "),
                 brief.next_steps.join("\n- "),
+            );
+            Ok(())
+        }
+
+        Command::SeedSponsorships { limit } => {
+            let businesses = load_businesses(&cli)?;
+            let profile = businesses.get(&cli.brand)?;
+            let summary = opportunity::seed_sponsorships(&db, profile, limit)?;
+            println!(
+                "\u{2713} sponsorship qualification considered {} account(s): {} added, {} updated, {} verified budget-role contact(s) mapped.",
+                summary.accounts_considered,
+                summary.opportunities_added,
+                summary.opportunities_updated,
+                summary.contacts_mapped,
+            );
+            println!(
+                "  held: {} without route fit, {} without relevance evidence, {} without source-backed budget/program evidence, {} without a verified route-matched person.",
+                summary.skipped_without_target_fit,
+                summary.skipped_without_evidence,
+                summary.skipped_without_budget_evidence,
+                summary.skipped_without_budget_contact,
+            );
+            Ok(())
+        }
+
+        Command::PlanSponsorshipOutreach {
+            opportunity: opportunity_id,
+            touches,
+        } => {
+            let client = make_engine(&rt, &cli)?;
+            let businesses = load_businesses(&cli)?;
+            let profile = businesses.get(&cli.brand)?;
+            let playbooks = load_playbooks(&cli)?;
+            let playbook = playbooks.get(&cli.brand)?;
+            let summary = rt.block_on(opportunity::plan_sponsorship_outreach(
+                &db,
+                &client,
+                profile,
+                playbook,
+                &playbooks.shared,
+                opportunity::SponsorshipOutreachOptions {
+                    opportunity_id: &opportunity_id,
+                    touches,
+                },
+            ))?;
+            println!(
+                "\u{2713} sponsorship review processed {} contact(s): {} manual draft(s), {} scheduled.",
+                summary.contacts_planned,
+                summary.touches_drafted,
+                summary.touches_scheduled,
+            );
+            println!("  Sponsorship planning never auto-schedules; review every draft in the CRM.");
+            Ok(())
+        }
+
+        Command::PrepareSponsorshipPack {
+            opportunity: opportunity_id,
+        } => {
+            let businesses = load_businesses(&cli)?;
+            let profile = businesses.get(&cli.brand)?;
+            let sponsorship_opportunity = db
+                .get_opportunity(&opportunity_id)?
+                .ok_or_else(|| anyhow::anyhow!("opportunity '{opportunity_id}' not found"))?;
+            let pack = opportunity::prepare_sponsorship_pack(profile, &sponsorship_opportunity)?;
+            println!(
+                "{}\nAsk: {}\n\nInfrastructure need:\n{}\n\nProduct truth:\n- {}\n\nPermitted sponsor benefits:\n- {}\n\nIndependence:\n- {}\n\nBuyer checks:\n- {}\n\nAgreement checks:\n- {}",
+                pack.title,
+                pack.price,
+                pack.infrastructure_need,
+                pack.product_truth.join("\n- "),
+                pack.sponsor_benefits.join("\n- "),
+                pack.independence_terms.join("\n- "),
+                pack.buyer_checks.join("\n- "),
+                pack.agreement_checks.join("\n- "),
             );
             Ok(())
         }

@@ -2701,6 +2701,61 @@ fn render_strategy_brand(
         b.push_str("</section>");
     }
 
+    if let Some(sponsorship) = &profile.sponsorship {
+        b.push_str(
+            "<section class=\"strategy-panel\"><div class=\"strategy-panel-head\">\
+             <h2>Infrastructure sponsorship</h2>\
+             <p>A commercial sponsor motion for an already-operating data resource — not a grant application.</p></div>",
+        );
+        b.push_str(&format!(
+            "<p class=\"strategy-lead\">{}</p><p class=\"metric\"><strong>Ask:</strong> {} ${}</p>",
+            esc(&sponsorship.objective),
+            esc(&sponsorship.currency),
+            sponsorship.ask_amount_cad,
+        ));
+        render_bullet_block(&mut b, "Product truth", &sponsorship.product_truth, "facts");
+        render_bullet_block(
+            &mut b,
+            "Permitted sponsor benefits",
+            &sponsorship.permitted_sponsor_benefits,
+            "goals",
+        );
+        render_bullet_block(
+            &mut b,
+            "Sponsor independence",
+            &sponsorship.sponsor_independence,
+            "constraints",
+        );
+        b.push_str(
+            "<h3 class=\"strategy-subhead\">Recipient routes</h3><div class=\"motion-grid\">",
+        );
+        for route in &sponsorship.routes {
+            b.push_str(&format!(
+                "<article class=\"motion-card\"><div class=\"motion-card-top\"><strong>{}</strong></div><p>{}</p><details><summary>Eligible titles</summary><ul class=\"strategy-list facts\">{}</ul></details><details><summary>Required budget/program evidence</summary><ul class=\"strategy-list constraints\">{}</ul></details></article>",
+                esc(&route.recipient_kind.replace('_', " ")),
+                esc(&route.action),
+                route
+                    .target_roles
+                    .iter()
+                    .map(|item| format!("<li>{}</li>", esc(item)))
+                    .collect::<String>(),
+                route
+                    .budget_evidence_terms
+                    .iter()
+                    .map(|item| format!("<li>{}</li>", esc(item)))
+                    .collect::<String>(),
+            ));
+        }
+        b.push_str("</div>");
+        if !sponsorship.doctrine.trim().is_empty() {
+            b.push_str(&format!(
+                "<details class=\"doctrine-full openable\" open><summary>Sponsorship email doctrine</summary><div class=\"prose\">{}</div></details>",
+                esc_multiline(sponsorship.doctrine.trim()),
+            ));
+        }
+        b.push_str("</section>");
+    }
+
     // Outreach playbook
     b.push_str(
         "<section class=\"strategy-panel\"><div class=\"strategy-panel-head\">\
@@ -5518,15 +5573,17 @@ mod tests {
 
         let ohub = businesses.get("outagehub").expect("outagehub profile");
         let ohub_pb = playbooks.get("outagehub").expect("outagehub playbook");
-        let funding_page = render_strategy_brand(
+        let sponsorship_page = render_strategy_brand(
             brand_meta("outagehub").expect("meta"),
             ohub,
             ohub_pb,
             &playbooks.shared,
             &counts,
         );
-        assert!(funding_page.contains("Funding motion"));
-        assert!(funding_page.contains("Official sources"));
+        assert!(sponsorship_page.contains("Infrastructure sponsorship"));
+        assert!(sponsorship_page.contains("Recipient routes"));
+        assert!(sponsorship_page.contains("commercial sponsor"));
+        assert!(!sponsorship_page.contains("Funding motion"));
     }
 
     #[test]
