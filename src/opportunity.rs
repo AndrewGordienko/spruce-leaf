@@ -70,6 +70,28 @@ pub struct SponsorshipSeedSummary {
     pub skipped_without_budget_contact: usize,
 }
 
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct SponsorshipCampaignAudit {
+    pub target: usize,
+    pub organizations: usize,
+    pub ready: usize,
+    pub blocked: usize,
+    pub scheduled_or_sent: usize,
+    pub direct_mailboxes: usize,
+    pub routed_mailboxes: usize,
+    pub issues: Vec<String>,
+}
+
+impl SponsorshipCampaignAudit {
+    pub fn passes(&self) -> bool {
+        self.organizations == self.target
+            && self.ready == self.target
+            && self.blocked == 0
+            && self.scheduled_or_sent == 0
+            && self.issues.is_empty()
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct SponsorshipPack {
     pub title: String,
@@ -91,6 +113,7 @@ pub struct FundingOutreachOptions<'a> {
 pub struct SponsorshipOutreachOptions<'a> {
     pub opportunity_id: &'a str,
     pub touches: usize,
+    pub refresh: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1834,6 +1857,299 @@ fn sponsorship_contact_score(title: &str, route: &SponsorshipRoute) -> Option<i6
     Some(seniority + remit)
 }
 
+pub(crate) fn sponsorship_contact_is_direct(contact: &OpportunityContact) -> bool {
+    let local_part = contact
+        .email
+        .split('@')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let normalized_local = local_part.replace(['.', '-', '_'], "");
+    let generic_mailboxes = [
+        "business",
+        "businesssales",
+        "community",
+        "corporaterelations",
+        "executiveassistant",
+        "hello",
+        "info",
+        "marketing",
+        "media",
+        "ontario",
+        "partnerships",
+        "sales",
+        "support",
+        "tantalusinfo",
+    ];
+    if generic_mailboxes.contains(&normalized_local.as_str()) {
+        return false;
+    }
+    if contact.source.ends_with("_direct") {
+        return true;
+    }
+    if contact.source != "existing_crm" {
+        return false;
+    }
+    contact
+        .name
+        .split(|character: char| !character.is_alphanumeric())
+        .map(str::to_ascii_lowercase)
+        .filter(|part| part.len() >= 3)
+        .any(|part| local_part.contains(&part))
+}
+
+fn sponsorship_recipient_route_issues(
+    body: &str,
+    stage: i64,
+    contact: &OpportunityContact,
+    company: &str,
+) -> Vec<String> {
+    if stage != 1 || sponsorship_contact_is_direct(contact) {
+        return Vec::new();
+    }
+    let salutation = body
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("");
+    let salutation_lower = salutation.to_ascii_lowercase();
+    let first_name = contact
+        .name
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .trim_matches(|character: char| !character.is_alphanumeric())
+        .to_ascii_lowercase();
+    let names_person = first_name.len() >= 3 && salutation_lower.contains(&first_name);
+    let names_company_team = salutation_lower.contains("team")
+        || company
+            .split_whitespace()
+            .next()
+            .is_some_and(|word| salutation_lower.contains(&word.to_ascii_lowercase()));
+    if names_person && !names_company_team {
+        vec![format!(
+            "shared mailbox {} must not be greeted as though it belongs to {}",
+            contact.email, contact.name
+        )]
+    } else {
+        Vec::new()
+    }
+}
+
+fn normalize_campaign_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn existing_sponsorship_subjects(
+    db: &SharedDb,
+    excluded_opportunity_id: &str,
+) -> Result<Vec<String>> {
+    let mut subjects = Vec::new();
+    for opportunity in db.list_opportunities(Some("outagehub"), None)? {
+        if opportunity.kind != "sponsorship" || opportunity.id == excluded_opportunity_id {
+            continue;
+        }
+        for contact in db.list_opportunity_contacts(&opportunity.id)? {
+            subjects.extend(
+                db.list_opportunity_touches(&contact.id)?
+                    .into_iter()
+                    .filter(|touch| touch.stage == 1 && !touch.subject.trim().is_empty())
+                    .map(|touch| touch.subject),
+            );
+        }
+    }
+    subjects.sort_by_key(|subject| normalize_campaign_text(subject));
+    subjects
+        .dedup_by(|left, right| normalize_campaign_text(left) == normalize_campaign_text(right));
+    Ok(subjects)
+}
+
+fn sponsorship_relevance_signature(body: &str) -> String {
+    body.split(|character: char| matches!(character, '.' | '!' | '?' | '\n'))
+        .map(str::trim)
+        .filter(|sentence| sentence.split_whitespace().count() >= 5)
+        .filter(|sentence| {
+            let sentence = sentence.to_ascii_lowercase();
+            let explicit_relevance = sentence.contains("because ")
+                || sentence.contains("given ")
+                || sentence.contains(" notes that")
+                || sentence.contains(" says that")
+                || sentence.contains(" says it")
+                || sentence.contains("relevant to")
+                || sentence.contains("direct connection");
+            explicit_relevance
+                || (!sentence.contains("u of t student")
+                    && !sentence.contains("past year building outagehub")
+                    && !sentence.contains("funded development ourselves")
+                    && !sentence.contains("funded the development ourselves")
+                    && !sentence.contains("collects and normalizes")
+                    && !sentence.contains("paid cad $10,000")
+                    && !sentence.contains("paid cad 10,000")
+                    && !sentence.contains("team time and infrastructure")
+                    && !sentence.contains("12 months of founding-sponsor recognition")
+                    && !sentence.contains("quarterly coverage")
+                    && !sentence.contains("eventual annual impact report")
+                    && !sentence.contains("sponsorship would not influence")
+                    && !(sentence.contains("budget") && sentence.contains("route")))
+        })
+        .map(normalize_campaign_text)
+        .filter(|sentence| !sentence.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn campaign_text_similarity(left: &str, right: &str) -> (f64, usize) {
+    let words = |value: &str| {
+        normalize_campaign_text(value)
+            .split_whitespace()
+            .filter(|word| word.len() >= 4)
+            .map(str::to_string)
+            .collect::<HashSet<_>>()
+    };
+    let left = words(left);
+    let right = words(right);
+    let union = left.union(&right).count();
+    let overlap = left.intersection(&right).count();
+    if union == 0 {
+        (0.0, 0)
+    } else {
+        (overlap as f64 / union as f64, overlap)
+    }
+}
+
+pub fn audit_sponsorship_campaign(
+    db: &SharedDb,
+    brand: &str,
+    target: usize,
+) -> Result<SponsorshipCampaignAudit> {
+    let mut audit = SponsorshipCampaignAudit {
+        target,
+        ..Default::default()
+    };
+    let opportunities = db
+        .list_opportunities(Some(brand), None)?
+        .into_iter()
+        .filter(|opportunity| opportunity.kind == "sponsorship")
+        .collect::<Vec<_>>();
+    audit.organizations = opportunities.len();
+    let mut subjects = std::collections::HashMap::<String, Vec<String>>::new();
+    let mut emails = std::collections::HashMap::<String, Vec<String>>::new();
+    let mut relevance = Vec::<(String, String)>::new();
+
+    for opportunity in opportunities {
+        let contacts = db.list_opportunity_contacts(&opportunity.id)?;
+        let mut opportunity_touches = Vec::new();
+        for contact in contacts {
+            let touches = db.list_opportunity_touches(&contact.id)?;
+            if touches.is_empty() {
+                continue;
+            }
+            if sponsorship_contact_is_direct(&contact) {
+                audit.direct_mailboxes += 1;
+            } else {
+                audit.routed_mailboxes += 1;
+            }
+            emails
+                .entry(contact.email.trim().to_ascii_lowercase())
+                .or_default()
+                .push(opportunity.funder.clone());
+            for touch in touches {
+                if matches!(touch.status.as_str(), "scheduled" | "sending" | "sent") {
+                    audit.scheduled_or_sent += 1;
+                }
+                for issue in sponsorship_recipient_route_issues(
+                    &touch.body,
+                    touch.stage,
+                    &contact,
+                    &opportunity.funder,
+                ) {
+                    audit
+                        .issues
+                        .push(format!("{}: {issue}", opportunity.funder));
+                }
+                opportunity_touches.push(touch);
+            }
+        }
+        if opportunity_touches.len() != 1 {
+            audit.issues.push(format!(
+                "{} has {} sponsorship first-touch rows; expected exactly one",
+                opportunity.funder,
+                opportunity_touches.len()
+            ));
+            continue;
+        }
+        let touch = &opportunity_touches[0];
+        match touch.status.as_str() {
+            "draft" if touch.review_passes == Some(true) && touch.review_issues.is_empty() => {
+                audit.ready += 1;
+            }
+            "blocked" => audit.blocked += 1,
+            "scheduled" | "sending" | "sent" => {}
+            status => audit.issues.push(format!(
+                "{} has non-ready sponsorship status `{status}`",
+                opportunity.funder
+            )),
+        }
+        subjects
+            .entry(normalize_campaign_text(&touch.subject))
+            .or_default()
+            .push(opportunity.funder.clone());
+        let signature = sponsorship_relevance_signature(&touch.body);
+        if signature.is_empty() {
+            audit.issues.push(format!(
+                "{} has no independently auditable company-specific relevance sentence",
+                opportunity.funder
+            ));
+        } else {
+            relevance.push((opportunity.funder, signature));
+        }
+    }
+
+    for companies in subjects.values().filter(|companies| companies.len() > 1) {
+        audit.issues.push(format!(
+            "duplicate sponsorship subject across {}",
+            companies.join(", ")
+        ));
+    }
+    for (email, companies) in emails
+        .iter()
+        .filter(|(email, companies)| !email.is_empty() && companies.len() > 1)
+    {
+        audit.issues.push(format!(
+            "duplicate sponsorship mailbox {email} across {}",
+            companies.join(", ")
+        ));
+    }
+    for left in 0..relevance.len() {
+        for right in (left + 1)..relevance.len() {
+            let (similarity, overlap) =
+                campaign_text_similarity(&relevance[left].1, &relevance[right].1);
+            if similarity >= 0.72 && overlap >= 7 {
+                audit.issues.push(format!(
+                    "company-specific sponsorship rationale is {:.0}% similar between {} and {}",
+                    similarity * 100.0,
+                    relevance[left].0,
+                    relevance[right].0,
+                ));
+            }
+        }
+    }
+    audit.issues.sort();
+    audit.issues.dedup();
+    Ok(audit)
+}
+
 pub async fn plan_funding_outreach(
     db: &SharedDb,
     engine: &Engine,
@@ -2018,6 +2334,7 @@ pub async fn plan_sponsorship_outreach(
     let SponsorshipOutreachOptions {
         opportunity_id,
         touches,
+        refresh,
     } = options;
     let sponsorship = profile.sponsorship()?;
     let opportunity = db
@@ -2050,13 +2367,20 @@ pub async fn plan_sponsorship_outreach(
         })?
         .clone();
     let existing = db.list_opportunity_touches(&selected.id)?;
-    if existing.iter().any(|touch| touch.status != "blocked") {
+    if existing
+        .iter()
+        .any(|touch| !matches!(touch.status.as_str(), "draft" | "blocked"))
+    {
+        bail!("refusing to replace a sponsorship touch that is no longer an unsent draft");
+    }
+    if !refresh && existing.iter().any(|touch| touch.status == "draft") {
         return Ok(FundingPlanSummary::default());
     }
     if !existing.is_empty() {
-        db.delete_blocked_opportunity_touches(&selected.id)?;
+        db.delete_unsent_opportunity_touches(&selected.id)?;
     }
 
+    let existing_subjects = existing_sponsorship_subjects(db, opportunity_id)?;
     let mut sequence = write_sponsorship_sequence(
         engine,
         profile,
@@ -2064,6 +2388,7 @@ pub async fn plan_sponsorship_outreach(
         &selected,
         &playbook.signature,
         n,
+        &existing_subjects,
     )
     .await?;
     if sequence.touches.len() != n {
@@ -2077,6 +2402,15 @@ pub async fn plan_sponsorship_outreach(
     let mut semantic_issues = Vec::new();
     let mut semantic_passes = false;
     for repair_attempt in 0..=2 {
+        let preflight_issues = sponsorship_sequence_preflight_issues(
+            &sequence,
+            &selected,
+            &opportunity,
+            sponsorship,
+            &forbidden,
+            &playbook.signature,
+            &existing_subjects,
+        );
         let mut repaired = false;
         let mut attempt_passes = true;
         semantic_issues.clear();
@@ -2087,13 +2421,23 @@ pub async fn plan_sponsorship_outreach(
                 &opportunity,
                 &selected,
                 &sequence,
+                &preflight_issues,
                 audit_round == 2,
             )
             .await?;
-            if review.passes && review.score >= 85 && review.issues.is_empty() {
+            if preflight_issues.is_empty()
+                && review.passes
+                && review.score >= 85
+                && review.issues.is_empty()
+            {
                 continue;
             }
             attempt_passes = false;
+            semantic_issues.extend(
+                preflight_issues
+                    .iter()
+                    .map(|issue| format!("deterministic preflight: {issue}")),
+            );
             semantic_issues.extend(
                 review
                     .issues
@@ -2133,6 +2477,19 @@ pub async fn plan_sponsorship_outreach(
         let body = playbook::enforce_signature(&copy.body, &playbook.signature);
         let mut issues =
             sponsorship_copy_issues(&copy.subject, &body, copy.stage, &opportunity.funding_type);
+        issues.extend(sponsorship_recipient_route_issues(
+            &body,
+            copy.stage,
+            &selected,
+            &opportunity.funder,
+        ));
+        if copy.stage == 1
+            && existing_subjects.iter().any(|subject| {
+                normalize_campaign_text(subject) == normalize_campaign_text(&copy.subject)
+            })
+        {
+            issues.push("sponsorship subject duplicates another company in this campaign".into());
+        }
         let lint = playbook::lint(
             &body,
             &forbidden,
@@ -2213,6 +2570,56 @@ pub async fn plan_sponsorship_outreach(
     Ok(summary)
 }
 
+fn sponsorship_sequence_preflight_issues(
+    sequence: &FundingSequence,
+    contact: &OpportunityContact,
+    opportunity: &Opportunity,
+    sponsorship: &crate::business::SponsorshipProfile,
+    forbidden: &[&str],
+    signature: &str,
+    existing_subjects: &[String],
+) -> Vec<String> {
+    let mut issues = Vec::new();
+    for copy in &sequence.touches {
+        let body = playbook::enforce_signature(&copy.body, signature);
+        issues.extend(sponsorship_copy_issues(
+            &copy.subject,
+            &body,
+            copy.stage,
+            &opportunity.funding_type,
+        ));
+        issues.extend(sponsorship_recipient_route_issues(
+            &body,
+            copy.stage,
+            contact,
+            &opportunity.funder,
+        ));
+        if copy.stage == 1
+            && existing_subjects.iter().any(|subject| {
+                normalize_campaign_text(subject) == normalize_campaign_text(&copy.subject)
+            })
+        {
+            issues.push("sponsorship subject duplicates another company in this campaign".into());
+        }
+        let lint = playbook::lint(
+            &body,
+            forbidden,
+            sponsorship.min_words,
+            sponsorship.max_words,
+        );
+        issues.extend(lint.forbidden_hits);
+        if !lint.length_ok {
+            issues.push(format!(
+                "body must contain {}–{} words",
+                sponsorship.min_words, sponsorship.max_words
+            ));
+        }
+    }
+    issues.sort();
+    issues.dedup();
+    issues
+}
+
 async fn write_sponsorship_sequence(
     engine: &Engine,
     profile: &BusinessProfile,
@@ -2220,6 +2627,7 @@ async fn write_sponsorship_sequence(
     contact: &OpportunityContact,
     signature: &str,
     n: usize,
+    existing_subjects: &[String],
 ) -> Result<FundingSequence> {
     let sponsorship = profile.sponsorship()?;
     let route = sponsorship
@@ -2242,9 +2650,11 @@ async fn write_sponsorship_sequence(
         "target_company_evidence_is_exhaustive": opportunity.evidence,
         "unverified_company_terms": opportunity.unknowns,
         "recipient": contact,
+        "recipient_mailbox_is_direct": sponsorship_contact_is_direct(contact),
+        "subjects_already_used_for_other_companies": existing_subjects,
     });
     let user = format!(
-        "Write {n} founder-led founding-sponsorship email touch(es), never more than two. The immediate commercial objective is one paid CAD $10,000 sponsorship. OutageHub is already built and operating; this is not a grant, donation, investment, server-bill appeal, repayment for prior work, or request to finance an unbuilt idea. Touch 1 opens naturally with Andrew as a U of T student who spent the past year building OutageHub with a few friends, says the team funded development themselves so far, and explains in one sentence that OutageHub already collects and normalizes monitored Canadian utilities' public outage reports into a public map and authenticated API. It then gives one concise, exact, supplied company-specific connection to outage resilience; asks for CAD $10,000 toward team time and infrastructure required to keep OutageHub operating and improve coverage; offers 12 months of founding-sponsor recognition, API access, quarterly coverage/data-quality briefings, and inclusion in the eventual annual impact report; and says the sponsorship would not influence the data or conclusions. End with exactly one question asking whether it can fit the recipient's partnerships, community-investment, or innovation budget and, in the same question, asking for routing if someone else owns it. Never claim this person owns the budget. Cloud and infrastructure vendors receive the same paid cash sponsorship ask, not a substitute credits request. Touch 2, if requested, adds one concrete product-truth, public-interest, or independence detail; never write a generic follow-up. Use plain 3–9 word subjects, day offsets 0 and 6, {min}–{max} words per body, and exactly the signature {signature}. Twelve months is the recognition period only; do not invent how long the money funds operations, a cost breakdown, live metric, endorsement, partnership, user, customer, SLA, private site status, or complete Canadian coverage. Use conversation claims only in the exact permitted form. Every target-company claim must appear in the exhaustive evidence. Return only the requested structure.\n\nBUSINESS-SPONSORSHIP DOCTRINE:\n{doctrine}\n\nCONTEXT:\n{context}\n\n{core}",
+        "Write {n} founder-led founding-sponsorship email touch(es), never more than two. The immediate commercial objective is one paid CAD $10,000 sponsorship. OutageHub is already built and operating; this is not a grant, donation, investment, server-bill appeal, repayment for prior work, or request to finance an unbuilt idea. Touch 1 opens naturally with Andrew as a U of T student who spent the past year building OutageHub with a few friends, says the team funded development themselves so far, and explains in one sentence that OutageHub already collects and normalizes monitored Canadian utilities' public outage reports into a public map and authenticated API. It then gives one concise, exact, supplied company-specific connection to outage resilience; asks for CAD $10,000 toward team time and infrastructure required to keep OutageHub operating and improve coverage; offers 12 months of founding-sponsor recognition, API access, quarterly coverage/data-quality briefings, and inclusion in the eventual annual impact report; and says the sponsorship would not influence the data or conclusions. End with exactly one question asking whether it can fit the recipient's partnerships, community-investment, or innovation budget and, in the same question, asking for routing if someone else owns it. Never claim this person owns the budget. If recipient_mailbox_is_direct is false, the email goes to a shared routing inbox: greet the company team rather than the named executive, say which named person or role you are trying to reach only when useful, and use the one final question to request routing. Never write a personal salutation to someone who does not own the mailbox. Use a truthful, company-linked 3–9 word subject that is not present in subjects_already_used_for_other_companies. Cloud and infrastructure vendors receive the same paid cash sponsorship ask, not a substitute credits request. Touch 2, if requested, adds one concrete product-truth, public-interest, or independence detail; never write a generic follow-up. Use day offsets 0 and 6, {min}–{max} words per body, and exactly the signature {signature}. Twelve months is the recognition period only; do not invent how long the money funds operations, a cost breakdown, live metric, endorsement, partnership, user, customer, SLA, private site status, or complete Canadian coverage. Use conversation claims only in the exact permitted form. Every target-company claim must appear in the exhaustive evidence. Return only the requested structure.\n\nBUSINESS-SPONSORSHIP DOCTRINE:\n{doctrine}\n\nCONTEXT:\n{context}\n\n{core}",
         min = sponsorship.min_words,
         max = sponsorship.max_words,
         doctrine = sponsorship.doctrine,
@@ -2267,6 +2677,7 @@ async fn review_sponsorship_sequence(
     opportunity: &Opportunity,
     contact: &OpportunityContact,
     sequence: &FundingSequence,
+    deterministic_preflight_issues: &[String],
     falsify_clean_result: bool,
 ) -> Result<SponsorshipReview> {
     let sponsorship = profile.sponsorship()?;
@@ -2285,10 +2696,13 @@ async fn review_sponsorship_sequence(
         "required_recipient_route": route,
         "verified_target_company_evidence_is_exhaustive": opportunity.evidence,
         "recipient": contact,
+        "recipient_mailbox_is_direct": sponsorship_contact_is_direct(contact),
         "sequence": sequence,
+        "deterministic_preflight_issues_that_must_all_be_repaired": deterministic_preflight_issues,
         "criteria": [
             "The subject and opening give this exact recipient an accurate reason to read.",
             "Every company claim is supported by the supplied evidence and no budget is presumed.",
+            "A direct mailbox may use the named person's salutation. A shared/routed mailbox must greet the company team and must not pretend the named executive owns that inbox.",
             "Andrew's U of T student/few-friends/past-year story is human credibility and never implies institutional endorsement.",
             "The copy makes clear OutageHub is already operating, the team funded development themselves, and CAD $10,000 supports continued team time and infrastructure rather than merely a server bill or repayment for old work.",
             "The configured benefits are stated accurately: 12 months of recognition, API access, quarterly coverage/data-quality briefings, and eventual annual impact-report inclusion.",
@@ -2298,11 +2712,12 @@ async fn review_sponsorship_sequence(
             "The note sounds like one founder speaking naturally, not a funding application or mass template."
         ],
         "repair_rule": "If and only if one concise revision can make a single-touch sequence pass without adding unsupported facts, return the complete revised subject and body. Otherwise leave both empty.",
+        "issue_rule": "The issues array is reserved for material defects that make the email not ready unchanged. Never put stylistic observations, optional improvements, or a concern you explicitly consider non-blocking in issues. If passes is true, issues must be empty.",
     });
     engine
         .structured_bulk::<SponsorshipReview>(
             "opportunity.sponsorship_review",
-            "You are an independent skeptical recipient-side reviewer. Compliance with a writer prompt is not sendability. Reject vague relevance, presumed budgets, seller-only value, hidden grant language, invented metrics or cost periods, implied institutional endorsement, the wrong recipient route, or any sale of influence over independent findings.",
+            "You are an independent skeptical recipient-side reviewer. Compliance with a writer prompt is not sendability. Reject vague relevance, presumed budgets, seller-only value, hidden grant language, invented metrics or cost periods, implied institutional endorsement, the wrong recipient route, or any sale of influence over independent findings. Report only material blocking defects as issues; never record a non-blocking observation as an issue.",
             &serde_json::to_string_pretty(&prompt).unwrap_or_default(),
             sponsorship_review_schema(),
         )
@@ -2362,18 +2777,14 @@ fn sponsorship_copy_issues(
         if !(lower.contains("impact report") || lower.contains("annual report")) {
             issues.push("sponsorship touch 1 must name eventual impact-report inclusion".into());
         }
-        let requests_budget_owner_routing = (lower.contains("someone else")
-            && (lower.contains("point me")
-                || lower.contains("route")
-                || lower.contains("introduc")))
-            || ((lower.contains("route me")
-                || lower.contains("point me")
-                || lower.contains("introduce me"))
-                && (lower.contains("person who owns")
+        let requests_budget_owner_routing =
+            (lower.contains("route") || lower.contains("point me") || lower.contains("introduc"))
+                && (lower.contains("someone else")
+                    || lower.contains("person who owns")
                     || lower.contains("whoever owns")
                     || lower.contains("person responsible")
                     || lower.contains("right person")
-                    || lower.contains("budget owner")));
+                    || lower.contains("budget owner"));
         if !requests_budget_owner_routing {
             issues.push(
                 "sponsorship touch 1 must request routing if someone else owns the budget".into(),
@@ -2955,14 +3366,15 @@ fn application_schema() -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        best_org_match, dedupe_candidates, domain_from_url, host_matches_allowed_domain,
-        interleave_candidate_batches, normalized_contains, opportunity_fingerprint,
-        sponsorship_contact_score, sponsorship_copy_issues, sponsorship_recipient_kind,
+        audit_sponsorship_campaign, best_org_match, dedupe_candidates, domain_from_url,
+        host_matches_allowed_domain, interleave_candidate_batches, normalized_contains,
+        opportunity_fingerprint, sponsorship_contact_is_direct, sponsorship_contact_score,
+        sponsorship_copy_issues, sponsorship_recipient_kind, sponsorship_recipient_route_issues,
         validated_research_url, Candidate,
     };
     use crate::apollo::ApolloOrg;
     use crate::business::SponsorshipRoute;
-    use crate::db::Opportunity;
+    use crate::db::{Db, Opportunity, OpportunityContact, OpportunityTouch};
 
     #[test]
     fn fingerprints_are_stable_and_brand_scoped() {
@@ -3147,5 +3559,125 @@ mod tests {
         )
         .iter()
         .any(|issue| issue.contains("endorsed by")));
+    }
+
+    #[test]
+    fn shared_sponsorship_mailboxes_cannot_masquerade_as_personal_addresses() {
+        let routed = OpportunityContact {
+            source: "first_party_published_routed".into(),
+            name: "Tony Chu".into(),
+            email: "sales@example.ca".into(),
+            ..Default::default()
+        };
+        assert!(!sponsorship_contact_is_direct(&routed));
+        assert_eq!(
+            sponsorship_recipient_route_issues(
+                "Hi Tony,\n\nA sponsorship note.",
+                1,
+                &routed,
+                "Example Cloud",
+            )
+            .len(),
+            1
+        );
+        assert!(sponsorship_recipient_route_issues(
+            "Hi Example Cloud team,\n\nA sponsorship note.",
+            1,
+            &routed,
+            "Example Cloud",
+        )
+        .is_empty());
+        assert!(!sponsorship_copy_issues(
+            "Example Cloud infrastructure sponsorship",
+            "I am a U of T student. Over the past year I built OutageHub with a few friends. We funded it ourselves. It has a map and API. A paid CAD $10,000 sponsorship supports team time and infrastructure, improves coverage, provides 12 months recognition plus quarterly data-quality briefings and an annual impact report, without sponsor influence. Could this fit your innovation budget, or could you route this to the person who owns that decision?",
+            1,
+            "commercial_sponsor",
+        )
+        .iter()
+        .any(|issue| issue.contains("request routing")));
+
+        let direct = OpportunityContact {
+            source: "first_party_published_direct".into(),
+            name: "Tony Chu".into(),
+            email: "tony@example.ca".into(),
+            ..Default::default()
+        };
+        assert!(sponsorship_contact_is_direct(&direct));
+        assert!(sponsorship_recipient_route_issues(
+            "Hi Tony,\n\nA sponsorship note.",
+            1,
+            &direct,
+            "Example Cloud",
+        )
+        .is_empty());
+
+        let mislabeled_shared = OpportunityContact {
+            source: "first_party_published_direct".into(),
+            name: "Gautam Navani".into(),
+            email: "corporate.relations@example.ca".into(),
+            ..Default::default()
+        };
+        assert!(!sponsorship_contact_is_direct(&mislabeled_shared));
+    }
+
+    #[test]
+    fn campaign_audit_requires_distinct_contact_matched_held_drafts() {
+        let db = std::sync::Arc::new(Db::open(":memory:").expect("open db"));
+        for (index, company, email, subject, rationale) in [
+            (
+                1,
+                "Acme Grid",
+                "maya@acme.example",
+                "Acme grid data sponsorship",
+                "Acme builds grid-resilience planning systems for Canadian utilities.",
+            ),
+            (
+                2,
+                "Boreal Risk",
+                "sam@boreal.example",
+                "Boreal blackout risk sponsorship",
+                "Boreal publishes guidance on business losses during extended blackouts.",
+            ),
+        ] {
+            let opportunity_id = db
+                .upsert_opportunity(&Opportunity {
+                    brand: "outagehub".into(),
+                    kind: "sponsorship".into(),
+                    fingerprint: format!("sponsor-{index}"),
+                    canonical_url: format!("https://example.org/sponsor-{index}"),
+                    funder: company.into(),
+                    ..Default::default()
+                })
+                .expect("insert opportunity");
+            let contact_id = db
+                .upsert_opportunity_contact(&OpportunityContact {
+                    opportunity_id: opportunity_id.clone(),
+                    brand: "outagehub".into(),
+                    source: "first_party_published_direct".into(),
+                    contact_key: email.into(),
+                    name: if index == 1 { "Maya" } else { "Sam" }.into(),
+                    email: email.into(),
+                    ..Default::default()
+                })
+                .expect("insert contact");
+            db.insert_opportunity_touch(&OpportunityTouch {
+                opportunity_id,
+                contact_id,
+                brand: "outagehub".into(),
+                stage: 1,
+                status: "draft".into(),
+                review_passes: Some(true),
+                subject: subject.into(),
+                body: format!("Hi,\n\n{rationale}\n\nAndrew Gordienko"),
+                ..Default::default()
+            })
+            .expect("insert draft");
+        }
+
+        let audit = audit_sponsorship_campaign(&db, "outagehub", 2).expect("audit campaign");
+        assert!(audit.passes(), "{:?}", audit.issues);
+        assert_eq!(audit.ready, 2);
+        assert_eq!(audit.direct_mailboxes, 2);
+        assert_eq!(audit.scheduled_or_sent, 0);
     }
 }

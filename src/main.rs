@@ -447,6 +447,16 @@ enum Command {
         opportunity: String,
         #[arg(long, default_value_t = 1, value_parser = positive_usize)]
         touches: usize,
+        /// Replace existing unsent draft/blocked sponsorship copy after a policy or evidence repair.
+        #[arg(long)]
+        refresh: bool,
+    },
+
+    /// Audit the entire held sponsorship campaign for count, contact routing,
+    /// duplicate subjects/rationales, review state, and zero delivery state.
+    AuditSponsorshipOutreach {
+        #[arg(long, default_value_t = 30, value_parser = positive_usize)]
+        target: usize,
     },
 
     /// Render the governed one-page sponsorship scope/checklist for one target.
@@ -1609,6 +1619,7 @@ fn main() -> Result<()> {
         Command::PlanSponsorshipOutreach {
             opportunity: opportunity_id,
             touches,
+            refresh,
         } => {
             let client = make_engine(&rt, &cli)?;
             let businesses = load_businesses(&cli)?;
@@ -1624,6 +1635,7 @@ fn main() -> Result<()> {
                 opportunity::SponsorshipOutreachOptions {
                     opportunity_id: &opportunity_id,
                     touches,
+                    refresh,
                 },
             ))?;
             println!(
@@ -1633,6 +1645,28 @@ fn main() -> Result<()> {
                 summary.touches_scheduled,
             );
             println!("  Sponsorship planning never auto-schedules; review every draft in the CRM.");
+            Ok(())
+        }
+
+        Command::AuditSponsorshipOutreach { target } => {
+            let audit = opportunity::audit_sponsorship_campaign(&db, &cli.brand, target)?;
+            println!(
+                "Sponsorship campaign QA: {}\n  organizations: {}/{}\n  ready drafts: {}\n  blocked drafts: {}\n  direct mailboxes: {}\n  routed mailboxes: {}\n  scheduled/sending/sent: {}",
+                if audit.passes() { "PASS" } else { "HOLD" },
+                audit.organizations,
+                audit.target,
+                audit.ready,
+                audit.blocked,
+                audit.direct_mailboxes,
+                audit.routed_mailboxes,
+                audit.scheduled_or_sent,
+            );
+            for issue in &audit.issues {
+                println!("  issue: {issue}");
+            }
+            if !audit.passes() {
+                anyhow::bail!("sponsorship campaign remains held");
+            }
             Ok(())
         }
 

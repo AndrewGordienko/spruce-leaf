@@ -756,7 +756,12 @@ async fn brand_index(
 async fn outagehub_sponsorship_index(State(state): State<WebState>) -> Html<String> {
     let counts = brand_tab_counts(&state.db);
     let execution = execution_dashboard(&state.db, Some("outagehub")).ok();
-    Html(render_sponsorship_page(execution.as_ref(), &counts))
+    let audit = crate::opportunity::audit_sponsorship_campaign(&state.db, "outagehub", 30).ok();
+    Html(render_sponsorship_page(
+        execution.as_ref(),
+        audit.as_ref(),
+        &counts,
+    ))
 }
 
 /// Portfolio strategy board: what each business is trying to do and the shared
@@ -1840,6 +1845,7 @@ fn reviewable_sponsorship_draft_count(dashboard: &ExecutionDashboard) -> usize {
 
 fn render_sponsorship_page(
     dashboard: Option<&ExecutionDashboard>,
+    audit: Option<&crate::opportunity::SponsorshipCampaignAudit>,
     counts: &[(&'static BrandMeta, usize)],
 ) -> String {
     let mut b = page_head("OutageHub Sponsorship · Sales CRM");
@@ -1879,6 +1885,32 @@ fn render_sponsorship_page(
         ],
     );
     b.push_str("<main class=\"sheet-scroll\" id=\"sponsorship-drafts\">");
+    if let Some(audit) = audit {
+        b.push_str(&format!(
+            "<section class=\"campaign-audit {}\"><b>Campaign QA: {}</b><span>{}/{} organizations · {} ready · {} blocked · {} direct mailboxes · {} routed inboxes · {} scheduled/sending/sent</span>{}</section>",
+            if audit.passes() { "pass" } else { "hold" },
+            if audit.passes() { "PASS" } else { "HOLD" },
+            audit.organizations,
+            audit.target,
+            audit.ready,
+            audit.blocked,
+            audit.direct_mailboxes,
+            audit.routed_mailboxes,
+            audit.scheduled_or_sent,
+            if audit.issues.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "<ul>{}</ul>",
+                    audit
+                        .issues
+                        .iter()
+                        .map(|issue| format!("<li>{}</li>", esc(issue)))
+                        .collect::<String>()
+                )
+            },
+        ));
+    }
     if let Some(dashboard) = dashboard {
         render_sponsorship_table(&mut b, &dashboard.opportunities);
     } else {
@@ -1922,13 +1954,18 @@ fn render_sponsorship_table(b: &mut String, opportunities: &[ExecutionOpportunit
         let ready = touch.status == "draft" && touch.review_passes == Some(true);
         let state = if ready { "ready" } else { "blocked" };
         b.push_str(&format!(
-            "<tr class=\"sponsor-row {state}\"><td class=\"company pin\"><span class=\"brand-tag outagehub\">OutageHub</span><strong>{company}</strong><small>CAD $10,000 founding sponsorship</small><a href=\"{url}\" rel=\"noreferrer\">Primary source ↗</a></td><td class=\"sponsor-evidence\"><ul>{evidence}</ul></td><td class=\"person\"><strong>{name}</strong><small>{title}</small><a class=\"email\" href=\"mailto:{email}\">{email}</a><span class=\"person-status verified\">{email_status}</span><p>{why}</p></td><td class=\"sponsor-subject\"><span class=\"subject\">{subject}</span></td><td class=\"sponsor-message\"><div class=\"message\">{body}</div></td><td class=\"sponsor-state\"><span class=\"touch-tag\">{state}</span>{qa}<small>Delivery: technically blocked from scheduling and sending</small></td></tr>",
+            "<tr class=\"sponsor-row {state}\"><td class=\"company pin\"><span class=\"brand-tag outagehub\">OutageHub</span><strong>{company}</strong><small>CAD $10,000 founding sponsorship</small><a href=\"{url}\" rel=\"noreferrer\">Primary source ↗</a></td><td class=\"sponsor-evidence\"><ul>{evidence}</ul></td><td class=\"person\"><strong>{name}</strong><small>{title}</small><a class=\"email\" href=\"mailto:{email}\">{email}</a><span class=\"person-status verified\">{email_status}</span><span class=\"person-status\">{route}</span><p>{why}</p></td><td class=\"sponsor-subject\"><span class=\"subject\">{subject}</span></td><td class=\"sponsor-message\"><div class=\"message\">{body}</div></td><td class=\"sponsor-state\"><span class=\"touch-tag\">{state}</span>{qa}<small>Delivery: technically blocked from scheduling and sending</small></td></tr>",
             state = state,
             company = esc(&opportunity.funder),
             name = esc(&contact.name),
             title = esc(&contact.title),
             email = esc(&contact.email),
             email_status = esc(&contact.email_status),
+            route = if crate::opportunity::sponsorship_contact_is_direct(contact) {
+                "direct mailbox"
+            } else {
+                "shared routing inbox"
+            },
             why = esc(&contact.why_them),
             evidence = opportunity
                 .evidence
@@ -4998,6 +5035,11 @@ body { color: var(--ink); background: var(--paper); font: 13px/1.45 var(--font);
 .top-stats { margin-left: auto; display: flex; gap: 22px; color: var(--faint); white-space: nowrap; }
 .top-stats strong { color: var(--ink); font-size: 14px; margin-right: 3px; }
 .sheet-scroll { flex: 1 1 auto; min-height: 0; overflow: auto; }
+.campaign-audit { position: sticky; left: 0; z-index: 7; display: flex; align-items: baseline; gap: 12px; padding: 9px 12px; border-bottom: 1px solid var(--line); font-size: 11px; }
+.campaign-audit.pass { color: var(--green); background: var(--green-tint); }
+.campaign-audit.hold { color: var(--red); background: var(--red-tint); }
+.campaign-audit span { color: var(--muted); }
+.campaign-audit ul { margin: 0 0 0 auto; padding-left: 18px; max-width: 700px; }
 .crm-sheet { border-collapse: separate; border-spacing: 0; table-layout: fixed; width: max-content; min-width: 100%; }
 .c-company { width: 210px; }.c-context { width: 360px; }.c-person { width: 220px; }.c-why { width: 280px; }.c-touch { width: 300px; }
 .c-sponsor-evidence { width: 360px; }.c-sponsor-subject { width: 230px; }.c-sponsor-email { width: 560px; }.c-sponsor-qa { width: 300px; }
