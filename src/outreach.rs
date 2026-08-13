@@ -1449,7 +1449,13 @@ fn finalize_reviewed_draft(
             .is_none();
     let mut touches_scheduled = 0usize;
     let mut touches_drafted = 0usize;
-    for t in &seq.touches {
+    // Slots are allocated in stage order and clamped monotonic: when capacity
+    // pushes an earlier stage later, every following stage moves with it. A
+    // sequence is chronological by construction, never by luck.
+    let mut ordered_touches = seq.touches.iter().collect::<Vec<_>>();
+    ordered_touches.sort_by_key(|touch| touch.stage);
+    let mut previous_due: Option<chrono::DateTime<Utc>> = None;
+    for t in ordered_touches {
         let is_email = is_email_capable_channel(&t.channel);
         let body = if is_email {
             playbook::enforce_signature(&t.body, &pb.signature)
@@ -1491,7 +1497,12 @@ fn finalize_reviewed_draft(
             touches_drafted += 1;
         }
 
-        let desired = now + Duration::days(t.day_offset as i64);
+        let mut desired = now + Duration::days(t.day_offset as i64);
+        if let Some(previous) = previous_due {
+            if desired <= previous {
+                desired = previous + Duration::hours(4);
+            }
+        }
         let stable_key = format!("{}:{}:{}", person.id, seq_id, t.stage);
         let timing = TimingContext {
             industry: &lead.industry,
@@ -1513,6 +1524,7 @@ fn finalize_reviewed_draft(
         let slot = calendar::schedule_with_capacity(business, &timing, desired, |start, end| {
             db.planned_touch_count_between(&pb.key, start, end)
         })?;
+        previous_due = Some(slot.at);
         let updated = db.update_touch_checkpoint(&Touch {
             sequence_id: seq_id.to_string(),
             person_id: person.id.clone(),
