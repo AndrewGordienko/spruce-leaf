@@ -47,6 +47,11 @@ struct Decision {
     /// Structured discovery fields are private operating notes. Empty means the
     /// reply did not establish them; the model must never fill gaps by inference.
     validated_problem: String,
+    /// none | weak | explicit. `explicit` requires a verbatim supporting quote
+    /// from this inbound message and is rechecked deterministically before it
+    /// can widen an OutageHub cadence.
+    problem_confirmation_grade: String,
+    problem_confirmation_quote: String,
     current_workflow: String,
     #[serde(default)]
     evidence_available: Vec<String>,
@@ -80,6 +85,12 @@ pub struct ReplyOutcome {
     pub action: String,
     pub draft_id: Option<String>,
     pub meeting_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ProblemConfirmation {
+    grade: String,
+    supporting_quote: String,
 }
 
 /// Process a sales reply already resolved to `conversation` by RFC headers or
@@ -188,6 +199,7 @@ pub async fn handle_inbound(
         ..Default::default()
     });
     let category = normalized_category(&decision.category);
+    let problem_confirmation = grade_problem_confirmation(&decision, &category, &inbound.body);
 
     if category == "unsubscribe" {
         let action = stop_for_optout(db, conversation, person, &inbound.from_email)?;
@@ -392,7 +404,7 @@ pub async fn handle_inbound(
         in_reply_to: inbound.in_reply_to.clone(),
         ..Default::default()
     })?;
-    record_customer_development_reply(db, conversation, person, &decision)?;
+    record_customer_development_reply(db, conversation, person, &decision, &problem_confirmation)?;
     record_gtm_reply_learning(
         db,
         conversation,
@@ -402,6 +414,7 @@ pub async fn handle_inbound(
         &inbound.in_reply_to,
         &category,
         &decision,
+        &problem_confirmation,
         booked.is_some(),
     )?;
 
@@ -417,6 +430,7 @@ fn record_customer_development_reply(
     conversation: &Conversation,
     person: &Person,
     decision: &Decision,
+    problem_confirmation: &ProblemConfirmation,
 ) -> Result<()> {
     let sales_opportunity_id = db
         .sequence_gtm_attribution(&conversation.sequence_id)?
@@ -439,7 +453,9 @@ fn record_customer_development_reply(
     if record.engaged_at.is_empty() {
         record.engaged_at = crate::db::now();
     }
-    replace_if_present(&mut record.problem, &decision.validated_problem);
+    if problem_confirmation.grade == "explicit" {
+        replace_if_present(&mut record.problem, &decision.validated_problem);
+    }
     replace_if_present(&mut record.current_workflow, &decision.current_workflow);
     replace_if_present(&mut record.task_scope, &decision.task_scope);
     replace_if_present(&mut record.why_manual, &decision.why_still_manual);
@@ -524,6 +540,7 @@ fn record_gtm_reply_learning(
     in_reply_to: &str,
     category: &str,
     decision: &Decision,
+    problem_confirmation: &ProblemConfirmation,
     meeting_booked: bool,
 ) -> Result<()> {
     let attribution = if conversation.sequence_id.is_empty() {
@@ -601,7 +618,7 @@ fn record_gtm_reply_learning(
     }
 
     let validated_problem = decision.validated_problem.trim();
-    if validated_problem.is_empty() {
+    if problem_confirmation.grade != "explicit" || validated_problem.is_empty() {
         return Ok(());
     }
     db.record_signal_observation(&SignalObservation {
@@ -612,12 +629,23 @@ fn record_gtm_reply_learning(
         conversation_id: conversation.id.clone(),
         source_name: "prospect_reply".into(),
         provider_key: source_key.to_string(),
-        value_json: serde_json::json!({"category": category}).to_string(),
-        evidence: validated_problem.to_string(),
+        value_json: serde_json::json!({
+            "category": category,
+            "grade": problem_confirmation.grade,
+            "supporting_quote": problem_confirmation.supporting_quote,
+        })
+        .to_string(),
+        evidence: format!(
+            "{} Supporting prospect quote: \"{}\"",
+            validated_problem, problem_confirmation.supporting_quote
+        ),
         confidence: if category == "correction" { 0.95 } else { 0.85 },
         status: "verified".into(),
         ..Default::default()
     })?;
+    if !attribution.sales_opportunity_id.trim().is_empty() {
+        db.recompute_outagehub_opportunity_priority(&attribution.sales_opportunity_id)?;
+    }
 
     // A proof brief is an internal handoff, never approval to build or send.
     // Even a model-rated "ready" proof stays at the human-review gate.
@@ -676,6 +704,57 @@ fn record_gtm_reply_learning(
         }
     }
     Ok(())
+}
+
+/// Turn the model's semantic grade into evidence only when its quote is
+/// recoverable from the actual inbound body. This prevents a friendly reply,
+/// meeting acceptance, or unsupported classifier paraphrase from unlocking a
+/// wider cadence.
+fn grade_problem_confirmation(
+    decision: &Decision,
+    category: &str,
+    inbound_body: &str,
+) -> ProblemConfirmation {
+    if decision.problem_confirmation_grade.trim() != "explicit"
+        || decision.validated_problem.trim().is_empty()
+        || !matches!(
+            category,
+            "interested" | "correction" | "objection" | "other"
+        )
+    {
+        return ProblemConfirmation {
+            grade: if decision.problem_confirmation_grade.trim() == "weak" {
+                "weak".into()
+            } else {
+                "none".into()
+            },
+            ..Default::default()
+        };
+    }
+    let quote = decision.problem_confirmation_quote.trim();
+    let normalized_quote = normalize_reply_evidence(quote);
+    let normalized_body = normalize_reply_evidence(inbound_body);
+    if normalized_quote.split_whitespace().count() < 5
+        || !normalized_body.contains(&normalized_quote)
+    {
+        return ProblemConfirmation {
+            grade: "weak".into(),
+            ..Default::default()
+        };
+    }
+    ProblemConfirmation {
+        grade: "explicit".into(),
+        supporting_quote: quote.to_string(),
+    }
+}
+
+fn normalize_reply_evidence(value: &str) -> String {
+    value
+        .to_ascii_lowercase()
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Explicitly finish pending acceptances created by `inbox` without `--book`.
@@ -761,7 +840,7 @@ async fn decide(
         ""
     };
     let system = format!(
-        "You are Andrew's thread-aware B2B reply and discovery agent for {brand}. Continue a real conversation, not a cold sequence. Be concise, answer direct questions honestly, preserve the sender's exact intent, and move only one commitment rung at a time. Extract validated_problem, current_workflow, evidence_available, customer_data, proof_scope, success_metric, and stop_condition only when the human's own message establishes them; leave unknown fields empty. proof_readiness is none, discovery_needed, or ready. A correction is valuable market evidence and must be categorized correction, not disguised as interest. Never claim a meeting is booked: only the application can book it after your structured decision. If the prospect accepts one of SENT_OFFERED_SLOTS, copy that exact RFC3339 value into accepted_slot. Otherwise accepted_slot must be empty. If offering a meeting, choose at most 2 values exactly from AVAILABLE_SLOTS and include their human display text naturally in draft_reply. Never invent availability, proof readiness, customer data, metrics, or a referral address.{customer_development_rules}",
+        "You are Andrew's thread-aware B2B reply and discovery agent for {brand}. Continue a real conversation, not a cold sequence. Be concise, answer direct questions honestly, preserve the sender's exact intent, and move only one commitment rung at a time. Extract validated_problem, current_workflow, evidence_available, customer_data, proof_scope, success_metric, and stop_condition only when the human's own message establishes them; leave unknown fields empty. Grade problem confirmation as none when there is no relevant operating statement, weak for politeness, curiosity, a meeting acceptance, or a hypothetical, and explicit only when the sender describes or corrects a real past/current problem or workflow in their own words. For explicit, copy one exact contiguous quote of at least five words from the newest inbound body into problem_confirmation_quote; otherwise leave the quote empty. proof_readiness is none, discovery_needed, or ready. A correction is valuable market evidence and must be categorized correction, not disguised as interest. Never claim a meeting is booked: only the application can book it after your structured decision. If the prospect accepts one of SENT_OFFERED_SLOTS, copy that exact RFC3339 value into accepted_slot. Otherwise accepted_slot must be empty. If offering a meeting, choose at most 2 values exactly from AVAILABLE_SLOTS and include their human display text naturally in draft_reply. Never invent availability, proof readiness, customer data, metrics, or a referral address.{customer_development_rules}",
         brand = pb.name,
     );
     let history = history
@@ -906,7 +985,7 @@ fn schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["category","summary","next_action","draft_reply","accepted_slot","offered_slots","referred_name","referred_email","validated_problem","current_workflow","evidence_available","customer_data","proof_scope","success_metric","stop_condition","proof_readiness","task_scope","why_still_manual","task_variations","task_exceptions","task_economics","commitment_kind","commitment_detail","loi_terms","next_commitment"],
+        "required": ["category","summary","next_action","draft_reply","accepted_slot","offered_slots","referred_name","referred_email","validated_problem","problem_confirmation_grade","problem_confirmation_quote","current_workflow","evidence_available","customer_data","proof_scope","success_metric","stop_condition","proof_readiness","task_scope","why_still_manual","task_variations","task_exceptions","task_economics","commitment_kind","commitment_detail","loi_terms","next_commitment"],
         "properties": {
             "category": {"type":"string","enum":["interested","correction","not_now","objection","referral","unsubscribe","auto_reply","other"]},
             "summary": {"type":"string"},
@@ -917,6 +996,8 @@ fn schema() -> Value {
             "referred_name": {"type":"string"},
             "referred_email": {"type":"string"},
             "validated_problem": {"type":"string"},
+            "problem_confirmation_grade": {"type":"string","enum":["none","weak","explicit"]},
+            "problem_confirmation_quote": {"type":"string"},
             "current_workflow": {"type":"string"},
             "evidence_available": {"type":"array","items":{"type":"string"}},
             "customer_data": {"type":"array","items":{"type":"string"}},
@@ -963,6 +1044,62 @@ mod tests {
         assert_eq!(
             validate_offers(&requested, &slots),
             vec![start.to_rfc3339()]
+        );
+    }
+
+    #[test]
+    fn explicit_problem_confirmation_requires_a_body_verified_quote() {
+        let decision = Decision {
+            category: "interested".into(),
+            validated_problem: "Dispatch checks utility context before rolling a crew.".into(),
+            problem_confirmation_grade: "explicit".into(),
+            problem_confirmation_quote: "We check the utility map before dispatching a crew".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            grade_problem_confirmation(
+                &decision,
+                "interested",
+                "Yes — we check the utility map before dispatching a crew today."
+            ),
+            ProblemConfirmation {
+                grade: "explicit".into(),
+                supporting_quote: "We check the utility map before dispatching a crew".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn politeness_or_an_invented_quote_cannot_unlock_engaged_cadence() {
+        let friendly = Decision {
+            category: "interested".into(),
+            validated_problem: "The workflow exists.".into(),
+            problem_confirmation_grade: "weak".into(),
+            problem_confirmation_quote: "Happy to have a quick chat".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            grade_problem_confirmation(
+                &friendly,
+                "interested",
+                "Thanks, this sounds interesting. Happy to have a quick chat."
+            )
+            .grade,
+            "weak"
+        );
+
+        let unsupported = Decision {
+            problem_confirmation_grade: "explicit".into(),
+            ..friendly
+        };
+        assert_eq!(
+            grade_problem_confirmation(
+                &unsupported,
+                "interested",
+                "Thanks, this sounds interesting."
+            )
+            .grade,
+            "weak"
         );
     }
 }

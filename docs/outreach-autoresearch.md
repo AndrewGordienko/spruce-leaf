@@ -57,10 +57,16 @@ external trigger or direct mechanism evidence, and a recipient close to the
 work. Company category or a generally plausible cross-system workflow is not
 problem evidence.
 
-OutageHub currently runs one EV-charging experiment. Research must verify an
-operated Canadian charging footprint and complete a real historical match
-between an operated location and a utility outage area/timestamp. Only then can
-Sales OS generate the two-email day-0/day-6 sequence.
+OutageHub covers a governed catalog of distributed operating segments. One
+source-backed footprint plus a segment-matched operator may receive a single
+premise-testing discovery email. A multi-touch sequence requires an evidenced
+outage-time decision and a completed historical match between a verified
+operating address and a utility outage area/timestamp. Website research can
+now intake, geocode, cache, and match exact first-party addresses for every
+physical-location segment; the public EV feed remains the automated catalog
+source for charging networks. A four-touch motion additionally requires a
+prospect reply whose explicit problem confirmation and exact supporting quote
+pass the reply-evidence grade.
 
 Wapahki retains its plant-first task/economics gate. Product variety alone
 cannot establish a manual task, automation failure, or economic consequence.

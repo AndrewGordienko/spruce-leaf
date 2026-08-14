@@ -825,6 +825,9 @@ fn main() -> Result<()> {
                 source_groups,
                 output
             );
+            if !report.geocoding_attribution.trim().is_empty() {
+                println!("  {}", report.geocoding_attribution);
+            }
             Ok(())
         }
 

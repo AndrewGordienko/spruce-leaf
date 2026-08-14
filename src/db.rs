@@ -18,6 +18,7 @@
 //!   * touch.status  — draft | scheduled | sent | skipped | failed | replied |
 //!     cancelled  (only `scheduled` + due fire in the daemon)
 
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -1140,6 +1141,20 @@ impl Db {
         for person in self.list_people(None, None)? {
             self.upsert_person(&person)?;
         }
+        // Some pre-priority databases contain more than one still-current
+        // opportunity for an account/task history. Re-materializing the latest
+        // assessment updates only its matching task identity, so finish the
+        // startup backfill across every surviving OutageHub row. This is what
+        // makes a lane visible before any planner has touched the account.
+        for opportunity in self.list_sales_opportunities(Some("outagehub"), None)? {
+            self.recompute_outagehub_opportunity_priority(&opportunity.id)
+                .with_context(|| {
+                    format!(
+                        "backfilling OutageHub priority for opportunity {}",
+                        opportunity.id
+                    )
+                })?;
+        }
         Ok(())
     }
 
@@ -2043,6 +2058,7 @@ impl Db {
                 "evidence was downgraded to research_required after re-research; the draft no longer has a supported premise",
             )?;
         }
+        self.recompute_outagehub_opportunity_priority(&opportunity_id)?;
         Ok(opportunity_id)
     }
 
@@ -2552,6 +2568,111 @@ impl Db {
             ],
         )?;
         Ok(())
+    }
+
+    /// Recompute OutageHub's deterministic lane from the whole persisted
+    /// opportunity, rather than from whichever recipient the planner happens
+    /// to inspect first. Called during qualification/materialization and every
+    /// contact refresh so even never-planned accounts have a visible lane.
+    pub fn recompute_outagehub_opportunity_priority(
+        &self,
+        opportunity_id: &str,
+    ) -> Result<Option<crate::priority::CommercialPriority>> {
+        let opportunity = {
+            let conn = self.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT * FROM sales_opportunities WHERE id=?1 AND status<>'superseded'",
+                params![opportunity_id],
+                |row| Ok(row_to_sales_opportunity(row)),
+            )
+            .optional()?
+        };
+        let Some(opportunity) = opportunity else {
+            return Ok(None);
+        };
+        if !opportunity.brand.eq_ignore_ascii_case("outagehub") {
+            return Ok(None);
+        }
+
+        let claims = self
+            .list_evidence_claims(Some(&opportunity.id), Some(&opportunity.brand))?
+            .into_iter()
+            .filter(|claim| matches!(claim.status.as_str(), "observed" | "verified"))
+            .collect::<Vec<_>>();
+        let decision_evidence = claims
+            .iter()
+            .filter(|claim| claim.claim_type == "account.outage_sensitive_decision")
+            .filter(|claim| {
+                crate::qualification::credible_outagehub_signal(
+                    "account.outage_sensitive_decision",
+                    &claim.claim_text,
+                )
+            })
+            .map(|claim| claim.claim_text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let has_claim = |claim_type: &str| {
+            claims.iter().any(|claim| {
+                claim.claim_type == claim_type
+                    && crate::qualification::credible_outagehub_signal(
+                        claim_type,
+                        &claim.claim_text,
+                    )
+            })
+        };
+        let people = self
+            .list_people(Some(&opportunity.brand), None)?
+            .into_iter()
+            .filter(|person| person.lead_id == opportunity.lead_id)
+            .map(|person| (person.id.clone(), person))
+            .collect::<HashMap<_, _>>();
+        let reachable_direct_owner = self
+            .list_opportunity_stakeholders(Some(&opportunity.id), Some(&opportunity.brand))?
+            .into_iter()
+            .filter(|stakeholder| {
+                stakeholder.role_fit == "direct"
+                    && !stakeholder.evidence_claim_ids.is_empty()
+                    && stakeholder.evidence_claim_ids.iter().all(|claim_id| {
+                        claims.iter().any(|claim| {
+                            claim.id == *claim_id && claim.task_key == opportunity.task_key
+                        })
+                    })
+            })
+            .filter_map(|stakeholder| people.get(&stakeholder.person_id))
+            .any(|person| {
+                self.person_employment_block_reason(person)
+                    .is_ok_and(|reason| reason.is_none())
+                    && (person.email_status.eq_ignore_ascii_case("verified")
+                        || !person.linkedin_url.trim().is_empty())
+                    && crate::response_design::is_workflow_discovery_contact(
+                        &person.title,
+                        &person.vantage,
+                    )
+                    && crate::qualification::outagehub_role_matches_decision(
+                        &person.title,
+                        &person.vantage,
+                        &decision_evidence,
+                    )
+            });
+        let headcount = self
+            .get_lead(&opportunity.lead_id)?
+            .map(|lead| lead.headcount)
+            .unwrap_or_default();
+        let computed = crate::priority::outagehub_priority(&crate::priority::PriorityInputs {
+            segment: crate::segments::segment_for_evidence(&decision_evidence),
+            active_claims: claims.len(),
+            decision_evidenced: has_claim("account.outage_sensitive_decision"),
+            historical_match: has_claim("account.historical_location_outage_match"),
+            reachable_direct_owner,
+            headcount,
+            problem_confirmed: crate::gtm::graded_problem_confirmed_for_lead(
+                self,
+                &opportunity.brand,
+                &opportunity.lead_id,
+            )?,
+        });
+        self.update_opportunity_priority(&opportunity.id, &computed)?;
+        Ok(Some(computed))
     }
 
     /// Append a new current commercial assessment and supersede the previous
@@ -12365,6 +12486,145 @@ mod tests {
         assert_eq!(outcome.experiment_arm, second.arm);
         assert_eq!(outcome.generation_backend, "codex");
         assert_eq!(outcome.generation_model, "gpt-5.6-terra");
+    }
+
+    #[test]
+    fn outagehub_assessment_persists_a_lane_before_any_planning_call() {
+        let db = Db::open(":memory:").expect("open memory db");
+        let play = db
+            .current_gtm_play("outagehub")
+            .expect("play query")
+            .expect("current play");
+        let lead_id = db
+            .upsert_lead(&Lead {
+                brand: "outagehub".into(),
+                apollo_org_id: "org-priority-at-qualification".into(),
+                name: "Unplanned Cold Storage".into(),
+                domain: "unplanned-cold.example".into(),
+                industry: "cold storage".into(),
+                hypothesis: "Research the outage-time operating decision.".into(),
+                observed_facts: vec!["A URL-backed operating fact exists.".into()],
+                status: "research_needed".into(),
+                ..Default::default()
+            })
+            .expect("lead");
+        let candidates = vec![
+            crate::gtm::SignalCandidate {
+                definition_key: "account.fit_evidence".into(),
+                evidence: "The company provides multi-temperature food storage.".into(),
+                source_url: "https://unplanned-cold.example/services".into(),
+                confidence: 0.9,
+            },
+            crate::gtm::SignalCandidate {
+                definition_key: "account.distributed_locations".into(),
+                evidence: "The operator runs cold-storage facilities across Ontario and Quebec."
+                    .into(),
+                source_url: "https://unplanned-cold.example/locations".into(),
+                confidence: 0.9,
+            },
+            crate::gtm::SignalCandidate {
+                definition_key: "account.outage_sensitive_exposure".into(),
+                evidence: "The operator runs cold-storage facilities across Ontario and Quebec."
+                    .into(),
+                source_url: "https://unplanned-cold.example/locations".into(),
+                confidence: 0.9,
+            },
+        ];
+        db.record_signal_candidates("outagehub", &lead_id, &candidates, "test")
+            .expect("signals");
+        db.upsert_account_play_assessment(&AccountPlayAssessment {
+            lead_id: lead_id.clone(),
+            brand: "outagehub".into(),
+            play_id: play.id,
+            play_version: play.version,
+            status: "research_needed".into(),
+            fit_score: 60,
+            matched_signal_keys: candidates
+                .iter()
+                .map(|candidate| candidate.definition_key.clone())
+                .collect(),
+            symptom: "A distributed cold-storage footprint with no verified outage decision."
+                .into(),
+            source: "test".into(),
+            ..Default::default()
+        })
+        .expect("assessment");
+
+        let opportunity = db
+            .list_sales_opportunities(Some("outagehub"), Some(&lead_id))
+            .expect("opportunities")
+            .into_iter()
+            .next()
+            .expect("materialized opportunity");
+        assert_eq!(opportunity.priority_lane, "research");
+        let priority: crate::priority::CommercialPriority =
+            serde_json::from_str(&opportunity.priority_components)
+                .expect("persisted component breakdown");
+        assert_eq!(priority.lane, "research");
+        assert!(!priority.next_missing_fact.is_empty());
+    }
+
+    #[test]
+    fn startup_backfills_priority_for_legacy_current_opportunities() {
+        let path = std::env::temp_dir().join(format!(
+            "spruce-priority-backfill-test-{}.sqlite",
+            Uuid::new_v4()
+        ));
+        let db = Db::open(&path).expect("open temp db");
+        let play = db
+            .current_gtm_play("outagehub")
+            .expect("play query")
+            .expect("current play");
+        let lead_id = db
+            .upsert_lead(&Lead {
+                brand: "outagehub".into(),
+                apollo_org_id: "org-legacy-priority".into(),
+                name: "Legacy Priority Operator".into(),
+                domain: "legacy-priority.example".into(),
+                ..Default::default()
+            })
+            .expect("lead");
+        db.upsert_account_play_assessment(&AccountPlayAssessment {
+            lead_id: lead_id.clone(),
+            brand: "outagehub".into(),
+            play_id: play.id,
+            play_version: play.version,
+            status: "research_needed".into(),
+            source: "test".into(),
+            ..Default::default()
+        })
+        .expect("assessment");
+        let base = db
+            .list_sales_opportunities(Some("outagehub"), Some(&lead_id))
+            .expect("opportunities")
+            .into_iter()
+            .next()
+            .expect("materialized opportunity");
+        let legacy_id = db
+            .upsert_sales_opportunity(&SalesOpportunity {
+                id: String::new(),
+                identity_key: String::new(),
+                task_key: "legacy-unplanned-task".into(),
+                title: "Legacy unplanned task".into(),
+                task_or_decision: "Legacy unplanned task".into(),
+                priority_lane: String::new(),
+                priority_components: String::new(),
+                ..base
+            })
+            .expect("legacy opportunity");
+        drop(db);
+
+        let reopened = Db::open(&path).expect("reopen temp db");
+        let legacy = reopened
+            .list_sales_opportunities(Some("outagehub"), Some(&lead_id))
+            .expect("opportunities")
+            .into_iter()
+            .find(|opportunity| opportunity.id == legacy_id)
+            .expect("legacy opportunity remains current");
+        assert_eq!(legacy.priority_lane, "research");
+        assert!(!legacy.priority_components.is_empty());
+        drop(reopened);
+        remove_temp_db(&path);
     }
 
     #[test]

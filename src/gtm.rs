@@ -281,8 +281,8 @@ pub struct GtmActionContext {
     pub experiment: Option<GtmExperiment>,
     pub experiment_assignment_id: String,
     pub experiment_arm: String,
-    /// The account has human-confirmed the problem (reply or customer
-    /// development), unlocking a coordinated multi-touch motion.
+    /// A prospect reply has passed the explicit-confirmation evidence grade,
+    /// unlocking OutageHub's coordinated four-touch motion.
     #[serde(default)]
     pub engaged: bool,
     /// Deterministic commercial lane computed from persisted evidence.
@@ -504,6 +504,37 @@ pub fn problem_confirmed_for_lead(db: &SharedDb, brand: &str, lead_id: &str) -> 
         .any(|observation| {
             observation.definition_key == "conversation.problem_confirmed"
                 && matches!(observation.status.as_str(), "observed" | "verified")
+        }))
+}
+
+/// Stronger boundary for widening an OutageHub sequence after a reply. The
+/// reply agent must have persisted an exact, body-verified supporting quote and
+/// an explicit confirmation grade. Legacy positive replies and manually
+/// advanced customer-development rows remain useful discovery evidence, but
+/// cannot silently unlock four touches.
+pub fn graded_problem_confirmed_for_lead(
+    db: &crate::db::Db,
+    brand: &str,
+    lead_id: &str,
+) -> Result<bool> {
+    Ok(db
+        .list_active_signal_observations(Some(brand), Some(lead_id), None)?
+        .iter()
+        .filter(|observation| {
+            observation.definition_key == "conversation.problem_confirmed"
+                && observation.source_name == "prospect_reply"
+                && observation.status == "verified"
+        })
+        .any(|observation| {
+            serde_json::from_str::<serde_json::Value>(&observation.value_json)
+                .ok()
+                .is_some_and(|value| {
+                    value.get("grade").and_then(|grade| grade.as_str()) == Some("explicit")
+                        && value
+                            .get("supporting_quote")
+                            .and_then(|quote| quote.as_str())
+                            .is_some_and(|quote| !quote.trim().is_empty())
+                })
         }))
 }
 
@@ -1251,38 +1282,26 @@ pub fn prepare_action(
     // Deterministic commercial priority: lane + component breakdown derived
     // from the same persisted evidence that authorized the state. Persisted on
     // the opportunity so the CRM can display *why* an account sits in a lane.
-    let engaged = problem_confirmed_for_lead(db, brand, lead_id)?;
-    let mut priority = None;
-    if brand.eq_ignore_ascii_case("outagehub") {
-        let decision_evidence = observations
-            .iter()
-            .filter(|observation| observation.definition_key == "account.outage_sensitive_decision")
-            .map(|observation| observation.evidence.as_str())
-            .collect::<Vec<_>>()
-            .join(" ");
-        let has_key = |key: &str| claim_keys.iter().any(|matched| matched == key);
-        let computed = crate::priority::outagehub_priority(&crate::priority::PriorityInputs {
-            segment: crate::segments::segment_for_evidence(&decision_evidence),
-            active_claims: evidence_claims
-                .iter()
-                .filter(|claim| matches!(claim.status.as_str(), "observed" | "verified"))
-                .count(),
-            decision_evidenced: has_key("account.outage_sensitive_decision"),
-            historical_match: has_key("account.historical_location_outage_match"),
-            reachable_direct_owner: person_is_direct
-                && has_reachable_channel
-                && has_workflow_vantage,
-            headcount: db
-                .get_lead(lead_id)?
-                .map(|lead| lead.headcount)
-                .unwrap_or_default(),
-            problem_confirmed: engaged,
-        });
+    let engaged = graded_problem_confirmed_for_lead(db, brand, lead_id)?;
+    let priority = if brand.eq_ignore_ascii_case("outagehub") {
         if let Some(opportunity) = &opportunity {
-            db.update_opportunity_priority(&opportunity.id, &computed)?;
+            db.recompute_outagehub_opportunity_priority(&opportunity.id)?
+        } else {
+            Some(crate::priority::outagehub_priority(
+                &crate::priority::PriorityInputs {
+                    segment: None,
+                    active_claims: 0,
+                    decision_evidenced: false,
+                    historical_match: false,
+                    reachable_direct_owner: false,
+                    headcount: 0,
+                    problem_confirmed: false,
+                },
+            ))
         }
-        priority = Some(computed);
-    }
+    } else {
+        None
+    };
 
     let mut experiment = None;
     let mut experiment_assignment_id = String::new();
@@ -1632,8 +1651,9 @@ pub fn seed_defaults(db: &SharedDb) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        customer_development_missing, customer_development_stage, default_signal_definitions,
-        prepare_action, seed_defaults, GtmActionContext, SignalCandidate,
+        customer_development_missing, customer_development_stage, default_plays,
+        default_signal_definitions, graded_problem_confirmed_for_lead, prepare_action,
+        seed_defaults, GtmActionContext, SignalCandidate,
     };
     use crate::db::{
         AccountPlayAssessment, CustomerDevelopmentRecord, Db, EvidenceClaim, Lead, Person, SharedDb,
@@ -1698,6 +1718,66 @@ mod tests {
             "operational_executive",
             charging_decision,
         ));
+    }
+
+    #[test]
+    fn outagehub_four_touch_state_requires_a_graded_reply_observation() {
+        let db = Db::open(":memory:").expect("open memory db");
+        let lead_id = db
+            .upsert_lead(&Lead {
+                brand: "outagehub".into(),
+                apollo_org_id: "org-graded-reply".into(),
+                name: "Graded Reply Operator".into(),
+                ..Default::default()
+            })
+            .expect("lead");
+        db.record_signal_observation(&crate::db::SignalObservation {
+            brand: "outagehub".into(),
+            definition_key: "conversation.problem_confirmed".into(),
+            lead_id: lead_id.clone(),
+            conversation_id: "conversation-friendly".into(),
+            source_name: "prospect_reply".into(),
+            value_json: serde_json::json!({"category":"interested"}).to_string(),
+            evidence: "Sounds interesting; happy to talk.".into(),
+            confidence: 0.85,
+            status: "verified".into(),
+            ..Default::default()
+        })
+        .expect("legacy reply observation");
+        assert!(!graded_problem_confirmed_for_lead(&db, "outagehub", &lead_id).unwrap());
+
+        db.record_signal_observation(&crate::db::SignalObservation {
+            brand: "outagehub".into(),
+            definition_key: "conversation.problem_confirmed".into(),
+            lead_id: lead_id.clone(),
+            conversation_id: "conversation-explicit".into(),
+            source_name: "prospect_reply".into(),
+            value_json: serde_json::json!({
+                "category":"correction",
+                "grade":"explicit",
+                "supporting_quote":"We check the utility map before dispatching a crew"
+            })
+            .to_string(),
+            evidence: "Dispatch checks utility context before rolling a crew.".into(),
+            confidence: 0.95,
+            status: "verified".into(),
+            ..Default::default()
+        })
+        .expect("graded reply observation");
+        let engaged = graded_problem_confirmed_for_lead(&db, "outagehub", &lead_id).unwrap();
+        assert!(engaged);
+        assert_eq!(
+            GtmActionContext {
+                state: "action_ready".into(),
+                play: default_plays()
+                    .into_iter()
+                    .find(|play| play.brand == "outagehub"),
+                engaged,
+                ..Default::default()
+            }
+            .max_authorized_touches(),
+            4
+        );
     }
 
     fn qualify_current_play(db: &SharedDb, brand: &str, lead_id: &str, keys: &[&str]) {

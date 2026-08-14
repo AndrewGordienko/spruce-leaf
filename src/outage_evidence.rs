@@ -11,6 +11,8 @@ use std::fmt;
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -30,6 +32,8 @@ pub struct LocationOutageMatch {
     pub domain: String,
     #[serde(default)]
     pub location_kind: String,
+    #[serde(default)]
+    pub operating_relationship: String,
     pub station_id: i64,
     pub station_name: String,
     pub network: String,
@@ -44,6 +48,10 @@ pub struct LocationOutageMatch {
     pub outage_end_ts: i64,
     pub outage_start_utc: String,
     pub station_source_url: String,
+    #[serde(default)]
+    pub geocode_source_url: String,
+    #[serde(default)]
+    pub geocoding_attribution: String,
     pub outage_source_url: String,
 }
 
@@ -53,7 +61,26 @@ pub struct MatchReport {
     pub station_source_url: String,
     pub outage_archive: String,
     pub interpretation_boundary: String,
+    #[serde(default)]
+    pub geocoding_attribution: String,
     pub matches: Vec<LocationOutageMatch>,
+}
+
+/// A first-party, exact-page-validated operating address nominated by company
+/// research. Coordinates are deliberately absent: the evidence extractor does
+/// not get to invent them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VerifiedLocationCandidate {
+    /// owned | operated | managed | monitored
+    pub relationship: String,
+    pub location_kind: String,
+    pub name: String,
+    pub street_address: String,
+    pub city: String,
+    pub province: String,
+    pub postal_code: String,
+    pub source_url: String,
+    pub source_excerpt: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -62,7 +89,7 @@ struct StationPayload {
     fuel_stations: Vec<Station>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Station {
     #[serde(default)]
     id: i64,
@@ -74,6 +101,8 @@ struct Station {
     domain: String,
     #[serde(default = "default_location_kind")]
     location_kind: String,
+    #[serde(default)]
+    operating_relationship: String,
     #[serde(default)]
     station_name: String,
     #[serde(default)]
@@ -88,7 +117,35 @@ struct Station {
     longitude: f64,
     #[serde(default)]
     source_url: String,
+    #[serde(default)]
+    source_excerpt: String,
+    #[serde(default)]
+    postal_code: String,
+    #[serde(default)]
+    geocode_source_url: String,
+    #[serde(default)]
+    geocoding_attribution: String,
 }
+
+#[derive(Debug, Deserialize)]
+struct GeocodeResult {
+    lat: String,
+    lon: String,
+    #[serde(default)]
+    licence: String,
+    #[serde(default)]
+    address: GeocodeAddress,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GeocodeAddress {
+    #[serde(default)]
+    country_code: String,
+}
+
+static LOCATION_INVENTORY_WRITE: OnceLock<Mutex<()>> = OnceLock::new();
+static GEOCODER_RATE_LIMIT: OnceLock<tokio::sync::Mutex<Option<tokio::time::Instant>>> =
+    OnceLock::new();
 
 fn default_location_kind() -> String {
     "operating location".into()
@@ -153,10 +210,11 @@ pub async fn build_report(archive: &Path, output: &Path) -> Result<MatchReport> 
 }
 
 /// Match an operator-supplied JSON array of verified Canadian locations. Every
-/// row must include `company`, `domain`, `location_kind`, `station_name`,
-/// `street_address`, `city`, `state`, `latitude`, `longitude`, and a public
-/// `source_url`. Coordinates make the polygon result reproducible; the address
-/// and source establish that it belongs to the operator rather than a customer.
+/// row must include `company`, `domain`, `location_kind`,
+/// `operating_relationship`, `station_name`, `street_address`, `city`, `state`,
+/// `latitude`, `longitude`, and a public `source_url`. Coordinates make the
+/// polygon result reproducible; the address and source establish that it
+/// belongs to the operator rather than a customer.
 pub fn build_verified_location_report(
     archive: &Path,
     locations: &Path,
@@ -172,12 +230,19 @@ pub fn build_verified_location_report(
         }
         if row.company.trim().is_empty()
             || row.domain.trim().is_empty()
+            || row.location_kind.trim().is_empty()
+            || !matches!(
+                row.operating_relationship.trim(),
+                "owned" | "operated" | "managed" | "monitored"
+            )
             || row.station_name.trim().is_empty()
             || row.street_address.trim().is_empty()
+            || row.city.trim().is_empty()
+            || row.state.trim().is_empty()
             || row.source_url.trim().is_empty()
         {
             anyhow::bail!(
-                "verified location row {} must name company, domain, station_name, street_address, and source_url",
+                "verified location row {} must name company, domain, location_kind, an owned/operated/managed/monitored relationship, station_name, street_address, city, state, and source_url",
                 index + 1
             );
         }
@@ -189,6 +254,207 @@ pub fn build_verified_location_report(
         }
     }
     build_report_from_locations(archive, output, rows, &locations.display().to_string())
+}
+
+/// Geocode, cache, and match exact-page-validated operating addresses found by
+/// account research. The public default is intentionally conservative: one
+/// globally serialized request every 15 seconds, cached permanently, with a
+/// configurable endpoint. This is account evidence intake, not a general
+/// geocoding API.
+pub async fn ingest_researched_locations(
+    company: &str,
+    domain: &str,
+    candidates: &[VerifiedLocationCandidate],
+    archive: &Path,
+    inventory: &Path,
+    output: &Path,
+) -> Result<Vec<String>> {
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let existing = read_station_inventory(inventory);
+    let mut additions = Vec::new();
+    // One verified address is sufficient for the bounded historical replay.
+    // Trying at most three prevents a malformed first address from blocking an
+    // account while keeping public-geocoder use deliberately small.
+    for candidate in candidates.iter().take(3) {
+        if let Some(cached) = existing.iter().find(|station| {
+            station.domain.eq_ignore_ascii_case(domain)
+                && normalize(&station.street_address) == normalize(&candidate.street_address)
+        }) {
+            // Coordinates and geocoder provenance are immutable cache data;
+            // operating metadata comes from the newly validated first-party
+            // page so an older cache row cannot erase its relationship lineage.
+            let mut refreshed = cached.clone();
+            refreshed.company = company.trim().to_string();
+            refreshed.domain = domain
+                .trim()
+                .trim_start_matches("www.")
+                .to_ascii_lowercase();
+            refreshed.location_kind = candidate.location_kind.trim().to_string();
+            refreshed.operating_relationship = candidate.relationship.trim().to_string();
+            refreshed.station_name = candidate.name.trim().to_string();
+            refreshed.street_address = candidate.street_address.trim().to_string();
+            refreshed.city = candidate.city.trim().to_string();
+            refreshed.state = candidate.province.trim().to_string();
+            refreshed.postal_code = candidate.postal_code.trim().to_string();
+            refreshed.source_url = candidate.source_url.trim().to_string();
+            refreshed.source_excerpt = candidate.source_excerpt.trim().to_string();
+            additions.push(refreshed);
+            break;
+        }
+        if let Some(geocoded) = geocode_verified_location(company, domain, candidate).await? {
+            additions.push(geocoded);
+            break;
+        }
+    }
+    if additions.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let _guard = LOCATION_INVENTORY_WRITE
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| anyhow::anyhow!("verified-location inventory lock was poisoned"))?;
+    let mut inventory_rows = read_station_inventory(inventory);
+    for addition in additions {
+        if let Some(existing) = inventory_rows.iter_mut().find(|station| {
+            station.domain.eq_ignore_ascii_case(&addition.domain)
+                && normalize(&station.street_address) == normalize(&addition.street_address)
+        }) {
+            *existing = addition;
+        } else {
+            inventory_rows.push(addition);
+        }
+    }
+    inventory_rows.sort_by(|left, right| {
+        left.domain
+            .cmp(&right.domain)
+            .then_with(|| left.street_address.cmp(&right.street_address))
+    });
+    crate::storage::atomic_write(inventory, serde_json::to_vec_pretty(&inventory_rows)?)?;
+    if !archive.exists() {
+        return Ok(Vec::new());
+    }
+    build_report_from_locations(
+        archive,
+        output,
+        inventory_rows,
+        &inventory.display().to_string(),
+    )?;
+    Ok(evidence_for_company(output, company, domain))
+}
+
+fn read_station_inventory(path: &Path) -> Vec<Station> {
+    File::open(path)
+        .ok()
+        .and_then(|file| serde_json::from_reader(BufReader::new(file)).ok())
+        .unwrap_or_default()
+}
+
+async fn geocode_verified_location(
+    company: &str,
+    domain: &str,
+    candidate: &VerifiedLocationCandidate,
+) -> Result<Option<Station>> {
+    let endpoint = std::env::var("SPRUCE_GEOCODER_URL")
+        .unwrap_or_else(|_| "https://nominatim.openstreetmap.org/search".into());
+    let mut url = reqwest::Url::parse(&endpoint).context("parse SPRUCE_GEOCODER_URL")?;
+    url.query_pairs_mut()
+        .append_pair(
+            "q",
+            &format!(
+                "{}, {}, {}, {}, Canada",
+                candidate.street_address, candidate.city, candidate.province, candidate.postal_code
+            ),
+        )
+        .append_pair("format", "jsonv2")
+        .append_pair("addressdetails", "1")
+        .append_pair("countrycodes", "ca")
+        .append_pair("limit", "1");
+
+    let public_nominatim = url.host_str() == Some("nominatim.openstreetmap.org");
+    let minimum_interval = if public_nominatim {
+        15
+    } else {
+        std::env::var("SPRUCE_GEOCODER_INTERVAL_SECONDS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(1)
+            .max(1)
+    };
+    let rate_limit = GEOCODER_RATE_LIMIT.get_or_init(|| tokio::sync::Mutex::new(None));
+    let mut previous = rate_limit.lock().await;
+    if let Some(previous) = *previous {
+        let elapsed = previous.elapsed();
+        let interval = Duration::from_secs(minimum_interval);
+        if elapsed < interval {
+            tokio::time::sleep(interval - elapsed).await;
+        }
+    }
+    *previous = Some(tokio::time::Instant::now());
+    drop(previous);
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .user_agent("spruce-leaf/0.1 verified-location-research")
+        .build()?;
+    let response = client
+        .get(url.clone())
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Vec<GeocodeResult>>()
+        .await?;
+    let Some(result) = response.into_iter().next() else {
+        return Ok(None);
+    };
+    if !result.address.country_code.eq_ignore_ascii_case("ca") {
+        return Ok(None);
+    }
+    let Ok(latitude) = result.lat.parse::<f64>() else {
+        return Ok(None);
+    };
+    let Ok(longitude) = result.lon.parse::<f64>() else {
+        return Ok(None);
+    };
+    if !(41.0..=84.0).contains(&latitude) || !(-142.0..=-52.0).contains(&longitude) {
+        return Ok(None);
+    }
+    let identity = format!("{}|{}", domain, normalize(&candidate.street_address));
+    Ok(Some(Station {
+        location_id: format!("verified-{:016x}", stable_location_hash(&identity)),
+        company: company.trim().to_string(),
+        domain: domain
+            .trim()
+            .trim_start_matches("www.")
+            .to_ascii_lowercase(),
+        location_kind: candidate.location_kind.trim().to_string(),
+        operating_relationship: candidate.relationship.trim().to_string(),
+        station_name: candidate.name.trim().to_string(),
+        street_address: candidate.street_address.trim().to_string(),
+        city: candidate.city.trim().to_string(),
+        state: candidate.province.trim().to_string(),
+        postal_code: candidate.postal_code.trim().to_string(),
+        latitude,
+        longitude,
+        source_url: candidate.source_url.trim().to_string(),
+        source_excerpt: candidate.source_excerpt.trim().to_string(),
+        geocode_source_url: url.to_string(),
+        geocoding_attribution: if result.licence.trim().is_empty() {
+            "Geocoding © OpenStreetMap contributors, ODbL 1.0".into()
+        } else {
+            result.licence
+        },
+        ..Default::default()
+    }))
+}
+
+fn stable_location_hash(value: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn build_report_from_locations(
@@ -223,6 +489,14 @@ fn build_report_from_locations(
         station_source_url: location_source.into(),
         outage_archive: archive.display().to_string(),
         interpretation_boundary: "A match means a source-verified operating-location coordinate fell inside a utility-reported outage polygon at the recorded time. It does not establish private site or asset status, telemetry, incident cause, or the operator's internal workflow.".into(),
+        geocoding_attribution: index
+            .stations
+            .iter()
+            .find_map(|station| {
+                (!station.geocoding_attribution.trim().is_empty())
+                    .then(|| station.geocoding_attribution.clone())
+            })
+            .unwrap_or_default(),
         matches,
     };
     if let Some(parent) = output.parent() {
@@ -526,6 +800,7 @@ impl<'de> Visitor<'de> for OutagesVisitor<'_> {
                     company: station.company.clone(),
                     domain: station.domain.clone(),
                     location_kind: station.location_kind.clone(),
+                    operating_relationship: station.operating_relationship.clone(),
                     station_id: station.id,
                     station_name: station.station_name.clone(),
                     network: station.ev_network.clone(),
@@ -546,6 +821,8 @@ impl<'de> Visitor<'de> for OutagesVisitor<'_> {
                     } else {
                         station.source_url.clone()
                     },
+                    geocode_source_url: station.geocode_source_url.clone(),
+                    geocoding_attribution: station.geocoding_attribution.clone(),
                     outage_source_url: format!("https://api.outagehub.ca/v1/outages/{}", outage.id),
                 });
             }
@@ -692,8 +969,9 @@ fn format_location(matched: &LocationOutageMatch) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_report_from_locations, company_matches_network, extract_public_api_key, parse_wkt,
-        point_in_polygons, LocationOutageMatch, Station,
+        build_report_from_locations, company_matches_network, extract_public_api_key,
+        ingest_researched_locations, parse_wkt, point_in_polygons, LocationOutageMatch,
+        MatchReport, Station, VerifiedLocationCandidate,
     };
 
     #[test]
@@ -736,6 +1014,7 @@ mod tests {
             outage_start_utc: String::new(),
             station_source_url: String::new(),
             outage_source_url: String::new(),
+            ..Default::default()
         };
         assert!(company_matches_network(
             "swtchenergyinc",
@@ -812,5 +1091,77 @@ mod tests {
         assert_eq!(report.matches.len(), 2);
         let _ = std::fs::remove_file(archive);
         let _ = std::fs::remove_file(output);
+    }
+
+    #[tokio::test]
+    async fn researched_location_intake_reuses_cache_and_produces_company_evidence() {
+        let run = uuid::Uuid::new_v4();
+        let root = std::env::temp_dir().join(format!("outage-intake-{run}"));
+        let archive = root.join("archive.json");
+        let inventory = root.join("verified-locations.json");
+        let output = root.join("matches.json");
+        std::fs::create_dir_all(&root).unwrap();
+        serde_json::to_writer(
+            std::fs::File::create(&archive).unwrap(),
+            &serde_json::json!({
+                "outages": [{
+                    "id": 42,
+                    "provider": "Test Utility",
+                    "polygon": "POLYGON((-80 43,-78 43,-78 45,-80 45,-80 43))",
+                    "startTs": 1786636800,
+                    "endTs": 1786640400
+                }]
+            }),
+        )
+        .unwrap();
+        serde_json::to_writer(
+            std::fs::File::create(&inventory).unwrap(),
+            &vec![Station {
+                location_id: "verified-lab-one".into(),
+                company: "Dynacare".into(),
+                domain: "dynacare.ca".into(),
+                location_kind: "laboratory".into(),
+                station_name: "Lab one".into(),
+                street_address: "123 King Street West".into(),
+                city: "Toronto".into(),
+                state: "Ontario".into(),
+                latitude: 43.7,
+                longitude: -79.4,
+                source_url: "https://dynacare.ca/locations".into(),
+                geocode_source_url: "https://nominatim.openstreetmap.org/search?q=cached".into(),
+                geocoding_attribution: "Data © OpenStreetMap contributors, ODbL 1.0".into(),
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+        let evidence = ingest_researched_locations(
+            "Dynacare",
+            "dynacare.ca",
+            &[VerifiedLocationCandidate {
+                relationship: "operated".into(),
+                location_kind: "laboratory".into(),
+                name: "Lab one".into(),
+                street_address: "123 King Street West".into(),
+                city: "Toronto".into(),
+                province: "Ontario".into(),
+                postal_code: "M5V 1A1".into(),
+                source_url: "https://dynacare.ca/locations".into(),
+                source_excerpt: "Lab one — 123 King Street West, Toronto, Ontario".into(),
+            }],
+            &archive,
+            &inventory,
+            &output,
+        )
+        .await
+        .unwrap();
+        assert!(evidence
+            .iter()
+            .any(|fact| fact.contains("Completed historical geospatial result")));
+        let report: MatchReport =
+            serde_json::from_reader(std::fs::File::open(&output).unwrap()).unwrap();
+        assert_eq!(report.matches.len(), 1);
+        assert_eq!(report.matches[0].operating_relationship, "operated");
+        assert!(report.geocoding_attribution.contains("OpenStreetMap"));
+        let _ = std::fs::remove_dir_all(root);
     }
 }

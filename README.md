@@ -42,8 +42,12 @@ Automatic account-framing refreshes reuse source-backed research for six hours b
 Bulk outreach honors the requested recipient count per account and defaults to seven reviewed touches per recipient.
 Each recipient is written and reviewed in an isolated model call, so a large account request cannot
 overflow one structured response or discard good copy for other contacts.
-Discovery-ready accounts are held for research unless the request is a single manual routing note;
-only action-ready evidence can produce a multi-touch campaign. An explicit four-touch request still
+Discovery-ready accounts can produce only one manually reviewed premise-testing email;
+only action-ready evidence can produce a multi-touch campaign. For OutageHub, action-ready
+authorizes two touches and a prospect reply must pass the explicit-confirmation quote grade before
+four touches unlock. Exact first-party Canadian operating addresses can be automatically geocoded,
+cached, and matched across physical-location segments; see
+[docs/outage-location-evidence.md](docs/outage-location-evidence.md). An explicit four-touch request
 uses the compact email/email/LinkedIn/email cadence. Run `cargo run -- eval-outreach --double-blind`
 to compare copy against the pairwise corpus before promoting a prompt or model change.
 Run `cargo run -- eval-outreach-ablation --cases 3 --repeats 1` to hold the

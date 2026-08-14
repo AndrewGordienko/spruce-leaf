@@ -55,28 +55,83 @@ fn distributed_operating_footprint(text: &str) -> bool {
                 "asset network",
             ],
         );
-    let operating_site = concrete_site || operated_network;
-    let distributed = has(
+    // An insurer operates no exposed sites, but its outage-relevant footprint
+    // is the geographic spread of INSURED locations: a claims/CAT operation
+    // whose policyholder book crosses utility territories makes location-to-
+    // outage matching operationally relevant in exactly the way a site network
+    // does. Generic underwriting language (no claims-operations verb) never
+    // qualifies — that is the "CAT exposure is not a workflow" boundary.
+    let claims_operation = has(
+        text,
+        &[
+            "claims operations",
+            "cat claims",
+            "catastrophe claims",
+            "catastrophe response",
+            "claims team",
+            "claims desk",
+        ],
+    );
+    let insured_book = has(
+        text,
+        &[
+            "policyholders",
+            "insured locations",
+            "insured properties",
+            "claims book",
+            "claim portfolio",
+            "claims portfolio",
+        ],
+    );
+    let geographic_book = has(
         text,
         &[
             "multiple",
-            "two",
-            "three",
-            "several",
             "across",
+            "regional",
             "province",
-            "region",
             "territor",
             "nationwide",
             "canada",
-            "remote",
-            "distributed",
-            "locations",
-            "facilities",
-            "sites",
+            "canadian",
+            "ontario",
+            "quebec",
+            "alberta",
+            "british columbia",
         ],
     );
-    let office_only = has(text, &["office", "headquarters", " hq"])
+    let claims_book = claims_operation && insured_book && geographic_book;
+    let operating_site = concrete_site || operated_network || claims_book;
+    let distributed = claims_book
+        || has(
+            text,
+            &[
+                "multiple",
+                "two",
+                "three",
+                "several",
+                "across",
+                "province",
+                "region",
+                "territor",
+                "nationwide",
+                "canada",
+                "remote",
+                "distributed",
+                "locations",
+                "facilities",
+                "sites",
+                "warehouses",
+                "plants",
+                "stores",
+                "branches",
+                "towers",
+                "policyholder",
+                "insured",
+            ],
+        );
+    let office_only = !claims_book
+        && has(text, &["office", "headquarters", " hq"])
         && !has(
             text,
             &[
@@ -435,6 +490,7 @@ fn outage_sensitive_exposure(text: &str) -> bool {
             || communications_network
             || claims_response))
         || managed_power_response
+        || claims_response
 }
 
 /// Whether a title is close enough to the exact evidenced outage-time decision
@@ -569,6 +625,43 @@ mod tests {
         assert!(credible_outagehub_signal(
             "account.distributed_locations",
             "The operator runs automated cold-storage facilities across Ontario, Alberta, and Quebec."
+        ));
+    }
+
+    #[test]
+    fn a_geographically_distributed_claims_book_is_the_insurer_footprint() {
+        for evidence in [
+            "Regional claims operations handles storm response for policyholders across Ontario.",
+            "The CAT claims desk coordinates a claims portfolio across Alberta and British Columbia.",
+            "The claims office supports insured locations across Canada during catastrophe response.",
+        ] {
+            assert!(
+                credible_outagehub_signal("account.distributed_locations", evidence),
+                "{evidence}"
+            );
+        }
+
+        for evidence in [
+            "The underwriting office models catastrophe reinsurance exposure across Canada.",
+            "The claims team reviewed one storm claim for a policyholder.",
+            "The company has claims offices across Canada.",
+        ] {
+            assert!(
+                !credible_outagehub_signal("account.distributed_locations", evidence),
+                "{evidence}"
+            );
+        }
+    }
+
+    #[test]
+    fn cat_claims_response_is_outage_sensitive_without_operated_sites() {
+        assert!(credible_outagehub_signal(
+            "account.outage_sensitive_exposure",
+            "The CAT claims team coordinates storm response for policyholders across Ontario."
+        ));
+        assert!(!credible_outagehub_signal(
+            "account.outage_sensitive_exposure",
+            "The property underwriting team models catastrophe exposure across Ontario."
         ));
     }
 

@@ -36,6 +36,10 @@ pub struct CompanyBrief {
     pub problem_hypothesis: String,
     #[serde(default)]
     pub why: String,
+    /// Exact-page operating addresses nominated by the extractor, then
+    /// deterministically revalidated before geocoding or historical matching.
+    #[serde(default)]
+    pub operating_locations: Vec<crate::outage_evidence::VerifiedLocationCandidate>,
     #[serde(default)]
     pub sources: Vec<String>,
     /// Deterministically extracted from the exact fetched source page. This is
@@ -58,6 +62,7 @@ impl CompanyBrief {
             && self.observed_facts.is_empty()
             && self.signals.is_empty()
             && self.hiring_signals.is_empty()
+            && self.operating_locations.is_empty()
             && self.problem_hypothesis.trim().is_empty()
     }
 
@@ -562,7 +567,12 @@ pub async fn research_company(
          manual work, customers named ON their site); signals specifically relevant to the motion; \
          hiring_signals (only current investments, systems, workflows, or responsibilities explicitly \
          named on the supplied first-party careers/jobs page; never inferred pain or buying intent); \
-         one problem_hypothesis this company plausibly has that fits the motion; and the 'why' — \
+         For OutageHub only, operating_locations may contain an exact Canadian address only when \
+         the supplied first-party page itself lists that address as the company's owned, operated, \
+         managed, or monitored location. Copy one exact source_excerpt from that same page; never \
+         return a customer, delivery, claim, service-area, or hypothetical address. Leave the array \
+         empty for every other motion or when any address term is missing. Return one \
+         problem_hypothesis this company plausibly has that fits the motion; and the 'why' — \
          the crux (for a workflow: why it is still manual / the missing layer; for automation: why \
          conventional automation is uneconomic; for outage data: why the decision is hard). If the \
          pages are too thin, return only what is supported and leave the rest empty.",
@@ -583,6 +593,48 @@ pub async fn research_company(
         Ok(mut brief) => {
             brief.sources = sources;
             brief.source_locations = source_locations;
+            brief.operating_locations = validate_researched_operating_locations(
+                &brief.operating_locations,
+                &corpus,
+                &domain,
+            );
+            for location in &brief.operating_locations {
+                let fact = format!(
+                    "[{}] The company's first-party page lists a {} {} at {}, {}, {}.",
+                    location.source_url,
+                    location.relationship,
+                    location.location_kind,
+                    location.street_address,
+                    location.city,
+                    location.province,
+                );
+                if !brief.observed_facts.contains(&fact) {
+                    brief.observed_facts.push(fact);
+                }
+            }
+            if pb.key.eq_ignore_ascii_case("outagehub")
+                && outage_location_discovery_enabled()
+                && !brief.operating_locations.is_empty()
+            {
+                let archive = std::env::var("SPRUCE_OUTAGE_ARCHIVE")
+                    .unwrap_or_else(|_| ".spruce/outage-archive.json".into());
+                let inventory = std::env::var("SPRUCE_VERIFIED_LOCATIONS")
+                    .unwrap_or_else(|_| ".spruce/verified-locations.json".into());
+                let report = std::env::var("SPRUCE_OUTAGE_MATCH_REPORT")
+                    .unwrap_or_else(|_| ".spruce/outage-location-matches.json".into());
+                if let Ok(evidence) = crate::outage_evidence::ingest_researched_locations(
+                    &org.name,
+                    &domain,
+                    &brief.operating_locations,
+                    std::path::Path::new(&archive),
+                    std::path::Path::new(&inventory),
+                    std::path::Path::new(&report),
+                )
+                .await
+                {
+                    add_outage_evidence(&mut brief, evidence);
+                }
+            }
             add_outage_evidence(&mut brief, outage_evidence);
             if brief.is_empty() {
                 None
@@ -591,6 +643,172 @@ pub async fn research_company(
             }
         }
         Err(_) => None,
+    }
+}
+
+fn outage_location_discovery_enabled() -> bool {
+    std::env::var("SPRUCE_OUTAGE_LOCATION_DISCOVERY")
+        .map(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            )
+        })
+        .unwrap_or(true)
+}
+
+fn validate_researched_operating_locations(
+    candidates: &[crate::outage_evidence::VerifiedLocationCandidate],
+    corpus: &str,
+    company_domain: &str,
+) -> Vec<crate::outage_evidence::VerifiedLocationCandidate> {
+    let sections = source_sections(corpus);
+    let mut accepted = Vec::new();
+    for candidate in candidates.iter().take(10) {
+        if candidate.location_kind.trim().is_empty()
+            || !matches!(
+                candidate.relationship.trim(),
+                "owned" | "operated" | "managed" | "monitored"
+            )
+            || candidate.name.trim().is_empty()
+            || candidate.street_address.trim().is_empty()
+            || candidate.city.trim().is_empty()
+            || candidate.province.trim().is_empty()
+            || candidate.postal_code.trim().is_empty()
+            || candidate.source_url.trim().is_empty()
+            || candidate.source_excerpt.trim().is_empty()
+        {
+            continue;
+        }
+        let Ok(source_url) = reqwest::Url::parse(candidate.source_url.trim()) else {
+            continue;
+        };
+        if source_url.scheme() != "https"
+            || !same_company_host(source_url.host_str().unwrap_or_default(), company_domain)
+        {
+            continue;
+        }
+        let path = source_url.path().to_ascii_lowercase();
+        if ["customer", "case-stud", "project", "dealer", "partner"]
+            .iter()
+            .any(|marker| path.contains(marker))
+        {
+            continue;
+        }
+        let Some((_, body)) = sections.iter().find(|(url, _)| {
+            url.trim_end_matches('/') == candidate.source_url.trim().trim_end_matches('/')
+        }) else {
+            continue;
+        };
+        let body = normalize_location_evidence(body);
+        let excerpt = normalize_location_evidence(&candidate.source_excerpt);
+        let street = normalize_location_evidence(&candidate.street_address);
+        let city = normalize_location_evidence(&candidate.city);
+        let province = normalize_location_evidence(&candidate.province);
+        let postal_code = normalize_location_evidence(&candidate.postal_code);
+        let province_supported = body.contains(&province)
+            || province_aliases(&province)
+                .iter()
+                .any(|alias| contains_token(&body, alias));
+        let relationship_in_excerpt = [
+            "operate",
+            "owned",
+            "manage",
+            "monitor",
+            "our location",
+            "our facility",
+            "our site",
+            "our branch",
+            "our store",
+            "our property",
+        ]
+        .iter()
+        .any(|marker| excerpt.contains(marker));
+        let first_party_location_directory = [
+            "location",
+            "facility",
+            "facilities",
+            "branch",
+            "store",
+            "warehouse",
+            "laborator",
+            "residence",
+            "properties",
+            "contact-us",
+        ]
+        .iter()
+        .any(|marker| path.contains(marker));
+        if excerpt.split_whitespace().count() < 3
+            || !body.contains(&excerpt)
+            || !body.contains(&street)
+            || !body.contains(&city)
+            || !province_supported
+            || !body.contains(&postal_code)
+            || !(relationship_in_excerpt || first_party_location_directory)
+        {
+            continue;
+        }
+        if accepted.iter().any(
+            |existing: &crate::outage_evidence::VerifiedLocationCandidate| {
+                existing
+                    .source_url
+                    .eq_ignore_ascii_case(&candidate.source_url)
+                    && normalize_location_evidence(&existing.street_address) == street
+            },
+        ) {
+            continue;
+        }
+        accepted.push(candidate.clone());
+    }
+    accepted
+}
+
+fn source_sections(corpus: &str) -> Vec<(String, String)> {
+    corpus
+        .split("SOURCE URL: ")
+        .skip(1)
+        .filter_map(|section| {
+            let (url, body) = section.split_once('\n')?;
+            Some((
+                url.trim().to_string(),
+                body.split("SOURCE URL: ")
+                    .next()
+                    .unwrap_or(body)
+                    .to_string(),
+            ))
+        })
+        .collect()
+}
+
+fn normalize_location_evidence(value: &str) -> String {
+    value
+        .to_ascii_lowercase()
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn contains_token(text: &str, token: &str) -> bool {
+    format!(" {text} ").contains(&format!(" {token} "))
+}
+
+fn province_aliases(province: &str) -> &'static [&'static str] {
+    match province {
+        "ontario" => &["on"],
+        "quebec" => &["qc", "pq"],
+        "alberta" => &["ab"],
+        "british columbia" => &["bc"],
+        "manitoba" => &["mb"],
+        "saskatchewan" => &["sk"],
+        "nova scotia" => &["ns"],
+        "new brunswick" => &["nb"],
+        "newfoundland and labrador" => &["nl"],
+        "prince edward island" => &["pe", "pei"],
+        "northwest territories" => &["nt"],
+        "nunavut" => &["nu"],
+        "yukon" => &["yt"],
+        _ => &[],
     }
 }
 
@@ -635,7 +853,9 @@ fn add_outage_evidence(brief: &mut CompanyBrief, evidence: Vec<String>) {
                 brief.sources.push(source.to_string());
             }
         }
-        brief.observed_facts.push(fact);
+        if !brief.observed_facts.contains(&fact) {
+            brief.observed_facts.push(fact);
+        }
     }
 }
 
@@ -1467,6 +1687,27 @@ fn brief_schema() -> Value {
             "hiring_signals": str_array("Only investments, systems, workflows, or responsibilities explicitly named on the supplied first-party careers/jobs page. Never inferred pain, urgency, budget, buying intent, or recipient ownership."),
             "problem_hypothesis": { "type": "string" },
             "why": { "type": "string" }
+            ,"operating_locations": {
+                "type": "array",
+                "maxItems": 10,
+                "description": "OutageHub only: exact first-party Canadian operating addresses; never customer, delivery, claim, service-area, or hypothetical addresses.",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["relationship","location_kind","name","street_address","city","province","postal_code","source_url","source_excerpt"],
+                    "properties": {
+                        "relationship": {"type":"string","enum":["owned","operated","managed","monitored"]},
+                        "location_kind": {"type":"string"},
+                        "name": {"type":"string"},
+                        "street_address": {"type":"string"},
+                        "city": {"type":"string"},
+                        "province": {"type":"string"},
+                        "postal_code": {"type":"string"},
+                        "source_url": {"type":"string"},
+                        "source_excerpt": {"type":"string"}
+                    }
+                }
+            }
         }
     })
 }
@@ -1478,8 +1719,10 @@ mod tests {
         job_page_has_task_evidence, linked_job_page_credible, ranked_internal_links,
         relevant_internal_links, relevant_job_links, research_page_usable,
         research_seed_urls_from_json, role_search_queries, search_result_urls,
-        source_locations_from_corpus, trusted_ats_host, trusted_job_mirror_host, CompanyBrief,
+        source_locations_from_corpus, trusted_ats_host, trusted_job_mirror_host,
+        validate_researched_operating_locations, CompanyBrief,
     };
+    use crate::outage_evidence::VerifiedLocationCandidate;
 
     #[test]
     fn source_locations_require_ontario_on_the_exact_page() {
@@ -1491,6 +1734,41 @@ mod tests {
             "https://jobs.example.com/cambridge"
         );
         assert_eq!(locations[0].city, "Cambridge");
+    }
+
+    #[test]
+    fn automated_outage_locations_require_every_address_term_on_one_first_party_page() {
+        let corpus = "FIRST-PARTY COMPANY PAGE\nSOURCE URL: https://example.com/locations\nToronto laboratory — 123 King Street West, Toronto, ON M5V 1A1\n\nSOURCE URL: https://example.com/customers\nCustomer warehouse — 900 Buyer Road, Ottawa, ON";
+        let valid = VerifiedLocationCandidate {
+            relationship: "operated".into(),
+            location_kind: "laboratory".into(),
+            name: "Toronto laboratory".into(),
+            street_address: "123 King Street West".into(),
+            city: "Toronto".into(),
+            province: "Ontario".into(),
+            postal_code: "M5V 1A1".into(),
+            source_url: "https://example.com/locations".into(),
+            source_excerpt: "Toronto laboratory — 123 King Street West, Toronto, ON M5V 1A1".into(),
+        };
+        let cross_page = VerifiedLocationCandidate {
+            city: "Ottawa".into(),
+            ..valid.clone()
+        };
+        let third_party = VerifiedLocationCandidate {
+            source_url: "https://directory.invalid/locations/example".into(),
+            ..valid.clone()
+        };
+        let missing_postal_code = VerifiedLocationCandidate {
+            postal_code: String::new(),
+            ..valid.clone()
+        };
+        let accepted = validate_researched_operating_locations(
+            &[valid.clone(), cross_page, third_party, missing_postal_code],
+            corpus,
+            "example.com",
+        );
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted[0].street_address, valid.street_address);
     }
 
     #[test]

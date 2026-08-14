@@ -183,6 +183,11 @@ your behalf is deliberately gated:
 
 ## Ongoing ops
 
+- **Policy cutovers:** after deploying a build with copy-policy changes, restart
+  every daemon and CRM process against the database. Startup pauses stale active
+  sequences, cancels their unsent touches, and abandons incomplete old-policy
+  builds. Until all old binaries stop, the CRM shows an amber stale-policy
+  count; regenerate from current evidence after the restart.
 - **API-key rotation:** update `OPENAI_API_KEY` in `.env`, then run
   `docker compose up -d` to recreate the services.
 - **Backups:** the whole world is `.spruce/sales.db`. Snapshot the `spruce-data`
