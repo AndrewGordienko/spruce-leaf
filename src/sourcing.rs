@@ -1219,26 +1219,31 @@ async fn qualify_candidate(
             ..Default::default()
         })
     } else {
-        let (research_block, research_sources, source_locations) = match researcher {
-            Some(researcher) => {
-                match research::research_company(client, researcher, pb, &org, thesis).await {
-                    Some(brief) => {
-                        log_sourcing(format!(
-                            "research {} · sources [{}]",
-                            org.name,
-                            compact_list(&brief.sources, 8)
-                        ));
-                        (
-                            brief.as_facts_block(),
-                            brief.sources,
-                            brief.source_locations,
-                        )
+        let (research_block, research_sources, source_locations, research_warnings) =
+            match researcher {
+                Some(researcher) => {
+                    match research::research_company(client, researcher, pb, &org, thesis).await {
+                        Some(brief) => {
+                            log_sourcing(format!(
+                                "research {} · sources [{}]",
+                                org.name,
+                                compact_list(&brief.sources, 8)
+                            ));
+                            for warning in &brief.operator_warnings {
+                                log_sourcing(format!("research warning {} · {warning}", org.name));
+                            }
+                            (
+                                brief.as_facts_block(),
+                                brief.sources,
+                                brief.source_locations,
+                                brief.operator_warnings,
+                            )
+                        }
+                        None => (String::new(), Vec::new(), Vec::new(), Vec::new()),
                     }
-                    None => (String::new(), Vec::new(), Vec::new()),
                 }
-            }
-            None => (String::new(), Vec::new(), Vec::new()),
-        };
+                None => (String::new(), Vec::new(), Vec::new(), Vec::new()),
+            };
         let mut qualification = qualify_org(
             client,
             system,
@@ -1253,6 +1258,9 @@ async fn qualify_candidate(
         .await;
         if let Ok(value) = &mut qualification {
             value.research_sources = research_sources;
+            value.evidence_gaps.extend(research_warnings);
+            value.evidence_gaps.sort();
+            value.evidence_gaps.dedup();
             augment_brand_signals(
                 &pb.key,
                 &value.observed_facts,
@@ -3379,6 +3387,89 @@ fn compact_list(values: &[String], limit: usize) -> String {
     }
 }
 
+fn outagehub_source_keywords(segment_key: &str) -> &'static [&'static str] {
+    match crate::segments::segment_for_market_key(segment_key).map(|segment| segment.key) {
+        Some("insurance_cat") => &[
+            "property insurance carrier",
+            "catastrophe claims",
+            "claims administration",
+            "mutual insurance",
+        ],
+        Some("telecom") => &[
+            "telecommunications network",
+            "wireless internet service provider",
+            "fiber network operator",
+            "tower infrastructure",
+        ],
+        Some("ev_charging") => &[
+            "EV charging network",
+            "electric vehicle charging operator",
+            "charging point operator",
+            "EV charging software",
+        ],
+        Some("generator_services") => &[
+            "backup power service",
+            "generator service",
+            "emergency power maintenance",
+            "generator rental",
+        ],
+        Some("cold_storage") => &[
+            "cold storage",
+            "refrigerated warehousing",
+            "cold chain logistics",
+            "food distribution center",
+        ],
+        Some("data_centres") => &[
+            "data center operator",
+            "colocation provider",
+            "critical facilities",
+            "data centre services",
+        ],
+        Some("labs_healthcare") => &[
+            "diagnostic laboratory",
+            "laboratory network",
+            "pharmacy network",
+            "healthcare facilities",
+        ],
+        Some("senior_residences") => &[
+            "senior living operator",
+            "retirement residences",
+            "long term care operator",
+            "care home network",
+        ],
+        Some("retail_fuel") => &[
+            "grocery store chain",
+            "fuel station network",
+            "multi site retail",
+            "convenience store chain",
+        ],
+        Some("property_facilities") => &[
+            "property management company",
+            "facilities management",
+            "commercial real estate operator",
+            "building operations",
+        ],
+        Some("municipal_emergency") => &[
+            "municipal emergency management",
+            "regional municipality",
+            "public safety agency",
+            "emergency operations center",
+        ],
+        Some("embedded_partners") => &[
+            "weather data platform",
+            "risk intelligence software",
+            "incident management software",
+            "field service management software",
+        ],
+        _ => &[
+            "distributed infrastructure operator",
+            "multi site operations",
+            "critical facilities",
+            "field service operations",
+        ],
+    }
+}
+
 /// The model chooses the current campaign wedge. These coverage terms keep the
 /// long-term market visible without collapsing every sourcing pass into one
 /// narrow vertical. Qualification and evidence strength determine action-ready,
@@ -3549,65 +3640,25 @@ fn apply_brand_icp_guard(brand: &str, thesis: &str, segment_key: Option<&str>, i
             ],
         }
     } else if brand.eq_ignore_ascii_case("outagehub") {
-        let disallowed: &[&str] = match segment_key.as_str() {
-            "canada_telecom_site_continuity" => &[
-                "ev charging",
-                "electric vehicle charging",
-                "charging point",
-                "backup power",
-                "generator",
-                "cold storage",
-                "data center",
-                "retail",
-                "facilities management",
-            ],
-            "canada_backup_power_dispatch" => &[
-                "ev charging",
-                "electric vehicle charging",
-                "charging point",
-                "telecommunications",
-                "fiber network",
-                "tower infrastructure",
-                "cold storage",
-                "data center",
-                "retail",
-            ],
-            _ => &[
-                "telecommunications",
-                "fiber network",
-                "tower infrastructure",
-                "backup power",
-                "generator",
-                "cold storage",
-                "data center",
-                "retail",
-                "facilities management",
-            ],
-        };
-        icp.keywords.retain(|keyword| {
-            let keyword = keyword.to_ascii_lowercase();
-            !disallowed.iter().any(|term| keyword.contains(term))
-        });
-        match segment_key.as_str() {
-            "canada_telecom_site_continuity" => &[
-                "telecommunications network",
-                "wireless internet service provider",
-                "fiber network operator",
-                "tower infrastructure",
-            ],
-            "canada_backup_power_dispatch" => &[
-                "backup power service",
-                "generator service",
-                "emergency power maintenance",
-                "generator rental",
-            ],
-            _ => &[
-                "EV charging network",
-                "electric vehicle charging operator",
-                "charging point operator",
-                "EV charging software",
-            ],
+        let coverage = outagehub_source_keywords(&segment_key);
+        // Segment identity is an operator choice/coverage-ledger decision, not
+        // a model suggestion. Replace mixed generated categories with the
+        // segment's deterministic enumerator terms so every one of the twelve
+        // markets can be swept independently and measured honestly.
+        icp.keywords = coverage.iter().map(|term| (*term).to_string()).collect();
+        if let Some(segment) = crate::segments::segment_for_market_key(&segment_key) {
+            icp.titles = segment
+                .witness_titles
+                .iter()
+                .chain(segment.owner_titles.iter())
+                .chain(crate::segments::CONTINUITY_SEARCH_TITLES.iter())
+                .map(|title| (*title).to_string())
+                .collect();
+            icp.titles.sort();
+            icp.titles.dedup();
+            icp.titles.truncate(10);
         }
+        coverage
     } else {
         return;
     };
@@ -4035,18 +4086,22 @@ fn choose_source_segment<'a>(
             "canada_3pl_exception_decisions"
         }
     } else if brand.eq_ignore_ascii_case("outagehub") {
-        if ["telecom", "tower", "network operations"]
-            .iter()
-            .any(|term| context.contains(term))
-        {
-            "canada_telecom_site_continuity"
-        } else if ["generator", "backup power", "refuel"]
-            .iter()
-            .any(|term| context.contains(term))
-        {
-            "canada_backup_power_dispatch"
+        if let Some(segment) = crate::segments::segment_for_evidence(&context) {
+            crate::segments::market_key_for_segment(segment.key).unwrap_or_default()
         } else {
-            "canada_ev_charging_operations"
+            // A vague broad-market thesis must not silently become an EV run.
+            // Rotate into the least-covered persisted segment so all twelve
+            // enumerators are measurable and repeated runs fill real gaps.
+            return segments
+                .iter()
+                .filter(|segment| segment.status == "active")
+                .min_by_key(|segment| {
+                    (
+                        segment.accounts_discovered,
+                        segment.accounts_with_opportunities,
+                        segment.key.clone(),
+                    )
+                });
         }
     } else {
         ""
@@ -4434,7 +4489,7 @@ pub async fn refresh_lead_context(
         let thesis = thesis.to_string();
         let gtm_play_context = gtm_play_context.clone();
         async move {
-            let (website_research, source_locations) = match researcher_ref {
+            let (website_research, source_locations, research_warnings) = match researcher_ref {
                 Some(researcher) => {
                     let org = ApolloOrg {
                         id: lead.apollo_org_id.clone(),
@@ -4447,13 +4502,22 @@ pub async fn refresh_lead_context(
                         ..Default::default()
                     };
                     match research::research_company(client, researcher, pb, &org, &thesis).await {
-                        Some(brief) => (brief.as_facts_block(), brief.source_locations),
-                        None => (String::new(), Vec::new()),
+                        Some(brief) => {
+                            for warning in &brief.operator_warnings {
+                                log_sourcing(format!("research warning {} · {warning}", lead.name));
+                            }
+                            (
+                                brief.as_facts_block(),
+                                brief.source_locations,
+                                brief.operator_warnings,
+                            )
+                        }
+                        None => (String::new(), Vec::new(), Vec::new()),
                     }
                 }
-                None => (String::new(), Vec::new()),
+                None => (String::new(), Vec::new(), Vec::new()),
             };
-            let refresh = refresh_one_lead(
+            let mut refresh = refresh_one_lead(
                 client,
                 &system,
                 pb,
@@ -4465,6 +4529,11 @@ pub async fn refresh_lead_context(
                 &knowledge,
             )
             .await;
+            if let Ok(doc) = &mut refresh {
+                doc.evidence_gaps.extend(research_warnings);
+                doc.evidence_gaps.sort();
+                doc.evidence_gaps.dedup();
+            }
             (lead, refresh, source_locations)
         }
     }))
@@ -4721,10 +4790,10 @@ mod tests {
     use super::{
         apply_brand_icp_guard, augment_gnk_signals, augment_outage_signals,
         augment_wapahki_signals, bind_wapahki_task_locations, brand_candidate_precheck,
-        brand_qualification_guard, clamp_employee_ranges, committee_role_for_title,
-        committee_title_groups, company_identity_keys, credible_canonical_signal,
-        enforce_play_qualification, enforce_refresh_qualification, may_revisit_owned_account,
-        merge_prior_refresh_evidence, portfolio_orgs_for_exact_domains,
+        brand_qualification_guard, choose_source_segment, clamp_employee_ranges,
+        committee_role_for_title, committee_title_groups, company_identity_keys,
+        credible_canonical_signal, enforce_play_qualification, enforce_refresh_qualification,
+        may_revisit_owned_account, merge_prior_refresh_evidence, portfolio_orgs_for_exact_domains,
         preferred_contact_locations, qualification_skip_keys_for_run, reusable_workflow_contact,
         reuse_lead_score, reuse_person_score, reuse_portfolio_people, select_reuse_excluding,
         source_candidate_target, Icp, LeadRefresh, OrgQual,
@@ -5070,6 +5139,61 @@ mod tests {
             .iter()
             .any(|term| term == "telecommunications network"));
         assert!(!icp.keywords.iter().any(|term| term == "data center"));
+    }
+
+    #[test]
+    fn every_outage_market_has_its_own_keywords_and_role_search() {
+        for market in crate::gtm::default_market_segments()
+            .into_iter()
+            .filter(|market| market.brand == "outagehub")
+        {
+            let mut icp = Icp::default();
+            apply_brand_icp_guard(
+                "outagehub",
+                "Canadian outage operations",
+                Some(&market.key),
+                &mut icp,
+            );
+            assert!(icp.keywords.len() >= 4, "{} keywords", market.key);
+            assert!(!icp.titles.is_empty(), "{} titles", market.key);
+            assert!(crate::segments::segment_for_market_key(&market.key).is_some());
+        }
+    }
+
+    #[test]
+    fn broad_outage_selector_uses_evidence_or_least_covered_not_ev_default() {
+        let mut markets = crate::gtm::default_market_segments()
+            .into_iter()
+            .filter(|market| market.brand == "outagehub")
+            .collect::<Vec<_>>();
+        for market in &mut markets {
+            market.accounts_discovered = 10;
+        }
+        let cold = markets
+            .iter_mut()
+            .find(|market| market.key == "canada_outage_cold_storage")
+            .expect("cold storage market");
+        cold.accounts_discovered = 0;
+        assert_eq!(
+            choose_source_segment(
+                "outagehub",
+                "Canadian distributed operators",
+                &Icp::default(),
+                &markets,
+            )
+            .map(|market| market.key.as_str()),
+            Some("canada_outage_cold_storage")
+        );
+        assert_eq!(
+            choose_source_segment(
+                "outagehub",
+                "catastrophe claims operations for insured locations",
+                &Icp::default(),
+                &markets,
+            )
+            .map(|market| market.key.as_str()),
+            Some("canada_outage_insurance_cat")
+        );
     }
 
     #[test]

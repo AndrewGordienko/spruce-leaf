@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 
 const STATION_LOCATOR_URL: &str = "https://natural-resources.canada.ca/energy-efficiency/transportation-energy-efficiency/electric-charging-alternative-fuelling-stationslocator-map";
 const STATION_API_URL: &str = "https://developer.nlr.gov/api/alt-fuel-stations/v1.json";
+const HISTORICAL_EVIDENCE_LOCATOR_PREFIX: &str = "outagehub-historical-v1:";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LocationOutageMatch {
@@ -53,6 +54,95 @@ pub struct LocationOutageMatch {
     #[serde(default)]
     pub geocoding_attribution: String,
     pub outage_source_url: String,
+}
+
+/// The exact buyer-safe tuple carried from a completed historical match into
+/// outreach. Copy never gets to restate these fields from memory: the active
+/// evidence claim is parsed into this structure and the sentence is rendered
+/// by code.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoricalEvidenceTuple {
+    pub location_kind: String,
+    pub address: String,
+    pub utility_provider: String,
+    pub outage_start_utc: String,
+}
+
+impl HistoricalEvidenceTuple {
+    pub fn from_match(matched: &LocationOutageMatch) -> Self {
+        Self {
+            location_kind: if matched.location_kind.trim().is_empty() {
+                "operating location".into()
+            } else {
+                matched.location_kind.trim().into()
+            },
+            address: format_location(matched),
+            utility_provider: matched.utility_provider.trim().into(),
+            outage_start_utc: matched.outage_start_utc.trim().into(),
+        }
+    }
+
+    /// Parse only the canonical evidence sentence emitted by this module.
+    /// Legacy free text intentionally returns `None` and therefore cannot
+    /// authorize a historical claim in buyer-facing copy.
+    pub fn from_evidence_text(value: &str) -> Option<Self> {
+        let value = value
+            .trim()
+            .split_once("] ")
+            .map(|(_, evidence)| evidence)
+            .unwrap_or(value.trim());
+        let rest = value.strip_prefix("Completed historical geospatial result: the verified ")?;
+        let (location, rest) = rest.split_once(" fell inside ")?;
+        let (location_kind, address) = location.split_once(" at ")?;
+        let (utility_provider, outage_start_utc) =
+            rest.split_once("'s reported utility outage area beginning ")?;
+        let outage_start_utc = outage_start_utc.strip_suffix(
+            ". This is outside utility context only, not evidence of private site or asset status or cause.",
+        )?;
+        let parsed = Self {
+            location_kind: location_kind.trim().into(),
+            address: address.trim().into(),
+            utility_provider: utility_provider.trim().into(),
+            outage_start_utc: outage_start_utc.trim().into(),
+        };
+        if parsed.location_kind.is_empty()
+            || parsed.address.is_empty()
+            || parsed.utility_provider.is_empty()
+            || DateTime::parse_from_rfc3339(&parsed.outage_start_utc).is_err()
+        {
+            return None;
+        }
+        Some(parsed)
+    }
+
+    pub fn buyer_facing_sentence(&self) -> String {
+        format!(
+            "The verified {} at {} fell inside {}'s reported utility outage area beginning {}. This is outside utility context only, not evidence of private site or asset status or cause.",
+            self.location_kind, self.address, self.utility_provider, self.outage_start_utc
+        )
+    }
+
+    pub fn source_locator(&self) -> String {
+        format!(
+            "{HISTORICAL_EVIDENCE_LOCATOR_PREFIX}{}",
+            serde_json::to_string(self).expect("historical evidence tuple is serializable")
+        )
+    }
+
+    pub fn from_source_locator(value: &str) -> Option<Self> {
+        let json = value
+            .trim()
+            .strip_prefix(HISTORICAL_EVIDENCE_LOCATOR_PREFIX)?;
+        let parsed = serde_json::from_str::<Self>(json).ok()?;
+        if parsed.location_kind.trim().is_empty()
+            || parsed.address.trim().is_empty()
+            || parsed.utility_provider.trim().is_empty()
+            || DateTime::parse_from_rfc3339(parsed.outage_start_utc.trim()).is_err()
+        {
+            return None;
+        }
+        Some(parsed)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -309,7 +399,9 @@ pub async fn ingest_researched_locations(
         }
     }
     if additions.is_empty() {
-        return Ok(Vec::new());
+        anyhow::bail!(
+            "geocoder returned no Canadian result for the verified operating addresses supplied for {company} ({domain})"
+        );
     }
 
     let _guard = LOCATION_INVENTORY_WRITE
@@ -334,7 +426,10 @@ pub async fn ingest_researched_locations(
     });
     crate::storage::atomic_write(inventory, serde_json::to_vec_pretty(&inventory_rows)?)?;
     if !archive.exists() {
-        return Ok(Vec::new());
+        anyhow::bail!(
+            "OutageHub archive {} does not exist; the verified address was cached but historical matching could not run",
+            archive.display()
+        );
     }
     build_report_from_locations(
         archive,
@@ -532,6 +627,7 @@ pub fn evidence_for_company(report_path: &Path, company: &str, domain: &str) -> 
         .take(3)
         .flat_map(|matched| {
             let location = format_location(matched);
+            let historical = HistoricalEvidenceTuple::from_match(matched);
             [
                 format!(
                     "[{}] A verified source lists {} {} {} at {}{}.",
@@ -545,10 +641,10 @@ pub fn evidence_for_company(report_path: &Path, company: &str, domain: &str) -> 
                 format!(
                     "[{}] Completed historical geospatial result: the verified {} at {} fell inside {}'s reported utility outage area beginning {}. This is outside utility context only, not evidence of private site or asset status or cause.",
                     matched.outage_source_url,
-                    if matched.location_kind.trim().is_empty() { "operating location" } else { &matched.location_kind },
-                    location,
-                    matched.utility_provider,
-                    matched.outage_start_utc
+                    historical.location_kind,
+                    historical.address,
+                    historical.utility_provider,
+                    historical.outage_start_utc
                 ),
             ]
         })
@@ -970,8 +1066,8 @@ fn format_location(matched: &LocationOutageMatch) -> String {
 mod tests {
     use super::{
         build_report_from_locations, company_matches_network, extract_public_api_key,
-        ingest_researched_locations, parse_wkt, point_in_polygons, LocationOutageMatch,
-        MatchReport, Station, VerifiedLocationCandidate,
+        ingest_researched_locations, parse_wkt, point_in_polygons, HistoricalEvidenceTuple,
+        LocationOutageMatch, MatchReport, Station, VerifiedLocationCandidate,
     };
 
     #[test]
@@ -980,6 +1076,26 @@ mod tests {
             extract_public_api_key("window.options = { apiKey: 'public-key' };").as_deref(),
             Some("public-key")
         );
+    }
+
+    #[test]
+    fn historical_evidence_tuple_accepts_only_canonical_timed_claims() {
+        let evidence = "[https://api.outagehub.ca/v1/outages/42] Completed historical geospatial result: the verified laboratory at 123 King Street West, Toronto, Ontario fell inside Test Utility's reported utility outage area beginning 2026-08-13T16:00:00+00:00. This is outside utility context only, not evidence of private site or asset status or cause.";
+        let parsed =
+            HistoricalEvidenceTuple::from_evidence_text(evidence).expect("canonical tuple");
+        assert_eq!(parsed.address, "123 King Street West, Toronto, Ontario");
+        assert_eq!(parsed.utility_provider, "Test Utility");
+        assert!(parsed
+            .buyer_facing_sentence()
+            .contains("2026-08-13T16:00:00+00:00"));
+        assert_eq!(
+            HistoricalEvidenceTuple::from_source_locator(&parsed.source_locator()),
+            Some(parsed.clone())
+        );
+        assert!(HistoricalEvidenceTuple::from_evidence_text(
+            "I found a Toronto site inside a Test Utility outage in 2026."
+        )
+        .is_none());
     }
 
     #[test]
@@ -1162,6 +1278,55 @@ mod tests {
         assert_eq!(report.matches.len(), 1);
         assert_eq!(report.matches[0].operating_relationship, "operated");
         assert!(report.geocoding_attribution.contains("OpenStreetMap"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn researched_location_intake_reports_a_missing_archive() {
+        let root =
+            std::env::temp_dir().join(format!("outage-intake-missing-{}", uuid::Uuid::new_v4()));
+        let inventory = root.join("verified-locations.json");
+        let output = root.join("matches.json");
+        let archive = root.join("missing-archive.json");
+        std::fs::create_dir_all(&root).unwrap();
+        serde_json::to_writer(
+            std::fs::File::create(&inventory).unwrap(),
+            &vec![Station {
+                company: "Dynacare".into(),
+                domain: "dynacare.ca".into(),
+                location_kind: "laboratory".into(),
+                station_name: "Lab one".into(),
+                street_address: "123 King Street West".into(),
+                city: "Toronto".into(),
+                state: "Ontario".into(),
+                latitude: 43.7,
+                longitude: -79.4,
+                source_url: "https://dynacare.ca/locations".into(),
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+        let error = ingest_researched_locations(
+            "Dynacare",
+            "dynacare.ca",
+            &[VerifiedLocationCandidate {
+                relationship: "operated".into(),
+                location_kind: "laboratory".into(),
+                name: "Lab one".into(),
+                street_address: "123 King Street West".into(),
+                city: "Toronto".into(),
+                province: "Ontario".into(),
+                postal_code: "M5V 1A1".into(),
+                source_url: "https://dynacare.ca/locations".into(),
+                source_excerpt: "Lab one — 123 King Street West, Toronto, Ontario".into(),
+            }],
+            &archive,
+            &inventory,
+            &output,
+        )
+        .await
+        .expect_err("missing archive must be visible");
+        assert!(error.to_string().contains("does not exist"));
         let _ = std::fs::remove_dir_all(root);
     }
 }

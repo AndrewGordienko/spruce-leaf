@@ -1,5 +1,14 @@
 # OutageHub representative dry-run outputs — 2026-08-13
 
+> **Fixture coverage only; not a pilot release artifact.** These fictional
+> comparisons remain useful regression tests, but they do not satisfy the real
+> sourcing/generation/approval/SMTP threshold. Run
+> `spruce-leaf --brand outagehub pilot-audit` against the execution database.
+> That read-only command requires 20 source-backed real accounts across five
+> persisted segments, ten current model-generated and explicitly manually
+> approved messages, zero current role/copy failures, and at least one SMTP
+> delivery to a currently allowlisted controlled inbox.
+
 Eight segment walk-throughs produced without sending email, spending Apollo
 credits, or calling paid models. Every readiness state, role verdict, touch
 count, lane, and T1 below is **verified by tests** against the production

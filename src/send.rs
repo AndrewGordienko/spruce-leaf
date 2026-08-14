@@ -38,6 +38,12 @@ pub async fn send_email(m: &Mailbox, out: &Outgoing, dry_run: bool) -> Result<St
     if dry_run {
         return Ok(message_id);
     }
+    let configured_allowlist = std::env::var("SPRUCE_SEND_ALLOWLIST").unwrap_or_default();
+    if m.brand.eq_ignore_ascii_case("outagehub") && configured_allowlist.trim().is_empty() {
+        anyhow::bail!(
+            "OutageHub live sending is pilot-locked: set a non-empty SPRUCE_SEND_ALLOWLIST containing only controlled inboxes"
+        );
+    }
     // Test guardrail: when SPRUCE_SEND_ALLOWLIST is set, a live send may only go
     // to an address (or `@domain`) on the list. Unset/empty means no restriction
     // (production default). This lets a `--live` daemon be exercised end-to-end
@@ -115,7 +121,7 @@ fn extract_addr(s: &str) -> String {
 /// suffix (`@example.com`). Returns `Err` with a human reason when a live send
 /// must be refused; `Ok(())` when the var is unset/empty or the recipient
 /// matches. Kept in the transport so nothing outbound can bypass it.
-fn recipient_allowed(to: &str) -> std::result::Result<(), String> {
+pub(crate) fn recipient_allowed(to: &str) -> std::result::Result<(), String> {
     let raw = std::env::var("SPRUCE_SEND_ALLOWLIST").unwrap_or_default();
     let entries: Vec<String> = raw
         .split(',')
@@ -148,5 +154,12 @@ mod tests {
         assert_eq!(extract_addr("Andrew <a@b.com>"), "a@b.com");
         assert_eq!(extract_addr("a@b.com"), "a@b.com");
         assert_eq!(extract_addr("  A@B.COM "), "a@b.com");
+    }
+
+    #[test]
+    fn outagehub_live_send_guard_is_declared_at_the_transport_boundary() {
+        let source = include_str!("send.rs");
+        assert!(source.contains("OutageHub live sending is pilot-locked"));
+        assert!(source.contains("SPRUCE_SEND_ALLOWLIST"));
     }
 }

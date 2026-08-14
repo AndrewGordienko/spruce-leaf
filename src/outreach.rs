@@ -92,8 +92,17 @@ pub fn approve_ready_touches(
             let _ = db.log_event(&pb.key, &person.id, "", "approval_held", &reason);
             continue;
         }
-        summary.touches_scheduled +=
-            db.schedule_reviewed_touches(Some(&pb.key), Some(&person.id))?;
+        let scheduled = db.schedule_reviewed_touches(Some(&pb.key), Some(&person.id))?;
+        summary.touches_scheduled += scheduled;
+        if scheduled > 0 {
+            db.log_event(
+                &pb.key,
+                &person.id,
+                "",
+                "manual_approved",
+                &format!("operator approved {scheduled} reviewed touch(es)"),
+            )?;
+        }
     }
     Ok(summary)
 }
@@ -2090,6 +2099,7 @@ async fn review_person_copy(
         touches: raw.touches,
         applied_principles: normalize_principle_ids(&raw.applied_principles, &allowed_principles),
     };
+    bind_outagehub_historical_result(pb, gtm_context, &mut sequence, n)?;
     let copy_lineage = CopyLineage {
         sales_opportunity_id: raw.sales_opportunity_id.clone(),
         task_key: raw.task_key.clone(),
@@ -2156,6 +2166,7 @@ async fn review_person_copy(
         &person.id,
     )
     .await?;
+    bind_outagehub_historical_result(pb, gtm_context, &mut sequence, n)?;
     if critique && sales_council_enabled(lean) {
         reviews = satisfy_sales_council(
             client,
@@ -2174,6 +2185,7 @@ async fn review_person_copy(
     }
     person_progress("running final sendability gate");
     scrub_ai_punctuation(&mut sequence);
+    bind_outagehub_historical_result(pb, gtm_context, &mut sequence, n)?;
     let issues = account_sequence_quality_issues(
         pb,
         shared,
@@ -4431,8 +4443,13 @@ fn asks_recipient_to_find_wapahki_task(body: &str) -> bool {
 
 fn asks_for_call_or_meeting(body: &str) -> bool {
     let body = body.to_ascii_lowercase();
-    [
+    let explicit = [
         "minute call",
+        "minutes for",
+        "minutes next",
+        "15 minutes",
+        "20 minutes",
+        "30 minutes",
         "short call",
         "brief call",
         "quick call",
@@ -4443,12 +4460,26 @@ fn asks_for_call_or_meeting(body: &str) -> bool {
         "short conversation",
         "brief conversation",
         "quick conversation",
+        "open to chat",
+        "quick chat",
+        "brief chat",
         "meet for",
+        "meet next",
         "meeting",
         "calendar",
+        "availability",
+        "available next week",
+        "time next week",
+        "zoom",
+        "teams call",
+        "demo",
     ]
     .iter()
-    .any(|marker| body.contains(marker))
+    .any(|marker| body.contains(marker));
+    let generic_call = body
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|word| word == "call");
+    explicit || generic_call
 }
 
 fn starts_with_greeting_prefix(body: &str) -> bool {
@@ -4531,6 +4562,127 @@ fn names_historical_outage_result(body: &str) -> bool {
         .split(|character: char| !character.is_ascii_digit())
         .any(|number| number.len() == 4 && number.starts_with("20"));
     mentions_historical_outage_result(body) && time
+}
+
+fn active_historical_evidence_tuple(
+    context: &GtmActionContext,
+) -> Option<crate::outage_evidence::HistoricalEvidenceTuple> {
+    let mut claims = context
+        .evidence_claims
+        .iter()
+        .filter(|claim| {
+            claim.claim_type == "account.historical_location_outage_match"
+                && matches!(claim.status.as_str(), "observed" | "verified")
+        })
+        .collect::<Vec<_>>();
+    claims.sort_by(|left, right| left.id.cmp(&right.id));
+    claims.into_iter().find_map(|claim| {
+        crate::outage_evidence::HistoricalEvidenceTuple::from_source_locator(&claim.source_locator)
+            .or_else(|| {
+                crate::outage_evidence::HistoricalEvidenceTuple::from_evidence_text(
+                    &claim.source_excerpt,
+                )
+            })
+            .or_else(|| {
+                crate::outage_evidence::HistoricalEvidenceTuple::from_evidence_text(
+                    &claim.claim_text,
+                )
+            })
+    })
+}
+
+fn historical_sentence_candidate(sentence: &str) -> bool {
+    let sentence = sentence.to_ascii_lowercase();
+    let dated = sentence
+        .split(|character: char| !character.is_ascii_digit())
+        .any(|number| number.len() == 4 && number.starts_with("20"));
+    (sentence.contains("outage") || sentence.contains("utility report") || dated)
+        && [
+            "historical",
+            "fell inside",
+            "fell within",
+            "overlapped",
+            "i matched",
+            "we matched",
+            "i found",
+            "we found",
+        ]
+        .iter()
+        .any(|marker| sentence.contains(marker))
+}
+
+/// Replace any model-authored historical wording with the exact sentence
+/// rendered from the active evidence tuple. The model still controls the
+/// surrounding explanation and CTA, but never the address, utility, timestamp,
+/// or interpretation boundary.
+fn bind_outagehub_historical_result(
+    pb: &Playbook,
+    context: Option<&GtmActionContext>,
+    sequence: &mut CopySequence,
+    expected_touches: usize,
+) -> Result<()> {
+    if !pb.key.eq_ignore_ascii_case("outagehub") || !matches!(expected_touches, 2 | 4) {
+        return Ok(());
+    }
+    let context = context.ok_or_else(|| {
+        anyhow!("OutageHub historical copy has no active sales-opportunity evidence context")
+    })?;
+    let historical = active_historical_evidence_tuple(context).ok_or_else(|| anyhow!(
+        "OutageHub historical copy requires one canonical active location/utility/timestamp evidence tuple"
+    ))?;
+    let touch = sequence
+        .touches
+        .iter_mut()
+        .find(|touch| touch.stage == 2)
+        .ok_or_else(|| anyhow!("OutageHub historical copy has no stage 2"))?;
+    let signature = pb.signature.trim();
+    let mut retained = Vec::new();
+    for paragraph in touch.body.split("\n\n") {
+        let paragraph = paragraph.trim();
+        if paragraph.is_empty() || paragraph == signature {
+            continue;
+        }
+        let sentences = paragraph
+            .split_inclusive(['.', '?', '!'])
+            .filter(|sentence| !historical_sentence_candidate(sentence))
+            .map(str::trim)
+            .filter(|sentence| !sentence.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !sentences.is_empty() {
+            retained.push(sentences);
+        }
+    }
+    retained.push(historical.buyer_facing_sentence());
+    retained.push(signature.to_string());
+    touch.body = retained.join("\n\n");
+    Ok(())
+}
+
+fn outagehub_historical_binding_issues(
+    pb: &Playbook,
+    context: Option<&GtmActionContext>,
+    sequence: &CopySequence,
+    expected_touches: usize,
+) -> Vec<String> {
+    if !pb.key.eq_ignore_ascii_case("outagehub") || !matches!(expected_touches, 2 | 4) {
+        return Vec::new();
+    }
+    let Some(historical) = context.and_then(active_historical_evidence_tuple) else {
+        return vec![
+            "OutageHub stage 2 has no canonical active location/utility/timestamp evidence tuple; refresh historical research before drafting"
+                .into(),
+        ];
+    };
+    let expected = historical.buyer_facing_sentence();
+    match sequence.touches.iter().find(|touch| touch.stage == 2) {
+        Some(touch) if touch.body.contains(&expected) => Vec::new(),
+        Some(_) => vec![
+            "OutageHub stage 2 does not contain the exact address, utility, timestamp, and boundary rendered from its active evidence claim"
+                .into(),
+        ],
+        None => vec!["OutageHub historical sequence has no stage 2".into()],
+    }
 }
 
 /// Correction and routing are legitimate outcomes, but the failed campaigns
@@ -5187,6 +5339,12 @@ pub(crate) fn account_sequence_quality_issues(
                     "discovery-ready stage 1 must ask exactly one decision-sized question by email; found {question_count} question marks"
                 ));
             }
+            if touch.stage == 1 && asks_for_call_or_meeting(&touch.body) {
+                issues.push(
+                    "discovery-ready stage 1 must request an email answer only and must not ask for a call, meeting, demo, chat, calendar slot, or synchronous conversation"
+                        .into(),
+                );
+            }
         }
     }
     if let Some(context) = gtm_context {
@@ -5220,6 +5378,12 @@ pub(crate) fn account_sequence_quality_issues(
         gtm_context,
         sequence,
     ));
+    issues.extend(outagehub_historical_binding_issues(
+        pb,
+        gtm_context,
+        sequence,
+        expected_touches,
+    ));
     issues.extend(source_attribution_issues(account, gtm_context, sequence));
     issues.extend(unconfirmed_subject_claim_issues(
         pb,
@@ -5235,6 +5399,57 @@ pub(crate) fn account_sequence_quality_issues(
     issues.sort();
     issues.dedup();
     issues
+}
+
+/// Re-run the production copy gate over a persisted sequence for the supervised
+/// pilot audit. This converts database rows back into the exact domain objects
+/// used at generation time; it does not trust a historical `review_passes`
+/// flag as a substitute for current policy or evidence.
+pub(crate) fn audit_persisted_outagehub_sequence(
+    pb: &Playbook,
+    shared: &Shared,
+    lead: &crate::db::Lead,
+    context: &GtmActionContext,
+    touches: &[crate::db::Touch],
+) -> Vec<String> {
+    let sequence = CopySequence {
+        touches: touches
+            .iter()
+            .map(|touch| CopyTouch {
+                stage: touch.stage as u32,
+                day_offset: touch.day_offset.max(0) as u32,
+                channel: touch.channel.clone(),
+                subject: touch.subject.clone(),
+                body: touch.body.clone(),
+                purpose: touch.purpose.clone(),
+                goal: touch.goal.clone(),
+            })
+            .collect(),
+        applied_principles: Vec::new(),
+    };
+    let reviews = touches
+        .iter()
+        .map(|touch| TouchReview {
+            stage: touch.stage as u32,
+            passes: touch.review_passes == Some(true) && touch.review_issues.is_empty(),
+            score: if touch.review_passes == Some(true) {
+                100
+            } else {
+                0
+            },
+            issues: touch.review_issues.clone(),
+        })
+        .collect::<Vec<_>>();
+    account_sequence_quality_issues(
+        pb,
+        shared,
+        &copy_account(lead),
+        &sequence,
+        &reviews,
+        touches.len(),
+        true,
+        Some(context),
+    )
 }
 
 pub(crate) fn sequence_quality_issues(
@@ -6194,14 +6409,15 @@ fn review_edit_schema(n: usize) -> Value {
 mod tests {
     use super::{
         account_sequence_quality_issues, affected_stages, apply_targeted_repairs,
-        approve_ready_touches, brand_trigger_contract, business_copy_context, copy_research_rule,
-        copy_sentence_count, cross_recipient_similarity_issue, format_progress_status,
-        generic_subject_label, gnk_hedge_moves, gnk_names_operating_consequence,
-        has_forced_response_menu, has_natural_response_path, has_stacked_operating_questions,
-        is_email_capable_channel, is_empty_linkedin_praise, is_retreat_or_route_touch,
-        locked_must_reject_reason, mentions_historical_outage_result, mentions_outreach_asset,
-        names_historical_outage_result, narrates_internal_copy_logic, normalize_dashes,
-        normalize_principle_ids, normalize_thread_subjects, provisional_channel,
+        approve_ready_touches, asks_for_call_or_meeting, bind_outagehub_historical_result,
+        brand_trigger_contract, business_copy_context, copy_research_rule, copy_sentence_count,
+        cross_recipient_similarity_issue, format_progress_status, generic_subject_label,
+        gnk_hedge_moves, gnk_names_operating_consequence, has_forced_response_menu,
+        has_natural_response_path, has_stacked_operating_questions, is_email_capable_channel,
+        is_empty_linkedin_praise, is_retreat_or_route_touch, locked_must_reject_reason,
+        mentions_historical_outage_result, mentions_outreach_asset, names_historical_outage_result,
+        narrates_internal_copy_logic, normalize_dashes, normalize_principle_ids,
+        normalize_thread_subjects, outagehub_historical_binding_issues, provisional_channel,
         provisional_day_offset, select_people_for_planning, sequence_quality_issues,
         source_attribution_issues, supported_touch_count, supported_touch_count_for_brand,
         touch_question_limit, touch_word_band, unconfirmed_subject_claim_issues,
@@ -6390,6 +6606,105 @@ mod tests {
         assert!(!names_historical_outage_result(
             "On March 8, Hydro One reported an outage area that included the CHARGELAB-network station in Orono."
         ));
+    }
+
+    #[test]
+    fn discovery_copy_blocks_synchronous_asks_even_with_one_question() {
+        for body in [
+            "Would you be open to 20 minutes next week?",
+            "Could we schedule a quick call?",
+            "Would Tuesday work for a Zoom chat?",
+            "Are you available next week for a demo?",
+        ] {
+            assert!(asks_for_call_or_meeting(body), "missed: {body}");
+        }
+        let playbooks = Playbooks::load("playbooks").expect("load playbooks");
+        let pb = playbooks.get("outagehub").expect("outagehub playbook");
+        let sequence = CopySequence {
+            touches: vec![CopyTouch {
+                stage: 1,
+                day_offset: 0,
+                channel: "email".into(),
+                subject: "Tower dispatch after power loss".into(),
+                body: "Hi Maya,\n\nYour operations page names tower dispatch during power events. OutageHub matches Canadian utility outage reports to locations through an API, adding outside context without claiming private site status. Would you be open to 20 minutes next week?\n\nAndrew Gordienko".into(),
+                purpose: String::new(),
+                goal: String::new(),
+            }],
+            applied_principles: Vec::new(),
+        };
+        let issues = account_sequence_quality_issues(
+            pb,
+            &playbooks.shared,
+            &super::copy_account(&Lead::default()),
+            &sequence,
+            &[],
+            1,
+            false,
+            Some(&GtmActionContext {
+                state: "discovery_ready".into(),
+                ..Default::default()
+            }),
+        );
+        assert!(issues
+            .iter()
+            .any(|issue| issue.contains("email answer only")));
+    }
+
+    #[test]
+    fn outagehub_t2_is_rendered_from_and_exactly_bound_to_active_evidence() {
+        let playbooks = Playbooks::load("playbooks").expect("load playbooks");
+        let pb = playbooks.get("outagehub").expect("outagehub playbook");
+        let evidence = "Completed historical geospatial result: the verified warehouse at 41 Rail Side Rd, Brampton, Ontario fell inside Alectra Utilities's reported utility outage area beginning 2026-01-18T02:14:00+00:00. This is outside utility context only, not evidence of private site or asset status or cause.";
+        let context = GtmActionContext {
+            state: "action_ready".into(),
+            evidence_claims: vec![EvidenceClaim {
+                id: "historical-claim".into(),
+                claim_type: "account.historical_location_outage_match".into(),
+                claim_text: evidence.into(),
+                source_excerpt: evidence.into(),
+                status: "verified".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut sequence = CopySequence {
+            touches: vec![
+                CopyTouch {
+                    stage: 1,
+                    day_offset: 0,
+                    channel: "email".into(),
+                    subject: "Brampton power checks".into(),
+                    body: "Hi Maya,\n\nOutageHub matches utility reports to locations.\n\nAndrew Gordienko".into(),
+                    purpose: String::new(),
+                    goal: String::new(),
+                },
+                CopyTouch {
+                    stage: 2,
+                    day_offset: 6,
+                    channel: "email".into(),
+                    subject: "re: Brampton power checks".into(),
+                    body: "Hi Maya,\n\nI matched a Calgary site to Enmax in 2025.\n\nAndrew Gordienko".into(),
+                    purpose: String::new(),
+                    goal: String::new(),
+                },
+            ],
+            applied_principles: Vec::new(),
+        };
+        bind_outagehub_historical_result(pb, Some(&context), &mut sequence, 2)
+            .expect("bind historical result");
+        let body = &sequence.touches[1].body;
+        assert!(body.contains("41 Rail Side Rd, Brampton, Ontario"));
+        assert!(body.contains("Alectra Utilities"));
+        assert!(body.contains("2026-01-18T02:14:00+00:00"));
+        assert!(!body.contains("Calgary"));
+        assert!(outagehub_historical_binding_issues(pb, Some(&context), &sequence, 2).is_empty());
+
+        sequence.touches[1].body = body.replace("Alectra Utilities", "Hydro One");
+        assert!(
+            outagehub_historical_binding_issues(pb, Some(&context), &sequence, 2)
+                .iter()
+                .any(|issue| issue.contains("exact address, utility, timestamp"))
+        );
     }
 
     #[test]

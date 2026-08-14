@@ -42,6 +42,7 @@ mod outagehub_eval;
 mod outreach;
 mod outreach_ablation;
 mod outreach_eval;
+mod pilot;
 mod pipeline;
 mod playbook;
 mod priority;
@@ -276,6 +277,17 @@ enum Command {
         /// Run only one named variant against full (for example no-role-contract).
         #[arg(long)]
         only: Option<String>,
+    },
+
+    /// Audit the real OutageHub pipeline against the supervised-pilot release threshold.
+    /// Read-only: never sources, generates, approves, or sends anything.
+    PilotAudit {
+        #[arg(long, default_value_t = 20, value_parser = positive_usize)]
+        accounts: usize,
+        #[arg(long, default_value_t = 5, value_parser = positive_usize)]
+        segments: usize,
+        #[arg(long, default_value_t = 10, value_parser = positive_usize)]
+        messages: usize,
     },
 
     /// Approve drafted email touches so the cadence engine may send them.
@@ -1109,6 +1121,47 @@ fn main() -> Result<()> {
                     only: only.as_deref(),
                 },
             ))?;
+            Ok(())
+        }
+
+        Command::PilotAudit {
+            accounts,
+            segments,
+            messages,
+        } => {
+            if !cli.brand.eq_ignore_ascii_case("outagehub") {
+                return Err(anyhow!(
+                    "pilot-audit currently supports --brand outagehub only"
+                ));
+            }
+            let playbooks = load_playbooks(&cli)?;
+            let audit = pilot::audit(&db, &playbooks, accounts, segments, messages)?;
+            println!(
+                "OutageHub pilot audit: {} real researched account(s) across {} segment(s); {} generated/current message(s); {} manually approved; {} allowlisted SMTP delivery/deliveries.",
+                audit.researched_accounts,
+                audit.segments.len(),
+                audit.generated_messages,
+                audit.manually_approved_messages,
+                audit.allowlisted_smtp_messages,
+            );
+            if !audit.segments.is_empty() {
+                println!("  segments: {}", audit.segments.join(", "));
+            }
+            for issue in audit.wrong_role_sequences.iter().take(10) {
+                println!("  wrong role: {issue}");
+            }
+            for issue in audit.unsupported_sequences.iter().take(10) {
+                println!("  copy/evidence: {issue}");
+            }
+            if !audit.passed() {
+                for blocker in &audit.blockers {
+                    println!("  BLOCKED: {blocker}");
+                }
+                return Err(anyhow!(
+                    "OutageHub supervised-pilot threshold is not yet satisfied"
+                ));
+            }
+            println!("✓ OutageHub supervised-pilot threshold satisfied.");
             Ok(())
         }
 

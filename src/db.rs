@@ -1955,20 +1955,34 @@ impl Db {
         };
         let mut claims = observations
             .into_iter()
-            .map(|observation| EvidenceClaim {
-                sales_opportunity_id: opportunity_id.clone(),
-                brand: assessment.brand.clone(),
-                lead_id: assessment.lead_id.clone(),
-                facility_id: opportunity.facility_id.clone(),
-                task_key: task_key.clone(),
-                claim_type: observation.definition_key,
-                claim_text: observation.evidence.clone(),
-                source_url: observation.source_url,
-                source_excerpt: observation.evidence,
-                confidence: observation.confidence,
-                status: observation.status,
-                observed_at: observation.observed_at,
-                ..Default::default()
+            .map(|observation| {
+                let source_locator =
+                    if observation.definition_key == "account.historical_location_outage_match" {
+                        serde_json::from_str::<crate::outage_evidence::HistoricalEvidenceTuple>(
+                            &observation.value_json,
+                        )
+                        .ok()
+                        .map(|value| value.source_locator())
+                        .unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+                EvidenceClaim {
+                    sales_opportunity_id: opportunity_id.clone(),
+                    brand: assessment.brand.clone(),
+                    lead_id: assessment.lead_id.clone(),
+                    facility_id: opportunity.facility_id.clone(),
+                    task_key: task_key.clone(),
+                    claim_type: observation.definition_key,
+                    claim_text: observation.evidence.clone(),
+                    source_url: observation.source_url,
+                    source_excerpt: observation.evidence,
+                    source_locator,
+                    confidence: observation.confidence,
+                    status: observation.status,
+                    observed_at: observation.observed_at,
+                    ..Default::default()
+                }
             })
             .collect::<Vec<_>>();
         if assessment.brand.eq_ignore_ascii_case("wapahki") {
@@ -3689,6 +3703,18 @@ impl Db {
                 |row| Ok(row_to_sequence(row)),
             )
             .optional()?)
+    }
+
+    /// Read-only sequence inventory used by release/pilot audits. Delivery
+    /// paths continue to use their narrower due-work queries.
+    pub fn list_sequences(&self, brand: Option<&str>) -> Result<Vec<Sequence>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT * FROM sequences WHERE (?1 IS NULL OR brand=?1)
+             ORDER BY created_at ASC,id ASC",
+        )?;
+        let rows = stmt.query_map(params![brand], |row| Ok(row_to_sequence(row)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// Most recent sequence attempt for a person, including held, rejected,
@@ -6179,6 +6205,17 @@ impl Db {
                 lead_id: lead_id.to_string(),
                 source_name: source_name.to_string(),
                 source_url: candidate.source_url.trim().to_string(),
+                value_json: if candidate.definition_key
+                    == "account.historical_location_outage_match"
+                {
+                    crate::outage_evidence::HistoricalEvidenceTuple::from_evidence_text(
+                        &candidate.evidence,
+                    )
+                    .and_then(|value| serde_json::to_string(&value).ok())
+                    .unwrap_or_default()
+                } else {
+                    String::new()
+                },
                 evidence: candidate.evidence.trim().to_string(),
                 confidence: candidate.confidence.clamp(0.0, 1.0),
                 status: "observed".into(),
@@ -12486,6 +12523,45 @@ mod tests {
         assert_eq!(outcome.experiment_arm, second.arm);
         assert_eq!(outcome.generation_backend, "codex");
         assert_eq!(outcome.generation_model, "gpt-5.6-terra");
+    }
+
+    #[test]
+    fn canonical_historical_signal_is_persisted_as_structured_json() {
+        let db = Db::open(":memory:").expect("open memory db");
+        let lead_id = db
+            .upsert_lead(&Lead {
+                brand: "outagehub".into(),
+                apollo_org_id: "structured-history-org".into(),
+                name: "Structured History Co".into(),
+                domain: "structured-history.example".into(),
+                ..Default::default()
+            })
+            .expect("lead");
+        let evidence = "Completed historical geospatial result: the verified warehouse at 41 Rail Side Rd, Brampton, Ontario fell inside Alectra Utilities's reported utility outage area beginning 2026-01-18T02:14:00+00:00. This is outside utility context only, not evidence of private site or asset status or cause.";
+        db.record_signal_candidates(
+            "outagehub",
+            &lead_id,
+            &[crate::gtm::SignalCandidate {
+                definition_key: "account.historical_location_outage_match".into(),
+                evidence: evidence.into(),
+                source_url: "https://api.outagehub.ca/v1/outages/42".into(),
+                confidence: 0.9,
+            }],
+            "test",
+        )
+        .expect("record signal");
+        let observation = db
+            .list_active_signal_observations(Some("outagehub"), Some(&lead_id), None)
+            .expect("observations")
+            .into_iter()
+            .find(|observation| {
+                observation.definition_key == "account.historical_location_outage_match"
+            })
+            .expect("historical observation");
+        let tuple: crate::outage_evidence::HistoricalEvidenceTuple =
+            serde_json::from_str(&observation.value_json).expect("structured tuple");
+        assert_eq!(tuple.utility_provider, "Alectra Utilities");
+        assert_eq!(tuple.outage_start_utc, "2026-01-18T02:14:00+00:00");
     }
 
     #[test]

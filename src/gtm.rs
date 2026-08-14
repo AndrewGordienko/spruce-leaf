@@ -1600,16 +1600,13 @@ pub fn default_plays() -> Vec<GtmPlay> {
 }
 
 pub fn default_market_segments() -> Vec<MarketSegment> {
-    [
+    let mut segments = [
         ("wapahki", "canada_food_case_palletizing", "Canadian food case packing and palletizing", "Canada", "Repeatable case/tray packing, palletizing, depalletizing, or cold-chain handling at food plants and distribution centres", "company × facility × line/workcell × task"),
         ("wapahki", "canada_warehouse_case_handling", "Canadian warehouse case handling", "Canada", "Manual case, tote, pallet, and outbound handling at warehouses, 3PLs, and distribution centres", "company × facility × zone × task"),
         ("wapahki", "canada_manufacturing_machine_tending", "Canadian manufacturing machine tending", "Canada", "Repetitive loading, unloading, transfer, inspection, or kitting around production equipment", "company × facility × line/workcell × task"),
         ("gnk", "canada_3pl_exception_decisions", "3PL exception and reconciliation decisions", "Canada", "Recurring shipment, deduction, claim, document, and SLA exceptions that require cross-system reconstruction", "company × workflow opportunity"),
         ("gnk", "canada_construction_delay_evidence", "Construction delay-evidence reconstruction", "Canada", "Recurring delay, change-order, payment, and project-record decisions with evidence split across tools", "company × project workflow opportunity"),
         ("gnk", "canada_specialty_claims_admin", "Specialty claims and case administration", "Canada", "Recurring eligibility, evidence, escalation, recovery, and filing decisions with narrow software gaps", "company × case workflow opportunity"),
-        ("outagehub", "canada_ev_charging_operations", "Canadian EV charging operations", "Canada", "Utility-outage attribution, SLA triage, driver communication, and dispatch across operated charging sites", "operator × operated site network × outage-time decision"),
-        ("outagehub", "canada_telecom_site_continuity", "Canadian telecom site continuity", "Canada", "Battery, generator, refuelling, crew, and restoration prioritization across distributed telecom assets", "operator × asset portfolio × outage-time decision"),
-        ("outagehub", "canada_backup_power_dispatch", "Canadian backup-power dispatch", "Canada", "Customer outage awareness, generator/refuelling triage, and service dispatch for backup-power providers", "provider × customer site portfolio × dispatch decision"),
     ]
     .into_iter()
     .map(|(brand, key, name, geography, wedge, unit)| MarketSegment {
@@ -1628,7 +1625,34 @@ pub fn default_market_segments() -> Vec<MarketSegment> {
         status: "active".into(),
         ..Default::default()
     })
-    .collect()
+    .collect::<Vec<_>>();
+    segments.extend(crate::segments::OUTAGE_SEGMENTS.iter().map(|segment| {
+        MarketSegment {
+            brand: "outagehub".into(),
+            key: crate::segments::market_key_for_segment(segment.key)
+                .expect("every OutageHub doctrine segment has a market key")
+                .into(),
+            version: 1,
+            name: match segment.key {
+                "ev_charging" => "Canadian EV charging operations",
+                "telecom" => "Canadian telecom site continuity",
+                "generator_services" => "Canadian backup-power dispatch",
+                _ => segment.name,
+            }
+            .into(),
+            geography: "Canada".into(),
+            wedge: format!("{} {}", segment.operating_event, segment.decision),
+            unit_of_analysis: "operator × location portfolio × outage-time decision".into(),
+            enumeration_sources: vec![
+                "official registries/directories".into(),
+                "company operating-location pages and job postings".into(),
+                "Apollo enrichment after first-party enumeration".into(),
+            ],
+            status: "active".into(),
+            ..Default::default()
+        }
+    }));
+    segments
 }
 
 pub fn seed_defaults(db: &SharedDb) -> Result<()> {
@@ -1651,9 +1675,9 @@ pub fn seed_defaults(db: &SharedDb) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        customer_development_missing, customer_development_stage, default_plays,
-        default_signal_definitions, graded_problem_confirmed_for_lead, prepare_action,
-        seed_defaults, GtmActionContext, SignalCandidate,
+        customer_development_missing, customer_development_stage, default_market_segments,
+        default_plays, default_signal_definitions, graded_problem_confirmed_for_lead,
+        prepare_action, seed_defaults, GtmActionContext, SignalCandidate,
     };
     use crate::db::{
         AccountPlayAssessment, CustomerDevelopmentRecord, Db, EvidenceClaim, Lead, Person, SharedDb,
@@ -1678,6 +1702,20 @@ mod tests {
         };
         assert!(ready.sequence_ready_for(1));
         assert!(ready.delivery_ready_for(1));
+    }
+
+    #[test]
+    fn all_twelve_outagehub_doctrine_segments_are_persisted_markets() {
+        let markets = default_market_segments()
+            .into_iter()
+            .filter(|segment| segment.brand == "outagehub")
+            .collect::<Vec<_>>();
+        assert_eq!(markets.len(), crate::segments::OUTAGE_SEGMENTS.len());
+        for doctrine in crate::segments::OUTAGE_SEGMENTS {
+            let key =
+                crate::segments::market_key_for_segment(doctrine.key).expect("doctrine market key");
+            assert!(markets.iter().any(|market| market.key == key), "{key}");
+        }
     }
 
     fn remove_temp_db(path: &std::path::Path) {

@@ -460,6 +460,33 @@ pub fn segment_by_key(key: &str) -> Option<&'static OutageSegment> {
         .find(|segment| segment.key.eq_ignore_ascii_case(key.trim()))
 }
 
+/// Stable database/CLI market key for each doctrine segment. The first three
+/// retain their shipped keys so existing coverage ledgers remain valid.
+pub fn market_key_for_segment(key: &str) -> Option<&'static str> {
+    match key.trim() {
+        "insurance_cat" => Some("canada_outage_insurance_cat"),
+        "telecom" => Some("canada_telecom_site_continuity"),
+        "ev_charging" => Some("canada_ev_charging_operations"),
+        "generator_services" => Some("canada_backup_power_dispatch"),
+        "cold_storage" => Some("canada_outage_cold_storage"),
+        "data_centres" => Some("canada_outage_data_centres"),
+        "labs_healthcare" => Some("canada_outage_labs_healthcare"),
+        "senior_residences" => Some("canada_outage_senior_residences"),
+        "retail_fuel" => Some("canada_outage_retail_fuel"),
+        "property_facilities" => Some("canada_outage_property_facilities"),
+        "municipal_emergency" => Some("canada_outage_municipal_emergency"),
+        "embedded_partners" => Some("canada_outage_embedded_partners"),
+        _ => None,
+    }
+}
+
+pub fn segment_for_market_key(key: &str) -> Option<&'static OutageSegment> {
+    OUTAGE_SEGMENTS.iter().find(|segment| {
+        market_key_for_segment(segment.key)
+            .is_some_and(|market_key| market_key.eq_ignore_ascii_case(key.trim()))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{segment_for_evidence, OUTAGE_SEGMENTS};

@@ -216,7 +216,7 @@ pub(crate) async fn judge_candidates(
 
 fn eval_system_prompt() -> String {
     format!(
-        "You are a blind, skeptical cold-outreach evaluator. First judge each candidate independently as sendable or not sendable; then choose the stronger message. A winner may still be unsendable. Judge evidence safety, recipient value, specificity, natural spoken language, cognitive load, and whether replying is easy. Minimum length is not the goal. A scripted yes/no/category/referral menu is not low friction. Penalize invented task nouns and internal labels. Do not reward polish or visible framework compliance.\n\nFor Wapahki first touches, sendable means 75–110 words, one source-supported facility/task/consequence, one hypothesis, one concrete contribution, exactly one question, and no call or meeting request. The recipient must not be asked to find the use case.\n\nThe verified account facts and verified seller facts are separate exhaustive evidence boundaries; a supplied hypothesis is not a fact. Flag materially new declarative details or capabilities. Return tie only when neither is materially better. Never infer the preferred answer from candidate order.\n\nHUMAN STYLE RUBRIC:\n{HUMAN_STYLE_RUBRIC}"
+        "You are a blind, skeptical cold-outreach evaluator. First judge each candidate independently as sendable or not sendable; then choose the stronger message. A winner may still be unsendable. Judge evidence safety, recipient value, specificity, natural spoken language, cognitive load, and whether replying is easy. Minimum length is not the goal. A scripted yes/no/category/referral menu is not low friction. Penalize invented task nouns and internal labels. Do not reward polish or visible framework compliance.\n\nFor Wapahki first touches, sendable means 75–110 words, one source-supported facility/task/consequence, one hypothesis, one concrete contribution, exactly one question, and no call or meeting request. The recipient must not be asked to find the use case.\n\nFor OutageHub discovery first touches, sendable means 60–95 words, an operations recipient whose title matches the evidenced segment, one sourced distributed/exposure fact, one honest outage-time operating question, and a plain explanation that OutageHub matches Canadian utility reports to locations through an API. The sole next step is a direct email answer: any call, meeting, demo, chat, calendar, or synchronous-conversation request is unsendable. Never assert a private site outage or internal workflow. A historical result is sendable only when its exact verified address, utility, full timestamp, and outside-utility-context boundary are all present.\n\nThe verified account facts and verified seller facts are separate exhaustive evidence boundaries; a supplied hypothesis is not a fact. Flag materially new declarative details or capabilities. Return tie only when neither is materially better. Never infer the preferred answer from candidate order.\n\nHUMAN STYLE RUBRIC:\n{HUMAN_STYLE_RUBRIC}"
     )
 }
 
@@ -281,7 +281,42 @@ mod tests {
         assert!(prompt.contains("scripted yes/no/category/referral menu"));
         assert!(prompt.contains("First judge each candidate independently"));
         assert!(prompt.contains("For Wapahki first touches"));
+        assert!(prompt.contains("For OutageHub discovery first touches"));
+        assert!(prompt.contains("sole next step is a direct email answer"));
         assert!(!prompt.contains("expected"));
         assert!(!prompt.contains("editor_note"));
+    }
+
+    #[test]
+    fn outagehub_gold_cases_match_the_current_discovery_contract() {
+        let cases = load(Path::new("evals/outreach-gold.jsonl")).expect("load eval corpus");
+        let outagehub = cases
+            .iter()
+            .filter(|case| case.brand == "outagehub")
+            .collect::<Vec<_>>();
+        assert_eq!(outagehub.len(), 7);
+        for case in outagehub {
+            assert_eq!(case.expected_sendable_a, Some(true), "{}", case.id);
+            assert_eq!(case.expected_sendable_b, Some(false), "{}", case.id);
+            let body = case.candidate_a.to_ascii_lowercase();
+            assert!(body.contains("through an api"), "{}", case.id);
+            assert_eq!(body.matches('?').count(), 1, "{}", case.id);
+            assert!(
+                ![
+                    "minute call",
+                    "minutes next",
+                    "conversation next",
+                    "meeting",
+                    "demo",
+                    "calendar",
+                ]
+                .iter()
+                .any(|marker| body.contains(marker)),
+                "{}",
+                case.id
+            );
+            let words = body.split_whitespace().count();
+            assert!((60..=95).contains(&words), "{}: {words}", case.id);
+        }
     }
 }

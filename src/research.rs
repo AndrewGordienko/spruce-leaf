@@ -47,6 +47,10 @@ pub struct CompanyBrief {
     /// page's Ontario location.
     #[serde(skip)]
     pub source_locations: Vec<SourceLocation>,
+    /// Infrastructure/data warnings are operator state, never prospect facts.
+    /// Callers persist or display them separately from `as_facts_block`.
+    #[serde(skip)]
+    pub operator_warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -63,6 +67,7 @@ impl CompanyBrief {
             && self.signals.is_empty()
             && self.hiring_signals.is_empty()
             && self.operating_locations.is_empty()
+            && self.operator_warnings.is_empty()
             && self.problem_hypothesis.trim().is_empty()
     }
 
@@ -134,16 +139,26 @@ pub async fn research_company(
     if domain.trim().is_empty() {
         return None;
     }
-    let outage_evidence = if pb.key.eq_ignore_ascii_case("outagehub") {
+    let (outage_evidence, outage_report_warning) = if pb.key.eq_ignore_ascii_case("outagehub") {
         let report = std::env::var("SPRUCE_OUTAGE_MATCH_REPORT")
             .unwrap_or_else(|_| ".spruce/outage-location-matches.json".into());
-        crate::outage_evidence::evidence_for_company(
-            std::path::Path::new(&report),
-            &org.name,
-            &domain,
-        )
+        let report_path = std::path::Path::new(&report);
+        if report_path.exists() {
+            (
+                crate::outage_evidence::evidence_for_company(report_path, &org.name, &domain),
+                None,
+            )
+        } else {
+            (
+                Vec::new(),
+                Some(format!(
+                    "OutageHub historical report {} is unavailable; this account cannot become action-ready until archive matching succeeds",
+                    report_path.display()
+                )),
+            )
+        }
     } else {
-        Vec::new()
+        (Vec::new(), None)
     };
 
     // Fetch the homepage and optional job pages in one concurrent wave. If the
@@ -591,6 +606,9 @@ pub async fn research_company(
         .await
     {
         Ok(mut brief) => {
+            if let Some(warning) = outage_report_warning {
+                brief.operator_warnings.push(warning);
+            }
             brief.sources = sources;
             brief.source_locations = source_locations;
             brief.operating_locations = validate_researched_operating_locations(
@@ -622,7 +640,7 @@ pub async fn research_company(
                     .unwrap_or_else(|_| ".spruce/verified-locations.json".into());
                 let report = std::env::var("SPRUCE_OUTAGE_MATCH_REPORT")
                     .unwrap_or_else(|_| ".spruce/outage-location-matches.json".into());
-                if let Ok(evidence) = crate::outage_evidence::ingest_researched_locations(
+                match crate::outage_evidence::ingest_researched_locations(
                     &org.name,
                     &domain,
                     &brief.operating_locations,
@@ -632,7 +650,11 @@ pub async fn research_company(
                 )
                 .await
                 {
-                    add_outage_evidence(&mut brief, evidence);
+                    Ok(evidence) => add_outage_evidence(&mut brief, evidence),
+                    Err(error) => brief.operator_warnings.push(format!(
+                        "OutageHub archive/geocoder intake failed for {}: {error:#}",
+                        org.name
+                    )),
                 }
             }
             add_outage_evidence(&mut brief, outage_evidence);
