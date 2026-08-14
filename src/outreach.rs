@@ -19,14 +19,17 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Result};
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::business::BusinessProfile;
 use crate::calendar::{self, TimingContext};
-use crate::db::{current_copy_policy_hash, current_copy_policy_version, Sequence, SharedDb, Touch};
+use crate::db::{
+    current_copy_policy_hash, current_copy_policy_version, MessageCandidateAudit, Sequence,
+    SharedDb, Touch,
+};
 use crate::domain::{
     Account as CopyAccount, Contact as CopyContact, Sequence as CopySequence, Touch as CopyTouch,
     TouchReview,
@@ -36,6 +39,33 @@ use crate::gtm::GtmActionContext;
 use crate::knowledge::Library;
 use crate::playbook::{self, Playbook, SalesCriticPersona, Shared};
 use crate::response_design;
+
+const OUTREACH_QUALITY_RUBRIC: &str = include_str!("../evals/outreach-quality-rubric.md");
+const GNK_SALES_MANUAL: &str = include_str!("../docs/gnk-sales-manual.md");
+const WAPAHKI_SALES_MANUAL: &str = include_str!("../docs/wapahki-sales-manual.md");
+const OUTAGEHUB_SALES_MANUAL: &str = include_str!("../docs/sales-manual.md");
+const OUTAGEHUB_FOLLOWUP_DOCTRINE: &str = include_str!("../docs/follow-up-doctrine.md");
+const ACQUISITION_CHANNEL_DOCTRINE: &str = include_str!("../docs/acquisition-channels.md");
+
+fn sales_doctrine(brand: &str) -> &'static str {
+    if brand.eq_ignore_ascii_case("gnk") {
+        GNK_SALES_MANUAL
+    } else if brand.eq_ignore_ascii_case("wapahki") {
+        WAPAHKI_SALES_MANUAL
+    } else if brand.eq_ignore_ascii_case("outagehub") {
+        OUTAGEHUB_SALES_MANUAL
+    } else {
+        ""
+    }
+}
+
+fn followup_doctrine(brand: &str) -> &'static str {
+    if brand.eq_ignore_ascii_case("outagehub") {
+        OUTAGEHUB_FOLLOWUP_DOCTRINE
+    } else {
+        "Follow-ups require a new evidence, artifact, buyer-action, routing, or close record. Silence alone never authorizes another touch."
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct PlanSummary {
@@ -289,6 +319,10 @@ fn report_review_progress(progress: Option<&(dyn Fn(&str) + Send + Sync)>, phase
 struct ReviewedCopy {
     sequence: CopySequence,
     reviews: Vec<TouchReview>,
+    message_mode: String,
+    offer_type: String,
+    value_offered: String,
+    evidence_strength: i64,
 }
 
 struct FinalizedDraft {
@@ -451,8 +485,427 @@ struct PersonSequenceCopy {
     value_exchange: String,
     #[serde(default)]
     touches: Vec<CopyTouch>,
+    /// For T1-only generation the writer must expose all three unchanged
+    /// strategies. Selection happens later; the writer is not allowed to blend
+    /// them into one committee-authored draft.
+    #[serde(default)]
+    candidates: Vec<MessageCandidate>,
     #[serde(default)]
     applied_principles: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SendableBrief {
+    account_claim_ids: Vec<String>,
+    person_role_claim_id: String,
+    opportunity_id: String,
+    expensive_moment: String,
+    plausible_consequence: String,
+    gnk_deliverable: String,
+    required_customer_input: String,
+    decision_improved: String,
+    expected_reply: String,
+    unique_observation: String,
+    why_this_person: String,
+    why_now: String,
+    evidence_boundary: String,
+    personalization_strength: u8,
+    contribution_status: ContributionStatus,
+    trigger: OutreachTrigger,
+    selected_play: String,
+    operational_workflow: String,
+    current_workaround: String,
+    current_workaround_status: String,
+    message_objective: String,
+    credibility_basis: String,
+    smallest_ask: String,
+    artifact_id: String,
+    artifact_status: String,
+    consent_basis: String,
+    consent_evidence_url: String,
+    consent_evidence_captured_at: String,
+    uncertainties: Vec<String>,
+    technical_kill_conditions: Vec<String>,
+    lead_source: String,
+    source_phase: String,
+    outreach_channel: String,
+    source_event: String,
+    conversation_summary: String,
+    promised_action: String,
+    agreed_next_action: String,
+    referrer_or_partner: String,
+    relationship_reference: String,
+    observed_acquisition_signals: Vec<String>,
+    event_engagement: Option<crate::db::EventEngagement>,
+    lead_temperature: String,
+    relationship_owner: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OutreachTrigger {
+    facility_id: String,
+    task_id: String,
+    trigger_type: TriggerType,
+    observed_at: DateTime<Utc>,
+    economic_consequence: String,
+    consequence_strength: u8,
+    contact_can_answer: bool,
+    reason_now: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TriggerType {
+    CurrentHiring,
+    Expansion,
+    NewEquipment,
+    OperatingChange,
+    HistoricalEvent,
+    PublicResponsibility,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ContributionStatus {
+    None,
+    PreparedObservation,
+    CompletedPublicEvidenceScreen,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+enum MessageMode {
+    OperatingQuestion,
+    CompletedTeardown,
+    RoutingQuestion,
+}
+
+impl MessageMode {
+    fn key(self) -> &'static str {
+        match self {
+            Self::OperatingQuestion => "operating_question",
+            Self::CompletedTeardown => "completed_teardown",
+            Self::RoutingQuestion => "routing_question",
+        }
+    }
+}
+
+impl ContributionStatus {
+    fn key(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::PreparedObservation => "prepared_observation",
+            Self::CompletedPublicEvidenceScreen => "completed_public_evidence_screen",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MessageCandidate {
+    id: String,
+    mode: MessageMode,
+    channel: String,
+    subject: String,
+    body: String,
+    #[serde(default)]
+    evidence_claim_ids: Vec<String>,
+    intended_response: String,
+    recipient_value: String,
+    contribution_status: ContributionStatus,
+}
+
+#[derive(Debug, Deserialize)]
+struct BlindSelection {
+    selected_candidate_id: String,
+    send_unchanged: bool,
+    recipient_value: u32,
+    specificity: u32,
+    credibility: u32,
+    reply_ease: u32,
+    naturalness: u32,
+    #[serde(default)]
+    reasons: Vec<String>,
+}
+
+impl BlindSelection {
+    fn score(&self) -> u32 {
+        self.recipient_value
+            + self.specificity
+            + self.credibility
+            + self.reply_ease
+            + self.naturalness
+    }
+
+    fn passes(&self) -> bool {
+        self.send_unchanged
+            && !self.selected_candidate_id.trim().is_empty()
+            && self.recipient_value >= 24
+            && self.specificity >= 16
+            && self.credibility >= 16
+            && self.reply_ease >= 12
+            && self.naturalness >= 12
+            && self.score() >= 80
+    }
+}
+
+fn contribution_rank(status: ContributionStatus) -> u8 {
+    match status {
+        ContributionStatus::None => 0,
+        ContributionStatus::PreparedObservation => 1,
+        ContributionStatus::CompletedPublicEvidenceScreen => 2,
+    }
+}
+
+fn candidate_sequence(candidate: &MessageCandidate) -> CopySequence {
+    CopySequence {
+        touches: vec![CopyTouch {
+            stage: 1,
+            day_offset: 0,
+            channel: candidate.channel.clone(),
+            subject: candidate.subject.clone(),
+            body: candidate.body.clone(),
+            purpose: format!("unchanged {:?} candidate", candidate.mode),
+            goal: candidate.intended_response.clone(),
+        }],
+        applied_principles: Vec::new(),
+    }
+}
+
+fn candidate_batch_issues(
+    pb: &Playbook,
+    shared: &Shared,
+    account: &CopyAccount,
+    contact: &CopyContact,
+    candidates: &[MessageCandidate],
+    brief: &SendableBrief,
+    gtm_context: Option<&GtmActionContext>,
+) -> Vec<String> {
+    let mut issues = Vec::new();
+    if candidates.len() != 3 {
+        issues.push(format!(
+            "candidate batch must contain exactly three visible drafts; found {}",
+            candidates.len()
+        ));
+        return issues;
+    }
+    let required_modes = HashSet::from([
+        MessageMode::OperatingQuestion,
+        MessageMode::CompletedTeardown,
+        MessageMode::RoutingQuestion,
+    ]);
+    let modes = candidates
+        .iter()
+        .map(|candidate| candidate.mode)
+        .collect::<HashSet<_>>();
+    if modes != required_modes {
+        issues.push(
+            "candidate batch must contain one operating question, one completed teardown, and one routing question"
+                .into(),
+        );
+    }
+    let ids = candidates
+        .iter()
+        .map(|candidate| candidate.id.trim().to_string())
+        .collect::<HashSet<_>>();
+    if ids.len() != 3 || ids.contains("") {
+        issues.push("candidate ids must be non-empty and unique".into());
+    }
+    let mut allowed_claims = brief
+        .account_claim_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    if !brief
+        .person_role_claim_id
+        .starts_with("verified-adjacent-person:")
+    {
+        allowed_claims.insert(brief.person_role_claim_id.as_str());
+    }
+    for candidate in candidates {
+        let channel_allowed = match brief.outreach_channel.as_str() {
+            "email" => candidate.channel == "email",
+            "linkedin" => candidate.channel == "linkedin",
+            "email_or_linkedin" => matches!(candidate.channel.as_str(), "email" | "linkedin"),
+            _ => false,
+        };
+        if !channel_allowed {
+            issues.push(format!(
+                "candidate {} does not use the approved acquisition channel {}",
+                candidate.id, brief.outreach_channel
+            ));
+        }
+        if candidate.channel == "linkedin" && !candidate.subject.trim().is_empty() {
+            issues.push(format!(
+                "candidate {} gives a LinkedIn first contact an email subject",
+                candidate.id
+            ));
+        }
+        if candidate.recipient_value.trim().is_empty() {
+            issues.push(format!(
+                "candidate {} does not state a recipient value",
+                candidate.id
+            ));
+        }
+        if candidate.intended_response.trim().is_empty() {
+            issues.push(format!(
+                "candidate {} does not state an intended response",
+                candidate.id
+            ));
+        }
+        if candidate.evidence_claim_ids.is_empty()
+            || candidate
+                .evidence_claim_ids
+                .iter()
+                .any(|claim_id| !allowed_claims.contains(claim_id.as_str()))
+        {
+            issues.push(format!(
+                "candidate {} cites evidence outside its deterministic brief",
+                candidate.id
+            ));
+        }
+        if contribution_rank(candidate.contribution_status)
+            > contribution_rank(brief.contribution_status)
+        {
+            issues.push(format!(
+                "candidate {} overstates its prepared contribution",
+                candidate.id
+            ));
+        }
+        let sequence = candidate_sequence(candidate);
+        for issue in account_sequence_quality_issues(
+            pb,
+            shared,
+            account,
+            &sequence,
+            &[],
+            1,
+            false,
+            gtm_context,
+        ) {
+            issues.push(format!("candidate {}: {issue}", candidate.id));
+        }
+        if let Some(reason) = locked_must_reject_reason(account, contact, gtm_context) {
+            issues.push(format!("candidate {}: {reason}", candidate.id));
+        }
+    }
+    for left in 0..candidates.len() {
+        for right in (left + 1)..candidates.len() {
+            let (body_similarity, body_overlap) = word_set_similarity(
+                &candidates[left].body,
+                &candidates[right].body,
+                &pb.signature,
+            );
+            let left_question = primary_question(&candidates[left].body);
+            let right_question = primary_question(&candidates[right].body);
+            let (question_similarity, question_overlap) =
+                word_set_similarity(&left_question, &right_question, &pb.signature);
+            if (body_similarity >= 0.52 && body_overlap >= 8)
+                || (question_similarity >= 0.65 && question_overlap >= 5)
+            {
+                issues.push(format!(
+                    "candidates {} and {} are structurally repetitive (body {:.0}%, question {:.0}%)",
+                    candidates[left].id,
+                    candidates[right].id,
+                    body_similarity * 100.0,
+                    question_similarity * 100.0
+                ));
+            }
+        }
+    }
+    issues.sort();
+    issues.dedup();
+    issues
+}
+
+fn blind_selector_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["selected_candidate_id", "send_unchanged", "recipient_value", "specificity", "credibility", "reply_ease", "naturalness", "reasons"],
+        "properties": {
+            "selected_candidate_id": { "type": "string", "description": "Candidate id, or an empty string when none is sendable unchanged." },
+            "send_unchanged": { "type": "boolean" },
+            "recipient_value": { "type": "integer", "minimum": 0, "maximum": 30 },
+            "specificity": { "type": "integer", "minimum": 0, "maximum": 20 },
+            "credibility": { "type": "integer", "minimum": 0, "maximum": 20 },
+            "reply_ease": { "type": "integer", "minimum": 0, "maximum": 15 },
+            "naturalness": { "type": "integer", "minimum": 0, "maximum": 15 },
+            "reasons": { "type": "array", "items": { "type": "string" } }
+        }
+    })
+}
+
+async fn select_unchanged_candidate(
+    client: &Engine,
+    pb: &Playbook,
+    person: &crate::db::Person,
+    candidates: &[MessageCandidate],
+) -> Result<(MessageCandidate, Vec<TouchReview>)> {
+    let inbox_candidates = candidates
+        .iter()
+        .map(|candidate| {
+            json!({
+                "id": candidate.id,
+                "channel": candidate.channel,
+                "subject": candidate.subject,
+                "body": candidate.body,
+            })
+        })
+        .collect::<Vec<_>>();
+    let prompt = format!(
+        "RECIPIENT TITLE:\n{}\n\nPUBLIC SELLER DESCRIPTION:\n{}\n\nINBOX CANDIDATES:\n{}",
+        person.title,
+        pb.one_liner,
+        serde_json::to_string_pretty(&inbox_candidates).unwrap_or_default()
+    );
+    let system = format!(
+        "You are an independent buyer-perspective inbox judge. You see no account brief and may not infer one. Select the single message a busy recipient would most likely value and Andrew could send with every word unchanged. Score recipient value /30, specificity /20, credibility /20, reply ease /15, and naturalness /15. Hard reject copy that mainly asks the recipient to educate the sender, lacks a concrete contribution, needs hidden context to matter, sounds accurate but uninteresting, or reads like a research template. Return an empty selected_candidate_id when none is genuinely sendable. Do not rewrite, merge, or suggest replacement copy.\n\nCURRENT BLIND QUALITY RUBRIC:\n{}",
+        OUTREACH_QUALITY_RUBRIC
+    );
+    let schema = blind_selector_schema();
+    let (left, right) = futures::join!(
+        client.structured_bulk::<BlindSelection>(
+            "outreach.blind_select_a",
+            &system,
+            &prompt,
+            schema.clone(),
+        ),
+        client.structured_bulk::<BlindSelection>(
+            "outreach.blind_select_b",
+            &system,
+            &prompt,
+            schema,
+        )
+    );
+    let left = left?;
+    let right = right?;
+    if !left.passes()
+        || !right.passes()
+        || left.selected_candidate_id != right.selected_candidate_id
+    {
+        return Err(anyhow!(
+            "blind inbox review held all candidates or the two independent selectors disagreed (A: {} / {}, B: {} / {})",
+            left.selected_candidate_id,
+            left.reasons.join("; "),
+            right.selected_candidate_id,
+            right.reasons.join("; ")
+        ));
+    }
+    let selected = candidates
+        .iter()
+        .find(|candidate| candidate.id == left.selected_candidate_id)
+        .cloned()
+        .ok_or_else(|| anyhow!("blind selector returned an unknown candidate id"))?;
+    let score = left.score().min(right.score());
+    Ok((
+        selected,
+        vec![TouchReview {
+            stage: 1,
+            passes: true,
+            score,
+            issues: Vec::new(),
+        }],
+    ))
 }
 
 #[derive(Debug, Clone)]
@@ -500,6 +953,409 @@ fn locked_must_reject_reason(
                     .contains(&fixture.opportunity_task_contains.to_ascii_lowercase()))
     })
     .map(|fixture| format!("locked must-reject fixture: {}", fixture.reason))
+}
+
+fn build_sendable_brief(
+    brand: &str,
+    context: &GtmActionContext,
+    person: &crate::db::Person,
+) -> std::result::Result<SendableBrief, String> {
+    let opportunity = context
+        .opportunity
+        .as_ref()
+        .ok_or_else(|| "no current sales opportunity".to_string())?;
+    let sales_brief = context.sales_brief.as_ref().ok_or_else(|| {
+        "no approved prospect sales brief or documented consent basis".to_string()
+    })?;
+    let brief_issues = sales_brief.gate_issues();
+    if !brief_issues.is_empty() {
+        return Err(brief_issues.join("; "));
+    }
+    if !sales_brief.brand.eq_ignore_ascii_case(brand)
+        || sales_brief.sales_opportunity_id != opportunity.id
+        || sales_brief.person_id != person.id
+    {
+        return Err("sales brief is scoped to a different brand, opportunity, or person".into());
+    }
+    let acquisition = context.acquisition_context.as_ref().ok_or_else(|| {
+        "no approved acquisition-source context for this email/LinkedIn first contact".to_string()
+    })?;
+    let acquisition_issues = acquisition.gate_issues();
+    if !acquisition_issues.is_empty() {
+        return Err(acquisition_issues.join("; "));
+    }
+    if !acquisition.brand.eq_ignore_ascii_case(brand)
+        || acquisition.sales_opportunity_id != opportunity.id
+        || acquisition.person_id != person.id
+    {
+        return Err(
+            "acquisition context is scoped to a different brand, opportunity, or person".into(),
+        );
+    }
+    let expected_brief_type = if brand.eq_ignore_ascii_case("gnk") {
+        "gnk"
+    } else if brand.eq_ignore_ascii_case("wapahki") {
+        "wapahki_task"
+    } else if brand.eq_ignore_ascii_case("outagehub") {
+        "outagehub"
+    } else {
+        brand
+    };
+    if sales_brief.brief_type != expected_brief_type {
+        return Err(format!(
+            "sales brief type {} does not match {brand}",
+            sales_brief.brief_type
+        ));
+    }
+    if sales_brief.account_decision != "send" {
+        return Err(format!(
+            "account decision is {}; standard outreach generation is disabled",
+            sales_brief.account_decision
+        ));
+    }
+    DateTime::parse_from_rfc3339(&sales_brief.consent_evidence_captured_at)
+        .map_err(|_| "consent evidence capture timestamp is not RFC3339".to_string())?;
+    if brand.eq_ignore_ascii_case("outagehub")
+        && !matches!(
+            sales_brief.selected_play.as_str(),
+            "telecom_noc"
+                | "msp"
+                | "multi_site_facilities"
+                | "generator_dispatch"
+                | "cold_storage_labs"
+                | "insurance"
+        )
+    {
+        return Err("OutageHub sales brief has no recognized use-case play".into());
+    }
+    if matches!(
+        brand.to_ascii_lowercase().as_str(),
+        "gnk" | "wapahki" | "outagehub"
+    ) && matches!(sales_brief.artifact_status.as_str(), "none" | "")
+    {
+        return Err("no real prepared or honestly producible recipient-side contribution".into());
+    }
+    let active = context
+        .evidence_claims
+        .iter()
+        .filter(|claim| {
+            matches!(claim.status.as_str(), "observed" | "verified")
+                && crate::db::credible_source_url(&claim.source_url)
+                && !claim.source_excerpt.trim().is_empty()
+                && claim.sales_opportunity_id == opportunity.id
+                && claim.task_key == opportunity.task_key
+        })
+        .collect::<Vec<_>>();
+    let active_ids = active
+        .iter()
+        .map(|claim| claim.id.as_str())
+        .collect::<HashSet<_>>();
+    if sales_brief
+        .fact_claim_ids
+        .iter()
+        .any(|claim_id| !active_ids.contains(claim_id.as_str()))
+    {
+        return Err("sales brief cites an inactive or out-of-scope fact claim".into());
+    }
+    let claim_of_type = |types: &[&str]| {
+        types.iter().find_map(|kind| {
+            active
+                .iter()
+                .find(|claim| claim.claim_type == *kind)
+                .copied()
+        })
+    };
+    let moment_types: &[&str] = if brand.eq_ignore_ascii_case("gnk") {
+        &[
+            "account.specific_recurring_decision",
+            "account.external_trigger_or_mechanism_evidence",
+        ]
+    } else if brand.eq_ignore_ascii_case("wapahki") {
+        &["account.bounded_repetitive_task"]
+    } else if brand.eq_ignore_ascii_case("outagehub") {
+        &[
+            "account.outage_sensitive_decision",
+            "account.outage_sensitive_exposure",
+        ]
+    } else {
+        &["account.fit_evidence"]
+    };
+    let consequence_types: &[&str] = if brand.eq_ignore_ascii_case("gnk") {
+        &["account.believable_operating_consequence"]
+    } else if brand.eq_ignore_ascii_case("wapahki") {
+        &["account.manual_task_economic_pressure"]
+    } else if brand.eq_ignore_ascii_case("outagehub") {
+        &[
+            "account.outage_sensitive_decision",
+            "account.outage_sensitive_exposure",
+        ]
+    } else {
+        &["account.fit_evidence"]
+    };
+    let moment = claim_of_type(moment_types)
+        .ok_or_else(|| "no URL-backed expensive operating moment".to_string())?;
+    let consequence = claim_of_type(consequence_types)
+        .ok_or_else(|| "no URL-backed plausible operating consequence".to_string())?;
+    if !sales_brief.fact_claim_ids.contains(&moment.id)
+        || !sales_brief.fact_claim_ids.contains(&consequence.id)
+    {
+        return Err(
+            "sales brief does not bind the current expensive moment and consequence claims".into(),
+        );
+    }
+
+    let stakeholder = context
+        .stakeholders
+        .iter()
+        .find(|stakeholder| stakeholder.person_id == person.id && stakeholder.status != "held")
+        .ok_or_else(|| "recipient is not mapped to the opportunity".to_string())?;
+    let person_locator = format!("person:{}", person.id);
+    let person_role_claim = stakeholder.evidence_claim_ids.iter().find_map(|claim_id| {
+        active.iter().find(|claim| {
+            claim.id == *claim_id
+                && claim.source_locator == person_locator
+                && matches!(
+                    claim.claim_type.as_str(),
+                    "contact.workflow_responsibility"
+                        | "contact.task_responsibility"
+                        | "contact.workflow_vantage"
+                        | "contact.facility_employment"
+                )
+        })
+    });
+    let verified_adjacent_identity = person_role_claim.is_none()
+        && stakeholder.role_fit == "adjacent"
+        && !person.apollo_org_id.trim().is_empty()
+        && matches!(
+            person
+                .employer_verification
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "apollo" | "official"
+        )
+        && !person.title.trim().is_empty();
+    if person_role_claim.is_none() && !verified_adjacent_identity {
+        return Err(
+            "no person-specific role source; account evidence cannot prove direct ownership".into(),
+        );
+    }
+    if person_role_claim.map(|claim| claim.id.as_str())
+        != Some(sales_brief.recipient_role_claim_id.as_str())
+    {
+        return Err(
+            "sales brief recipient responsibility is not the current person-specific role claim"
+                .into(),
+        );
+    }
+    let contact_can_answer =
+        crate::response_design::is_workflow_discovery_contact(&person.title, &person.vantage);
+    if !contact_can_answer && !verified_adjacent_identity {
+        return Err("recipient cannot answer or route the selected task".into());
+    }
+
+    let combined = format!(
+        "{} {} {}",
+        moment.source_excerpt, consequence.source_excerpt, opportunity.task_or_decision
+    )
+    .to_ascii_lowercase();
+    let (trigger_type, reason_now) = if combined.contains("hir")
+        || combined.contains("job posting")
+        || moment.source_url.contains("/job")
+        || moment.source_url.contains("/career")
+    {
+        (
+            TriggerType::CurrentHiring,
+            Some("A current public role names the task or operating burden.".to_string()),
+        )
+    } else if combined.contains("expansion") || combined.contains("new facility") {
+        (
+            TriggerType::Expansion,
+            Some("A public expansion creates a current operating change.".to_string()),
+        )
+    } else if combined.contains("new equipment") || combined.contains("install") {
+        (
+            TriggerType::NewEquipment,
+            Some("A public equipment change makes the decision current.".to_string()),
+        )
+    } else if combined.contains("changeover") || combined.contains("line change") {
+        (
+            TriggerType::OperatingChange,
+            Some("The source names an active operating change or changeover burden.".to_string()),
+        )
+    } else if brand.eq_ignore_ascii_case("outagehub")
+        && claim_of_type(&["account.historical_location_outage_match"]).is_some()
+    {
+        (
+            TriggerType::HistoricalEvent,
+            Some("A location-specific historical utility event is already reconstructed.".into()),
+        )
+    } else {
+        (
+            TriggerType::PublicResponsibility,
+            Some("A first-party source names the exact operating responsibility.".into()),
+        )
+    };
+    let observed_at = DateTime::parse_from_rfc3339(&moment.observed_at)
+        .or_else(|_| DateTime::parse_from_rfc3339(&consequence.observed_at))
+        .map(|value| value.with_timezone(&Utc))
+        .map_err(|_| "trigger evidence has no parseable observation timestamp".to_string())?;
+
+    let historical = claim_of_type(&["account.historical_location_outage_match"]);
+    let completed_screen = claim_of_type(&["account.completed_fit_screen_result"]);
+    let distributed_locations = claim_of_type(&["account.distributed_locations"]);
+    if !matches!(
+        brand.to_ascii_lowercase().as_str(),
+        "gnk" | "wapahki" | "outagehub"
+    ) {
+        return Err("no concrete first contribution is defined for this brand".into());
+    }
+    if brand.eq_ignore_ascii_case("outagehub")
+        && historical.is_none()
+        && distributed_locations.is_none()
+    {
+        return Err(
+            "OutageHub has neither a completed match nor a public location for a real comparison"
+                .into(),
+        );
+    }
+    if brand.eq_ignore_ascii_case("wapahki")
+        && sales_brief.artifact_status == "completed"
+        && completed_screen.is_none()
+    {
+        return Err("completed Wapahki artifact has no bound completed-screen claim".into());
+    }
+    let deliverable = sales_brief.concrete_contribution.trim().to_string();
+    let required_input = sales_brief.required_customer_input.trim().to_string();
+    let decision_improved = sales_brief.decision_improved.trim().to_string();
+    let contribution_status = match sales_brief.artifact_status.as_str() {
+        "completed" => ContributionStatus::CompletedPublicEvidenceScreen,
+        "prepared" | "producible" => ContributionStatus::PreparedObservation,
+        _ => ContributionStatus::None,
+    };
+
+    let distributed_excerpt = distributed_locations
+        .map(|claim| claim.source_excerpt.to_ascii_lowercase())
+        .unwrap_or_default();
+    let names_specific_canadian_place = [
+        "ontario",
+        "quebec",
+        "alberta",
+        "british columbia",
+        "manitoba",
+        "saskatchewan",
+        "nova scotia",
+        "new brunswick",
+        "newfoundland",
+        "prince edward island",
+        "northwest territories",
+        "nunavut",
+        "yukon",
+    ]
+    .iter()
+    .any(|place| distributed_excerpt.contains(place));
+    let personalization_strength = if historical.is_some() {
+        3
+    } else if brand.eq_ignore_ascii_case("outagehub") {
+        if moment.claim_type == "account.outage_sensitive_decision"
+            || names_specific_canadian_place
+            || !opportunity.facility_id.trim().is_empty()
+        {
+            2
+        } else {
+            1
+        }
+    } else if moment.claim_type == "account.fit_evidence" {
+        1
+    } else {
+        2
+    };
+    if personalization_strength < 2 {
+        return Err("personalization is only a company category or homepage summary".into());
+    }
+    let mut account_claim_ids = vec![moment.id.clone(), consequence.id.clone()];
+    if let Some(historical) = historical {
+        account_claim_ids.push(historical.id.clone());
+    }
+    if let Some(distributed_locations) = distributed_locations {
+        account_claim_ids.push(distributed_locations.id.clone());
+    }
+    if let Some(completed_screen) = completed_screen {
+        account_claim_ids.push(completed_screen.id.clone());
+    }
+    account_claim_ids.sort();
+    account_claim_ids.dedup();
+
+    Ok(SendableBrief {
+        account_claim_ids,
+        person_role_claim_id: person_role_claim
+            .map(|claim| claim.id.clone())
+            .unwrap_or_else(|| format!("verified-adjacent-person:{}", person.id)),
+        opportunity_id: opportunity.id.clone(),
+        expensive_moment: moment.source_excerpt.trim().to_string(),
+        plausible_consequence: consequence.source_excerpt.trim().to_string(),
+        gnk_deliverable: deliverable,
+        required_customer_input: required_input,
+        decision_improved,
+        expected_reply: sales_brief.expected_reply.clone(),
+        unique_observation: moment.source_excerpt.trim().to_string(),
+        why_this_person: if let Some(claim) = person_role_claim {
+            claim.source_excerpt.trim().to_string()
+        } else {
+            format!(
+                "Apollo verifies current company employment and the title '{}'; treat this person as adjacent and ask only a routing question.",
+                person.title.trim()
+            )
+        },
+        why_now: sales_brief.trigger.clone(),
+        evidence_boundary: format!(
+            "Only the listed claim ids may be stated as account facts. These remain uncertainties and must not become facts: {}",
+            if sales_brief.uncertainties.is_empty() {
+                "ownership, pain, urgency, frequency, and internal systems".into()
+            } else {
+                sales_brief.uncertainties.join("; ")
+            }
+        ),
+        personalization_strength,
+        contribution_status,
+        trigger: OutreachTrigger {
+            facility_id: opportunity.facility_id.clone(),
+            task_id: opportunity.task_key.clone(),
+            trigger_type,
+            observed_at,
+            economic_consequence: consequence.source_excerpt.trim().to_string(),
+            consequence_strength: if moment.id == consequence.id { 2 } else { 3 },
+            contact_can_answer,
+            reason_now,
+        },
+        selected_play: sales_brief.selected_play.clone(),
+        operational_workflow: sales_brief.operational_workflow.clone(),
+        current_workaround: sales_brief.current_workaround.clone(),
+        current_workaround_status: sales_brief.current_workaround_status.clone(),
+        message_objective: sales_brief.message_objective.clone(),
+        credibility_basis: sales_brief.credibility_basis.clone(),
+        smallest_ask: sales_brief.smallest_ask.clone(),
+        artifact_id: sales_brief.artifact_id.clone(),
+        artifact_status: sales_brief.artifact_status.clone(),
+        consent_basis: sales_brief.consent_basis.clone(),
+        consent_evidence_url: sales_brief.consent_evidence_url.clone(),
+        consent_evidence_captured_at: sales_brief.consent_evidence_captured_at.clone(),
+        uncertainties: sales_brief.uncertainties.clone(),
+        technical_kill_conditions: sales_brief.technical_kill_conditions.clone(),
+        lead_source: acquisition.lead_source.key().into(),
+        source_phase: acquisition.source_phase.clone(),
+        outreach_channel: acquisition.outreach_channel.clone(),
+        source_event: acquisition.source_event.clone(),
+        conversation_summary: acquisition.conversation_summary.clone(),
+        promised_action: acquisition.promised_action.clone(),
+        agreed_next_action: acquisition.agreed_next_action.clone(),
+        referrer_or_partner: acquisition.referrer_or_partner.clone(),
+        relationship_reference: acquisition.relationship_reference.clone(),
+        observed_acquisition_signals: acquisition.observed_signals.clone(),
+        event_engagement: acquisition.event_engagement.clone(),
+        lead_temperature: acquisition.lead_temperature.clone(),
+        relationship_owner: acquisition.relationship_owner.clone(),
+    })
 }
 
 /// The strategy the agent reasons out for one recipient BEFORE any copy is
@@ -753,6 +1609,11 @@ fn create_building_checkpoint(
             body: "Writing draft…".into(),
             status: "writing".into(),
             review_issues: vec!["Generation in progress".into()],
+            value_add_type: if stage == 1 {
+                "initial".into()
+            } else {
+                String::new()
+            },
             ..Default::default()
         }) {
             let _ = db.reject_building_sequence(&sequence_id, &error.to_string());
@@ -808,6 +1669,11 @@ fn checkpoint_sequence_copy(
                     issues
                 })
                 .unwrap_or_else(|| vec!["Copy review in progress".into()]),
+            value_add_type: if touch.stage == 1 {
+                "initial".into()
+            } else {
+                String::new()
+            },
             ..Default::default()
         })?;
         if !updated {
@@ -1415,17 +2281,15 @@ pub fn supported_touch_count(requested: usize) -> usize {
 }
 
 pub fn supported_touch_count_for_brand(brand: &str, requested: usize) -> usize {
-    // OutageHub is still validating the operating premise. A default/full
-    // cadence request therefore becomes one discovery email; two/four touches
-    // remain available only through the downstream matched-evidence gate, and
-    // seven-touch OutageHub sequences are retired outright.
-    if brand.eq_ignore_ascii_case("outagehub") {
-        match requested.max(1) {
-            1 => 1,
-            2 => 2,
-            3..=6 => 4,
-            _ => 1,
-        }
+    // The supervised brands generate T1 only. Replies, buyer actions, or new
+    // evidence create separately reviewed conditional follow-ups; the
+    // account-level seven-stage motion is never prewritten as one cadence.
+    if matches!(
+        brand.to_ascii_lowercase().as_str(),
+        "gnk" | "wapahki" | "outagehub"
+    ) {
+        let _ = requested;
+        1
     } else {
         supported_touch_count(requested)
     }
@@ -1451,6 +2315,13 @@ fn finalize_reviewed_draft(
     if let Some(reason) = cross_recipient_similarity_issue(db, pb, person, seq_id, seq)? {
         return Err(anyhow!(reason));
     }
+    db.set_sequence_message_attribution(
+        seq_id,
+        &copy.message_mode,
+        &copy.offer_type,
+        &copy.value_offered,
+        copy.evidence_strength,
+    )?;
     let now = Utc::now();
     let delivery_ready = auto_schedule
         && gtm_context.delivery_ready_for(seq.touches.len())
@@ -1674,9 +2545,53 @@ async fn write_account_sequences(
 ) -> Result<AccountCopyResult> {
     let account = copy_account(lead);
 
+    // Evidence and the concrete contribution are resolved before the writer is
+    // invoked. A missing field is an intentional abstention, not a prompt for
+    // the model to fill the gap with a hypothesis.
+    let mut sendable_briefs = HashMap::<String, SendableBrief>::new();
+    let mut prewrite_failures = HashMap::<String, CopyFailure>::new();
+    let eligible_people = people
+        .iter()
+        .filter_map(|person| {
+            let result = gtm_contexts
+                .get(&person.id)
+                .ok_or_else(|| "no current GTM action context".to_string())
+                .and_then(|context| build_sendable_brief(&pb.key, context, person));
+            match result {
+                Ok(brief) => {
+                    sendable_briefs.insert(person.id.clone(), brief);
+                    Some(person.clone())
+                }
+                Err(reason) => {
+                    let reason = format!("pre-writer hold: {reason}");
+                    if let Some(sequence_id) = checkpoints.get(&person.id) {
+                        let _ = db.hold_building_sequence(sequence_id, &reason);
+                    }
+                    prewrite_failures.insert(
+                        person.id.clone(),
+                        CopyFailure {
+                            reason,
+                            provider_stopped: false,
+                            held: true,
+                        },
+                    );
+                    None
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+    if eligible_people.is_empty() {
+        return Ok(AccountCopyResult {
+            copies: HashMap::new(),
+            failures: prewrite_failures,
+            stopped_reason: None,
+        });
+    }
+    let people = eligible_people.as_slice();
+
     let mut plans: HashMap<String, SequencePlan> = HashMap::new();
     let lean = client.prefers_lean_outreach();
-    if !lean {
+    if !lean && n != 1 {
         // Production keeps angle selection independent from realization so the
         // writer is not forced to defend its first idea. An explicit experiment
         // flag can fold the planner into the writer for a lower-cost comparison.
@@ -1726,6 +2641,15 @@ async fn write_account_sequences(
         people,
     );
     let recipient_payload = |person: &crate::db::Person| {
+        if n == 1 {
+            return json!({
+                "person_key": person.id,
+                "name": person.name,
+                "first_name": person.first_name,
+                "title": person.title,
+                "sendable_brief": sendable_briefs.get(&person.id),
+            });
+        }
         let context = gtm_contexts.get(&person.id);
         let mut verified_person_insights = vec![format!("Current title: {}", person.title)];
         if !person.location.trim().is_empty() {
@@ -1766,24 +2690,45 @@ async fn write_account_sequences(
                 .get(&person.id)
                 .map(GtmActionContext::copy_prompt_block)
                 .unwrap_or_else(|| "GTM ACTION STATE: unavailable".into()),
+            "sendable_brief": sendable_briefs.get(&person.id),
         })
     };
-    let planning_contract = if lean {
-        "For each recipient, choose one source-backed trigger and one operating decision this title can plausibly answer. Keep the mechanism explicitly unverified. Privately draft three genuinely different T1 candidates: a problem-sniffing note, a concise point of view, and an existence-or-routing note. Pick one; never blend or return the alternatives. T2 must sharpen the mechanism rather than restate T1. T3 is a natural connection request that gives a concrete reason to connect; never fill it with praise for the recipient's remit, background, perspective, or work. If T4 is present, add only a sourced fact, a useful concrete distinction, or an honest answer to the strongest objection; never invent an artifact to fill the slot. The sequence stays on one human thread and must not become an interview or a chain of retreats. Do not expose the private plan or discarded candidates."
+    let planning_contract = if n == 1 {
+        "Return exactly three visible, unchanged T1 candidates with different modes: operating_question, completed_teardown, and routing_question. Do not choose, merge, average, or rewrite them. Each candidate must use the sendable_brief acquisition channel and must name its intended response, recipient value, contribution status, and only the exact evidence claim ids it uses. A completed_teardown may mention collateral only when sendable_brief.contribution_status is completed_public_evidence_screen."
+    } else if lean {
+        "For each recipient, choose one source-backed trigger and one operating decision this title can plausibly answer. Keep the mechanism explicitly unverified. T2 must sharpen the mechanism rather than restate T1. T3 is a natural connection request that gives a concrete reason to connect; never fill it with praise for the recipient's remit, background, perspective, or work. If T4 is present, add only a sourced fact, a useful concrete distinction, or an honest answer to the strongest objection; never invent an artifact to fill the slot. The sequence stays on one human thread and must not become an interview or a chain of retreats."
     } else {
         "Follow each recipient's supplied private sequence_plan. Treat response_strategy as the governing outcome and recipient-friction brief, not language to paste into the email."
     };
     let writer_knowledge = knowledge.writer.block.clone();
     let brand_trigger_contract = brand_trigger_contract(&pb.key, n);
     let t1_contract = "T1 CONTRACT: Write a complete founder note inside the configured word band. Explain why this person, name one recognizable problem and plausible consequence, state one concrete and evidence-safe seller contribution, and offer one natural response path. For a discovery-ready account, the one direct operating answer is the sole CTA; do not add a call before the missing term is confirmed. A correction may be useful, but Andrew's desire for one is never the recipient's reason to answer. When the operator requested a supported operating decision or response, preserve it in T1; never broaden it into a generic workflow interview such as `what takes the most time`, `what happens today`, or `how do you handle this`. Keep every attributed claim faithful to its exact source: never replace a source's generic noun with a more specific noun learned from another URL. If a job posting says `finished products` and the company page separately names the product, retain `finished products` when describing the posting or state the two facts in separate sentences. The subject is also a factual claim: never put the unconfirmed term being asked about—such as `manual`, `staffed by hand`, a guessed system, or a presumed consequence—into it. A concise source-backed quantity may be used when it makes the operating burden concrete; never invent or estimate one. Start with the one most salient exact observation in ordinary spoken language; do not inventory every sourced duty or use evidence-audit phrases such as `company-attributed posting`. Put Andrew's practical reason for the recipient to answer before the final question. Hold rather than manufacture any missing account foundation.";
-    let writer_instructions = format!(
-        r#"Write one {n}-touch no-reply sequence for each recipient. {planning_contract}
+    let writer_instructions = if n == 1 {
+        format!(
+            r#"Write exactly three visible T1 candidates for every recipient: one operating_question, one completed_teardown, and one routing_question. Return the candidates unchanged in the schema; do not privately choose, merge, average, or rewrite them.
+
+The deterministic sendable_brief is the complete account contract. Use only its exact claim ids and fields. You have not been given an old account hypothesis, and you must not invent one. Choose hold_for_research when the brief cannot support three honest, structurally different drafts. Do not invent an attachment, completed analysis, customer fact, urgency, ownership, machine, consequence, or private workflow.
+
+Use lead_source and outreach_channel as hard context. cold_email starts from verified public evidence. conference must reference only the recorded conversation and should deliver the promised action or confirm the agreed next step. webinar may reference only the recorded attendance, topic, or question and must not treat registration as buying intent. referral and partner may name only the recorded introducer and reason. existing_customer starts from the recorded relationship and measured outcome or adjacent constraint, never a cold pitch. Lead temperature is routing metadata, not language to show the recipient.
+
+For email, each body must start with `Hi [First name],` on its own line, end with the exact signature `{signature}` on its own line, use the {min_words}–{max_words} word band, and have a plain 3–9 word subject. For LinkedIn, set subject empty, use the first name naturally, omit the email signature, and stay within 300 characters. Every candidate must contain one verified trigger, one recognizable expensive moment, one concrete contribution or seconds-to-answer correction/route, and exactly one easy question. Do not request a call unless this is a verified pre-conference meeting request or the reviewed post-event/referral context records that exact agreed next action. Do not ask the recipient to help Andrew research. Do not use internal framework language such as hypothesis, fit screen, decision trail, external context, workflow surface, first-pass result, or review-ready.
+
+The three candidates must differ in opening, sentence structure, value offered, and question—not merely synonyms. A completed_teardown may state a completed screen or result only when contribution_status is completed_public_evidence_screen; otherwise it may present only the prepared observation explicitly supported by the brief. Mention a screen only when that completed status exists. University of Toronto and Automata are optional for Wapahki and normally omitted unless they materially establish credibility. Wapahki may omit its own name when one precise operating question is stronger. GnK must say exactly what it examines and the concrete artifact it returns. OutageHub must offer or lead with a location-specific historical comparison or sample API result it can actually produce; when a completed historical result exists, put that exact result in T1.
+
+Set each candidate's evidence_claim_ids to only the brief claims it actually uses. State recipient_value and intended_response privately in their schema fields. Use send only if all three drafts are truthful and each stands on its own in an inbox; otherwise abstain."#,
+            signature = pb.signature,
+            min_words = pb.min_words,
+            max_words = pb.max_words,
+        )
+    } else {
+        format!(
+            r#"Write one {n}-touch no-reply sequence for each recipient. {planning_contract}
 
 {brand_trigger_contract}
 
 {t1_contract}
 
-Think through the buyer-safe brief and copy decision context. Return exactly one result for every person_key. First choose send_decision. Use send only when verified facts support the trigger, the title can credibly answer the ask, and one natural first note can test the hypothesis without pretending it is true. Otherwise choose hold_for_research, explain the missing evidence privately in decision_reason, and return no touches. Abstention is better than filler. For a send decision, privately state the operating decision, mechanism to test, strongest objection, recipient's reason to reply, and supported give-back. Never invent collateral, customer proof, or prior analysis.
+The deterministic sendable_brief is the complete pre-writing contract. Do not use old account hypotheses, mechanism fields, unrelated facts, or information outside its cited claims. Return exactly one result for every person_key. First choose send_decision. Use send only when the brief supports a natural message; otherwise choose hold_for_research and name the missing recipient value privately. Abstention is better than filler. Never invent collateral, customer proof, or prior analysis.
 
 If previous_rejection_feedback_internal_only is nonempty, this is a whole-sequence rewrite after a failed review. Treat every saved finding as a hard defect to remove, reconsider the structure that produced it, and return genuinely revised copy. Do not quote or mention the feedback to the recipient.
 
@@ -1794,15 +2739,29 @@ Before returning T1, privately write five possible subjects and discard any that
 For one touch use email/0. For two touches use email/0 and email/6. For four touches use email/0, email/3, linkedin_request/7, email/14. For seven touches use email/0, email/3, linkedin_request/5, email/9, linkedin_or_email/13, email/17, linkedin_or_email/21. In a seven-touch sequence only stages 1, 2, 4, and 6 may contain a question mark; stages 3, 5, and 7 must be useful statements without questions. Every email-capable touch must look like an email: `Hi [First name],` on its own line, a coherent message, and the exact signature on its own line. T1 uses one plain, specific 3-9 word operational subject; sentence case or title case is fine. Later email-capable touches preserve it with one re: prefix. A linkedin_request has no subject, greeting, signature, pitch, meeting ask, or prior-email reference; keep it below 260 characters and 40 words so it survives exact channel limits after punctuation cleanup. It must name the operating question or shared topic that makes connecting useful. Empty compliments such as `substantial remit`, `valuable perspective`, `impressive background`, or `I respect your work` fail.
 
 Purpose and goal are private CRM notes, never substitutes for buyer-facing prose. Before returning, read the whole sequence as the recipient. Remove generic lessons, fragments, surveys, framework language, and repeated retreat lines. In four touches, at most one touch may mainly say Andrew may be wrong, invite a correction/referral, or close; in seven touches the maximum is three. Rewrite any excess around mechanism, useful contribution, and the hard buyer objection. Never reveal play labels, experiment arms, confidence scores, or internal hypotheses."#,
-        n = n,
-        planning_contract = planning_contract,
-        brand_trigger_contract = brand_trigger_contract,
-        t1_contract = t1_contract,
-    );
+            n = n,
+            planning_contract = planning_contract,
+            brand_trigger_contract = brand_trigger_contract,
+            t1_contract = t1_contract,
+        )
+    };
     let writer_user = |recipients: &[Value]| {
+        if n == 1 {
+            return format!(
+                "{instructions}\n\nBRAND SALES DOCTRINE (source of truth):\n{doctrine}\n\nEMAIL/LINKEDIN ACQUISITION DOCTRINE:\n{acquisition_doctrine}\n\nRECIPIENTS AND DETERMINISTIC BRIEFS:\n{recipients}\n\nPUBLIC SELLER DESCRIPTION:\n{one_liner}\n\nVERIFIED SELLER FACTS:\n{seller_facts}",
+                instructions = writer_instructions,
+                doctrine = sales_doctrine(&pb.key),
+                acquisition_doctrine = ACQUISITION_CHANNEL_DOCTRINE,
+                recipients = serde_json::to_string_pretty(recipients).unwrap_or_default(),
+                one_liner = pb.one_liner,
+                seller_facts = pb.verified_seller_facts.join("\n"),
+            );
+        }
         format!(
-            "{instructions}\n\nCOMMERCIAL SCOPE: Each recipient's copy_decision_context is the only commercial unit. Use its exact sales_opportunity_id, task_key, and evidence claim ids. Do not use lead-level hypotheses, mechanisms, or system concepts.\n\nRECIPIENTS (private context; never quote its labels):\n{recipients}\n\nVERIFIED SELLER CONTEXT:\n{business_context}\n\nEMPIRICAL OUTBOUND FEEDBACK (learn the shape, never copy wording or treat prior reply details as facts about this account):\n{performance_context}\n\nRETRIEVED KNOWLEDGE (apply as judgment; never paste a framework or force a citation):\n{knowledge}",
+            "{instructions}\n\nBRAND SALES DOCTRINE (source of truth):\n{doctrine}\n\nFOLLOW-UP DOCTRINE:\n{followup}\n\nCOMMERCIAL SCOPE: Each recipient's copy_decision_context is the only commercial unit. Use its exact sales_opportunity_id, task_key, and evidence claim ids. Do not use lead-level hypotheses, mechanisms, or system concepts.\n\nRECIPIENTS (private context; never quote its labels):\n{recipients}\n\nVERIFIED SELLER CONTEXT:\n{business_context}\n\nEMPIRICAL OUTBOUND FEEDBACK (learn the shape, never copy wording or treat prior reply details as facts about this account):\n{performance_context}\n\nRETRIEVED KNOWLEDGE (apply as judgment; never paste a framework or force a citation):\n{knowledge}",
             instructions = writer_instructions,
+            doctrine = sales_doctrine(&pb.key),
+            followup = followup_doctrine(&pb.key),
             recipients = serde_json::to_string_pretty(recipients).unwrap_or_default(),
             business_context = business_context,
             performance_context = performance_context,
@@ -1858,7 +2817,7 @@ Purpose and goal are private CRM notes, never substitutes for buyer-facing prose
         .map(|person| person.id.as_str())
         .collect::<HashSet<_>>();
     let mut raw_by_person = HashMap::new();
-    let mut write_failures = HashMap::<String, CopyFailure>::new();
+    let mut write_failures = prewrite_failures;
     let mut write_stop_reason = None;
     for (requested_people, result) in written {
         match result {
@@ -1868,10 +2827,12 @@ Purpose and goal are private CRM notes, never substitutes for buyer-facing prose
                         let lineage_valid = gtm_contexts
                             .get(&raw.person_key)
                             .is_some_and(|context| copy_lineage_matches(&raw, context));
-                        if raw.send_decision.trim() == "send"
-                            && raw.touches.len() == n
-                            && lineage_valid
-                        {
+                        let copy_shape_valid = if n == 1 {
+                            raw.touches.is_empty() && raw.candidates.len() == 3
+                        } else {
+                            raw.touches.len() == n && raw.candidates.is_empty()
+                        };
+                        if raw.send_decision.trim() == "send" && copy_shape_valid && lineage_valid {
                             raw_by_person.entry(raw.person_key.clone()).or_insert(raw);
                         } else {
                             let reason = if !lineage_valid {
@@ -1925,6 +2886,57 @@ Purpose and goal are private CRM notes, never substitutes for buyer-facing prose
                 person.id.clone(),
                 CopyFailure {
                     reason: "writer returned no sequence for this recipient".into(),
+                    provider_stopped: false,
+                    held: false,
+                },
+            );
+        }
+    }
+    // Compare the visible candidates across the whole current account batch
+    // before either selector sees them. This prevents a concurrent generation
+    // from producing the same opening/question skeleton for several people and
+    // only discovering the mail merge after one has already been persisted.
+    if n == 1 {
+        let person_ids = raw_by_person.keys().cloned().collect::<Vec<_>>();
+        let mut repetitive = HashMap::<String, Vec<String>>::new();
+        for left in 0..person_ids.len() {
+            for right in (left + 1)..person_ids.len() {
+                let left_id = &person_ids[left];
+                let right_id = &person_ids[right];
+                let Some(left_raw) = raw_by_person.get(left_id) else {
+                    continue;
+                };
+                let Some(right_raw) = raw_by_person.get(right_id) else {
+                    continue;
+                };
+                let reused = left_raw.candidates.iter().any(|left_candidate| {
+                    right_raw.candidates.iter().any(|right_candidate| {
+                        cross_recipient_structural_similarity(
+                            &candidate_sequence(left_candidate),
+                            &candidate_sequence(right_candidate),
+                            &pb.signature,
+                        )
+                        .is_some()
+                    })
+                });
+                if reused {
+                    let issue = format!(
+                        "cross_account_template_reuse: current candidate batches for {left_id} and {right_id} repeat an opening or question skeleton"
+                    );
+                    repetitive
+                        .entry(left_id.clone())
+                        .or_default()
+                        .push(issue.clone());
+                    repetitive.entry(right_id.clone()).or_default().push(issue);
+                }
+            }
+        }
+        for (person_id, reasons) in repetitive {
+            raw_by_person.remove(&person_id);
+            write_failures.insert(
+                person_id,
+                CopyFailure {
+                    reason: reasons.join("; "),
                     provider_stopped: false,
                     held: false,
                 },
@@ -2030,17 +3042,17 @@ Purpose and goal are private CRM notes, never substitutes for buyer-facing prose
 
 pub(crate) fn brand_trigger_contract(brand: &str, touches: usize) -> &'static str {
     if brand == "gnk" && touches == 1 {
-        "GNK PRECISE FIRST-TOUCH CONTRACT: Research must support one account-specific recurring decision OR direct mechanism/artifact evidence, plus a recipient close to it. T1 distinguishes sourced fact from hypothesis, names the recognizable workflow in ordinary language, frames the unproved consequence as one sharp question when necessary, and explains one concrete way GnK could help. Honor the supplied copy decision state: discovery-ready copy asks for one direct operating answer by email and stops; action-ready copy may offer a short conversation with an email alternative. Never reuse a universal records/reconstruction fork or make correction the only recipient value."
+        "GNK PRECISE FIRST-TOUCH CONTRACT: Research must support one account-specific recurring decision, expensive moment, consequence, concrete deliverable, and person-specific responsibility evidence or an honest adjacent route. T1 says what GnK can examine, the artifact it returns, and the decision that result improves. Ask one direct operating or routing question by email and stop; do not request a cold call. Never reuse a universal records/reconstruction fork, make correction the only recipient value, or substitute generic software and AI language for the deliverable."
     } else if brand == "gnk" {
         "GNK COMMERCIAL DISCOVERY CONTRACT: Multi-touch copy requires a specific recurring decision, believable consequence, mechanism evidence, and recipient close to the work. T1 names the problem, explains one concrete GnK contribution, and offers a short conversation with an email alternative. Follow-ups add evidence, consequence, a bounded test, or a useful route."
     } else if brand == "wapahki" && touches == 1 {
-        "WAPAHKI PRECISE FIRST-TOUCH CONTRACT: Research must carry an exact facility id, physical-task claim, economic-consequence claim, and person-to-facility evidence id. T1 is 75–110 words with one evidence-bounded hypothesis, Andrew's University of Toronto and Automata context, one concrete Wapahki contribution, and exactly one question. Offer to apply Wapahki's completed one-page automation-fit screen to this exact task and return a first-pass result. Never ask for a call or meeting, stack an email fallback, or ask the recipient to find or prioritize a use case. Earn a conversation from the reply."
+        "WAPAHKI PRECISE FIRST-TOUCH CONTRACT: Research must support one exact public facility task, an operating consequence, and verified company employment. A person-specific facility link permits an owner question; a verified adjacent operations contact permits only a routing question and must not be described as the owner or as working at that facility. T1 is 45–95 words and chooses one natural mode: a completed public-evidence observation, one seconds-to-answer operating question, or one routing question. University of Toronto, Automata, Wapahki, the word hypothesis, and the fit screen are optional. Mention a screen only when an account-specific completed result is persisted. Never ask for a call or meeting, ask permission to begin analysis, or ask the recipient to find a use case."
     } else if brand == "wapahki" {
-        "WAPAHKI EVIDENCE-LED CADENCE CONTRACT: Multi-touch copy is allowed only for an action-ready opportunity with an exact facility, a source-supported physical task, an operating-consequence claim, and a person linked to that facility. T1 gives Andrew's University of Toronto and Automata context, names one concrete Wapahki contribution, and asks one answerable question. Follow-ups advance the same task with distinct sourced evidence, a completed fit-screen finding, an objection answer, or a useful close; never stretch one premise into repeated check-ins or ask the recipient to find an automation use case."
+        "WAPAHKI COLD CADENCE HOLD: Wapahki permits one cold email only. A reply or newly persisted evidence must create a separately reviewed next step; silence never authorizes follow-up copy."
     } else if brand == "outagehub" && touches == 2 {
-        "OUTAGEHUB TWO-EMAIL EVIDENCE CONTRACT: This cadence is for distributed Canadian operators with one exact outage-time decision, a nearby operations recipient, and a completed location-specific historical utility match. T1 explains OutageHub's location-matched Canadian utility API, frames one evidence-safe consequence, and offers a natural short conversation or email path. T2 contributes the verified location and timestamp without claiming private site or asset status. Do not prescribe a universal dark-site/equipment-ticket binary."
+        "OUTAGEHUB TWO-EMAIL EVIDENCE CONTRACT: This cadence is for distributed Canadian operators with one exact outage-time decision, a nearby operations recipient, and a completed location-specific historical utility match. T1 leads with the exact verified location, utility, and timestamp result plus its public-evidence boundary. T2 may add a distinct implementation detail or correction path; it must not hold back or repeat the only useful fact. Do not prescribe a universal dark-site/equipment-ticket binary."
     } else if brand == "outagehub" && touches == 1 {
-        "OUTAGEHUB PRECISE FIRST-TOUCH CONTRACT: Target an operator with distributed Canadian locations and one evidenced outage-time diagnosis, dispatch, escalation, continuity, prioritization, or communication decision. T1 names the account-specific decision and explains in plain language that OutageHub supplies location-matched Canadian utility reports through an API. Honor the supplied copy decision state: discovery-ready copy asks for one direct operating answer by email and stops; action-ready copy may offer a short conversation with an email alternative. A completed historical match may be mentioned only with its full date including year or exact timestamp and its outside-context boundary; it is not required for this first discovery touch. Never make a historical match sound current, claim private site status, or reuse a universal dark-site/ticket binary."
+        "OUTAGEHUB PRECISE FIRST-TOUCH CONTRACT: Target an operator with distributed Canadian locations and one evidenced outage-time diagnosis, dispatch, escalation, continuity, prioritization, or communication decision. A proof-ready T1 leads with the exact completed historical result. A discovery-ready T1 offers a specific location comparison or sample API response the system can actually produce and asks one direct operating question by email. Anything weaker is held. Never make a historical match sound current, claim private site status, or reuse a universal dark-site/ticket binary."
     } else if brand == "outagehub" {
         "OUTAGEHUB MATCHED-EVIDENCE CONTRACT: Multi-touch outreach is allowed only after an exact outage-time decision, its role owner, and a completed verified-address historical match are established. T1 explains OutageHub's location-matched Canadian utility API and the account-specific decision. Every later step must add a distinct sourced angle, historical result, implementation boundary, objection answer, or useful close; hold rather than stretch one premise into repeated check-ins."
     } else {
@@ -2095,16 +3107,104 @@ async fn review_person_copy(
             "copy lineage does not match the selected sales opportunity, task, and evidence claims"
         ));
     }
-    let mut sequence = CopySequence {
-        touches: raw.touches,
-        applied_principles: normalize_principle_ids(&raw.applied_principles, &allowed_principles),
-    };
-    bind_outagehub_historical_result(pb, gtm_context, &mut sequence, n)?;
     let copy_lineage = CopyLineage {
         sales_opportunity_id: raw.sales_opportunity_id.clone(),
         task_key: raw.task_key.clone(),
         evidence_claim_ids: raw.evidence_claim_ids.clone(),
     };
+    if n == 1 {
+        let brief = build_sendable_brief(&pb.key, context, person)
+            .map_err(|reason| anyhow!("pre-writer brief no longer passes: {reason}"))?;
+        person_progress("validating three unchanged candidates");
+        let candidate_issues = candidate_batch_issues(
+            pb,
+            shared,
+            account,
+            &copy_contact(person),
+            &raw.candidates,
+            &brief,
+            gtm_context,
+        );
+        if !candidate_issues.is_empty() {
+            return Err(anyhow!(
+                "candidate validation held the batch: {}",
+                candidate_issues.join("; ")
+            ));
+        }
+        db.replace_message_candidate_audit(
+            sequence_id,
+            &raw.candidates
+                .iter()
+                .map(|candidate| MessageCandidateAudit {
+                    sequence_id: sequence_id.to_string(),
+                    candidate_id: candidate.id.clone(),
+                    mode: candidate.mode.key().into(),
+                    channel: candidate.channel.clone(),
+                    subject: candidate.subject.clone(),
+                    body: candidate.body.clone(),
+                    evidence_claim_ids: candidate.evidence_claim_ids.clone(),
+                    intended_response: candidate.intended_response.clone(),
+                    recipient_value: candidate.recipient_value.clone(),
+                    contribution_status: candidate.contribution_status.key().into(),
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>(),
+        )?;
+        person_progress("running two blind inbox selections");
+        let (selected, reviews) =
+            select_unchanged_candidate(client, pb, person, &raw.candidates).await?;
+        db.mark_selected_message_candidate(
+            sequence_id,
+            &selected.id,
+            reviews
+                .first()
+                .map(|review| review.score as i64)
+                .unwrap_or(0),
+        )?;
+        let mut sequence = candidate_sequence(&selected);
+        sequence.applied_principles =
+            normalize_principle_ids(&raw.applied_principles, &allowed_principles);
+        if let Some(plan) = plan {
+            sequence
+                .applied_principles
+                .extend(plan.applied_principles.iter().cloned());
+            sequence.applied_principles.sort();
+            sequence.applied_principles.dedup();
+        }
+        person_progress("running final unchanged-copy gate");
+        let issues = account_sequence_quality_issues(
+            pb,
+            shared,
+            account,
+            &sequence,
+            &reviews,
+            1,
+            true,
+            gtm_context,
+        );
+        if !issues.is_empty() {
+            return Err(anyhow!(
+                "selected candidate failed the final unchanged-copy gate: {}",
+                issues.join("; ")
+            ));
+        }
+        checkpoint_sequence_copy(db, sequence_id, pb, lead, person, &sequence, &reviews)?;
+        person_progress("unchanged copy accepted");
+        return Ok(ReviewedCopy {
+            sequence,
+            reviews,
+            message_mode: selected.mode.key().into(),
+            offer_type: selected.contribution_status.key().into(),
+            value_offered: selected.recipient_value,
+            evidence_strength: i64::from(brief.personalization_strength),
+        });
+    }
+
+    let mut sequence = CopySequence {
+        touches: raw.touches,
+        applied_principles: normalize_principle_ids(&raw.applied_principles, &allowed_principles),
+    };
+    bind_outagehub_historical_result(pb, gtm_context, &mut sequence, n)?;
     // Principles are lineage, not a quota. Forcing at least one citation made
     // the model visibly inject frameworks even when plain account evidence was
     // the stronger basis for the email. Keep only IDs it says materially
@@ -2201,7 +3301,14 @@ async fn review_person_copy(
     }
     checkpoint_sequence_copy(db, sequence_id, pb, lead, person, &sequence, &reviews)?;
     person_progress("copy accepted");
-    Ok(ReviewedCopy { sequence, reviews })
+    Ok(ReviewedCopy {
+        sequence,
+        reviews,
+        message_mode: String::new(),
+        offer_type: String::new(),
+        value_offered: String::new(),
+        evidence_strength: 0,
+    })
 }
 
 /// The ten-lens council is useful as an explicit audit, not as a production
@@ -4330,6 +5437,17 @@ fn gnk_names_operating_consequence(body: &str) -> bool {
         "reviewer capacity",
         "revenue leakage",
         "cash leakage",
+        "filing risk",
+        "submission risk",
+        "missing evidence",
+        "incomplete evidence",
+        "contradictory record",
+        "delayed decision",
+        "claim deduction",
+        "dispute deadline",
+        "project delay",
+        "change order",
+        "abandoned dispute",
     ];
     let quantified = body.split_whitespace().any(|word| {
         word.chars().any(|character| character.is_ascii_digit())
@@ -4384,6 +5502,289 @@ fn has_natural_response_path(body: &str) -> bool {
         && ["send", "share"].iter().any(|marker| body.contains(marker))
         && body.contains('?');
     exact_path || email_path || conversation_path || useful_asset_path
+}
+
+fn recipient_value_issues(
+    pb: &Playbook,
+    sequence: &CopySequence,
+    context: Option<&GtmActionContext>,
+) -> Vec<String> {
+    let Some(first) = sequence.touches.iter().find(|touch| touch.stage == 1) else {
+        return Vec::new();
+    };
+    let body = first.body.to_ascii_lowercase();
+    let mut issues = Vec::new();
+    if matches!(
+        pb.key.to_ascii_lowercase().as_str(),
+        "gnk" | "wapahki" | "outagehub"
+    ) {
+        match context.and_then(|context| context.sales_brief.as_ref()) {
+            Some(brief) => {
+                for issue in brief.gate_issues() {
+                    issues.push(format!("no_documented_consent_or_sales_basis: {issue}"));
+                }
+            }
+            None => issues.push(
+                "no_documented_consent_or_sales_basis: no approved prospect sales brief is attached"
+                    .into(),
+            ),
+        }
+        match context.and_then(|context| context.acquisition_context.as_ref()) {
+            Some(acquisition) => {
+                for issue in acquisition.gate_issues() {
+                    issues.push(format!("invalid_acquisition_context: {issue}"));
+                }
+            }
+            None => issues.push(
+                "invalid_acquisition_context: no approved email/LinkedIn source context is attached"
+                    .into(),
+            ),
+        }
+    }
+    if asks_for_call_or_meeting(&first.body)
+        && !context.is_some_and(|context| context.engaged)
+        && !acquisition_allows_synchronous_first_contact(context)
+    {
+        issues.push(
+            "meeting_request_before_interest: a cold first touch must earn a small reply before requesting synchronous time"
+                .into(),
+        );
+    }
+    let after_greeting = first
+        .body
+        .lines()
+        .skip_while(|line| line.trim().is_empty() || line.trim_start().starts_with("Hi "))
+        .take(2)
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    if (after_greeting.starts_with("i'm building")
+        || after_greeting.starts_with("i am building")
+        || after_greeting.starts_with("gnk ")
+        || after_greeting.starts_with("wapahki ")
+        || after_greeting.starts_with("outagehub "))
+        && ["api", "software", "ai", "robot", "platform", "build"]
+            .iter()
+            .any(|term| after_greeting.contains(term))
+    {
+        issues.push(
+            "product_first_introduction: lead with the recipient's verified decision or task, not the product"
+                .into(),
+        );
+    }
+    if [
+        "would help me",
+        "would help us",
+        "an answer would help",
+        "your perspective would be useful",
+        "would love to learn",
+        "trying to understand",
+        "i'm exploring",
+        "i am exploring",
+        "compare notes",
+        "would value your perspective",
+    ]
+    .iter()
+    .any(|phrase| body.contains(phrase))
+    {
+        issues.push(
+            "sender_benefit_without_recipient_benefit: the email asks the recipient to advance Andrew's research"
+                .into(),
+        );
+    }
+    let has_specific_location = [
+        "ontario",
+        "quebec",
+        "alberta",
+        "british columbia",
+        "manitoba",
+        "saskatchewan",
+        "nova scotia",
+        "new brunswick",
+        "newfoundland",
+        "prince edward island",
+        "yukon",
+        "nunavut",
+        "northwest territories",
+        "facility at",
+        "site at",
+        "located at",
+    ]
+    .iter()
+    .any(|marker| body.contains(marker));
+    if [
+        "operates charging sites",
+        "operates cold-storage facilities",
+        "operates cold storage facilities",
+        "is a charging network",
+        "is a cold-storage company",
+        "is a logistics company",
+    ]
+    .iter()
+    .any(|summary| body.contains(summary))
+        && !has_specific_location
+    {
+        issues.push(
+            "generic_company_summary: a company category or homepage restatement is not a commercial reason for this email"
+                .into(),
+        );
+    }
+    if [
+        "without claiming",
+        "not claiming what happened",
+        "does not claim what happened",
+        "without assuming what happened",
+    ]
+    .iter()
+    .any(|phrase| body.contains(phrase))
+    {
+        issues.push(
+            "defensive_boundary_dominates_message: keep the evidence boundary in the brief, not as buyer-facing caveat prose"
+                .into(),
+        );
+    }
+    if [
+        "decision trail",
+        "external context",
+        "operational distinction",
+        "review-ready",
+        "workflow surface",
+        "working hypothesis",
+        "my hypothesis",
+        "first-pass result",
+        "intervention frequency",
+        "changeover stability",
+        "applied the fit screen to the public evidence",
+    ]
+    .iter()
+    .any(|phrase| body.contains(phrase))
+    {
+        issues.push(
+            "research_request_disguised_as_outreach: internal framework language makes the recipient decode the research process"
+                .into(),
+        );
+    }
+
+    if pb.key.eq_ignore_ascii_case("gnk") {
+        let examines = [
+            "examine",
+            "review",
+            "reconstruct",
+            "take a small set",
+            "build",
+            "produce",
+            "show where",
+        ]
+        .iter()
+        .any(|marker| body.contains(marker));
+        let output = [
+            "cited",
+            "timeline",
+            "chronology",
+            "exception queue",
+            "missing",
+            "contradictory",
+            "pre-filing view",
+            "comparison",
+        ]
+        .iter()
+        .any(|marker| body.contains(marker));
+        if !examines || !output {
+            issues.push(
+                "no_concrete_deliverable: GnK T1 must say what it examines and the concrete decision artifact it returns"
+                    .into(),
+            );
+        }
+    }
+
+    if pb.key.eq_ignore_ascii_case("outagehub") {
+        let useful_offer = [
+            "historical comparison",
+            "sample api response",
+            "what the api would have returned",
+            "one-page replay",
+            "location-specific historical",
+        ]
+        .iter()
+        .any(|marker| body.contains(marker))
+            && [
+                "i can send",
+                "i can produce",
+                "i can prepare",
+                "i can share",
+                "i matched",
+            ]
+            .iter()
+            .any(|verb| body.contains(verb));
+        let easy_correction = [
+            "or is that handled elsewhere",
+            "or does someone else own",
+            "who owns that check",
+            "is that owned by",
+        ]
+        .iter()
+        .any(|marker| body.contains(marker));
+        if !names_historical_outage_result(&first.body) && !useful_offer && !easy_correction {
+            issues.push(
+                "feature_description_without_useful_output: OutageHub T1 needs a completed result, a specific producible comparison/API sample, or a one-line correction path"
+                    .into(),
+            );
+        }
+    }
+
+    if pb.key.eq_ignore_ascii_case("wapahki")
+        && (body.contains("fit screen") || body.contains("one-page screen"))
+    {
+        let completed = context.is_some_and(|context| {
+            context.evidence_claims.iter().any(|claim| {
+                claim.claim_type == "account.completed_fit_screen_result"
+                    && matches!(claim.status.as_str(), "observed" | "verified")
+            }) || context.observations.iter().any(|observation| {
+                observation.definition_key == "account.completed_fit_screen_result"
+                    && matches!(observation.status.as_str(), "observed" | "verified")
+            })
+        });
+        if !completed {
+            issues.push(
+                "unprepared_collateral: a Wapahki screen may appear only after an account-specific completed result is persisted"
+                    .into(),
+            );
+        }
+    }
+    issues
+}
+
+fn acquisition_allows_synchronous_first_contact(context: Option<&GtmActionContext>) -> bool {
+    let Some(acquisition) = context.and_then(|context| context.acquisition_context.as_ref()) else {
+        return false;
+    };
+    match acquisition.lead_source {
+        crate::db::LeadSource::Conference => {
+            acquisition.source_phase == "pre_event"
+                || (acquisition.source_phase == "post_event"
+                    && names_synchronous_step(&acquisition.agreed_next_action))
+        }
+        crate::db::LeadSource::Referral
+        | crate::db::LeadSource::Partner
+        | crate::db::LeadSource::ExistingCustomer => {
+            names_synchronous_step(&acquisition.agreed_next_action)
+        }
+        crate::db::LeadSource::ColdEmail | crate::db::LeadSource::Webinar => false,
+    }
+}
+
+fn names_synchronous_step(value: &str) -> bool {
+    let value = value.to_ascii_lowercase();
+    ["meet", "meeting", "call", "conversation", "demo"]
+        .iter()
+        .any(|term| value.contains(term))
+}
+
+/// A Wapahki opener is deliberately allowed to end with one plain operating
+/// question. Requiring an extra "reply by email" sentence made the CTA sound
+/// templated and added no real response path.
+fn has_wapahki_response_path(body: &str) -> bool {
+    body.matches('?').count() == 1 && !asks_for_call_or_meeting(body)
 }
 
 fn asks_recipient_to_find_wapahki_task(body: &str) -> bool {
@@ -4480,18 +5881,6 @@ fn asks_for_call_or_meeting(body: &str) -> bool {
         .split(|character: char| !character.is_ascii_alphanumeric())
         .any(|word| word == "call");
     explicit || generic_call
-}
-
-fn starts_with_greeting_prefix(body: &str) -> bool {
-    let first = body
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase();
-    ["hi ", "hello ", "hey "]
-        .iter()
-        .any(|prefix| first.starts_with(prefix))
 }
 
 fn mentions_outreach_asset(body: &str) -> bool {
@@ -4612,29 +6001,40 @@ fn historical_sentence_candidate(sentence: &str) -> bool {
 }
 
 /// Replace any model-authored historical wording with the exact sentence
-/// rendered from the active evidence tuple. The model still controls the
-/// surrounding explanation and CTA, but never the address, utility, timestamp,
-/// or interpretation boundary.
+/// rendered from the active evidence tuple. The strongest evidence belongs in
+/// T1; holding it for a follow-up makes the opener less useful.
 fn bind_outagehub_historical_result(
     pb: &Playbook,
     context: Option<&GtmActionContext>,
     sequence: &mut CopySequence,
     expected_touches: usize,
 ) -> Result<()> {
-    if !pb.key.eq_ignore_ascii_case("outagehub") || !matches!(expected_touches, 2 | 4) {
+    if !pb.key.eq_ignore_ascii_case("outagehub") || !matches!(expected_touches, 1 | 2 | 4) {
         return Ok(());
     }
-    let context = context.ok_or_else(|| {
-        anyhow!("OutageHub historical copy has no active sales-opportunity evidence context")
-    })?;
-    let historical = active_historical_evidence_tuple(context).ok_or_else(|| anyhow!(
-        "OutageHub historical copy requires one canonical active location/utility/timestamp evidence tuple"
-    ))?;
+    let Some(context) = context else {
+        return if expected_touches == 1 {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "OutageHub historical copy has no active sales-opportunity evidence context"
+            ))
+        };
+    };
+    let Some(historical) = active_historical_evidence_tuple(context) else {
+        return if expected_touches == 1 {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "OutageHub historical copy requires one canonical active location/utility/timestamp evidence tuple"
+            ))
+        };
+    };
     let touch = sequence
         .touches
         .iter_mut()
-        .find(|touch| touch.stage == 2)
-        .ok_or_else(|| anyhow!("OutageHub historical copy has no stage 2"))?;
+        .find(|touch| touch.stage == 1)
+        .ok_or_else(|| anyhow!("OutageHub historical copy has no stage 1"))?;
     let signature = pb.signature.trim();
     let mut retained = Vec::new();
     for paragraph in touch.body.split("\n\n") {
@@ -4656,6 +6056,27 @@ fn bind_outagehub_historical_result(
     retained.push(historical.buyer_facing_sentence());
     retained.push(signature.to_string());
     touch.body = retained.join("\n\n");
+    for later in sequence.touches.iter_mut().filter(|touch| touch.stage != 1) {
+        let mut retained = Vec::new();
+        for paragraph in later.body.split("\n\n") {
+            let paragraph = paragraph.trim();
+            if paragraph.is_empty() || paragraph == signature {
+                continue;
+            }
+            let sentences = paragraph
+                .split_inclusive(['.', '?', '!'])
+                .filter(|sentence| !historical_sentence_candidate(sentence))
+                .map(str::trim)
+                .filter(|sentence| !sentence.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if !sentences.is_empty() {
+                retained.push(sentences);
+            }
+        }
+        retained.push(signature.to_string());
+        later.body = retained.join("\n\n");
+    }
     Ok(())
 }
 
@@ -4665,23 +6086,26 @@ fn outagehub_historical_binding_issues(
     sequence: &CopySequence,
     expected_touches: usize,
 ) -> Vec<String> {
-    if !pb.key.eq_ignore_ascii_case("outagehub") || !matches!(expected_touches, 2 | 4) {
+    if !pb.key.eq_ignore_ascii_case("outagehub") || !matches!(expected_touches, 1 | 2 | 4) {
         return Vec::new();
     }
     let Some(historical) = context.and_then(active_historical_evidence_tuple) else {
+        if expected_touches == 1 {
+            return Vec::new();
+        }
         return vec![
-            "OutageHub stage 2 has no canonical active location/utility/timestamp evidence tuple; refresh historical research before drafting"
+            "OutageHub T1 has no canonical active location/utility/timestamp evidence tuple; refresh historical research before drafting"
                 .into(),
         ];
     };
     let expected = historical.buyer_facing_sentence();
-    match sequence.touches.iter().find(|touch| touch.stage == 2) {
+    match sequence.touches.iter().find(|touch| touch.stage == 1) {
         Some(touch) if touch.body.contains(&expected) => Vec::new(),
         Some(_) => vec![
-            "OutageHub stage 2 does not contain the exact address, utility, timestamp, and boundary rendered from its active evidence claim"
+            "OutageHub T1 does not contain the exact address, utility, timestamp, and boundary rendered from its active evidence claim"
                 .into(),
         ],
-        None => vec!["OutageHub historical sequence has no stage 2".into()],
+        None => vec!["OutageHub historical sequence has no stage 1".into()],
     }
 }
 
@@ -5331,6 +6755,7 @@ pub(crate) fn account_sequence_quality_issues(
 ) -> Vec<String> {
     let mut issues =
         sequence_quality_issues(pb, shared, sequence, reviews, expected_touches, critique);
+    issues.extend(recipient_value_issues(pb, sequence, gtm_context));
     if gtm_context.is_some_and(|context| context.state == "discovery_ready") {
         for touch in &sequence.touches {
             let question_count = touch.body.matches('?').count();
@@ -5339,9 +6764,22 @@ pub(crate) fn account_sequence_quality_issues(
                     "discovery-ready stage 1 must ask exactly one decision-sized question by email; found {question_count} question marks"
                 ));
             }
-            if touch.stage == 1 && asks_for_call_or_meeting(&touch.body) {
+            if touch.stage == 1
+                && asks_for_call_or_meeting(&touch.body)
+                && !acquisition_allows_synchronous_first_contact(gtm_context)
+            {
                 issues.push(
                     "discovery-ready stage 1 must request an email answer only and must not ask for a call, meeting, demo, chat, calendar slot, or synchronous conversation"
+                        .into(),
+                );
+            }
+        }
+    }
+    if pb.key == "wapahki" && !acquisition_allows_synchronous_first_contact(gtm_context) {
+        for touch in &sequence.touches {
+            if touch.stage == 1 && asks_for_call_or_meeting(&touch.body) {
+                issues.push(
+                    "Wapahki cold stage 1 must not ask for a call or meeting; earn that step from the reply"
                         .into(),
                 );
             }
@@ -5405,7 +6843,7 @@ pub(crate) fn account_sequence_quality_issues(
 /// pilot audit. This converts database rows back into the exact domain objects
 /// used at generation time; it does not trust a historical `review_passes`
 /// flag as a substitute for current policy or evidence.
-pub(crate) fn audit_persisted_outagehub_sequence(
+pub(crate) fn audit_persisted_sequence(
     pb: &Playbook,
     shared: &Shared,
     lead: &crate::db::Lead,
@@ -5606,15 +7044,6 @@ pub(crate) fn sequence_quality_issues(
             });
         }
         if pb.key == "gnk" && touch.stage == 1 {
-            let body = touch.body.to_ascii_lowercase();
-            if !body.contains("gnk")
-                || !(body.contains("software") || body.contains("system") || body.contains("tool"))
-            {
-                issues.push(
-                    "GnK stage 1 must name GnK and one concrete software/system contribution"
-                        .into(),
-                );
-            }
             if !gnk_names_operating_consequence(&touch.body) {
                 issues.push(
                     "GnK stage 1 must connect the recurring decision to a believable operating or economic consequence"
@@ -5632,22 +7061,9 @@ pub(crate) fn sequence_quality_issues(
             }
         }
         if pb.key == "wapahki" && touch.stage == 1 {
-            let body = touch.body.to_ascii_lowercase();
-            if starts_with_greeting_prefix(&touch.body) {
-                issues.push(
-                    "Wapahki stage 1 starts with a greeting prefix; begin with the recipient's first name only"
-                        .into(),
-                );
-            }
             if question_count != 1 {
                 issues.push(
                     "Wapahki stage 1 must contain exactly one question and one response path"
-                        .into(),
-                );
-            }
-            if asks_for_call_or_meeting(&touch.body) {
-                issues.push(
-                    "Wapahki stage 1 must not ask for a call or meeting; earn that step from the reply"
                         .into(),
                 );
             }
@@ -5657,29 +7073,13 @@ pub(crate) fn sequence_quality_issues(
                         .into(),
                 );
             }
-            let has_university_context = body.contains("university of toronto")
-                || body.contains("u of t")
-                || body.contains("uoft");
-            if !has_university_context || !body.contains("automata") {
-                issues.push(
-                    "Wapahki stage 1 must briefly give Andrew's University of Toronto and Automata robotics context"
-                        .into(),
-                );
-            }
-            if !(body.contains("wapahki") || body.contains("robotic") || body.contains("robotics"))
-            {
-                issues.push(
-                    "Wapahki stage 1 must state one honest robotics contribution rather than only ask for research"
-                        .into(),
-                );
-            }
             if !wapahki_names_operating_consequence(&touch.body) {
                 issues.push(
                     "Wapahki stage 1 names no operating consequence; connect the candidate task to staffing, throughput, stoppage, utilization, economics, safety, or sanitation"
                         .into(),
                 );
             }
-            if !has_natural_response_path(&touch.body) {
+            if !has_wapahki_response_path(&touch.body) {
                 issues.push(
                     "Wapahki stage 1 must offer one natural role-matched response path".into(),
                 );
@@ -5850,14 +7250,17 @@ pub(crate) fn sequence_quality_issues(
         }) {
             issues.push("OutageHub stage 1 must name its utility-location contribution".into());
         }
-        if matches!(expected_touches, 2 | 4) {
-            let second = sequence.touches.iter().find(|touch| touch.stage == 2);
-            if second.is_some_and(|touch| !names_historical_outage_result(&touch.body)) {
-                issues.push(
-                    "OutageHub stage 2 must contribute a real location-specific historical result; hold the sequence when no verified example exists"
+        if matches!(expected_touches, 2 | 4)
+            && sequence
+                .touches
+                .iter()
+                .filter(|touch| touch.stage != 1)
+                .any(|touch| names_historical_outage_result(&touch.body))
+        {
+            issues.push(
+                    "OutageHub follow-up repeats the historical proof that must lead T1; later touches need a distinct useful angle"
                         .into(),
                 );
-            }
         } else if first.is_some_and(|touch| {
             mentions_historical_outage_result(&touch.body)
                 && !names_historical_outage_result(&touch.body)
@@ -6292,6 +7695,30 @@ fn touch_schema(n: usize) -> Value {
     })
 }
 
+fn candidate_schema(n: usize) -> Value {
+    json!({
+        "type": "array",
+        "minItems": if n == 1 { 3 } else { 0 },
+        "maxItems": if n == 1 { 3 } else { 0 },
+        "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "mode", "channel", "subject", "body", "evidence_claim_ids", "intended_response", "recipient_value", "contribution_status"],
+            "properties": {
+                "id": { "type": "string", "description": "Stable candidate id unique within this recipient." },
+                "mode": { "type": "string", "enum": ["operating_question", "completed_teardown", "routing_question"] },
+                "channel": { "type": "string", "enum": ["email", "linkedin"] },
+                "subject": { "type": "string" },
+                "body": { "type": "string" },
+                "evidence_claim_ids": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+                "intended_response": { "type": "string", "description": "One natural reply this exact unchanged message is designed to earn." },
+                "recipient_value": { "type": "string", "description": "What the recipient gains before educating Andrew." },
+                "contribution_status": { "type": "string", "enum": ["none", "prepared_observation", "completed_public_evidence_screen"] }
+            }
+        }
+    })
+}
+
 fn batch_sequence_schema(n: usize, people: usize) -> Value {
     json!({
         "type": "object",
@@ -6305,7 +7732,7 @@ fn batch_sequence_schema(n: usize, people: usize) -> Value {
                 "items": {
                     "type": "object",
                     "additionalProperties": false,
-                    "required": ["person_key", "sales_opportunity_id", "task_key", "evidence_claim_ids", "send_decision", "decision_reason", "operating_decision", "mechanism_to_test", "hard_buyer_objection", "recipient_reply_reason", "value_exchange", "touches", "applied_principles"],
+                    "required": ["person_key", "sales_opportunity_id", "task_key", "evidence_claim_ids", "send_decision", "decision_reason", "operating_decision", "mechanism_to_test", "hard_buyer_objection", "recipient_reply_reason", "value_exchange", "touches", "candidates", "applied_principles"],
                     "properties": {
                         "person_key": { "type": "string" },
                         "sales_opportunity_id": { "type": "string", "description": "Exact sales opportunity id supplied in this recipient's copy_decision_context." },
@@ -6318,7 +7745,8 @@ fn batch_sequence_schema(n: usize, people: usize) -> Value {
                         "hard_buyer_objection": { "type": "string", "description": if n == 4 { "Private: the strongest credible reason this recipient would dismiss the premise; the final follow-up should address it honestly when that creates a useful reply path." } else { "Private: the strongest credible reason this recipient would dismiss the premise; touch 5 should answer it honestly." } },
                         "recipient_reply_reason": { "type": "string", "description": "Private: the recipient's self-interested reason to reply, not Andrew's desire for research." },
                         "value_exchange": { "type": "string", "description": "Private: exact seller give-back explicitly supplied or permitted in verified context, including a tailored item Andrew is allowed to prepare; otherwise empty. Never invent prior analysis or collateral." },
-                        "touches": touch_schema(n),
+                        "touches": touch_schema(if n == 1 { 0 } else { n }),
+                        "candidates": candidate_schema(n),
                         "applied_principles": { "type": "array", "items": { "type": "string" } }
                     }
                 }
@@ -6428,7 +7856,7 @@ mod tests {
     };
 
     #[test]
-    fn seven_touch_requests_are_no_longer_collapsed_to_four() {
+    fn brand_touch_requests_are_normalized_to_their_policy_ceiling() {
         assert_eq!(supported_touch_count(7), 7);
         assert_eq!(supported_touch_count(9), 7);
         assert_eq!(supported_touch_count(4), 4);
@@ -6436,9 +7864,11 @@ mod tests {
         assert_eq!(supported_touch_count(1), 1);
         assert_eq!(supported_touch_count_for_brand("outagehub", 1), 1);
         assert_eq!(supported_touch_count_for_brand("outagehub", 7), 1);
+        assert_eq!(supported_touch_count_for_brand("gnk", 1), 1);
+        assert_eq!(supported_touch_count_for_brand("gnk", 7), 1);
         assert_eq!(supported_touch_count_for_brand("wapahki", 1), 1);
-        assert_eq!(supported_touch_count_for_brand("wapahki", 2), 2);
-        assert_eq!(supported_touch_count_for_brand("wapahki", 7), 7);
+        assert_eq!(supported_touch_count_for_brand("wapahki", 2), 1);
+        assert_eq!(supported_touch_count_for_brand("wapahki", 7), 1);
     }
     use crate::business::Businesses;
     use crate::db::{
@@ -6453,15 +7883,15 @@ mod tests {
         let contract = brand_trigger_contract("outagehub", 2);
         assert!(contract.contains("distributed Canadian operators"));
         assert!(contract.contains("completed location-specific historical utility match"));
-        assert!(contract.contains("T2 contributes the verified location and timestamp"));
-        assert!(contract.contains("OutageHub's location-matched Canadian utility API"));
+        assert!(contract.contains("T1 leads with the exact verified location"));
+        assert!(contract.contains("must not hold back"));
         let gnk = brand_trigger_contract("gnk", 4);
         assert!(gnk.contains("specific recurring decision"));
         assert!(gnk.contains("concrete GnK contribution"));
         assert!(gnk.contains("email alternative"));
         let wapahki = brand_trigger_contract("wapahki", 1);
-        assert!(wapahki.contains("facility id"));
-        assert!(wapahki.contains("75–110 words"));
+        assert!(wapahki.contains("exact public facility task"));
+        assert!(wapahki.contains("45–95 words"));
         assert!(wapahki.contains("Never ask for a call or meeting"));
     }
 
@@ -6651,7 +8081,7 @@ mod tests {
     }
 
     #[test]
-    fn outagehub_t2_is_rendered_from_and_exactly_bound_to_active_evidence() {
+    fn outagehub_t1_is_rendered_from_and_exactly_bound_to_active_evidence() {
         let playbooks = Playbooks::load("playbooks").expect("load playbooks");
         let pb = playbooks.get("outagehub").expect("outagehub playbook");
         let evidence = "Completed historical geospatial result: the verified warehouse at 41 Rail Side Rd, Brampton, Ontario fell inside Alectra Utilities's reported utility outage area beginning 2026-01-18T02:14:00+00:00. This is outside utility context only, not evidence of private site or asset status or cause.";
@@ -6692,14 +8122,14 @@ mod tests {
         };
         bind_outagehub_historical_result(pb, Some(&context), &mut sequence, 2)
             .expect("bind historical result");
-        let body = &sequence.touches[1].body;
+        let body = &sequence.touches[0].body;
         assert!(body.contains("41 Rail Side Rd, Brampton, Ontario"));
         assert!(body.contains("Alectra Utilities"));
         assert!(body.contains("2026-01-18T02:14:00+00:00"));
-        assert!(!body.contains("Calgary"));
+        assert!(!sequence.touches[1].body.contains("Calgary"));
         assert!(outagehub_historical_binding_issues(pb, Some(&context), &sequence, 2).is_empty());
 
-        sequence.touches[1].body = body.replace("Alectra Utilities", "Hydro One");
+        sequence.touches[0].body = body.replace("Alectra Utilities", "Hydro One");
         assert!(
             outagehub_historical_binding_issues(pb, Some(&context), &sequence, 2)
                 .iter()
@@ -7153,7 +8583,7 @@ mod tests {
         let playbooks = Playbooks::load("playbooks").expect("load playbooks");
         let pb = playbooks.get("gnk").expect("gnk playbook");
         for (stage, expected) in [
-            (1, (75, 130)),
+            (1, (60, 110)),
             (2, (35, 145)),
             (4, (35, 120)),
             (6, (25, 80)),
@@ -8131,6 +9561,135 @@ mod tests {
     }
 
     #[test]
+    fn wapahki_known_good_hi_greeting_passes_the_full_linter() {
+        let playbooks = Playbooks::load("playbooks").expect("load playbooks");
+        let pb = playbooks.get("wapahki").expect("wapahki playbook");
+        let account = CopyAccount {
+            name: "Example Foods".into(),
+            observed_facts: vec![
+                "The Guelph packing role names bottle-format changes and operator intervention."
+                    .into(),
+            ],
+            ..super::copy_account(&Lead::default())
+        };
+        let sequence = CopySequence {
+            touches: vec![CopyTouch {
+                stage: 1,
+                day_offset: 0,
+                channel: "email".into(),
+                subject: "Bottle format interruptions".into(),
+                body: "Hi Maya,\n\nThe packing role for your Guelph plant mentions bottle-format changes and operator intervention. That makes the useful question narrower than whether packing is repetitive: do interruptions happen mainly during changeovers, or throughout a run? If changeovers are the issue, Wapahki could rule out a flexible cell before asking anyone for production data.\n\nAndrew".into(),
+                purpose: "test the sourced task boundary".into(),
+                goal: "earn one operating answer".into(),
+            }],
+            applied_principles: Vec::new(),
+        };
+        let context = GtmActionContext {
+            opportunity: Some(SalesOpportunity {
+                id: "known-good-opportunity".into(),
+                task_key: "bottle-format-packing".into(),
+                ..Default::default()
+            }),
+            evidence_claims: vec![
+                crate::db::EvidenceClaim {
+                    id: "task-claim".into(),
+                    sales_opportunity_id: "known-good-opportunity".into(),
+                    brand: "wapahki".into(),
+                    task_key: "bottle-format-packing".into(),
+                    claim_type: "account.bounded_repetitive_task".into(),
+                    source_url: "https://example.com/packing-role".into(),
+                    source_excerpt: "The Guelph packing role names bottle-format changes and operator intervention.".into(),
+                    status: "verified".into(),
+                    ..Default::default()
+                },
+                crate::db::EvidenceClaim {
+                    id: "role-claim".into(),
+                    sales_opportunity_id: "known-good-opportunity".into(),
+                    brand: "wapahki".into(),
+                    task_key: "bottle-format-packing".into(),
+                    claim_type: "contact.workflow_vantage".into(),
+                    source_url: "https://example.com/contact".into(),
+                    source_excerpt: "The public profile places Maya in production operations.".into(),
+                    source_locator: "person:known-good-person".into(),
+                    status: "verified".into(),
+                    ..Default::default()
+                },
+            ],
+            sales_brief: Some(crate::db::SalesBrief {
+                brand: "wapahki".into(),
+                sales_opportunity_id: "known-good-opportunity".into(),
+                person_id: "known-good-person".into(),
+                brief_type: "wapahki_task".into(),
+                selected_play: "facility_task".into(),
+                account_decision: "send".into(),
+                why_company_could_buy: "A sourced packing task may support a bounded technical review.".into(),
+                commercial_potential: "A small task-feasibility screen could establish whether a paid proof is warranted.".into(),
+                opportunity_difficulty: "easy".into(),
+                confidence_level: "medium".into(),
+                operational_workflow: "Bottle-format packing at the Guelph facility.".into(),
+                expected_variation: "Bottle formats change between runs.".into(),
+                trigger: "A current packing role names bottle-format changes and operator intervention.".into(),
+                trigger_claim_id: "task-claim".into(),
+                current_workaround: "The public source does not establish the current workaround.".into(),
+                current_workaround_status: "unknown".into(),
+                consequence_hypothesis: "Intervention may make a bounded packing task worth screening.".into(),
+                recipient_relationship: "Production contact able to answer the sourced task question.".into(),
+                recipient_role_claim_id: "role-claim".into(),
+                concrete_contribution: "Rule out a flexible cell before requesting production data.".into(),
+                recipient_offer: "A bounded first-pass blocker view.".into(),
+                credibility_basis: "The contribution is limited to the sourced task and explicit unknowns.".into(),
+                required_customer_input: "Whether interruptions cluster around changeovers.".into(),
+                decision_improved: "Whether the task deserves a feasibility screen.".into(),
+                message_objective: "Earn one task-boundary answer.".into(),
+                expected_reply: "A correction about when interruptions occur.".into(),
+                smallest_ask: "Answer one operating question by email.".into(),
+                recommended_proof_asset: "Wapahki Task Brief".into(),
+                artifact_status: "producible".into(),
+                fact_claim_ids: vec!["task-claim".into(), "role-claim".into()],
+                uncertainties: vec!["The current intervention pattern is unknown.".into()],
+                technical_kill_conditions: vec!["The motion changes on nearly every cycle.".into()],
+                consent_basis: "conspicuous_publication".into(),
+                consent_evidence_url: "https://example.com/contact".into(),
+                consent_evidence_captured_at: "2026-08-14T10:00:00Z".into(),
+                no_solicitation_status: "absent".into(),
+                role_relevance: "The public role is relevant to the packing task.".into(),
+                compliance_review_status: "approved".into(),
+                compliance_reviewed_by: "test-reviewer".into(),
+                compliance_reviewed_at: "2026-08-14T10:05:00Z".into(),
+                status: "approved".into(),
+                ..Default::default()
+            }),
+            acquisition_context: Some(crate::db::AcquisitionContext {
+                brand: "wapahki".into(),
+                sales_opportunity_id: "known-good-opportunity".into(),
+                person_id: "known-good-person".into(),
+                lead_source: crate::db::LeadSource::ColdEmail,
+                source_phase: "prospecting".into(),
+                outreach_channel: "email".into(),
+                source_event: "Verified public task research selected this contact.".into(),
+                source_evidence_url: "https://example.com/contact".into(),
+                source_evidence_captured_at: "2026-08-14T10:00:00Z".into(),
+                lead_temperature: "cold".into(),
+                relationship_owner: "Andrew".into(),
+                status: "approved".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let issues = account_sequence_quality_issues(
+            pb,
+            &playbooks.shared,
+            &account,
+            &sequence,
+            &[],
+            1,
+            false,
+            Some(&context),
+        );
+        assert!(issues.is_empty(), "known-good copy failed: {issues:?}");
+    }
+
+    #[test]
     fn shared_gate_limits_questions_and_brand_repetition_for_outagehub() {
         let playbooks = Playbooks::load("playbooks").expect("load playbooks");
         let pb = playbooks.get("outagehub").expect("outagehub playbook");
@@ -8232,7 +9791,7 @@ mod tests {
         assert!(
             issues
                 .iter()
-                .any(|issue| issue.contains("historical result")),
+                .any(|issue| issue.contains("repeats collateral")),
             "issues were {issues:?}"
         );
     }

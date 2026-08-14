@@ -18,8 +18,8 @@ icp_note = "Cover organizations broadly wherever GnK could win a specific softwa
 
 # Word band for the email body. A first note should be complete, but short
 # enough that the operating event and question are obvious on one screen.
-min_words = 75
-max_words = 130
+min_words = 60
+max_words = 110
 
 # A high-value candidate should show more than one independent signal.
 # "They are hiring AI engineers" alone is NOT a sufficient thesis.
@@ -56,10 +56,11 @@ requirements = [
   "T1 uses one recognizable event, its decision, concrete source-safe artifacts, one believable consequence, one sharp guess, and one natural operating question.",
   "State only sourced facts. One uncertainty cue is enough; never stack caveats or apologize for the hypothesis.",
   "Use ordinary language about what someone pulls, compares, or rebuilds and what recovery, settlement, SLA, escalation, or senior capacity waits for it. Avoid internal labels.",
-  "Explain one concrete GnK contribution after the problem is clear, then offer a short conversation with an email answer as the easier alternative. Do not make a factual correction the only recipient value.",
+  "Explain one concrete GnK contribution after the expensive moment is clear, then ask one question answerable by email. Discovery-stage contacts never receive a call request.",
   "Match the ask to vantage: operators confirm the task, managers confirm recurrence or consequence, executives answer or route, and routers only identify the responsible role.",
-  "Name GnK once in T1 and explain its narrow, evidence-safe contribution after the operating scene is clear. Do not lead with the seller.",
+  "Name GnK only when it helps explain the concrete contribution. Never replace the deliverable with generic custom-software or AI capability language.",
   "Every follow-up adds a sourced example, consequence, bounded proof, adjacent question, or useful route. Never restate T1, explain it, retract it, or build escape hatches.",
+  "Cold planning produces T1 only. A human reply, buyer action, or new evidence may authorize a separately reviewed next touch; the absolute maximum is four touches and silence alone never authorizes T2.",
   "Never invent collateral, proof, ROI, named systems, or software limitations. If evidence cannot support the thread, hold the entire account.",
 ]
 
@@ -137,120 +138,68 @@ forbidden = [
 ]
 
 copy_doctrine = """
-A sendable GnK first email sounds like a founder who noticed one ugly operating
-moment and has a useful point of view about it. The recipient should think:
-"this person found the annoying thing we deal with," then be able to answer in
-five seconds. It must not sound like a careful internal hypothesis document
-translated into outreach.
+A sendable GnK first email sounds like one founder who noticed a recognizable
+expensive moment and arrived with a bounded contribution. It is generated from
+a validated SendableBrief, never from the old account hypothesis, mechanism,
+or a bag of unrelated company facts.
 
-Keep evidence readiness separate from cash-now, core, and strategic commercial
-lanes. A multi-touch sequence requires four
-foundations: a specific recurring decision, a believable consequence, an
-external trigger or direct mechanism, and a recipient genuinely close to the
-work. A one-email discovery-ready test may proceed when research supports the
-recurring decision OR direct mechanism and the recipient is close to it; the
-missing consequence must remain one clear question. Company category alone is
-research-required inventory and never supports generic copy.
+Cold planning produces T1 only. In 60–110 words it names one verified trigger,
+one expensive moment, and one concrete contribution. That contribution says
+what GnK can examine, what it will return, what decision the result improves,
+and how small the initial commitment is. Examples include reconstructing one
+completed case into a cited timeline, reviewing a small closed sample for
+missing support, or building a first exception queue from existing records.
+Generic custom-software or AI capability is not an offer.
 
-Build T1 in this order, expressed naturally rather than as a visible template:
-(1) one recognizable operating event, (2) the decision someone must make,
-(3) concrete source-safe artifacts or system categories that explain why the
-decision can be difficult, (4) one consequence such as settlement delay,
-leakage, audit exposure, missed recovery, SLA failure, or senior-reviewer
-capacity, (5) one sharp account-specific question, (6) one concrete sentence
-about how GnK could help without replacing expert judgment, and (7) a natural
-short-conversation ask with an email response as the easier path. Never reuse a
-universal decision-record question across accounts.
+The first email asks one question answerable by email. It never requests a call
+from a discovery-stage contact and never asks the recipient to educate GnK
+before receiving value. Router and adjacent contacts receive a routing
+question, not owner language.
 
-Mechanism creates specificity. Explain, without asserting it as account fact,
-which inputs, exceptions, approvals, handoffs, or system boundaries may prevent
-the recurring decision from being made quickly and consistently. Claims,
-project controls, logistics, manufacturing, and service operations should each
-produce different account-specific questions. State only sourced account
-details as facts. The mechanism remains a question until confirmed.
+Direct ownership requires a person-specific current source that explicitly
+connects this recipient to the same work. A title, account keywords, and
+account-level evidence may identify an adjacent person, but never a direct
+owner. If the role, expensive moment, consequence, deliverable, customer input,
+or improved decision cannot be supported, hold the account.
 
-One uncertainty cue is enough. "My guess is someone still has to do X manually"
-is honest and decisive. Do not surround it with "if this exists," "I do not
-know whether," "may," "could," "if not," or explanations that there may be
-nothing to build. That caution is understood and does not need to become the
-value proposition.
+Write three structurally different unchanged candidates: operating question,
+completed teardown, and routing question. A factual validator may reject them;
+the buyer-perspective reviewers select or hold. Reviewers never rewrite, merge,
+or expose the internal brief. Silence creates no automatic next touch.
 
-GnK appears once in T1, only after the operating scene is clear. One short sentence about building
-software for ugly cross-system work is enough. Do not name a system concept or
-explain that a human keeps judgment before the recipient confirms the pain. Do
-not manufacture a checklist, sketch, benchmark, or other collateral to give the
-sequence another thing to offer.
-
-The sequence is one unfolding investigation, not seven retreat notes. T1 makes
-the substantive case. T2 adds a sourced operating example or consequence; it
-does not explain what T1 really meant or offer "not an issue" as an escape.
-T3 gives a human reason to connect. T4 contributes a verified comparison,
-concrete distinction, or permitted work product. T5 addresses the strongest
-buyer objection without abandoning the premise. T6 routes once if needed. T7
-closes. Across all seven touches, no more than three may primarily ask for a
-correction, referral, or closure. Reject sequences built from repeated versions
-of "if this is already covered, I am wrong." Caution is an evidence rule, not
-the value proposition. If a later touch would have to apologize for or retract
-the premise, the account was not ready and the entire candidate must be held.
+An engaged account may progress through at most four conditional touches. Every
+touch after T1 binds a new evidence, artifact, buyer-action, routing, objection,
+or close record and receives exact-copy approval. Never prewrite four messages
+merely because the maximum exists.
 """
 
 doctrine = """
-GnK's motion: find a current, expensive, organization-specific information or
-software workflow that off-the-shelf products serve poorly, and propose ONE
-concrete system that improves a specific recurring decision.
+GnK finds a current, expensive, organization-specific information workflow and
+offers one small result that can improve a specific recurring decision. The
+offer is built before prose. Research may examine many accounts and hold most
+of them; no unique evidence plus no useful give-back means no email.
 
-Establish, across the email or sequence:
-  1. A concrete operating workflow (a recurring decision, delay, handoff,
-     exception, or investigation).
-  2. Public evidence or current signals that make the hypothesis plausible —
-     ideally MORE THAN ONE independent signal. "Hiring AI engineers" alone is
-     not a thesis.
-  3. Why the contacted role can observe or own it (their vantage, not title).
-  4. The MECHANISM producing time, risk, or rework — the specific inputs,
-     exceptions, approvals, coordination gaps, or system boundary supported by
-     this account's evidence.
-  5. ONE specific system GnK could build (see the concept examples).
-  6. What discovery must confirm.
-  7. A bounded next step (often: test against a small historical sample — but
-     never ask for that in the first email).
+A SendableBrief must bind account claim ids, one person-role claim, the exact
+opportunity, expensive moment, plausible consequence, deliverable, required
+customer input, improved decision, and expected reply. The writer receives
+only that boundary. Old hypotheses and unrelated research are excluded so they
+cannot leak into planning or review.
 
-Strong GnK opening logic (not a template): connect one verified account signal
-to one operating decision the recipient plausibly sees, frame the unverified
-workflow as a question, and explain GnK in one plain clause only if it helps the
-recipient understand why Andrew is asking.
+Useful first contributions are concrete: a cited timeline from one completed
+case, a small closed-sample review for missing or contradictory support, an
+exception queue from existing records, or a chronology around one delayed
+event. State only capabilities and artifacts GnK can actually produce. Keep
+expert judgment with the customer.
 
-Prioritize governed cash-now offers first, then core and strategic opportunities;
-do not erase the rest of the software-project market. Record any
-credible scale in magnitude_note (INTERNAL ONLY) and never invent or state a
-dollar figure to the buyer. The target is not generic "companies that could use
-AI"; each email still needs one concrete decision, coordination, reconciliation,
-or workflow-specific software wedge and the person nearest it.
+The final inbox judge sees only subject, body, recipient title, and GnK's public
+description. It scores recipient value, specificity, credibility, reply ease,
+and naturalness. Two independent reviewers must choose the same unchanged
+candidate; any disagreement holds the message. Andrew's exact-copy approval is
+the final gate and regeneration invalidates it.
 
-The funnel this outreach feeds: observed evidence -> falsifiable problem
-hypothesis -> the person closest to the workflow -> a sharp question earning
-confirmation / correction / routing -> discovery call -> quantify the economic
-problem (trigger -> inputs -> current process -> decision -> failure ->
-consequence) -> a NARROW paid pilot as the wedge (e.g. "give us 100 historical
-cases; we apply the proposed workflow to the historical inputs and compare its
-decision support with what actually happened") -> measurable value -> expansion into a
-recurring $40k+/month engagement across adjacent workflows. Outreach owns only the
-first few steps; write every touch to advance ONE rung, never to close the arc.
-
-Keep human judgment central: GnK organizes the relevant inputs, coordinates the
-exception workflow, or surfaces the likely pattern, while the expert decides
-what to do with it.
-
-SEQUENCE PROGRESSION. Do not copy a sample email or fill a fixed template.
-Touch one earns attention around a recognizable operating decision and a
-credible implication. Touch two adds a useful detail or simpler
-response path; it must not restate the first question in different words.
-The connection request supplies a channel-native reason to connect and never
-mentions a prior email. Never manufacture an asset to fill the sequence. A real
-supplied asset may be offered once and delivered once; otherwise a later touch
-should contribute a verified observation, a sharper distinction, or a simpler
-route. A narrow historical proof shape belongs only after the workflow is
-plausible. Use no more than three questions in
-the whole sequence. Route once if needed, then close without a question. Every
-line must be generated from this account's verified facts and this recipient's
-actual vantage.
+Learn from positive replies, correct referrals, meetings, and qualified task
+conversations by message mode, offer, segment, role, and evidence strength.
+Never optimize for opens or a model's preference score. Prospect sending stays
+disabled until 30 real messages exist, at least 24 are approved unchanged, and
+there are zero wrong recipients or vague research-interview emails.
 """

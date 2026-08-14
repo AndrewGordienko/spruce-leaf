@@ -333,11 +333,11 @@ fn enrichment_matches_account(lead: &Lead, matched: &ApolloPerson) -> bool {
     } else {
         matched.organization_id.trim()
     };
-    if !expected_org_id.is_empty()
-        && !matched_org_id.is_empty()
-        && expected_org_id == matched_org_id
-    {
-        return true;
+    if !expected_org_id.is_empty() && !matched_org_id.is_empty() {
+        // Two explicit provider identities outrank every domain heuristic. A
+        // shared or parent domain must never turn an Apollo organization
+        // mismatch into an accepted current-employer match.
+        return expected_org_id == matched_org_id;
     }
 
     let expected_domain = normalized_domain(&lead.domain);
@@ -673,5 +673,28 @@ mod tests {
         };
 
         assert!(enrichment_matches_account(&lead, &matched));
+    }
+
+    #[test]
+    fn enrichment_rejects_conflicting_apollo_ids_even_on_the_same_domain() {
+        let lead = Lead {
+            apollo_org_id: "agency-a".into(),
+            name: "Agency A".into(),
+            domain: "gov.bc.ca".into(),
+            ..Default::default()
+        };
+        let matched = ApolloPerson {
+            organization_id: "agency-b".into(),
+            email: "person@gov.bc.ca".into(),
+            organization: Some(ApolloOrg {
+                id: "agency-b".into(),
+                name: "Agency B".into(),
+                primary_domain: "gov.bc.ca".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert!(!enrichment_matches_account(&lead, &matched));
     }
 }

@@ -39,9 +39,9 @@ pub async fn send_email(m: &Mailbox, out: &Outgoing, dry_run: bool) -> Result<St
         return Ok(message_id);
     }
     let configured_allowlist = std::env::var("SPRUCE_SEND_ALLOWLIST").unwrap_or_default();
-    if m.brand.eq_ignore_ascii_case("outagehub") && configured_allowlist.trim().is_empty() {
+    if configured_allowlist.trim().is_empty() {
         anyhow::bail!(
-            "OutageHub live sending is pilot-locked: set a non-empty SPRUCE_SEND_ALLOWLIST containing only controlled inboxes"
+            "live sending is pilot-locked for every brand: set a non-empty SPRUCE_SEND_ALLOWLIST containing only controlled inboxes"
         );
     }
     // Test guardrail: when SPRUCE_SEND_ALLOWLIST is set, a live send may only go
@@ -116,11 +116,11 @@ fn extract_addr(s: &str) -> String {
     s.to_lowercase()
 }
 
-/// Enforce the optional `SPRUCE_SEND_ALLOWLIST` test guardrail. Entries are
+/// Enforce the mandatory pilot `SPRUCE_SEND_ALLOWLIST` guardrail. Entries are
 /// comma-separated and either a full address (`me@example.com`) or a domain
 /// suffix (`@example.com`). Returns `Err` with a human reason when a live send
-/// must be refused; `Ok(())` when the var is unset/empty or the recipient
-/// matches. Kept in the transport so nothing outbound can bypass it.
+/// must be refused; `Ok(())` only when the recipient matches. Kept in the
+/// transport so no brand can bypass the controlled-inbox pilot lock.
 pub(crate) fn recipient_allowed(to: &str) -> std::result::Result<(), String> {
     let raw = std::env::var("SPRUCE_SEND_ALLOWLIST").unwrap_or_default();
     let entries: Vec<String> = raw
@@ -129,7 +129,10 @@ pub(crate) fn recipient_allowed(to: &str) -> std::result::Result<(), String> {
         .filter(|s| !s.is_empty())
         .collect();
     if entries.is_empty() {
-        return Ok(());
+        return Err(
+            "SPRUCE_SEND_ALLOWLIST is empty — refusing live send while the supervised pilot lock is active"
+                .into(),
+        );
     }
     let addr = extract_addr(to);
     let allowed = entries.iter().any(|e| match e.strip_prefix('@') {
@@ -157,9 +160,9 @@ mod tests {
     }
 
     #[test]
-    fn outagehub_live_send_guard_is_declared_at_the_transport_boundary() {
+    fn every_brand_live_send_guard_is_declared_at_the_transport_boundary() {
         let source = include_str!("send.rs");
-        assert!(source.contains("OutageHub live sending is pilot-locked"));
+        assert!(source.contains("live sending is pilot-locked for every brand"));
         assert!(source.contains("SPRUCE_SEND_ALLOWLIST"));
     }
 }

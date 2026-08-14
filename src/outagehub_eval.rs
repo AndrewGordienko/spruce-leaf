@@ -170,11 +170,11 @@ fn account_corpus_states_roles_touches_and_lanes() {
 }
 
 #[test]
-fn engaged_accounts_unlock_four_touches_and_seven_stays_retired() {
+fn engaged_accounts_unlock_a_five_email_ceiling_and_prewrite_stays_retired() {
     let mut context = outagehub_context("action_ready");
     assert_eq!(context.max_authorized_touches(), 2);
     context.engaged = true;
-    assert_eq!(context.max_authorized_touches(), 4);
+    assert_eq!(context.max_authorized_touches(), 5);
     assert!(!context.sequence_ready_for(7));
     // A CLI request for the legacy full cadence collapses to one discovery email.
     assert_eq!(
@@ -183,7 +183,7 @@ fn engaged_accounts_unlock_four_touches_and_seven_stays_retired() {
     );
     assert_eq!(
         crate::outreach::supported_touch_count_for_brand("outagehub", 4),
-        4
+        1
     );
 }
 

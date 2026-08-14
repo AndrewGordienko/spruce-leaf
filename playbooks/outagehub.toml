@@ -44,11 +44,11 @@ vantage_notes = [
 
 requirements = [
   "For a one-email discovery test, research must establish a source-backed distributed Canadian operating footprint, outage-sensitive exposure, and a segment-matched reachable operating person. The outage-time decision remains an explicit question, never an account fact. A completed historical match plus evidenced decision upgrades the account to action-ready.",
-  "A two-email evidence sequence requires a completed historical location-to-utility-event match; T2 cannot present a match without the real location and timestamp.",
+  "A two-email evidence sequence requires a completed historical location-to-utility-event match; T1 leads with the exact location, utility and timestamp result instead of saving it for T2.",
   "T1 contains one account-specific diagnosis, dispatch, escalation, continuity, prioritization, or communication moment and a plausible consequence. Do not prescribe a universal dark-site, ticket, dispatch, or internal-system binary.",
   "T1 names OutageHub and explains its location-matched Canadian utility signal in one plain clause. Discovery-ready copy asks for one easy operating answer by email; only action-ready copy may offer a short conversation with an email alternative.",
-  "When present, a later touch may contribute the completed historical result: the verified location, utility-reported event, and actual timestamp. Without a match, later touches must add another source-supported decision-useful angle rather than implying one exists.",
-  "The default is one discovery email. A verified historical match and correct decision owner may earn a two- or four-touch sequence. Seven-touch OutageHub sequences are retired.",
+  "When present, T1 contributes the completed historical result: the verified location, utility-reported event, and actual timestamp. Without a match, T1 must offer a specific historical comparison or sample API result the system can actually produce.",
+  "The default is one discovery email. A verified historical match, correct decision owner and engagement may authorize up to five conditional emails to one person. The account may have a seven-stage sales motion, but never seven consecutive emails; LinkedIn and multithreading require distinct objectives and evidence.",
   "Public utility data is outside confirmation, not proof of charger status and not a replacement for telemetry. State that boundary naturally at most once across the two emails.",
   "Write like an operator discussing site diagnosis. Do not expose phrases such as account file, research, source material, external context, reported interruption, or operational action.",
 ]
@@ -76,6 +76,9 @@ forbidden = [
   "manually reconciling",
   "close this out",
   "closing the loop",
+  "a direct email answer would help",
+  "your perspective would be useful",
+  "would love to learn",
 ]
 
 copy_doctrine = """
@@ -95,9 +98,9 @@ by email while the account is discovery-ready; reserve a conversation option
 for action-ready copy. Never reuse a universal
 site-goes-dark or equipment-ticket fork.
 
-When an action-ready account receives a two- or four-touch review sequence, every later step
-must earn its existence with a distinct supported angle. A verified location,
-utility-reported event, and timestamp can anchor one touch. Other touches may
+When an action-ready account receives a two- or four-touch review sequence, T1
+must lead with the verified location, utility-reported event, and timestamp.
+Every later step must earn its existence with a distinct supported angle. Other touches may
 cover the outside-context boundary, provider completeness, a bounded workflow
 example, or an evaluation path. No real match means no historical claim.
 """
@@ -118,9 +121,9 @@ Research does the hard work before copy:
   4. When possible, preserve a genuine historical location/polygon overlap,
      timestamp, source, and what the API would have returned.
 
-T1 makes the account-specific hypothesis and OutageHub contribution clear
-enough to justify a short conversation or email answer. Existing telemetry may
-already settle the question; ask precisely rather than asserting a gap. A real
-historical result can support T2. Never invent more touches to rescue a generic
+T1 gives the recipient a concrete result or an honestly producible comparison
+and asks one precise operating question. Existing telemetry may already settle
+the question; ask precisely rather than asserting a gap. Never save the only
+interesting historical result for T2 or invent more touches to rescue a generic
 hypothesis.
 """

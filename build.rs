@@ -12,6 +12,22 @@ fn main() {
         PathBuf::from("src/response_design.rs"),
     ];
     collect_policy_files(Path::new("playbooks"), &mut inputs);
+    for path in [
+        "docs/sales-manual.md",
+        "docs/follow-up-doctrine.md",
+        "docs/wapahki-sales-manual.md",
+        "docs/gnk-sales-manual.md",
+        "docs/acquisition-channels.md",
+        "docs/plays/telecom-noc.md",
+        "docs/plays/msp.md",
+        "docs/plays/multi-site-facilities.md",
+        "docs/plays/generator-dispatch.md",
+        "docs/plays/cold-storage-labs.md",
+        "docs/plays/insurance.md",
+        "evals/outreach-quality-rubric.md",
+    ] {
+        inputs.push(PathBuf::from(path));
+    }
     inputs.sort();
 
     let mut hash = Sha256::new();

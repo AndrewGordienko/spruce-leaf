@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use crate::compliance::Compliance;
 use crate::db::{
     Conversation, ConversationMessage, CustomerDevelopmentRecord, GtmOutcome, Meeting, Person,
-    ProofBrief, Reply, SharedDb, SignalObservation,
+    ProofBrief, Reply, SalesStageTransition, SharedDb, SignalObservation,
 };
 use crate::engine::Engine;
 use crate::google_calendar::{CalendarSlot, GoogleCalendar};
@@ -404,7 +404,14 @@ pub async fn handle_inbound(
         in_reply_to: inbound.in_reply_to.clone(),
         ..Default::default()
     })?;
-    record_customer_development_reply(db, conversation, person, &decision, &problem_confirmation)?;
+    record_customer_development_reply(
+        db,
+        conversation,
+        person,
+        &inbound_id,
+        &decision,
+        &problem_confirmation,
+    )?;
     record_gtm_reply_learning(
         db,
         conversation,
@@ -429,6 +436,7 @@ fn record_customer_development_reply(
     db: &SharedDb,
     conversation: &Conversation,
     person: &Person,
+    inbound_id: &str,
     decision: &Decision,
     problem_confirmation: &ProblemConfirmation,
 ) -> Result<()> {
@@ -490,6 +498,16 @@ fn record_customer_development_reply(
     db.upsert_customer_development(&record)?;
 
     if record.stage != prior_stage {
+        db.record_sales_stage_transition(&SalesStageTransition {
+            brand: record.brand.clone(),
+            sales_opportunity_id: sales_opportunity_id.clone(),
+            from_stage: prior_stage.clone(),
+            to_stage: record.stage.clone(),
+            exit_criterion: "A human reply supplied the evidence required by the customer-development stage gate.".into(),
+            evidence_or_buyer_action_ids: vec![inbound_id.to_string()],
+            decided_by: "reply_evidence_gate".into(),
+            ..Default::default()
+        })?;
         db.record_gtm_outcome(&GtmOutcome {
             brand: record.brand.clone(),
             kind: "customer_development_stage".into(),
@@ -556,6 +574,9 @@ fn record_gtm_reply_learning(
         "correction" => "correction",
         "referral" => "referral",
         "not_now" => "not_now",
+        "timing_issue" => "timing_issue",
+        "already_solved" => "already_solved",
+        "wrong_hypothesis" => "wrong_hypothesis",
         "objection" => "objection",
         _ => "human_reply",
     };
@@ -950,8 +971,9 @@ fn validate_offers(requested: &[String], available: &[CalendarSlot]) -> Vec<Stri
 
 fn normalized_category(raw: &str) -> String {
     match raw.trim().to_lowercase().as_str() {
-        "interested" | "correction" | "not_now" | "objection" | "referral" | "unsubscribe"
-        | "auto_reply" | "other" => raw.trim().to_lowercase(),
+        "interested" | "correction" | "timing_issue" | "not_now" | "already_solved"
+        | "wrong_hypothesis" | "objection" | "referral" | "unsubscribe" | "auto_reply"
+        | "other" => raw.trim().to_lowercase(),
         _ => "other".into(),
     }
 }
@@ -987,9 +1009,9 @@ fn schema() -> Value {
         "additionalProperties": false,
         "required": ["category","summary","next_action","draft_reply","accepted_slot","offered_slots","referred_name","referred_email","validated_problem","problem_confirmation_grade","problem_confirmation_quote","current_workflow","evidence_available","customer_data","proof_scope","success_metric","stop_condition","proof_readiness","task_scope","why_still_manual","task_variations","task_exceptions","task_economics","commitment_kind","commitment_detail","loi_terms","next_commitment"],
         "properties": {
-            "category": {"type":"string","enum":["interested","correction","not_now","objection","referral","unsubscribe","auto_reply","other"]},
+            "category": {"type":"string","enum":["interested","correction","timing_issue","not_now","already_solved","wrong_hypothesis","objection","referral","unsubscribe","auto_reply","other"]},
             "summary": {"type":"string"},
-            "next_action": {"type":"string","enum":["none","answer","clarify","offer_meeting","accepted_meeting","referral"]},
+            "next_action": {"type":"string","enum":["none","answer","clarify","offer_meeting","accepted_meeting","referral","nurture","close"]},
             "draft_reply": {"type":"string"},
             "accepted_slot": {"type":"string"},
             "offered_slots": {"type":"array","items":{"type":"string"},"maxItems":2},

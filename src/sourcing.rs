@@ -2400,6 +2400,9 @@ fn reuse_portfolio_people(
 }
 
 fn shared_domain_requires_official_membership(db: &SharedDb, domain: &str) -> Result<bool> {
+    if crate::db::inherently_shared_employer_domain(domain) {
+        return Ok(true);
+    }
     let identities = db
         .list_leads(None)?
         .into_iter()

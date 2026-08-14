@@ -53,6 +53,7 @@ mod reply_agent;
 mod report;
 mod research;
 mod response_design;
+mod sales_packet;
 mod segments;
 mod send;
 mod sourcing;
@@ -225,8 +226,8 @@ enum Command {
 
     /// Write reviewed outreach drafts for verified contacts.
     Plan {
-        /// Requested touch count. OutageHub normalizes a full-cadence request to one discovery email.
-        #[arg(long, default_value_t = 7, value_parser = positive_usize)]
+        /// Requested touch count. Cold planning defaults to one manually reviewed T1.
+        #[arg(long, default_value_t = 1, value_parser = positive_usize)]
         touches: usize,
         /// Limit planning to the first N existing companies in CRM order.
         #[arg(long, value_parser = positive_usize)]
@@ -252,11 +253,11 @@ enum Command {
         replace_drafts: bool,
     },
 
-    /// Blind pairwise evaluation against a human-labeled outreach JSONL corpus.
+    /// Blind three-candidate inbox evaluation against human unchanged-send labels.
     EvalOutreach {
         #[arg(long, default_value = "evals/outreach-gold.jsonl")]
         corpus: String,
-        /// Judge each pair in both orders and require an order-consistent verdict.
+        /// Judge each candidate set in forward and reverse order and require consistency.
         #[arg(long)]
         double_blind: bool,
     },
@@ -279,15 +280,55 @@ enum Command {
         only: Option<String>,
     },
 
-    /// Audit the real OutageHub pipeline against the supervised-pilot release threshold.
+    /// Audit one real brand pipeline against its supervised-pilot release threshold.
     /// Read-only: never sources, generates, approves, or sends anything.
     PilotAudit {
-        #[arg(long, default_value_t = 20, value_parser = positive_usize)]
-        accounts: usize,
-        #[arg(long, default_value_t = 5, value_parser = positive_usize)]
-        segments: usize,
-        #[arg(long, default_value_t = 10, value_parser = positive_usize)]
-        messages: usize,
+        #[arg(long, value_parser = positive_usize)]
+        accounts: Option<usize>,
+        #[arg(long, value_parser = positive_usize)]
+        segments: Option<usize>,
+        #[arg(long, value_parser = positive_usize)]
+        messages: Option<usize>,
+        #[arg(long, value_parser = positive_usize)]
+        approvals: Option<usize>,
+    },
+
+    /// Export local, read-only sales decision packages. This never researches,
+    /// drafts, approves, schedules, or sends.
+    SalesPackets {
+        /// Exact sales-opportunity id. Omit to export every current opportunity for the brand.
+        #[arg(long)]
+        opportunity: Option<String>,
+        #[arg(long, default_value = ".spruce/opportunity_packets")]
+        output: PathBuf,
+    },
+
+    /// Import a founder/compliance-reviewed prospect sales brief from JSON.
+    /// Importing never generates, approves copy, schedules, or sends.
+    ImportSalesBrief { file: PathBuf },
+
+    /// Import reviewed source/channel context for email or LinkedIn acquisition.
+    /// A conference, webinar, referral, or customer context must be real.
+    ImportAcquisitionContext { file: PathBuf },
+
+    /// Import one manually reviewed conditional follow-up plan from JSON.
+    ImportConditionalFollowup { file: PathBuf },
+
+    /// Import a SPICED/discovery record; the database requires an in-scope human reply.
+    ImportDiscoveryQualification { file: PathBuf },
+
+    /// Import a post-reply application-centric sales brief. This cannot create
+    /// cold outreach and requires an in-scope human reply.
+    ImportSalesApplication { file: PathBuf },
+
+    /// Prepare one outside-in proof asset solely from a draft brief's cited evidence.
+    PrepareProofAsset {
+        opportunity: String,
+        person: String,
+        #[arg(long)]
+        asset_type: String,
+        #[arg(long, default_value = ".spruce/opportunity_packets")]
+        output: PathBuf,
     },
 
     /// Approve drafted email touches so the cadence engine may send them.
@@ -1128,16 +1169,20 @@ fn main() -> Result<()> {
             accounts,
             segments,
             messages,
+            approvals,
         } => {
-            if !cli.brand.eq_ignore_ascii_case("outagehub") {
-                return Err(anyhow!(
-                    "pilot-audit currently supports --brand outagehub only"
-                ));
-            }
             let playbooks = load_playbooks(&cli)?;
-            let audit = pilot::audit(&db, &playbooks, accounts, segments, messages)?;
+            let defaults = pilot::PilotThresholds::for_brand(&cli.brand);
+            let accounts = accounts.unwrap_or(defaults.accounts);
+            let segments = segments.unwrap_or(defaults.segments);
+            let messages = messages.unwrap_or(defaults.generated_messages);
+            let approvals = approvals.unwrap_or(defaults.exact_approvals);
+            let audit = pilot::audit(
+                &db, &playbooks, &cli.brand, accounts, segments, messages, approvals,
+            )?;
             println!(
-                "OutageHub pilot audit: {} real researched account(s) across {} segment(s); {} generated/current message(s); {} manually approved; {} allowlisted SMTP delivery/deliveries.",
+                "{} pilot audit: {} real researched account(s) across {} segment(s); {} generated/current message(s); {} exact-copy manually approved; {} allowlisted SMTP delivery/deliveries.",
+                cli.brand,
                 audit.researched_accounts,
                 audit.segments.len(),
                 audit.generated_messages,
@@ -1158,10 +1203,79 @@ fn main() -> Result<()> {
                     println!("  BLOCKED: {blocker}");
                 }
                 return Err(anyhow!(
-                    "OutageHub supervised-pilot threshold is not yet satisfied"
+                    "{} supervised-pilot threshold is not yet satisfied",
+                    cli.brand
                 ));
             }
-            println!("✓ OutageHub supervised-pilot threshold satisfied.");
+            println!("✓ {} supervised-pilot threshold satisfied.", cli.brand);
+            Ok(())
+        }
+
+        Command::SalesPackets {
+            opportunity,
+            output,
+        } => {
+            let summary = sales_packet::export(&db, &cli.brand, opportunity.as_deref(), &output)?;
+            println!(
+                "✓ exported {} local sales decision package(s)",
+                summary.packets
+            );
+            for path in summary.paths {
+                println!("  {}", path.display());
+            }
+            Ok(())
+        }
+
+        Command::ImportSalesBrief { file } => {
+            let id = sales_packet::import_sales_brief(&db, &file)?;
+            println!("✓ imported local sales brief {id}; no copy was approved or sent");
+            Ok(())
+        }
+
+        Command::ImportAcquisitionContext { file } => {
+            let ids = sales_packet::import_acquisition_context(&db, &file)?;
+            println!(
+                "✓ imported {} acquisition context(s); no outreach was generated, approved, or sent",
+                ids.len()
+            );
+            Ok(())
+        }
+
+        Command::ImportConditionalFollowup { file } => {
+            let id = sales_packet::import_conditional_followup(&db, &file)?;
+            println!("✓ imported conditional follow-up {id}; no message was generated or sent");
+            Ok(())
+        }
+
+        Command::ImportDiscoveryQualification { file } => {
+            let id = sales_packet::import_discovery_qualification(&db, &file)?;
+            println!("✓ imported reply-backed discovery qualification {id}");
+            Ok(())
+        }
+
+        Command::ImportSalesApplication { file } => {
+            let id = sales_packet::import_sales_application(&db, &file)?;
+            println!("✓ imported reply-backed sales application brief {id}");
+            Ok(())
+        }
+
+        Command::PrepareProofAsset {
+            opportunity,
+            person,
+            asset_type,
+            output,
+        } => {
+            let asset = sales_packet::prepare_proof_asset(
+                &db,
+                &opportunity,
+                &person,
+                &asset_type,
+                &output,
+            )?;
+            println!(
+                "✓ prepared {} proof asset {} at {}; no outreach was generated or sent",
+                asset.status, asset.id, asset.rendered_path
+            );
             Ok(())
         }
 
@@ -1211,6 +1325,16 @@ fn main() -> Result<()> {
             if live && compliance.physical_address.trim().is_empty() {
                 anyhow::bail!(
                     "refusing live sending: COMPLIANCE_ADDRESS is unset (required for CASL/CAN-SPAM)"
+                );
+            }
+            if live
+                && std::env::var("SPRUCE_CASL_PROGRAM_APPROVAL_REF")
+                    .unwrap_or_default()
+                    .trim()
+                    .is_empty()
+            {
+                anyhow::bail!(
+                    "refusing live sending: SPRUCE_CASL_PROGRAM_APPROVAL_REF is unset; record Canadian-counsel program approval before launch"
                 );
             }
             if live {

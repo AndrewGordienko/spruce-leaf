@@ -9,9 +9,9 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::db::{
-    CustomerDevelopmentRecord, EvidenceClaim, GtmExperiment, GtmPlay, Lead, MarketSegment,
-    OpportunityStakeholder, Person, SalesOpportunity, SharedDb, SignalDefinition,
-    SignalObservation,
+    AcquisitionContext, CustomerDevelopmentRecord, EvidenceClaim, GtmExperiment, GtmPlay, Lead,
+    MarketSegment, OpportunityStakeholder, Person, SalesBrief, SalesOpportunity, SharedDb,
+    SignalDefinition, SignalObservation,
 };
 use crate::playbook::Playbook;
 
@@ -288,6 +288,14 @@ pub struct GtmActionContext {
     /// Deterministic commercial lane computed from persisted evidence.
     #[serde(default)]
     pub priority: Option<crate::priority::CommercialPriority>,
+    /// Founder/compliance-owned prospect record. The writer receives its
+    /// validated projection, never the old free-form account hypothesis.
+    #[serde(default)]
+    pub sales_brief: Option<SalesBrief>,
+    /// Reviewed source/channel history. The writer may reference only this
+    /// context when the person is not a cold-research acquisition.
+    #[serde(default)]
+    pub acquisition_context: Option<AcquisitionContext>,
 }
 
 impl GtmActionContext {
@@ -301,14 +309,38 @@ impl GtmActionContext {
             .is_some_and(|play| play.brand.eq_ignore_ascii_case("outagehub"))
     }
 
+    fn is_gnk(&self) -> bool {
+        self.play
+            .as_ref()
+            .is_some_and(|play| play.brand.eq_ignore_ascii_case("gnk"))
+    }
+
+    fn is_wapahki(&self) -> bool {
+        self.play
+            .as_ref()
+            .is_some_and(|play| play.brand.eq_ignore_ascii_case("wapahki"))
+    }
+
+    fn is_supervised_pilot_brand(&self) -> bool {
+        self.play.as_ref().is_some_and(|play| {
+            matches!(
+                play.brand.to_ascii_lowercase().as_str(),
+                "gnk" | "wapahki" | "outagehub"
+            )
+        })
+    }
+
     /// The maximum cold-touch count the current evidence authorizes.
-    /// OutageHub: research 0; discovery 1; verified evidence 2; engaged 4.
-    /// Seven-touch OutageHub sequences are retired until real outcome evidence
-    /// demonstrates they help. Other brands keep the supported cadence ceiling.
+    /// Cold generation remains T1-only. These ceilings govern separately
+    /// approved, evidence-dependent next touches after engagement: OutageHub 5,
+    /// GnK 4, Wapahki 3. A seven-stage account motion is not seven emails.
     pub fn max_authorized_touches(&self) -> usize {
         match self.state.as_str() {
-            "action_ready" if self.is_outagehub() && self.engaged => 4,
+            "action_ready" if self.is_outagehub() && self.engaged => 5,
             "action_ready" if self.is_outagehub() => 2,
+            "action_ready" if self.is_gnk() && self.engaged => 4,
+            "action_ready" if self.is_wapahki() && self.engaged => 3,
+            "action_ready" if self.is_gnk() || self.is_wapahki() => 1,
             "action_ready" => 7,
             "discovery_ready" => 1,
             _ => 0,
@@ -333,7 +365,10 @@ impl GtmActionContext {
     /// Automatic scheduling remains action-ready only. Touch count may shorten a
     /// cadence but never weaken evidence or commercial authorization.
     pub fn automatic_delivery_ready_for(&self, touches: usize) -> bool {
-        self.action_ready() && touches >= 1 && touches <= self.max_authorized_touches()
+        self.action_ready()
+            && !self.is_supervised_pilot_brand()
+            && touches >= 1
+            && touches <= self.max_authorized_touches()
     }
 
     /// Private context for the planner/writer. This is decision infrastructure,
@@ -465,7 +500,7 @@ impl GtmActionContext {
         );
         let action = match self.state.as_str() {
             "action_ready" => "The account has enough sourced evidence for one narrow commercial note. Use only a supplied observation as the company-specific signal. Lead with a role-relevant implication and a credible point of view. A cold outcome may be a short working conversation, interest, correction, or referral; it is not yet a pilot or proof. Never invent collateral or claim an asset exists unless verified seller context explicitly supplies it.",
-            "discovery_ready" if self.is_outagehub() => "This opportunity is discovery-ready, not action-ready: research supports a distributed, outage-sensitive operating footprint and this recipient's title matches that segment, but the account's outage-time decision is unproved. Write one complete first email only. State one sourced exposure fact, ask one explicit operating question without implying the workflow exists, explain OutageHub's address-and-time matching contribution, and make a direct email answer the sole next step. Do not ask for a call, describe a private workflow as fact, or schedule follow-ups before a reply.",
+            "discovery_ready" if self.is_outagehub() => "This opportunity is discovery-ready, not action-ready: research supports a distributed, outage-sensitive operating footprint and this recipient is verified adjacent to that segment, but the account's outage-time decision is unproved. Write one complete first email only. Use a specific location, event, workflow, or public responsibility rather than a category summary; ask one explicit operating question without implying the workflow exists; and offer a historical comparison or sample response OutageHub can actually produce. A direct email answer is the sole next step, but Andrew's desire for research is never the reason to answer. Do not ask for a call, describe a private workflow as fact, or schedule follow-ups before a reply.",
             "discovery_ready" => "This opportunity is discovery-ready, not action-ready: research supports one concrete operating task, decision, or mechanism and this recipient is close to it, but one economic or workflow term remains unproved. Write one complete, useful first email only. State sourced account details as facts, present the exact missing term as one honest question, explain the seller's relevant contribution, and make a direct email answer the sole next step. Do not ask for a call before the missing term is confirmed. Never use a universal diagnostic template or schedule follow-ups before a reply.",
             _ => "The account does not yet have enough sourced evidence for a multi-touch sequence. Hold it for research or use one manual routing note; do not manufacture discovery questions or explain a proof, integration, pilot, or product.",
         };
@@ -1219,7 +1254,19 @@ pub fn prepare_action(
                 .is_none()
             })
         });
-    if (person_is_direct || outagehub_person_can_discover)
+    let wapahki_person_can_discover = brand.eq_ignore_ascii_case("wapahki")
+        && opportunity.as_ref().is_some_and(|opportunity| {
+            person_stakeholder.is_some_and(|stakeholder| {
+                wapahki_discovery_touch_block_reason(
+                    opportunity,
+                    stakeholder,
+                    person,
+                    &evidence_claims,
+                )
+                .is_none()
+            })
+        });
+    if (person_is_direct || outagehub_person_can_discover || wapahki_person_can_discover)
         && has_reachable_channel
         && has_workflow_vantage
     {
@@ -1250,7 +1297,7 @@ pub fn prepare_action(
     let opportunity_state = opportunity
         .as_ref()
         .map_or("research_required", |opportunity| {
-            if (!person_is_direct && !outagehub_person_can_discover)
+            if (!person_is_direct && !outagehub_person_can_discover && !wapahki_person_can_discover)
                 || !opportunity_has_required_site
             {
                 "research_required"
@@ -1303,6 +1350,15 @@ pub fn prepare_action(
         None
     };
 
+    let sales_brief = match &opportunity {
+        Some(opportunity) => db.get_sales_brief(&opportunity.id, &person.id)?,
+        None => None,
+    };
+    let acquisition_context = match &opportunity {
+        Some(opportunity) => db.get_acquisition_context(&opportunity.id, &person.id)?,
+        None => None,
+    };
+
     let mut experiment = None;
     let mut experiment_assignment_id = String::new();
     let mut experiment_arm = String::new();
@@ -1331,6 +1387,8 @@ pub fn prepare_action(
         experiment_arm,
         engaged,
         priority,
+        sales_brief,
+        acquisition_context,
     })
 }
 
@@ -1539,7 +1597,7 @@ pub fn default_plays() -> Vec<GtmPlay> {
         GtmPlay {
             brand: "outagehub".into(),
             key: "distributed_site_outage_decision".into(),
-            version: 14,
+            version: 15,
             name: "Distributed-site outage decision".into(),
             lifecycle: "testing".into(),
             motion: "internal_pipeline_to_forward_deployed_proof".into(),
@@ -1548,7 +1606,7 @@ pub fn default_plays() -> Vec<GtmPlay> {
             required_signal_keys: vec!["account.fit_evidence".into(), "account.distributed_locations".into(), "account.outage_sensitive_exposure".into(), "account.outage_sensitive_decision".into(), "account.historical_location_outage_match".into()],
             minimum_signal_matches: 5,
             hypothesis: "During an ambiguous location or asset incident, location-matched public utility context may improve one evidenced diagnosis, dispatch, escalation, continuity, prioritization, or communication decision.".into(),
-            action_policy: "Select one bounded market segment, then assess operator × site-network × outage-time-decision evidence separately from commercial lane. Action-ready opportunities have atomic source claims for the decision, a mapped committee, and completed historical proof. Discovery-ready opportunities may receive one independently reviewed, manually approved discovery touch; automation never schedules them. Explain OutageHub's API contribution and never claim private site status.".into(),
+            action_policy: "Select one bounded market segment, then assess operator × site-network × outage-time-decision evidence separately from commercial lane. Action-ready opportunities have atomic source claims for the decision, a mapped committee, and completed historical proof; T1 leads with the exact location, utility, and timestamp. Discovery-ready opportunities may receive one independently reviewed, manually approved T1 only when it offers a location-specific comparison or sample response OutageHub can actually produce. Generic footprint summaries and sender-benefit research requests are held. Automation never schedules cold copy and never claims private site status.".into(),
             proof_type: "historical_replay".into(),
             proof_description: "Match supplied or public operating locations to historical utility outage areas, recording the location, utility timestamp, and what an API response or webhook would have returned.".into(),
             success_metric: "Whether outside utility status is checked today and whether it changes the account-specific diagnosis, dispatch, escalation, continuity, prioritization, or communication decision.".into(),
@@ -1559,7 +1617,7 @@ pub fn default_plays() -> Vec<GtmPlay> {
         GtmPlay {
             brand: "gnk".into(),
             key: "closed_case_reconstruction".into(),
-            version: 6,
+            version: 7,
             name: "Workflow-specific decision support".into(),
             lifecycle: "testing".into(),
             motion: "internal_pipeline_to_forward_deployed_proof".into(),
@@ -1568,7 +1626,7 @@ pub fn default_plays() -> Vec<GtmPlay> {
             required_signal_keys: vec!["account.fit_evidence".into(), "account.specific_recurring_decision".into(), "account.believable_operating_consequence".into(), "account.external_trigger_or_mechanism_evidence".into()],
             minimum_signal_matches: 4,
             hypothesis: "A source-backed trigger creates a recurring exception decision whose inputs, coordination, or existing system boundary produces a meaningful operating consequence.".into(),
-            action_policy: "Work one bounded problem segment at a time and qualify company × workflow opportunity, not company category. Easy opportunities carry atomic claims for the recurring event, decision, consequence, mechanism, and a mapped committee. Medium opportunities may receive one independently reviewed, manually approved discovery touch; automation never schedules them. Explain one concrete GnK contribution and an email-first response path.".into(),
+            action_policy: "Work one bounded problem segment at a time and qualify company × workflow opportunity, not company category. Cold planning produces T1 only from a complete SendableBrief: atomic account claims, person-specific role evidence, one expensive moment, consequence, concrete deliverable, required input, improved decision, and expected reply. Titles and account keywords never prove direct ownership. Generate three unchanged modes, validate facts, select blindly, and require exact-copy manual approval. If the offer cannot honestly say what GnK examines and returns, hold it. Automation never schedules cold copy.".into(),
             proof_type: "bounded_workflow_replay".into(),
             proof_description: "Apply the proposed workflow to a small historical sample and compare decision time, exception handling, and outcome quality with the current process.".into(),
             success_metric: "The account-specific consequence named in research: resolution time, leakage or recoveries, audit exposure, customer SLA, throughput, escalation, or constrained expert capacity.".into(),
@@ -1579,16 +1637,16 @@ pub fn default_plays() -> Vec<GtmPlay> {
         GtmPlay {
             brand: "wapahki".into(),
             key: "task_exception_review".into(),
-            version: 8,
+            version: 9,
             name: "Task-and-exception feasibility review".into(),
             lifecycle: "testing".into(),
             motion: "internal_pipeline_to_forward_deployed_proof".into(),
-            target_icp: "Factories, product manufacturers, warehouses, distribution centres, and fulfillment operations across Canada. Rank one facility-linked physical task and a person demonstrably linked to that facility; economic pressure is required before outreach.".into(),
+            target_icp: "Factories, product manufacturers, warehouses, distribution centres, and fulfillment operations across Canada. Rank one facility-linked physical task and economic pressure first. Person-specific facility proof permits an owner question; a verified adjacent operations contact may receive one routing question without being described as the owner.".into(),
             target_vantages: vec!["process_owner".into(), "operator".into(), "technical_evaluator".into(), "router".into()],
             required_signal_keys: vec!["account.fit_evidence".into(), "account.bounded_repetitive_task".into(), "account.manual_task_economic_pressure".into()],
             minimum_signal_matches: 3,
             hypothesis: "One recurring physical movement may be automatable enough to investigate, with the exact variation, rate, integration, and economics confirmed by the operator closest to the work.".into(),
-            action_policy: "Work company × facility × line/workcell × task, keeping evidence readiness separate from commercial lane. Outreach requires facility_id, task_claim_id, economic_claim_id, and contact_facility_evidence_id. One independently reviewed 75–110 word email is allowed; it contains one hypothesis, one concrete fit-screen contribution, one question, and no call request. At most one later follow-up is allowed only with new evidence or a completed first-pass assessment. Automation never schedules discovery copy.".into(),
+            action_policy: "Work company × facility × line/workcell × task, keeping evidence readiness separate from commercial lane. One independently reviewed 45–95 word T1 may be considered only with facility, task, and economic claim lineage. Exact facility-employment proof permits an owner question; the bounded adjacent-contact lane permits only a routing question. Credentials, Wapahki, hypothesis language, and the fit screen are optional. A screen may appear only when a completed account-specific result is attached. Silence creates no cadence and automation never schedules cold copy.".into(),
             proof_type: "task_feasibility_review".into(),
             proof_description: "Review a task sketch, short video, or representative SKU/changeover set; model the normal motion, exceptions, rate, and technical boundaries.".into(),
             success_metric: "Required rate, intervention frequency, changeover burden, task coverage, and a clear technical/economic stop condition.".into(),
@@ -1759,7 +1817,7 @@ mod tests {
     }
 
     #[test]
-    fn outagehub_four_touch_state_requires_a_graded_reply_observation() {
+    fn outagehub_five_email_ceiling_requires_a_graded_reply_observation() {
         let db = Db::open(":memory:").expect("open memory db");
         let lead_id = db
             .upsert_lead(&Lead {
@@ -1814,7 +1872,7 @@ mod tests {
                 ..Default::default()
             }
             .max_authorized_touches(),
-            4
+            5
         );
     }
 
@@ -1840,7 +1898,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_contact_vantage_satisfies_reachable_owner_requirement() {
+    fn title_and_inferred_vantage_do_not_prove_direct_task_ownership() {
         let path = std::env::temp_dir().join(format!(
             "spruce-vantage-readiness-test-{}.sqlite",
             Uuid::new_v4()
@@ -1932,10 +1990,11 @@ mod tests {
         let person = db.get_person(&person_id).unwrap().unwrap();
         let context = prepare_action(&db, "gnk", &lead_id, &person).expect("action context");
 
-        assert!(context
+        assert!(!context
             .matched_signal_keys
             .contains(&"account.reachable_workflow_owner".to_string()));
-        assert!(context.action_ready());
+        assert_eq!(context.state, "research_required");
+        assert!(!context.action_ready());
 
         let discovery_lead_id = db
             .upsert_lead(&Lead {
@@ -2153,7 +2212,7 @@ mod tests {
     }
 
     #[test]
-    fn operated_ev_network_with_historical_match_is_action_ready() {
+    fn historical_match_without_person_responsibility_stays_discovery_only() {
         let path = std::env::temp_dir().join(format!(
             "spruce-outage-combined-signal-test-{}.sqlite",
             Uuid::new_v4()
@@ -2244,55 +2303,9 @@ mod tests {
         assert!(context
             .matched_signal_keys
             .contains(&"account.historical_location_outage_match".to_string()));
-        assert!(context.action_ready(), "{context:#?}");
-
-        // End-to-end guard: the selected account, its atomic evidence, and the
-        // decision-matched recipient must survive the final copy gate together.
-        let lead = db.get_lead(&lead_id).unwrap().unwrap();
-        let account = crate::domain::Account {
-            name: lead.name,
-            industry: lead.industry,
-            hq: lead.hq,
-            observed_facts: context
-                .evidence_claims
-                .iter()
-                .map(|claim| claim.source_excerpt.clone())
-                .collect(),
-            inferences: Vec::new(),
-            hypothesis: String::new(),
-            mechanism: String::new(),
-            consequence_metric: String::new(),
-            signals: Vec::new(),
-            system_concept: String::new(),
-            hard_buyer_question: String::new(),
-            kill_condition: String::new(),
-            magnitude_note: String::new(),
-            applied_principles: Vec::new(),
-        };
-        let sequence = crate::domain::Sequence {
-            touches: vec![crate::domain::Touch {
-                stage: 1,
-                day_offset: 0,
-                channel: "email".into(),
-                subject: "Utility check before dispatch".into(),
-                body: "Hi Morgan,\n\nOperated Charging Network runs charging sites across Canada. When a site reports a power issue, does Service Operations check the local utility before dispatching support or updating customers?\n\nOutageHub matches Canadian utility outage reports to specific addresses and times. I am trying to learn whether that removes a real lookup for your team or duplicates what you already have. A short email answer is plenty.\n\nThanks,\nAndrew Gordienko".into(),
-                purpose: "test one evidenced decision".into(),
-                goal: "earn one direct answer".into(),
-            }],
-            applied_principles: Vec::new(),
-        };
-        let playbooks = crate::playbook::Playbooks::load("playbooks").unwrap();
-        let issues = crate::outreach::account_sequence_quality_issues(
-            playbooks.get("outagehub").unwrap(),
-            &playbooks.shared,
-            &account,
-            &sequence,
-            &[],
-            1,
-            false,
-            Some(&context),
-        );
-        assert!(issues.is_empty(), "end-to-end copy issues: {issues:?}");
+        assert_eq!(context.state, "discovery_ready", "{context:#?}");
+        assert!(context.sequence_ready_for(1));
+        assert!(!context.sequence_ready_for(2));
         drop(db);
         remove_temp_db(&path);
     }

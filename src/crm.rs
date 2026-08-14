@@ -6479,10 +6479,7 @@ mod tests {
         .expect("map stakeholder");
         db.activate_opportunity_stakeholder(&sales_opportunity_id, &person_id)
             .expect("activate stakeholder thread");
-        for (index, channel) in ["email", "email", "linkedin_request", "email"]
-            .iter()
-            .enumerate()
-        {
+        for (index, channel) in ["email"].iter().enumerate() {
             let stage = index as i64 + 1;
             db.insert_touch(&Touch {
                 sequence_id: sequence_id.clone(),
@@ -6515,17 +6512,17 @@ mod tests {
         })
         .expect("insert mailbox");
 
-        // Approval schedules email only; manual channel tasks remain drafts.
+        // A copy review is not an account/compliance approval. Because this
+        // test intentionally has no SalesBrief, the real draft remains held.
         assert_eq!(
             db.schedule_reviewed_touches(Some("gnk"), Some(&person_id))
                 .expect("approve"),
-            3
+            0
         );
         let touches = db
             .list_touches_for_person(&person_id)
             .expect("list touches");
-        assert_eq!(touches[0].status, "scheduled");
-        assert_eq!(touches[2].status, "draft");
+        assert_eq!(touches[0].status, "draft");
 
         let dashboard = execution_dashboard(&db, Some("gnk")).expect("build dashboard");
         let json = serde_json::to_string(&dashboard).expect("serialize dashboard");
@@ -6540,7 +6537,7 @@ mod tests {
         );
         // Persistent brand tabs let you jump between the three CRMs from any page.
         assert!(html.contains("class=\"biz-tabs\""));
-        assert!(html.contains("LinkedIn request"));
+        assert!(!html.contains("LinkedIn request"));
         assert!(html.contains("LinkedIn connection status"));
         assert!(html.contains("value=\"requested\" selected"));
         assert!(html.contains(&format!(
@@ -6554,8 +6551,7 @@ mod tests {
         assert!(html.contains("href=\"/strategy/gnk\""));
         assert!(html.contains("Company context"));
         assert!(html.contains("Internal role fit (not sent)"));
-        assert!(html.contains("<th>T4</th>"));
-        assert!(!html.contains("<th>T5</th>"));
+        assert!(html.contains("<th>T1</th>"));
         assert!(html.contains("Real Logistics"));
         assert!(html.contains("Alex Rivera"));
         assert!(html.contains("alex@example.com"));
@@ -6574,13 +6570,15 @@ mod tests {
         assert!(html.contains("class=\"desktop-pipeline\""));
         assert!(html.contains("class=\"mobile-pipeline\""));
         assert!(html.contains(&format!("data-open-id=\"person-{person_id}\"")));
+        // Copy is review-ready but the missing prospect/compliance brief keeps
+        // it as a local draft instead of scheduling it.
         assert!(html.contains("0 sent · 1 ready"));
         assert!(html.contains("Next best work"));
         assert!(html.contains("ready companies"));
         assert!(html.contains("reviewed sequences"));
         assert!(html.contains("email drafts"));
         assert!(!html.contains("reviewed drafts"));
-        assert!(html.contains("<b>1</b><span>LinkedIn actions</span>"));
+        assert!(html.contains("<b>0</b><span>LinkedIn actions</span>"));
         assert!(html.contains("viewport-fit=cover"));
         assert!(html.contains(".surface-tabs {\n    order: 3; display: flex"));
 

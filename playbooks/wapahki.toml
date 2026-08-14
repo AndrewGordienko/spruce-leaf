@@ -20,11 +20,10 @@ motion = "find and automate one recurring physical task in a factory or warehous
 
 icp_note = "The long-term market is every plausible factory, product manufacturer, warehouse, distribution centre, and fulfillment operation in Canada. Work easy to hard: visible repetitive task + economic pressure + reachable operator first; visible task with unknown economics next; opaque sites last."
 
-# Match the human-approved founder/researcher notes: enough room for why this
-# operator, the plant hypothesis, Andrew's credible context, and a real path to
-# respond without turning the message into a dossier.
-min_words = 75
-max_words = 110
+# Keep enough room for one sourced task and one useful question without forcing
+# credentials, framework language, or a collateral pitch into every note.
+min_words = 45
+max_words = 95
 
 min_signals = 2
 
@@ -51,17 +50,17 @@ vantage_notes = [
 ]
 
 requirements = [
-  "T1 is 75–110 words. Name the sourced plant task and consequence, state one honest automation hypothesis, offer the completed one-page fit screen, and ask exactly one question.",
+  "T1 is 45–95 words. Name one sourced physical task or handoff, give one useful account-specific observation or ask one question answerable from memory, and use exactly one response path.",
   "Arrive with one concrete candidate task for the recipient to correct. Never ask them to inspect the plant, identify any suitable use case, translate the operation into a robotics taxonomy, or evaluate Wapahki's task boundary.",
   "Use a source-supported object, station, handoff, package, product, machine, line, warehouse flow, job posting, expansion, or equipment fact. Category alone does not prove the exact task.",
   "Every outreach-ready account shows why the task matters through an atomic economic or operating-consequence claim: staffing or vacancies, overtime, throughput, line stoppage, utilization, short-run economics, ergonomics, safety, sanitation burden, intervention, cycle time, or changeover cost.",
   "Test why an obviously repetitive job may remain manual: sanitation, irregular products, misfeeds, rate, integration, capital payback, or changeover burden. Mention only the one blocker that sharpens this account-specific question.",
   "Ask one natural account-specific operating question. The playbook supplies no fallback task, staffing claim, or automation blocker; every detail must come from account evidence.",
-  "After the plant moment is legible, briefly state Andrew's University of Toronto and Automata robotics context and one honest Wapahki contribution.",
+  "Andrew's University of Toronto and Automata context is optional. Use it only when it materially improves credibility without making the note sound like a student research request.",
   "T1 uses one email-first response path and never asks for a call or meeting. Earn a conversation after the recipient replies.",
   "A task sketch, video, data request, site visit, evaluation, pilot, or LOI must be earned after engagement.",
-  "Cold outreach is one first-touch email only. At most one follow-up may be written after new account evidence or a completed first-pass assessment exists.",
-  "The automation-fit screen and discovery-call observations are optional later contributions, not required campaign furniture. Offer or use each at most once and only when it advances this person's thread.",
+  "Cold planning is one first-touch email only. After engagement, at most two separately approved follow-ups may be written when each adds a new artifact, evidence item, narrower hypothesis, technical distinction, route, or close. Maximum three messages per person in 30 days.",
+  "The automation-fit screen and discovery-call observations are optional tools, not campaign furniture. Mention a screen only when a completed account-specific result is attached to the opportunity; never ask permission to begin producing value.",
   "Never turn participant-reported wages, margins, weights, volumes, or automation percentages into prospect claims.",
 ]
 
@@ -96,38 +95,6 @@ forbidden = [
   "not selling equipment yet",
   "20-minute call",
   "20 minute call",
-  "get",
-  "bank",
-  "credit",
-  "access",
-  "open",
-  "compare",
-  "problem",
-  "now",
-  "billing",
-  "deal",
-  "finance",
-  "financial",
-  "claims",
-  "insurance",
-  "mortgage",
-  "soon",
-  "new",
-  "performance",
-  "freedom",
-  "home",
-  "sales",
-  "medical",
-  "urgent",
-  "life",
-  "marketing",
-  "investment",
-  "diagnostics",
-  "friend",
-  "cash",
-  "invoice",
-  "extra",
-  "purchase",
   "off chance",
   "one time",
   "all good",
@@ -158,13 +125,14 @@ Do not ask the recipient to classify where variation enters, decide whether a
 motion fits a bounded exception envelope, or identify any suitable task.
 
 Keep evidence readiness separate from cash-now, core, and strategic commercial
-lanes. Every first touch needs a
-source-supported package, product, station, line, machine, warehouse flow, job,
-facility, expansion, or other physical operating clue and a recipient proven
-to work at that facility. Every outreach-ready opportunity also has a credible,
-atomic economic-pressure claim. Discovery-ready opportunities may receive one
-task-specific email only when the task, consequence, facility, and recipient
-relationship all have explicit lineage.
+lanes. Every first touch needs a source-supported package, product, station,
+line, machine, warehouse flow, job, facility, expansion, or other physical
+operating clue. Every outreach-ready opportunity also has a credible, atomic
+economic-pressure claim. A person-specific facility-employment source permits
+an owner question. A current verified adjacent operations contact may receive
+one routing question about the evidenced facility task even when exact
+facility-employment proof is still missing; the copy must not call that person
+the owner or claim they work at the facility.
 Research-required opportunities remain in research.
 Never promote category or product variety into a factual manual-work claim.
 
@@ -174,23 +142,20 @@ the proposed division between normal cases and exceptions before the recipient
 confirms why the task remains manual. Never claim installations, performance,
 savings, or a ready system.
 
-Andrew may use the verified student/researcher context in the first note: he is
-a University of Toronto student working in robotics at Automata. Used briefly,
-that can explain the discovery intent and lower sales resistance. It is not a
-substitute for a plant-specific hypothesis, and the conversation must become
-openly commercial once it reaches requirements, economics, a prototype, or a
-pilot. Never present Wapahki as purely academic research.
+Andrew may use the verified University of Toronto and Automata context when it
+answers a real credibility question. It is optional and should usually be
+omitted when the sourced operating observation already earns attention. Never
+present Wapahki as an academic research request.
 
-Wapahki has a real one-page automation-fit screen in seller context. It may be
-offered once as a give-back covering the motion, run stability, changeover,
-interventions, physical boundaries, rate, labour, and payback threshold. It is
-not a benchmark or plant assessment. A later touch may use one explicitly
-attributed discovery-call contrast, never as proof about the target.
+Wapahki has a real one-page automation-fit screen in seller context. It is not
+a benchmark or plant assessment. Buyer-facing copy may mention it only after a
+completed account-specific result is persisted; a blank screen or a promise to
+apply it later is not recipient value.
 
-Cold outreach contains one message. It tests one concrete task by contributing
-the completed fit screen and asking one question. A single follow-up is allowed
-only after it adds new evidence or a completed first-pass assessment. Never
-manufacture a cadence from repeated caveats.
+Cold outreach contains one message. It leads with one concrete task, completed
+observation, or seconds-to-answer operating question. Silence never creates a
+follow-up. New evidence or a human reply must start a separately reviewed next
+step.
 """
 
 doctrine = """
@@ -239,21 +204,16 @@ Translate internal terms into operational language:
     switches between a limited set of products and case formats without being
     rebuilt each time".
 
-For Wapahki, use this first-email logic without turning it into a fixed template:
-one verified station or handoff -> one observed operating condition -> one
-suspected consequence -> one likely reason ordinary automation struggles ->
-Andrew's credible researcher context -> one concrete Wapahki contribution ->
-one natural operating question and one response path matched to evidence state. Do not stack a
-call, email fallback, and asset offer into a response menu. The full
-technical/economic discovery set belongs only after the plant-floor premise is
-confirmed.
+For Wapahki, choose the smallest natural structure for this account: a completed
+public-evidence observation, an operating question, or a routing question. Use
+one verified station or handoff and one response path. Credentials, the word
+"hypothesis", a Wapahki description, and the fit screen are all optional. Do
+not stack a call, email fallback, and asset offer into a response menu.
 
-When the task is precise enough, the existing one-page automation-fit screen is
-a real give-back, not invented collateral. Offer to apply it to that exact task
-and return a first-pass view of motion stability, changeovers, interventions,
-rate, labour, and payback threshold after the recipient supplies the one missing
-operating fact. Never say the assessment already exists, and do not turn the
-screen into a second CTA or reuse identical asset wording across accounts.
+When a completed account-specific screen result exists, the message may share
+its strongest useful conclusion and offer the marked-up result. Never mention a
+screen that has not been completed, never make it a second CTA, and never reuse
+identical asset wording across accounts.
 
 The shortest LinkedIn version should sound typed for this one person: one
 specific plant-floor reference or a clean routing note. No biography, canned

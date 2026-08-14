@@ -316,7 +316,7 @@ impl Playbook {
         } else if role == "PLANNER" && self.key == "outagehub" {
             "Cover distributed Canadian operators across charging, telecom, facilities, cold storage, data centres, service dispatch, backup power, and adjacent sectors. Require a source-backed footprint, one exact outage-time decision, and a nearby operator. A one-touch discovery-ready account may proceed without a historical match. A two-email action-ready account requires a real location/polygon match and T2 contributes that timestamp/location result. Explain OutageHub's API contribution and never prescribe a universal outage/ticket binary or claim private site status."
         } else if role == "PLANNER" && self.key == "wapahki" {
-            "Cover factories and warehouses broadly, starting Ontario then Canada, while keeping evidence readiness separate from commercial lane. Every T1 needs one source-supported physical task or handoff and a close recipient. Action-ready accounts also support economic pressure and may use a cadence. A discovery-ready account may receive one task-specific email that asks whether the suspected consequence exists. Plan a natural founder/researcher T1 with Andrew's University of Toronto and Automata context, one Wapahki contribution, and a call-or-email path. Never ask the recipient to identify a use case from scratch."
+            "Cover factories and warehouses broadly, starting Ontario then Canada, while keeping evidence readiness separate from commercial lane. Every T1 needs one source-supported physical task or handoff and a close recipient. Cold outreach is one email only. Choose among a completed observation, an operating question, or a routing question; credentials and the fit screen are optional and a screen may be mentioned only when its account-specific result is already completed. Never ask the recipient to identify a use case from scratch."
         } else if role == "PLANNER" {
             "Choose the commercial angle before copy is written. Compare three distinct first-touch approaches against the verified trigger, recipient vantage, strongest objection, and easiest useful reply. Select one coherent thread; do not blend candidates or plan filler stages. A short discovery conversation is a valid first ask for a credible workflow owner; preserve the operator's requested outcome when earned and offer an email answer as the easier path. Hold when the evidence cannot support a natural note."
         } else {
@@ -641,7 +641,7 @@ mod tests {
         assert!(!reviewer.contains("=== SHARED OUTREACH DOCTRINE"));
         assert!(!planner.contains("=== SHARED OUTREACH DOCTRINE"));
         assert!(planner.split_whitespace().count() < 1_200);
-        assert_eq!((gnk.min_words, gnk.max_words), (75, 130));
+        assert_eq!((gnk.min_words, gnk.max_words), (60, 110));
         for phrase in [
             "does this merit attention",
             "if this exists",
@@ -670,7 +670,7 @@ mod tests {
         assert!(outagehub_copy.contains("one-email discovery test"));
         assert!(outagehub_copy.contains("two-email evidence sequence"));
         let wapahki = playbooks.get("wapahki").expect("wapahki");
-        assert_eq!((wapahki.min_words, wapahki.max_words), (75, 110));
+        assert_eq!((wapahki.min_words, wapahki.max_words), (45, 95));
         for phrase in [
             "repeatable packing or handling step",
             "where variation enters",

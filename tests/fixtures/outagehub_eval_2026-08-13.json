@@ -324,11 +324,11 @@
     },
     {
       "name": "dryrun_generator_two_touch",
-      "old_failure": "dry-run validation: action-ready generator sequence carries a real dated historical result in T2",
+      "old_failure": "dry-run validation: action-ready generator leads T1 with the real dated historical result",
       "expected_touches": 2,
       "subject": "Staging crews during area outages",
-      "body": "Hi Sam,\n\nPrairiePower's service page describes generator crews responding to emergency power calls across Alberta. When an area outage starts driving calls, does dispatch see the utility's reported footprint and restoration estimate anywhere, or does call volume arrive first? OutageHub aggregates Canadian utility outage reports by location and time through an API. A short reply either way would tell me whether this is real for your dispatch desk.\n\nAndrew Gordienko",
-      "second_body": "Hi Sam,\n\nOne concrete example from the archive. Your depot's verified site at 12 Range Rd, Red Deer fell inside FortisAlberta's reported outage area beginning 2026-02-03, with the provider's restoration estimate attached to the record. That is outside utility context only, not equipment status. If dispatch had that map during the February event, would staging have looked different?\n\nAndrew Gordienko",
+      "body": "Hi Sam,\n\nPrairiePower's service page describes generator crews responding to emergency power calls across Alberta. Its Red Deer depot at 12 Range Rd fell inside FortisAlberta's reported outage area beginning 2026-02-03; that is public utility context, not equipment status.\n\nWhen area outages start driving calls, does dispatch see the utility footprint before staging a crew? OutageHub can send the matching API response, including the provider timestamp and restoration estimate.\n\nAndrew Gordienko",
+      "second_body": "Hi Sam,\n\nThe implementation check is whether the lookup could use the location already attached to an incoming call, without asking dispatch to search a separate map. OutageHub returns the provider record for an address and time. Is that location normally available when the call first reaches the desk?\n\nAndrew Gordienko",
       "sendable": true,
       "expect_issue_containing": ""
     },
