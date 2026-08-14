@@ -934,6 +934,14 @@ impl SalesBrief {
         {
             issues.push("prepared/completed contribution has no artifact id".into());
         }
+        if self.brand.eq_ignore_ascii_case("gnk")
+            && !matches!(self.artifact_status.as_str(), "prepared" | "completed")
+        {
+            issues.push(
+                "GnK outreach requires a genuinely prepared claim-bound artifact; producible is insufficient"
+                    .into(),
+            );
+        }
         if self.no_solicitation_status != "absent"
             && self.no_solicitation_status != "not_applicable"
         {
@@ -975,6 +983,110 @@ pub struct ProofAsset {
     pub updated_at: String,
 }
 
+/// A prepared GnK asset must contain actual outside-in analysis, not a JSON
+/// serialization of the Sales Brief. The two artifact types deliberately use
+/// different structures so changing the label cannot manufacture a teardown.
+pub fn proof_asset_gate_issues(asset: &ProofAsset) -> Vec<String> {
+    let mut issues = Vec::new();
+    if !matches!(asset.status.as_str(), "prepared" | "completed") {
+        return issues;
+    }
+    let parsed = serde_json::from_str::<serde_json::Value>(&asset.content_json).ok();
+    let object = parsed.as_ref().and_then(serde_json::Value::as_object);
+    if object.is_none() {
+        issues.push("proof asset content is not a structured JSON object".into());
+        return issues;
+    }
+    let object = object.expect("checked above");
+    let text = |key: &str| {
+        object
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+    };
+    let array_len = |key: &str| {
+        object
+            .get(key)
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len)
+    };
+    if asset.brand.eq_ignore_ascii_case("wapahki") && asset.asset_type == "wapahki_task_brief" {
+        for key in [
+            "facility_task",
+            "likely_value_driver",
+            "minimum_data_for_feasibility",
+            "paid_feasibility_reason",
+            "recipient_usable_result",
+        ] {
+            if !text(key) {
+                issues.push(format!("Wapahki Task Brief missing {key}"));
+            }
+        }
+        for key in [
+            "confirmed_facts",
+            "inferences",
+            "unknowns",
+            "technical_kill_conditions",
+        ] {
+            if array_len(key) == 0 {
+                issues.push(format!("Wapahki Task Brief missing {key}"));
+            }
+        }
+        issues.sort();
+        issues.dedup();
+        return issues;
+    }
+    if !asset.brand.eq_ignore_ascii_case("gnk") {
+        return issues;
+    }
+    for key in [
+        "analysis_version",
+        "examined_scope",
+        "recipient_usable_result",
+    ] {
+        if !text(key) {
+            issues.push(format!("GnK proof asset missing {key}"));
+        }
+    }
+    if array_len("evidence_items") < 2 {
+        issues.push("GnK proof asset needs at least two cited evidence items".into());
+    }
+    if array_len("limitations") == 0 {
+        issues.push("GnK proof asset must state at least one evidence limitation".into());
+    }
+    match asset.asset_type.as_str() {
+        "workflow_risk_map" => {
+            if array_len("workflow_steps") < 2 {
+                issues.push("GnK workflow risk map needs at least two evidenced steps".into());
+            }
+            if array_len("risk_connections") == 0 {
+                issues.push("GnK workflow risk map has no analyzed risk connection".into());
+            }
+            if object.contains_key("failure_points") {
+                issues.push("workflow risk map cannot masquerade as a renamed teardown".into());
+            }
+        }
+        "failure_surface_teardown" => {
+            if !text("observable_surface") {
+                issues.push("GnK teardown missing observable_surface".into());
+            }
+            if array_len("failure_points") == 0 {
+                issues.push("GnK teardown has no evidenced failure point".into());
+            }
+            if !text("returned_analysis") {
+                issues.push("GnK teardown does not state the analysis it returns".into());
+            }
+            if object.contains_key("risk_connections") {
+                issues.push("failure-surface teardown cannot be a renamed risk map".into());
+            }
+        }
+        _ => issues.push("GnK proof asset type is not an approved contribution".into()),
+    }
+    issues.sort();
+    issues.dedup();
+    issues
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ConditionalFollowup {
     pub id: String,
@@ -1014,8 +1126,33 @@ pub struct MessageCandidateAudit {
     pub intended_response: String,
     pub recipient_value: String,
     pub contribution_status: String,
+    /// Every required mode is persisted. An unavailable mode is an explicit
+    /// abstention with empty buyer-facing copy, never a fabricated filler.
+    pub available: bool,
+    pub abstention_reason: String,
+    pub content_hash: String,
     pub selected: bool,
     pub selector_score: i64,
+    pub created_at: String,
+}
+
+/// Immutable provenance for the two independent inbox selectors. This binds
+/// their agreement to the exact candidate bytes and current copy policy so a
+/// later regeneration cannot inherit an earlier selection decision.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MessageSelectionAudit {
+    pub sequence_id: String,
+    pub selector_a_candidate_id: String,
+    pub selector_a_passed: bool,
+    pub selector_a_score: i64,
+    pub selector_a_reasons: Vec<String>,
+    pub selector_b_candidate_id: String,
+    pub selector_b_passed: bool,
+    pub selector_b_score: i64,
+    pub selector_b_reasons: Vec<String>,
+    pub agreed_candidate_id: String,
+    pub selected_content_hash: String,
+    pub copy_policy_hash: String,
     pub created_at: String,
 }
 
@@ -1993,6 +2130,31 @@ impl Db {
             ("touches", "value_add_type", "TEXT DEFAULT ''"),
             ("touches", "value_add_evidence_ids", "TEXT DEFAULT '[]'"),
             ("message_candidate_audit", "channel", "TEXT DEFAULT 'email'"),
+            (
+                "message_candidate_audit",
+                "available",
+                "INTEGER NOT NULL DEFAULT 1",
+            ),
+            (
+                "message_candidate_audit",
+                "abstention_reason",
+                "TEXT NOT NULL DEFAULT ''",
+            ),
+            (
+                "message_candidate_audit",
+                "content_hash",
+                "TEXT NOT NULL DEFAULT ''",
+            ),
+            (
+                "message_selection_audit",
+                "selector_a_reasons",
+                "TEXT NOT NULL DEFAULT '[]'",
+            ),
+            (
+                "message_selection_audit",
+                "selector_b_reasons",
+                "TEXT NOT NULL DEFAULT '[]'",
+            ),
             ("acquisition_contexts", "source_phase", "TEXT DEFAULT ''"),
             (
                 "acquisition_contexts",
@@ -2805,6 +2967,22 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Read-only account membership for coverage and supervised acceptance
+    /// exports. The tuple is `(market_account_id, segment_key)`; callers must
+    /// never infer qualification from membership alone.
+    pub fn list_market_segment_memberships(&self, brand: &str) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT msa.market_account_id,ms.key
+             FROM market_segment_accounts msa
+             JOIN market_segments ms ON ms.id=msa.segment_id
+             WHERE ms.brand=?1 AND ms.status='active'
+             ORDER BY ms.key,msa.market_account_id",
+        )?;
+        let rows = stmt.query_map(params![brand], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn upsert_coverage_run(&self, run: &CoverageRun) -> Result<String> {
         if run.segment_id.trim().is_empty()
             || run.source_name.trim().is_empty()
@@ -3236,6 +3414,19 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Historical opportunity rows for read-only coverage attribution. A
+    /// superseded opportunity may preserve which enumerated market segment an
+    /// account came from, but it never regains outreach authority.
+    pub fn list_sales_opportunity_history(&self, brand: &str) -> Result<Vec<SalesOpportunity>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT * FROM sales_opportunities WHERE brand=?1
+             ORDER BY updated_at DESC",
+        )?;
+        let rows = stmt.query_map(params![brand], |row| Ok(row_to_sales_opportunity(row)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn best_sales_opportunity(
         &self,
         brand: &str,
@@ -3456,24 +3647,59 @@ impl Db {
                 )
                 .optional()?;
             let expected_role_locator = format!("person:{}", brief.person_id);
-            if role_locator.as_deref() != Some(expected_role_locator.as_str()) {
+            let adjacent_locator = format!("verified-adjacent-person:{}", brief.person_id);
+            if brief.recipient_role_claim_id == adjacent_locator {
+                let adjacent_valid: i64 = conn.query_row(
+                    "SELECT EXISTS(
+                       SELECT 1 FROM opportunity_stakeholders os
+                       JOIN people p ON p.id=os.person_id
+                       JOIN sales_opportunities so ON so.id=os.sales_opportunity_id
+                       JOIN leads l ON l.id=so.lead_id AND l.id=p.lead_id
+                       WHERE os.sales_opportunity_id=?1 AND os.person_id=?2
+                         AND os.role_fit='adjacent' AND os.status<>'held'
+                         AND (
+                           (lower(p.employer_verification)='apollo'
+                            AND trim(p.apollo_org_id)<>''
+                            AND trim(l.apollo_org_id)<>''
+                            AND p.apollo_org_id=l.apollo_org_id)
+                           OR
+                           (lower(p.employer_verification)='official'
+                            AND trim(p.employer_source_url)<>'')
+                         )
+                         AND trim(p.title)<>''
+                     )",
+                    params![brief.sales_opportunity_id, brief.person_id],
+                    |row| row.get(0),
+                )?;
+                if adjacent_valid == 0
+                    || !matches!(brief.account_decision.as_str(), "route_only" | "send")
+                {
+                    bail!("sales brief adjacent route is not bound to a verified adjacent person");
+                }
+            } else if role_locator.as_deref() != Some(expected_role_locator.as_str()) {
                 bail!("sales brief recipient role claim is not person-specific");
             }
             if matches!(brief.artifact_status.as_str(), "prepared" | "completed") {
-                let artifact_valid: i64 = conn.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM proof_assets
-                     WHERE id=?1 AND sales_opportunity_id=?2 AND brand=?3 AND status=?4
-                       AND trim(content_json)<>'' AND content_json<>'{}')",
-                    params![
-                        brief.artifact_id,
-                        brief.sales_opportunity_id,
-                        brief.brand,
-                        brief.artifact_status,
-                    ],
-                    |row| row.get(0),
-                )?;
-                if artifact_valid == 0 {
+                let asset = conn
+                    .query_row(
+                        "SELECT * FROM proof_assets
+                     WHERE id=?1 AND sales_opportunity_id=?2 AND lower(brand)=lower(?3)
+                       AND status=?4",
+                        params![
+                            brief.artifact_id,
+                            brief.sales_opportunity_id,
+                            brief.brand,
+                            brief.artifact_status,
+                        ],
+                        |row| Ok(row_to_proof_asset(row)),
+                    )
+                    .optional()?;
+                let Some(asset) = asset else {
                     bail!("sales brief prepared/completed artifact is missing or unbound");
+                };
+                let issues = proof_asset_gate_issues(&asset);
+                if !issues.is_empty() {
+                    bail!("sales brief artifact is superficial: {}", issues.join("; "));
                 }
             }
         }
@@ -3627,6 +3853,10 @@ impl Db {
         {
             bail!("prepared/completed proof asset requires evidence and structured content");
         }
+        let content_issues = proof_asset_gate_issues(asset);
+        if !content_issues.is_empty() {
+            bail!("proof asset is superficial: {}", content_issues.join("; "));
+        }
         let conn = self.conn.lock().unwrap();
         for claim_id in &asset.evidence_claim_ids {
             let valid: i64 = conn.query_row(
@@ -3693,6 +3923,17 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    pub fn get_proof_asset(&self, id: &str) -> Result<Option<ProofAsset>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT * FROM proof_assets WHERE id=?1",
+            params![id],
+            |row| Ok(row_to_proof_asset(row)),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     pub fn upsert_conditional_followup(&self, plan: &ConditionalFollowup) -> Result<String> {
         if plan.brand.trim().is_empty()
             || plan.sales_opportunity_id.trim().is_empty()
@@ -3728,6 +3969,7 @@ impl Db {
         };
         let timestamp = now();
         let conn = self.conn.lock().unwrap();
+        validate_conditional_followup_refs(&conn, plan, plan.status == "approved")?;
         conn.execute(
             "INSERT INTO conditional_followups
              (id,brand,sales_opportunity_id,person_id,stage,day_offset,channel,message_type,
@@ -3795,7 +4037,35 @@ impl Db {
                 .iter()
                 .any(|candidate| candidate.sequence_id != sequence_id)
         {
-            bail!("candidate audit requires exactly three candidates for one sequence");
+            bail!("candidate audit requires exactly three mode decisions for one sequence");
+        }
+        let modes = candidates
+            .iter()
+            .map(|candidate| candidate.mode.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        if modes
+            != std::collections::HashSet::from([
+                "operating_question",
+                "evidence_contribution",
+                "routing_question",
+            ])
+        {
+            bail!("candidate audit requires one decision for every governed mode");
+        }
+        if candidates.iter().any(|candidate| {
+            (candidate.available
+                && ((candidate.channel != "linkedin" && candidate.subject.trim().is_empty())
+                    || candidate.body.trim().is_empty()
+                    || candidate.content_hash
+                        != touch_content_hash(&candidate.subject, &candidate.body)
+                    || !candidate.abstention_reason.trim().is_empty()))
+                || (!candidate.available
+                    && (!candidate.subject.trim().is_empty()
+                        || !candidate.body.trim().is_empty()
+                        || candidate.abstention_reason.trim().is_empty()
+                        || !candidate.content_hash.trim().is_empty()))
+        }) {
+            bail!("candidate availability, abstention, and content hash are inconsistent");
         }
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
@@ -3807,9 +4077,9 @@ impl Db {
             tx.execute(
                 "INSERT INTO message_candidate_audit
                  (id,sequence_id,candidate_id,mode,channel,subject,body,evidence_claim_ids,
-                  intended_response,recipient_value,contribution_status,selected,
-                  selector_score,created_at)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                  intended_response,recipient_value,contribution_status,available,
+                  abstention_reason,content_hash,selected,selector_score,created_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
                 params![
                     if candidate.id.trim().is_empty() {
                         Uuid::new_v4().to_string()
@@ -3826,6 +4096,9 @@ impl Db {
                     candidate.intended_response,
                     candidate.recipient_value,
                     candidate.contribution_status,
+                    candidate.available,
+                    candidate.abstention_reason,
+                    candidate.content_hash,
                     candidate.selected,
                     candidate.selector_score,
                     now(),
@@ -3874,11 +4147,150 @@ impl Db {
                 intended_response: g(row, "intended_response"),
                 recipient_value: g(row, "recipient_value"),
                 contribution_status: g(row, "contribution_status"),
+                available: row.get::<_, i64>("available").unwrap_or(1) != 0,
+                abstention_reason: g(row, "abstention_reason"),
+                content_hash: g(row, "content_hash"),
                 selected: row.get::<_, i64>("selected").unwrap_or(0) != 0,
                 selector_score: row.get("selector_score").unwrap_or(0),
                 created_at: g(row, "created_at"),
             })
         })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn record_message_selection_audit(&self, audit: &MessageSelectionAudit) -> Result<()> {
+        if audit.sequence_id.trim().is_empty()
+            || !audit.selector_a_passed
+            || !audit.selector_b_passed
+            || audit.selector_a_candidate_id != audit.selector_b_candidate_id
+            || audit.agreed_candidate_id != audit.selector_a_candidate_id
+            || audit.selected_content_hash.trim().is_empty()
+            || audit.copy_policy_hash != current_copy_policy_hash()
+        {
+            bail!("message selection audit requires two passing selectors on the same exact candidate");
+        }
+        let conn = self.conn.lock().unwrap();
+        let candidate: Option<(i64, String)> = conn
+            .query_row(
+                "SELECT available,content_hash FROM message_candidate_audit
+                 WHERE sequence_id=?1 AND candidate_id=?2",
+                params![audit.sequence_id, audit.agreed_candidate_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if candidate != Some((1, audit.selected_content_hash.clone())) {
+            bail!("selection audit does not match an available persisted candidate");
+        }
+        conn.execute(
+            "INSERT INTO message_selection_audit
+             (sequence_id,selector_a_candidate_id,selector_a_passed,selector_a_score,
+              selector_a_reasons,selector_b_candidate_id,selector_b_passed,selector_b_score,
+              selector_b_reasons,agreed_candidate_id,selected_content_hash,copy_policy_hash,created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+             ON CONFLICT(sequence_id) DO UPDATE SET
+              selector_a_candidate_id=excluded.selector_a_candidate_id,
+              selector_a_passed=excluded.selector_a_passed,
+              selector_a_score=excluded.selector_a_score,
+              selector_a_reasons=excluded.selector_a_reasons,
+              selector_b_candidate_id=excluded.selector_b_candidate_id,
+              selector_b_passed=excluded.selector_b_passed,
+              selector_b_score=excluded.selector_b_score,
+              selector_b_reasons=excluded.selector_b_reasons,
+              agreed_candidate_id=excluded.agreed_candidate_id,
+              selected_content_hash=excluded.selected_content_hash,
+              copy_policy_hash=excluded.copy_policy_hash,created_at=excluded.created_at",
+            params![
+                audit.sequence_id,
+                audit.selector_a_candidate_id,
+                audit.selector_a_passed,
+                audit.selector_a_score.clamp(0, 100),
+                js(&audit.selector_a_reasons),
+                audit.selector_b_candidate_id,
+                audit.selector_b_passed,
+                audit.selector_b_score.clamp(0, 100),
+                js(&audit.selector_b_reasons),
+                audit.agreed_candidate_id,
+                audit.selected_content_hash,
+                audit.copy_policy_hash,
+                now(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_message_selection_audit(
+        &self,
+        sequence_id: &str,
+    ) -> Result<Option<MessageSelectionAudit>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT * FROM message_selection_audit WHERE sequence_id=?1",
+            params![sequence_id],
+            |row| {
+                Ok(MessageSelectionAudit {
+                    sequence_id: g(row, "sequence_id"),
+                    selector_a_candidate_id: g(row, "selector_a_candidate_id"),
+                    selector_a_passed: row.get::<_, i64>("selector_a_passed").unwrap_or(0) != 0,
+                    selector_a_score: row.get("selector_a_score").unwrap_or(0),
+                    selector_a_reasons: jd(&g(row, "selector_a_reasons")),
+                    selector_b_candidate_id: g(row, "selector_b_candidate_id"),
+                    selector_b_passed: row.get::<_, i64>("selector_b_passed").unwrap_or(0) != 0,
+                    selector_b_score: row.get("selector_b_score").unwrap_or(0),
+                    selector_b_reasons: jd(&g(row, "selector_b_reasons")),
+                    agreed_candidate_id: g(row, "agreed_candidate_id"),
+                    selected_content_hash: g(row, "selected_content_hash"),
+                    copy_policy_hash: g(row, "copy_policy_hash"),
+                    created_at: g(row, "created_at"),
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn recent_message_candidate_audit(
+        &self,
+        brand: &str,
+        exclude_sequence_id: &str,
+        limit: i64,
+    ) -> Result<Vec<MessageCandidateAudit>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT m.* FROM message_candidate_audit m
+             JOIN sequences s ON s.id=m.sequence_id
+             WHERE lower(s.brand)=lower(?1) AND m.sequence_id<>?2 AND m.available=1
+               AND s.copy_policy_hash=?3
+             ORDER BY m.created_at DESC LIMIT ?4",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                brand,
+                exclude_sequence_id,
+                current_copy_policy_hash(),
+                limit.max(1)
+            ],
+            |row| {
+                Ok(MessageCandidateAudit {
+                    id: g(row, "id"),
+                    sequence_id: g(row, "sequence_id"),
+                    candidate_id: g(row, "candidate_id"),
+                    mode: g(row, "mode"),
+                    channel: g(row, "channel"),
+                    subject: g(row, "subject"),
+                    body: g(row, "body"),
+                    evidence_claim_ids: jd(&g(row, "evidence_claim_ids")),
+                    intended_response: g(row, "intended_response"),
+                    recipient_value: g(row, "recipient_value"),
+                    contribution_status: g(row, "contribution_status"),
+                    available: true,
+                    abstention_reason: g(row, "abstention_reason"),
+                    content_hash: g(row, "content_hash"),
+                    selected: row.get::<_, i64>("selected").unwrap_or(0) != 0,
+                    selector_score: row.get("selector_score").unwrap_or(0),
+                    created_at: g(row, "created_at"),
+                })
+            },
+        )?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -5833,10 +6245,21 @@ impl Db {
     /// reconciliation state instead of making another process send it twice.
     pub fn claim_touch_for_send(&self, id: &str) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
-        let approval: Option<(String, String, String, String, String)> = conn
+        let approval: Option<(
+            String,
+            String,
+            String,
+            String,
+            String,
+            i64,
+            String,
+            String,
+            String,
+        )> = conn
             .query_row(
                 "SELECT t.sequence_id,COALESCE(t.subject,''),COALESCE(t.body,''),
-                        COALESCE(s.copy_policy_hash,''),COALESCE(a.content_hash,'')
+                        COALESCE(s.copy_policy_hash,''),COALESCE(a.content_hash,''),
+                        COALESCE(t.stage,0),COALESCE(s.sales_opportunity_id,''),s.person_id,s.brand
                  FROM touches t
                  JOIN sequences s ON s.id=t.sequence_id
                  LEFT JOIN message_approvals a ON a.touch_id=t.id
@@ -5851,11 +6274,26 @@ impl Db {
                         row.get(2)?,
                         row.get(3)?,
                         row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((_sequence_id, subject, body, policy_hash, approved_hash)) = approval else {
+        let Some((
+            _sequence_id,
+            subject,
+            body,
+            policy_hash,
+            approved_hash,
+            stage,
+            sales_opportunity_id,
+            person_id,
+            touch_brand,
+        )) = approval
+        else {
             return Ok(false);
         };
         if policy_hash != current_copy_policy_hash()
@@ -5863,6 +6301,54 @@ impl Db {
             || approved_hash != touch_content_hash(&subject, &body)
         {
             return Ok(false);
+        }
+        if stage == 1
+            && !sales_opportunity_id.trim().is_empty()
+            && matches!(
+                touch_brand.to_ascii_lowercase().as_str(),
+                "gnk" | "wapahki" | "outagehub"
+            )
+        {
+            let content_hash = touch_content_hash(&subject, &body);
+            let provenance_valid: i64 = conn.query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM message_selection_audit msa
+                   JOIN message_candidate_audit mca
+                     ON mca.sequence_id=msa.sequence_id
+                    AND mca.candidate_id=msa.agreed_candidate_id
+                   WHERE msa.sequence_id=?1
+                     AND msa.selector_a_passed=1 AND msa.selector_b_passed=1
+                     AND msa.selector_a_candidate_id=msa.selector_b_candidate_id
+                     AND msa.agreed_candidate_id=msa.selector_a_candidate_id
+                     AND msa.copy_policy_hash=?2
+                     AND msa.selected_content_hash=?3
+                     AND mca.available=1 AND mca.selected=1 AND mca.content_hash=?3
+                     AND (SELECT COUNT(*) FROM message_candidate_audit all_modes
+                          WHERE all_modes.sequence_id=msa.sequence_id)=3
+                 )",
+                params![_sequence_id, current_copy_policy_hash(), content_hash],
+                |row| row.get(0),
+            )?;
+            if provenance_valid == 0 {
+                return Ok(false);
+            }
+        }
+        if stage > 1 && !sales_opportunity_id.trim().is_empty() {
+            let followup = conn
+                .query_row(
+                    "SELECT * FROM conditional_followups
+                     WHERE sales_opportunity_id=?1 AND person_id=?2 AND stage=?3
+                       AND status='approved' AND approval_required=1",
+                    params![sales_opportunity_id, person_id, stage],
+                    |row| Ok(row_to_conditional_followup(row)),
+                )
+                .optional()?;
+            let Some(followup) = followup else {
+                return Ok(false);
+            };
+            if validate_conditional_followup_refs(&conn, &followup, true).is_err() {
+                return Ok(false);
+            }
         }
         Ok(conn.execute(
             "UPDATE touches SET status='sending',error='' WHERE id=?1 AND status='scheduled'
@@ -5885,7 +6371,7 @@ impl Db {
                         SELECT 1 FROM sales_briefs sb
                         WHERE sb.sales_opportunity_id=s.sales_opportunity_id
                           AND sb.person_id=s.person_id AND lower(sb.brand)=lower(s.brand)
-                          AND sb.status='approved' AND sb.account_decision='send'
+                          AND sb.status='approved' AND sb.account_decision IN ('send','route_only')
                           AND sb.compliance_review_status='approved'
                           AND sb.no_solicitation_status IN ('absent','not_applicable')
                           AND trim(sb.consent_basis)<>''
@@ -6479,7 +6965,7 @@ impl Db {
                     SELECT 1 FROM sales_briefs sb \
                     WHERE sb.sales_opportunity_id=s.sales_opportunity_id \
                       AND sb.person_id=s.person_id AND lower(sb.brand)=lower(s.brand) \
-                      AND sb.status='approved' AND sb.account_decision='send' \
+                      AND sb.status='approved' AND sb.account_decision IN ('send','route_only') \
                       AND sb.compliance_review_status='approved' \
                       AND sb.no_solicitation_status IN ('absent','not_applicable') \
                       AND trim(sb.consent_basis)<>'' AND trim(sb.consent_evidence_url)<>'' \
@@ -9551,6 +10037,151 @@ fn row_to_proof_asset(r: &Row) -> ProofAsset {
     }
 }
 
+fn validate_conditional_followup_refs(
+    conn: &Connection,
+    plan: &ConditionalFollowup,
+    require_new_after_t1: bool,
+) -> Result<()> {
+    let scope_valid: i64 = conn.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM sales_opportunities so
+           JOIN opportunity_stakeholders os ON os.sales_opportunity_id=so.id
+           WHERE so.id=?1 AND lower(so.brand)=lower(?2)
+             AND os.person_id=?3 AND os.status<>'held'
+         )",
+        params![plan.sales_opportunity_id, plan.brand, plan.person_id],
+        |row| row.get(0),
+    )?;
+    if scope_valid == 0 {
+        bail!("conditional follow-up is not scoped to a current opportunity/person");
+    }
+
+    let sent_t1 = if require_new_after_t1 {
+        conn.query_row(
+            "SELECT t.sent_at FROM touches t
+             JOIN sequences s ON s.id=t.sequence_id
+             WHERE s.sales_opportunity_id=?1 AND s.person_id=?2 AND t.stage=1
+               AND t.status IN ('sent','replied') AND trim(t.sent_at)<>''
+             ORDER BY t.sent_at DESC LIMIT 1",
+            params![plan.sales_opportunity_id, plan.person_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            anyhow::anyhow!("approved follow-up requires a sent T1 in the same thread")
+        })?
+    } else {
+        String::new()
+    };
+    let sent_at = if sent_t1.is_empty() {
+        None
+    } else {
+        Some(
+            DateTime::parse_from_rfc3339(&sent_t1)
+                .with_context(|| "sent T1 timestamp is not RFC3339")?,
+        )
+    };
+
+    let mut kinds = std::collections::HashSet::<&'static str>::new();
+    for reference_id in &plan.evidence_or_action_ids {
+        let mut matched: Option<(&'static str, String)> = conn
+            .query_row(
+                "SELECT observed_at FROM evidence_claims
+                 WHERE id=?1 AND sales_opportunity_id=?2 AND lower(brand)=lower(?3)
+                   AND status IN ('observed','verified')",
+                params![reference_id, plan.sales_opportunity_id, plan.brand],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|timestamp| ("evidence", timestamp));
+        if matched.is_none() {
+            matched = conn
+                .query_row(
+                    "SELECT updated_at FROM proof_assets
+                     WHERE id=?1 AND sales_opportunity_id=?2 AND lower(brand)=lower(?3)
+                       AND status IN ('prepared','completed')",
+                    params![reference_id, plan.sales_opportunity_id, plan.brand],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .map(|timestamp| ("artifact", timestamp));
+        }
+        if matched.is_none() {
+            matched = conn
+                .query_row(
+                    "SELECT r.ts FROM replies r
+                     JOIN sequences s ON s.id=r.sequence_id
+                     WHERE r.id=?1 AND r.person_id=?2
+                       AND s.sales_opportunity_id=?3 AND s.person_id=?2
+                       AND lower(s.brand)=lower(?4)",
+                    params![
+                        reference_id,
+                        plan.person_id,
+                        plan.sales_opportunity_id,
+                        plan.brand
+                    ],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .map(|timestamp| ("buyer_action", timestamp));
+        }
+        if matched.is_none() {
+            matched = conn
+                .query_row(
+                    "SELECT o.observed_at FROM signal_observations o
+                     JOIN conversations c ON c.id=o.conversation_id
+                     JOIN sequences s ON s.id=c.sequence_id
+                     WHERE o.id=?1 AND o.person_id=?2
+                       AND s.sales_opportunity_id=?3 AND s.person_id=?2
+                       AND lower(o.brand)=lower(?4) AND o.status IN ('observed','verified')",
+                    params![
+                        reference_id,
+                        plan.person_id,
+                        plan.sales_opportunity_id,
+                        plan.brand
+                    ],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .map(|timestamp| ("buyer_action", timestamp));
+        }
+        let Some((kind, timestamp)) = matched else {
+            bail!(
+                "conditional follow-up reference {reference_id} is missing, stale, or outside the opportunity/person thread"
+            );
+        };
+        if let Some(sent_at) = sent_at.as_ref() {
+            let observed_at = DateTime::parse_from_rfc3339(&timestamp).with_context(|| {
+                format!("conditional follow-up reference {reference_id} has no RFC3339 timestamp")
+            })?;
+            if observed_at <= *sent_at {
+                bail!(
+                    "conditional follow-up reference {reference_id} predates or equals T1 and is not genuinely new"
+                );
+            }
+        }
+        kinds.insert(kind);
+    }
+
+    let kind_valid = match plan.value_add_type.as_str() {
+        "artifact" => kinds.contains("artifact"),
+        "new_evidence" | "narrower_hypothesis" | "technical_distinction" => {
+            kinds.contains("evidence") || kinds.contains("artifact")
+        }
+        "routing_request" | "objection_response" | "buyer_action" | "close" => {
+            kinds.contains("buyer_action")
+        }
+        _ => false,
+    };
+    if !kind_valid {
+        bail!(
+            "conditional follow-up reference types do not support value_add_type {}",
+            plan.value_add_type
+        );
+    }
+    Ok(())
+}
+
 fn row_to_conditional_followup(r: &Row) -> ConditionalFollowup {
     ConditionalFollowup {
         id: g(r, "id"),
@@ -12221,10 +12852,29 @@ CREATE TABLE IF NOT EXISTS message_candidate_audit (
     intended_response TEXT NOT NULL,
     recipient_value TEXT NOT NULL,
     contribution_status TEXT NOT NULL,
+    available INTEGER NOT NULL DEFAULT 1,
+    abstention_reason TEXT NOT NULL DEFAULT '',
+    content_hash TEXT NOT NULL DEFAULT '',
     selected INTEGER NOT NULL DEFAULT 0,
     selector_score INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     UNIQUE(sequence_id,candidate_id),
+    FOREIGN KEY(sequence_id) REFERENCES sequences(id)
+);
+CREATE TABLE IF NOT EXISTS message_selection_audit (
+    sequence_id TEXT PRIMARY KEY,
+    selector_a_candidate_id TEXT NOT NULL,
+    selector_a_passed INTEGER NOT NULL DEFAULT 0,
+    selector_a_score INTEGER NOT NULL DEFAULT 0,
+    selector_a_reasons TEXT NOT NULL DEFAULT '[]',
+    selector_b_candidate_id TEXT NOT NULL,
+    selector_b_passed INTEGER NOT NULL DEFAULT 0,
+    selector_b_score INTEGER NOT NULL DEFAULT 0,
+    selector_b_reasons TEXT NOT NULL DEFAULT '[]',
+    agreed_candidate_id TEXT NOT NULL,
+    selected_content_hash TEXT NOT NULL,
+    copy_policy_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
     FOREIGN KEY(sequence_id) REFERENCES sequences(id)
 );
 CREATE TABLE IF NOT EXISTS sales_stage_transitions (
@@ -12683,10 +13333,11 @@ mod tests {
         all_declared_sources_exhausted, current_copy_policy_hash, current_copy_policy_version,
         direct_role_claim_ids, evidence_names_operating_site, facility_observation_for_task,
         touch_content_hash, AccountPlayAssessment, AcquisitionContext, ApplicationBrief,
-        CommercialAssessment, CommercialEvent, ConversationMessage, CustomerDevelopmentRecord, Db,
-        EventEngagement, EvidenceClaim, GtmExperiment, GtmOutcome, Job, Lead, LeadSource, Mailbox,
-        Meeting, Opportunity, OpportunityContact, OpportunityStakeholder, OpportunityTouch, Person,
-        SalesApplicationBrief, SalesOpportunity, Sequence, SignalObservation, Touch,
+        CommercialAssessment, CommercialEvent, ConditionalFollowup, ConversationMessage,
+        CustomerDevelopmentRecord, Db, EventEngagement, EvidenceClaim, GtmExperiment, GtmOutcome,
+        Job, Lead, LeadSource, Mailbox, Meeting, MessageCandidateAudit, MessageSelectionAudit,
+        Opportunity, OpportunityContact, OpportunityStakeholder, OpportunityTouch, Person,
+        ProofAsset, SalesApplicationBrief, SalesOpportunity, Sequence, SignalObservation, Touch,
     };
     use chrono::{TimeZone, Utc};
     use uuid::Uuid;
@@ -15602,5 +16253,198 @@ mod tests {
             })
             .expect_err("application discovery requires a human reply");
         assert!(error.to_string().contains("in-scope human reply"));
+    }
+
+    #[test]
+    fn gnk_proof_asset_requires_real_analysis_not_restated_metadata() {
+        let superficial = ProofAsset {
+            brand: "gnk".into(),
+            asset_type: "workflow_risk_map".into(),
+            status: "prepared".into(),
+            content_json: serde_json::json!({
+                "analysis_version": "gnk_outside_in_v1",
+                "examined_scope": "claim evidence review",
+                "evidence_items": [{"claim_id":"a"}, {"claim_id":"b"}],
+                "limitations": ["private workflow unknown"]
+            })
+            .to_string(),
+            ..Default::default()
+        };
+        let issues = super::proof_asset_gate_issues(&superficial);
+        assert!(issues
+            .iter()
+            .any(|issue| issue.contains("recipient_usable_result")));
+        assert!(issues.iter().any(|issue| issue.contains("risk connection")));
+
+        let prepared = ProofAsset {
+            content_json: serde_json::json!({
+                "analysis_version": "gnk_outside_in_v1",
+                "examined_scope": "claim evidence review",
+                "evidence_items": [{"claim_id":"a"}, {"claim_id":"b"}],
+                "limitations": ["private workflow unknown"],
+                "recipient_usable_result": "A cited map of where the public filing record becomes incomplete.",
+                "workflow_steps": [
+                    {"step":"filing guidance", "claim_id":"a"},
+                    {"step":"evidence submission", "claim_id":"b"}
+                ],
+                "risk_connections": [{
+                    "from":"filing guidance",
+                    "to":"evidence submission",
+                    "observation":"The published requirements name documentation gaps at submission."
+                }]
+            })
+            .to_string(),
+            ..superficial
+        };
+        assert!(super::proof_asset_gate_issues(&prepared).is_empty());
+    }
+
+    #[test]
+    fn selector_provenance_binds_both_reviews_to_exact_candidate_bytes() {
+        let db = Db::open(":memory:").expect("open db");
+        let conn = db.conn.lock().expect("lock db");
+        conn.execute_batch(
+            "INSERT INTO leads (id,brand,apollo_org_id,name) VALUES ('lead-select','gnk','org-select','Selection Co');
+             INSERT INTO people (id,lead_id,brand,apollo_person_id,name,status)
+             VALUES ('person-select','lead-select','gnk','person-select','A Person','verified');
+             INSERT INTO sequences
+             (id,person_id,lead_id,brand,copy_policy_hash,copy_policy_version,status,created_at)
+             VALUES ('sequence-select','person-select','lead-select','gnk','','0','active','now');",
+        )
+        .expect("seed selection scope");
+        drop(conn);
+        let subject = "Evidence review";
+        let body = "Hi A,\n\nA complete prepared note.\n\nAndrew";
+        let content_hash = touch_content_hash(subject, body);
+        db.replace_message_candidate_audit(
+            "sequence-select",
+            &[
+                MessageCandidateAudit {
+                    sequence_id: "sequence-select".into(),
+                    candidate_id: "operating".into(),
+                    mode: "operating_question".into(),
+                    channel: "email".into(),
+                    subject: subject.into(),
+                    body: body.into(),
+                    evidence_claim_ids: vec!["claim".into()],
+                    intended_response: "Answer".into(),
+                    recipient_value: "Prepared note".into(),
+                    contribution_status: "prepared_observation".into(),
+                    available: true,
+                    content_hash: content_hash.clone(),
+                    ..Default::default()
+                },
+                MessageCandidateAudit {
+                    sequence_id: "sequence-select".into(),
+                    candidate_id: "evidence".into(),
+                    mode: "evidence_contribution".into(),
+                    channel: "email".into(),
+                    abstention_reason: "No completed artifact".into(),
+                    available: false,
+                    ..Default::default()
+                },
+                MessageCandidateAudit {
+                    sequence_id: "sequence-select".into(),
+                    candidate_id: "routing".into(),
+                    mode: "routing_question".into(),
+                    channel: "email".into(),
+                    abstention_reason: "Direct owner; routing is inappropriate".into(),
+                    available: false,
+                    ..Default::default()
+                },
+            ],
+        )
+        .expect("persist modes");
+        let audit = MessageSelectionAudit {
+            sequence_id: "sequence-select".into(),
+            selector_a_candidate_id: "operating".into(),
+            selector_a_passed: true,
+            selector_a_score: 90,
+            selector_b_candidate_id: "operating".into(),
+            selector_b_passed: true,
+            selector_b_score: 88,
+            agreed_candidate_id: "operating".into(),
+            selected_content_hash: content_hash,
+            copy_policy_hash: current_copy_policy_hash().into(),
+            ..Default::default()
+        };
+        db.record_message_selection_audit(&audit)
+            .expect("matching selection audit");
+        let mut changed = audit;
+        changed.selected_content_hash = touch_content_hash(subject, "changed");
+        assert!(db.record_message_selection_audit(&changed).is_err());
+    }
+
+    #[test]
+    fn approved_followup_references_must_be_in_thread_and_newer_than_t1() {
+        let db = Db::open(":memory:").expect("open db");
+        let conn = db.conn.lock().expect("lock db");
+        conn.execute_batch(
+            "INSERT INTO leads (id,brand,apollo_org_id,name)
+             VALUES ('lead-follow','gnk','org-follow','Follow Co');
+             INSERT INTO people (id,lead_id,brand,apollo_person_id,name,status)
+             VALUES ('person-follow','lead-follow','gnk','person-follow','A Person','verified');
+             INSERT INTO market_accounts
+             (id,identity_key,canonical_domain,apollo_org_id,name,created_at,updated_at)
+             VALUES ('account-follow','domain:follow.example','follow.example','org-follow','Follow Co','now','now');
+             INSERT INTO sales_opportunities
+             (id,identity_key,task_key,brand,market_account_id,lead_id,play_id,kind,title,
+              task_or_decision,evidence_status,evidence_tier,status,created_at,updated_at)
+             VALUES ('opportunity-follow','id-follow','task-follow','gnk','account-follow',
+                     'lead-follow','play','workflow','Task','Task','action_ready','action_ready',
+                     'qualified','now','now');
+             INSERT INTO opportunity_stakeholders
+             (id,sales_opportunity_id,person_id,role,role_fit,active_thread,status,created_at,updated_at)
+             VALUES ('stakeholder-follow','opportunity-follow','person-follow','process_owner',
+                     'direct',1,'mapped','now','now');
+             INSERT INTO sequences
+             (id,person_id,lead_id,brand,sales_opportunity_id,status,created_at)
+             VALUES ('sequence-follow','person-follow','lead-follow','gnk','opportunity-follow',
+                     'active','2026-08-14T09:00:00Z');
+             INSERT INTO touches
+             (id,sequence_id,person_id,lead_id,brand,stage,channel,status,sent_at,created_at)
+             VALUES ('touch-follow','sequence-follow','person-follow','lead-follow','gnk',1,
+                     'email','sent','2026-08-14T10:00:00Z','2026-08-14T09:00:00Z');
+             INSERT INTO evidence_claims
+             (id,sales_opportunity_id,brand,lead_id,task_key,claim_type,claim_text,source_url,
+              source_excerpt,lineage_key,independence_group,status,observed_at,created_at,updated_at)
+             VALUES
+             ('claim-new','opportunity-follow','gnk','lead-follow','task-follow','account.fit_evidence',
+              'New evidence','https://follow.example/new','New evidence','new','new','observed',
+              '2026-08-14T11:00:00Z','2026-08-14T11:00:00Z','2026-08-14T11:00:00Z'),
+             ('claim-old','opportunity-follow','gnk','lead-follow','task-follow','account.fit_evidence',
+              'Old evidence','https://follow.example/old','Old evidence','old','old','observed',
+              '2026-08-14T08:00:00Z','2026-08-14T08:00:00Z','2026-08-14T08:00:00Z');",
+        )
+        .expect("seed follow-up scope");
+        drop(conn);
+
+        let approved = ConditionalFollowup {
+            brand: "gnk".into(),
+            sales_opportunity_id: "opportunity-follow".into(),
+            person_id: "person-follow".into(),
+            stage: 2,
+            day_offset: 4,
+            channel: "email".into(),
+            message_type: "evidence".into(),
+            send_condition: "new evidence after T1".into(),
+            value_add_type: "new_evidence".into(),
+            new_information: "A new source changes the evidence view.".into(),
+            evidence_or_action_ids: vec!["claim-new".into()],
+            recipient_role: "process_owner".into(),
+            approval_required: true,
+            status: "approved".into(),
+            ..Default::default()
+        };
+        db.upsert_conditional_followup(&approved)
+            .expect("new in-scope evidence can authorize a follow-up plan");
+        let mut stale = approved;
+        stale.stage = 3;
+        stale.evidence_or_action_ids = vec!["claim-old".into()];
+        assert!(db
+            .upsert_conditional_followup(&stale)
+            .expect_err("old evidence must not authorize a follow-up")
+            .to_string()
+            .contains("not genuinely new"));
     }
 }

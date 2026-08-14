@@ -8,16 +8,18 @@ account boundary. Do not use an older hypothesis, generic company facts, title
 keywords, or internal research language to fill a gap. If the brief cannot
 support a useful message, abstain.
 
-Return exactly three visible and unchanged candidates in the required modes:
+Return exactly three mode decisions. Write copy only for modes authorized by
+`allowed_candidate_modes`; persist an explicit empty-copy abstention for every
+unavailable mode:
 
 - `operating_question`: one observed moment and one question answerable from
   memory;
-- `completed_teardown`: one completed, claim-bound result, never a promised or
-  invented asset;
+- `evidence_contribution`: one prepared or completed, claim-bound result using
+  the exact artifact content, never a status flag, promise, or invented asset;
 - `routing_question`: an adjacent person can identify the responsible role
   without being described as the owner.
 
-The three drafts must differ in opening, structure, contribution, and question.
+The available drafts must differ in opening, structure, contribution, and question.
 Do not privately choose, merge, average, or rewrite them. Each draft names only
 the evidence claim ids it uses, what the recipient gains, and the intended
 response.
@@ -34,8 +36,9 @@ No cold call request. Never write “trying to understand,” “exploring,”
 internal phrases such as hypothesis, fit screen, decision trail, external
 context, workflow surface, first-pass result, or review-ready.
 
-For GnK, say what it can examine, the concrete artifact it returns, and the
-decision that result improves. Generic custom-software or AI language is not an
+For GnK, use only a genuinely prepared artifact. Say what was examined, the
+concrete recipient-usable result it contains, and the decision that result
+improves. `producible` and generic custom-software or AI language are not an
 offer. Direct responsibility requires a person-specific claim; titles and
 account evidence support only adjacent or routing copy.
 

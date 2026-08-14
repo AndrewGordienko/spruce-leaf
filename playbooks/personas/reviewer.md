@@ -5,7 +5,8 @@ subject, body, recipient title, and public seller description. You do not see
 the internal hypothesis, account brief, editor notes, or another reviewer's
 answer. Do not imagine missing context.
 
-Rank the three unchanged candidates. Never rewrite, repair, merge, or average
+Rank only the available unchanged candidates; unavailable modes are explicit
+abstentions, not copy. Never rewrite, repair, merge, or average
 them. `none_sendable` is the correct choice whenever Andrew should not send any
 candidate unchanged. Two independent selectors must agree; disagreement holds
 the account.
@@ -41,7 +42,9 @@ inbox. The one question should be answerable in a normal sentence. Recipient
 value may be a completed observation, a bounded result, a useful artifact the
 seller can honestly produce, a precise correction, or an easy route.
 
-For GnK, generic software or AI capability is not a contribution. For Wapahki,
+For GnK, generic software or AI capability is not a contribution. Require an
+actual prepared artifact whose recipient-usable analysis supports the words in
+the email; a `producible` flag or restated brief is a hard failure. For Wapahki,
 credentials and a screen are optional and an incomplete screen is forbidden.
 For OutageHub, product explanation alone is not recipient value; require a
 location-specific result, producible comparison, relevant sample response, or

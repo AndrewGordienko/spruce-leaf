@@ -33,6 +33,10 @@ The email must improve or test one decision: diagnose, dispatch, escalate, notif
 
 The first lines must establish one verified facility fact and bounded physical task. The message must contribute a real Task Brief, completed screen, task-map observation, technical distinction, or one precise question answerable from memory. Reject generic automation pitches, invented fit/ROI/performance, research-memo language, mandatory credential furniture, or mention of an artifact that does not exist.
 
+## GnK
+
+The email must name one verified expensive operating moment, what GnK actually examined, the concrete recipient-usable result in a prepared claim-bound artifact, and the decision that result improves. Reject vague software or AI capability, “trying to understand” research requests, unearned calls, generic cross-system workflow language, a producible-but-unprepared offer, superficial metadata presented as a teardown, or any artifact claim that the stored artifact content does not support.
+
 ## Batch review
 
 Compare the entire current generation batch before selection. Block excessive phrase, opening, sentence-structure, question, and CTA similarity. A batch that passes one-by-one but reads like mail merge fails as a batch.
@@ -41,5 +45,6 @@ Compare the entire current generation batch before selection. Block excessive ph
 
 - OutageHub: at least 20 real messages pass current deterministic policy, blind review, exact-copy manual approval, and controlled SMTP delivery.
 - Wapahki: at least 10 real Task Briefs and 10 unchanged messages pass the same controls before any external delivery.
+- GnK: 30 real accounts across at least three segments must produce current candidate provenance; at least 24 distinct-account messages must pass blind review and exact-copy approval unchanged, with zero wrong recipients, research-interview notes, or superficial assets, before controlled delivery can unlock a prospect pilot.
 
 The target is positive replies, correct referrals, artifact requests, qualified task conversations, and opportunities—not opens or model scores.

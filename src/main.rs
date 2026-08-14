@@ -15,6 +15,7 @@
 //!   spruce-leaf simulate "..."  synthetic prompt experiment, never filed or sent
 //!   spruce-leaf crm        just serve the CRM dashboard
 
+mod acceptance;
 mod agent;
 mod apollo;
 mod business;
@@ -303,6 +304,13 @@ enum Command {
         output: PathBuf,
     },
 
+    /// Export a read-only supervised acceptance sample and its honest failure
+    /// report. Never researches, generates, labels, approves, schedules, or sends.
+    AcceptanceReport {
+        #[arg(long, default_value = ".spruce/acceptance-report")]
+        output: PathBuf,
+    },
+
     /// Import a founder/compliance-reviewed prospect sales brief from JSON.
     /// Importing never generates, approves copy, schedules, or sends.
     ImportSalesBrief { file: PathBuf },
@@ -320,6 +328,10 @@ enum Command {
     /// Import a post-reply application-centric sales brief. This cannot create
     /// cold outreach and requires an in-scope human reply.
     ImportSalesApplication { file: PathBuf },
+
+    /// Import a claim-bound proof asset after a human has completed its real
+    /// analysis. Superficial GnK summaries are rejected by the database.
+    ImportProofAsset { file: PathBuf },
 
     /// Prepare one outside-in proof asset solely from a draft brief's cited evidence.
     PrepareProofAsset {
@@ -1181,12 +1193,15 @@ fn main() -> Result<()> {
                 &db, &playbooks, &cli.brand, accounts, segments, messages, approvals,
             )?;
             println!(
-                "{} pilot audit: {} real researched account(s) across {} segment(s); {} generated/current message(s); {} exact-copy manually approved; {} allowlisted SMTP delivery/deliveries.",
+                "{} pilot audit: {} real researched account(s) across {} segment(s); {} distinct-account generated/current message(s); {} with full selector provenance; {} exact-copy approvals on distinct accounts; {} distinct approved facilities; {} complete Wapahki Task Briefs; {} allowlisted SMTP delivery/deliveries.",
                 cli.brand,
                 audit.researched_accounts,
                 audit.segments.len(),
                 audit.generated_messages,
-                audit.manually_approved_messages,
+                audit.selector_provenance_messages,
+                audit.approved_distinct_accounts,
+                audit.approved_distinct_facilities,
+                audit.complete_wapahki_task_briefs,
                 audit.allowlisted_smtp_messages,
             );
             if !audit.segments.is_empty() {
@@ -1226,6 +1241,19 @@ fn main() -> Result<()> {
             Ok(())
         }
 
+        Command::AcceptanceReport { output } => {
+            let summary = acceptance::export(&db, &cli.brand, &output)?;
+            println!(
+                "{} supervised acceptance report: {} companies, {} contacts, {} candidate decisions",
+                if summary.passed { "✓" } else { "BLOCKED" },
+                summary.companies,
+                summary.contacts,
+                summary.candidates
+            );
+            println!("  {}", summary.directory.display());
+            Ok(())
+        }
+
         Command::ImportSalesBrief { file } => {
             let id = sales_packet::import_sales_brief(&db, &file)?;
             println!("✓ imported local sales brief {id}; no copy was approved or sent");
@@ -1256,6 +1284,12 @@ fn main() -> Result<()> {
         Command::ImportSalesApplication { file } => {
             let id = sales_packet::import_sales_application(&db, &file)?;
             println!("✓ imported reply-backed sales application brief {id}");
+            Ok(())
+        }
+
+        Command::ImportProofAsset { file } => {
+            let id = sales_packet::import_proof_asset(&db, &file)?;
+            println!("✓ imported validated proof asset {id}; no copy was approved or sent");
             Ok(())
         }
 

@@ -1,5 +1,6 @@
 //! Human-anchored three-candidate inbox evaluation.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -115,6 +116,7 @@ pub async fn run(engine: &Engine, path: &Path, double_blind: bool) -> Result<()>
     let mut consistent = 0usize;
     let mut absolute_correct = 0usize;
     let mut absolute_labels = 0usize;
+    let mut brand_scores = HashMap::<String, (usize, usize, usize, usize, usize, usize)>::new();
     for case in &cases {
         let forward = judge_three(engine, case, false).await?;
         let reverse = judge_three(engine, case, true).await?;
@@ -135,6 +137,15 @@ pub async fn run(engine: &Engine, path: &Path, double_blind: bool) -> Result<()>
         let expected = normalize_label(&case.expected);
         let passed = preferred == expected;
         correct += usize::from(passed);
+        let brand_score = brand_scores
+            .entry(case.brand.trim().to_ascii_lowercase())
+            .or_default();
+        brand_score.0 += usize::from(passed);
+        brand_score.1 += 1;
+        if case.partition == "holdout" {
+            brand_score.4 += usize::from(passed);
+            brand_score.5 += 1;
+        }
         for (expected, judged) in [
             (case.expected_sendable_a, forward.sendable_a),
             (case.expected_sendable_b, forward.sendable_b),
@@ -143,6 +154,8 @@ pub async fn run(engine: &Engine, path: &Path, double_blind: bool) -> Result<()>
             if let Some(expected) = expected {
                 absolute_labels += 1;
                 absolute_correct += usize::from(expected == judged);
+                brand_score.3 += 1;
+                brand_score.2 += usize::from(expected == judged);
             }
         }
         println!(
@@ -174,7 +187,21 @@ pub async fn run(engine: &Engine, path: &Path, double_blind: bool) -> Result<()>
         "Absolute sendability accuracy: {absolute_correct}/{absolute_labels} ({:.1}%)",
         absolute_accuracy * 100.0
     );
-    if accuracy < 0.90 || absolute_accuracy < 0.90 {
+    let mut brand_failed = false;
+    for (brand, (selected, cases, absolute, labels, holdout, holdout_cases)) in &brand_scores {
+        let selection_accuracy = *selected as f64 / *cases as f64;
+        let absolute_brand_accuracy = *absolute as f64 / *labels as f64;
+        let holdout_accuracy = *holdout as f64 / *holdout_cases as f64;
+        println!(
+            "{brand}: selection {selected}/{cases} ({:.1}%), absolute {absolute}/{labels} ({:.1}%), sealed holdout {holdout}/{holdout_cases} ({:.1}%)",
+            selection_accuracy * 100.0,
+            absolute_brand_accuracy * 100.0,
+            holdout_accuracy * 100.0,
+        );
+        brand_failed |=
+            selection_accuracy < 0.90 || absolute_brand_accuracy < 0.90 || holdout_accuracy < 0.90;
+    }
+    if accuracy < 0.90 || absolute_accuracy < 0.90 || brand_failed {
         bail!(
             "outreach evaluation failed: selection {:.1}%, absolute {:.1}% (requires >=90% for both)",
             accuracy * 100.0,
@@ -185,7 +212,11 @@ pub async fn run(engine: &Engine, path: &Path, double_blind: bool) -> Result<()>
 }
 
 fn validate_promotion_corpus(cases: &[EvalCase], path: &Path) -> Result<()> {
-    for (brand, minimum) in [("gnk", 30usize), ("wapahki", 30), ("outagehub", 30)] {
+    for (brand, minimum, minimum_holdout) in [
+        ("gnk", 30usize, 6usize),
+        ("wapahki", 10, 2),
+        ("outagehub", 40, 10),
+    ] {
         let brand_cases = cases
             .iter()
             .filter(|case| case.brand.eq_ignore_ascii_case(brand))
@@ -223,8 +254,10 @@ fn validate_promotion_corpus(cases: &[EvalCase], path: &Path) -> Result<()> {
             .iter()
             .filter(|case| case.partition == "holdout")
             .count();
-        if holdout * 5 < brand_cases.len() {
-            bail!("{brand} promotion requires at least a 20% holdout partition");
+        if holdout < minimum_holdout || holdout * 5 < brand_cases.len() {
+            bail!(
+                "{brand} promotion requires at least {minimum_holdout} sealed holdout cases and at least 20% of the brand corpus"
+            );
         }
         let labels = brand_cases
             .iter()

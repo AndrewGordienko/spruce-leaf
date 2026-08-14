@@ -27,8 +27,8 @@ use serde_json::{json, Value};
 use crate::business::BusinessProfile;
 use crate::calendar::{self, TimingContext};
 use crate::db::{
-    current_copy_policy_hash, current_copy_policy_version, MessageCandidateAudit, Sequence,
-    SharedDb, Touch,
+    current_copy_policy_hash, current_copy_policy_version, MessageCandidateAudit,
+    MessageSelectionAudit, Sequence, SharedDb, Touch,
 };
 use crate::domain::{
     Account as CopyAccount, Contact as CopyContact, Sequence as CopySequence, Touch as CopyTouch,
@@ -521,6 +521,9 @@ struct SendableBrief {
     smallest_ask: String,
     artifact_id: String,
     artifact_status: String,
+    artifact_type: String,
+    artifact_recipient_result: String,
+    allowed_candidate_modes: Vec<String>,
     consent_basis: String,
     consent_evidence_url: String,
     consent_evidence_captured_at: String,
@@ -576,7 +579,7 @@ enum ContributionStatus {
 #[serde(rename_all = "snake_case")]
 enum MessageMode {
     OperatingQuestion,
-    CompletedTeardown,
+    EvidenceContribution,
     RoutingQuestion,
 }
 
@@ -584,7 +587,7 @@ impl MessageMode {
     fn key(self) -> &'static str {
         match self {
             Self::OperatingQuestion => "operating_question",
-            Self::CompletedTeardown => "completed_teardown",
+            Self::EvidenceContribution => "evidence_contribution",
             Self::RoutingQuestion => "routing_question",
         }
     }
@@ -612,9 +615,17 @@ struct MessageCandidate {
     intended_response: String,
     recipient_value: String,
     contribution_status: ContributionStatus,
+    #[serde(default = "default_candidate_available")]
+    available: bool,
+    #[serde(default)]
+    abstention_reason: String,
 }
 
-#[derive(Debug, Deserialize)]
+fn default_candidate_available() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct BlindSelection {
     selected_candidate_id: String,
     send_unchanged: bool,
@@ -625,6 +636,13 @@ struct BlindSelection {
     naturalness: u32,
     #[serde(default)]
     reasons: Vec<String>,
+}
+
+struct CandidateSelectionOutcome {
+    selected: MessageCandidate,
+    selector_a: BlindSelection,
+    selector_b: BlindSelection,
+    reviews: Vec<TouchReview>,
 }
 
 impl BlindSelection {
@@ -683,14 +701,14 @@ fn candidate_batch_issues(
     let mut issues = Vec::new();
     if candidates.len() != 3 {
         issues.push(format!(
-            "candidate batch must contain exactly three visible drafts; found {}",
+            "candidate batch must persist exactly three governed mode decisions; found {}",
             candidates.len()
         ));
         return issues;
     }
     let required_modes = HashSet::from([
         MessageMode::OperatingQuestion,
-        MessageMode::CompletedTeardown,
+        MessageMode::EvidenceContribution,
         MessageMode::RoutingQuestion,
     ]);
     let modes = candidates
@@ -699,7 +717,7 @@ fn candidate_batch_issues(
         .collect::<HashSet<_>>();
     if modes != required_modes {
         issues.push(
-            "candidate batch must contain one operating question, one completed teardown, and one routing question"
+            "candidate batch must contain one decision for operating question, evidence contribution, and routing question"
                 .into(),
         );
     }
@@ -721,7 +739,43 @@ fn candidate_batch_issues(
     {
         allowed_claims.insert(brief.person_role_claim_id.as_str());
     }
+    let allowed_modes = brief
+        .allowed_candidate_modes
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let mut available_count = 0usize;
     for candidate in candidates {
+        let should_be_available = allowed_modes.contains(candidate.mode.key());
+        if candidate.available != should_be_available {
+            issues.push(format!(
+                "candidate {} availability contradicts the evidence-aware mode plan",
+                candidate.id
+            ));
+        }
+        if !candidate.available {
+            if !candidate.subject.trim().is_empty()
+                || !candidate.body.trim().is_empty()
+                || !candidate.evidence_claim_ids.is_empty()
+                || !candidate.intended_response.trim().is_empty()
+                || !candidate.recipient_value.trim().is_empty()
+                || candidate.contribution_status != ContributionStatus::None
+                || candidate.abstention_reason.trim().is_empty()
+            {
+                issues.push(format!(
+                    "candidate {} must persist an empty-copy abstention and a reason",
+                    candidate.id
+                ));
+            }
+            continue;
+        }
+        available_count += 1;
+        if !candidate.abstention_reason.trim().is_empty() {
+            issues.push(format!(
+                "available candidate {} cannot carry an abstention reason",
+                candidate.id
+            ));
+        }
         let channel_allowed = match brief.outreach_channel.as_str() {
             "email" => candidate.channel == "email",
             "linkedin" => candidate.channel == "linkedin",
@@ -788,15 +842,19 @@ fn candidate_batch_issues(
             issues.push(format!("candidate {}: {reason}", candidate.id));
         }
     }
-    for left in 0..candidates.len() {
-        for right in (left + 1)..candidates.len() {
-            let (body_similarity, body_overlap) = word_set_similarity(
-                &candidates[left].body,
-                &candidates[right].body,
-                &pb.signature,
-            );
-            let left_question = primary_question(&candidates[left].body);
-            let right_question = primary_question(&candidates[right].body);
+    if available_count == 0 {
+        issues.push("all evidence-aware candidate modes abstained".into());
+    }
+    let available = candidates
+        .iter()
+        .filter(|candidate| candidate.available)
+        .collect::<Vec<_>>();
+    for left in 0..available.len() {
+        for right in (left + 1)..available.len() {
+            let (body_similarity, body_overlap) =
+                word_set_similarity(&available[left].body, &available[right].body, &pb.signature);
+            let left_question = primary_question(&available[left].body);
+            let right_question = primary_question(&available[right].body);
             let (question_similarity, question_overlap) =
                 word_set_similarity(&left_question, &right_question, &pb.signature);
             if (body_similarity >= 0.52 && body_overlap >= 8)
@@ -804,8 +862,8 @@ fn candidate_batch_issues(
             {
                 issues.push(format!(
                     "candidates {} and {} are structurally repetitive (body {:.0}%, question {:.0}%)",
-                    candidates[left].id,
-                    candidates[right].id,
+                    available[left].id,
+                    available[right].id,
                     body_similarity * 100.0,
                     question_similarity * 100.0
                 ));
@@ -840,9 +898,10 @@ async fn select_unchanged_candidate(
     pb: &Playbook,
     person: &crate::db::Person,
     candidates: &[MessageCandidate],
-) -> Result<(MessageCandidate, Vec<TouchReview>)> {
+) -> Result<CandidateSelectionOutcome> {
     let inbox_candidates = candidates
         .iter()
+        .filter(|candidate| candidate.available)
         .map(|candidate| {
             json!({
                 "id": candidate.id,
@@ -893,19 +952,21 @@ async fn select_unchanged_candidate(
     }
     let selected = candidates
         .iter()
-        .find(|candidate| candidate.id == left.selected_candidate_id)
+        .find(|candidate| candidate.available && candidate.id == left.selected_candidate_id)
         .cloned()
         .ok_or_else(|| anyhow!("blind selector returned an unknown candidate id"))?;
     let score = left.score().min(right.score());
-    Ok((
+    Ok(CandidateSelectionOutcome {
         selected,
-        vec![TouchReview {
+        selector_a: left,
+        selector_b: right,
+        reviews: vec![TouchReview {
             stage: 1,
             passes: true,
             score,
             issues: Vec::new(),
         }],
-    ))
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -953,6 +1014,21 @@ fn locked_must_reject_reason(
                     .contains(&fixture.opportunity_task_contains.to_ascii_lowercase()))
     })
     .map(|fixture| format!("locked must-reject fixture: {}", fixture.reason))
+}
+
+fn recipient_role_binding_matches(
+    stored_role_claim_id: &str,
+    person_id: &str,
+    current_person_role_claim_id: Option<&str>,
+    verified_adjacent_identity: bool,
+) -> bool {
+    match current_person_role_claim_id {
+        Some(claim_id) => claim_id == stored_role_claim_id,
+        None => {
+            verified_adjacent_identity
+                && stored_role_claim_id == format!("verified-adjacent-person:{person_id}")
+        }
+    }
 }
 
 fn build_sendable_brief(
@@ -1007,7 +1083,7 @@ fn build_sendable_brief(
             sales_brief.brief_type
         ));
     }
-    if sales_brief.account_decision != "send" {
+    if !matches!(sales_brief.account_decision.as_str(), "send" | "route_only") {
         return Err(format!(
             "account decision is {}; standard outreach generation is disabled",
             sales_brief.account_decision
@@ -1034,6 +1110,54 @@ fn build_sendable_brief(
     ) && matches!(sales_brief.artifact_status.as_str(), "none" | "")
     {
         return Err("no real prepared or honestly producible recipient-side contribution".into());
+    }
+    if brand.eq_ignore_ascii_case("gnk")
+        && !matches!(
+            sales_brief.artifact_status.as_str(),
+            "prepared" | "completed"
+        )
+    {
+        return Err(
+            "GnK requires a genuinely prepared claim-bound contribution; producible metadata cannot authorize writing"
+                .into(),
+        );
+    }
+    let proof_asset = if matches!(
+        sales_brief.artifact_status.as_str(),
+        "prepared" | "completed"
+    ) {
+        let asset = context.proof_asset.as_ref().ok_or_else(|| {
+            "prepared/completed artifact is not loaded from durable storage".to_string()
+        })?;
+        if asset.id != sales_brief.artifact_id
+            || asset.sales_opportunity_id != opportunity.id
+            || !asset.brand.eq_ignore_ascii_case(brand)
+            || asset.status != sales_brief.artifact_status
+        {
+            return Err("prepared artifact is bound to a different scope or state".into());
+        }
+        let issues = crate::db::proof_asset_gate_issues(asset);
+        if !issues.is_empty() {
+            return Err(format!(
+                "prepared artifact is superficial: {}",
+                issues.join("; ")
+            ));
+        }
+        Some(asset)
+    } else {
+        None
+    };
+    let artifact_recipient_result = proof_asset
+        .and_then(|asset| serde_json::from_str::<serde_json::Value>(&asset.content_json).ok())
+        .and_then(|content| {
+            content
+                .get("recipient_usable_result")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    if brand.eq_ignore_ascii_case("gnk") && artifact_recipient_result.trim().is_empty() {
+        return Err("GnK artifact has no concrete recipient-usable result".into());
     }
     let active = context
         .evidence_claims
@@ -1140,13 +1264,18 @@ fn build_sendable_brief(
             "no person-specific role source; account evidence cannot prove direct ownership".into(),
         );
     }
-    if person_role_claim.map(|claim| claim.id.as_str())
-        != Some(sales_brief.recipient_role_claim_id.as_str())
-    {
-        return Err(
+    if !recipient_role_binding_matches(
+        &sales_brief.recipient_role_claim_id,
+        &person.id,
+        person_role_claim.map(|claim| claim.id.as_str()),
+        verified_adjacent_identity,
+    ) {
+        return Err(if person_role_claim.is_some() {
             "sales brief recipient responsibility is not the current person-specific role claim"
-                .into(),
-        );
+                .into()
+        } else {
+            "adjacent recipient is not bound to the verified routing sentinel".into()
+        });
     }
     let contact_can_answer =
         crate::response_design::is_workflow_discovery_contact(&person.title, &person.vantage);
@@ -1233,6 +1362,24 @@ fn build_sendable_brief(
         "prepared" | "producible" => ContributionStatus::PreparedObservation,
         _ => ContributionStatus::None,
     };
+    let mut allowed_candidate_modes = Vec::new();
+    if person_role_claim.is_some() && sales_brief.account_decision == "send" && contact_can_answer {
+        allowed_candidate_modes.push(MessageMode::OperatingQuestion.key().to_string());
+    }
+    if person_role_claim.is_some()
+        && proof_asset.is_some()
+        && !artifact_recipient_result.trim().is_empty()
+    {
+        allowed_candidate_modes.push(MessageMode::EvidenceContribution.key().to_string());
+    }
+    if verified_adjacent_identity || sales_brief.account_decision == "route_only" {
+        allowed_candidate_modes.push(MessageMode::RoutingQuestion.key().to_string());
+    }
+    allowed_candidate_modes.sort();
+    allowed_candidate_modes.dedup();
+    if allowed_candidate_modes.is_empty() {
+        return Err("recipient role and artifact state authorize no honest message mode".into());
+    }
 
     let distributed_excerpt = distributed_locations
         .map(|claim| claim.source_excerpt.to_ascii_lowercase())
@@ -1337,6 +1484,11 @@ fn build_sendable_brief(
         smallest_ask: sales_brief.smallest_ask.clone(),
         artifact_id: sales_brief.artifact_id.clone(),
         artifact_status: sales_brief.artifact_status.clone(),
+        artifact_type: proof_asset
+            .map(|asset| asset.asset_type.clone())
+            .unwrap_or_default(),
+        artifact_recipient_result,
+        allowed_candidate_modes,
         consent_basis: sales_brief.consent_basis.clone(),
         consent_evidence_url: sales_brief.consent_evidence_url.clone(),
         consent_evidence_captured_at: sales_brief.consent_evidence_captured_at.clone(),
@@ -2694,7 +2846,7 @@ async fn write_account_sequences(
         })
     };
     let planning_contract = if n == 1 {
-        "Return exactly three visible, unchanged T1 candidates with different modes: operating_question, completed_teardown, and routing_question. Do not choose, merge, average, or rewrite them. Each candidate must use the sendable_brief acquisition channel and must name its intended response, recipient value, contribution status, and only the exact evidence claim ids it uses. A completed_teardown may mention collateral only when sendable_brief.contribution_status is completed_public_evidence_screen."
+        "Return exactly three mode decisions: operating_question, evidence_contribution, and routing_question. A mode absent from sendable_brief.allowed_candidate_modes must explicitly abstain with available=false, empty copy/value/evidence fields, and a precise abstention_reason. Do not invent filler to keep three drafts visible. Available candidates remain unchanged and must use the approved channel, exact evidence ids, recipient value, intended response, and contribution state."
     } else if lean {
         "For each recipient, choose one source-backed trigger and one operating decision this title can plausibly answer. Keep the mechanism explicitly unverified. T2 must sharpen the mechanism rather than restate T1. T3 is a natural connection request that gives a concrete reason to connect; never fill it with praise for the recipient's remit, background, perspective, or work. If T4 is present, add only a sourced fact, a useful concrete distinction, or an honest answer to the strongest objection; never invent an artifact to fill the slot. The sequence stays on one human thread and must not become an interview or a chain of retreats."
     } else {
@@ -2705,7 +2857,7 @@ async fn write_account_sequences(
     let t1_contract = "T1 CONTRACT: Write a complete founder note inside the configured word band. Explain why this person, name one recognizable problem and plausible consequence, state one concrete and evidence-safe seller contribution, and offer one natural response path. For a discovery-ready account, the one direct operating answer is the sole CTA; do not add a call before the missing term is confirmed. A correction may be useful, but Andrew's desire for one is never the recipient's reason to answer. When the operator requested a supported operating decision or response, preserve it in T1; never broaden it into a generic workflow interview such as `what takes the most time`, `what happens today`, or `how do you handle this`. Keep every attributed claim faithful to its exact source: never replace a source's generic noun with a more specific noun learned from another URL. If a job posting says `finished products` and the company page separately names the product, retain `finished products` when describing the posting or state the two facts in separate sentences. The subject is also a factual claim: never put the unconfirmed term being asked about—such as `manual`, `staffed by hand`, a guessed system, or a presumed consequence—into it. A concise source-backed quantity may be used when it makes the operating burden concrete; never invent or estimate one. Start with the one most salient exact observation in ordinary spoken language; do not inventory every sourced duty or use evidence-audit phrases such as `company-attributed posting`. Put Andrew's practical reason for the recipient to answer before the final question. Hold rather than manufacture any missing account foundation.";
     let writer_instructions = if n == 1 {
         format!(
-            r#"Write exactly three visible T1 candidates for every recipient: one operating_question, one completed_teardown, and one routing_question. Return the candidates unchanged in the schema; do not privately choose, merge, average, or rewrite them.
+            r#"Return exactly three governed mode decisions for every recipient: operating_question, evidence_contribution, and routing_question. Only modes listed in sendable_brief.allowed_candidate_modes may contain copy. For every unavailable mode set available=false, leave subject, body, evidence_claim_ids, intended_response, and recipient_value empty, use contribution_status=none, and state the honest abstention_reason. Never fabricate differentiation to fill a mode. Available candidates are returned unchanged; do not privately choose, merge, average, or rewrite them.
 
 The deterministic sendable_brief is the complete account contract. Use only its exact claim ids and fields. You have not been given an old account hypothesis, and you must not invent one. Choose hold_for_research when the brief cannot support three honest, structurally different drafts. Do not invent an attachment, completed analysis, customer fact, urgency, ownership, machine, consequence, or private workflow.
 
@@ -2713,9 +2865,9 @@ Use lead_source and outreach_channel as hard context. cold_email starts from ver
 
 For email, each body must start with `Hi [First name],` on its own line, end with the exact signature `{signature}` on its own line, use the {min_words}–{max_words} word band, and have a plain 3–9 word subject. For LinkedIn, set subject empty, use the first name naturally, omit the email signature, and stay within 300 characters. Every candidate must contain one verified trigger, one recognizable expensive moment, one concrete contribution or seconds-to-answer correction/route, and exactly one easy question. Do not request a call unless this is a verified pre-conference meeting request or the reviewed post-event/referral context records that exact agreed next action. Do not ask the recipient to help Andrew research. Do not use internal framework language such as hypothesis, fit screen, decision trail, external context, workflow surface, first-pass result, or review-ready.
 
-The three candidates must differ in opening, sentence structure, value offered, and question—not merely synonyms. A completed_teardown may state a completed screen or result only when contribution_status is completed_public_evidence_screen; otherwise it may present only the prepared observation explicitly supported by the brief. Mention a screen only when that completed status exists. University of Toronto and Automata are optional for Wapahki and normally omitted unless they materially establish credibility. Wapahki may omit its own name when one precise operating question is stronger. GnK must say exactly what it examines and the concrete artifact it returns. OutageHub must offer or lead with a location-specific historical comparison or sample API result it can actually produce; when a completed historical result exists, put that exact result in T1.
+Available candidates must differ in opening, sentence structure, value offered, and question—not merely synonyms. evidence_contribution must be grounded in artifact_type and artifact_recipient_result; artifact_status alone proves nothing. Prepared work may be described only as prepared, and a completed result only as completed_public_evidence_screen. Mention a Wapahki screen only when that completed status exists. University of Toronto and Automata are optional for Wapahki and normally omitted unless they materially establish credibility. Wapahki may omit its own name when one precise operating question is stronger. GnK must state the exact prepared analysis and recipient-usable result in the brief, never generic software capability. OutageHub must offer or lead with a location-specific historical comparison or sample API result it can actually produce; when a completed historical result exists, put that exact result in T1.
 
-Set each candidate's evidence_claim_ids to only the brief claims it actually uses. State recipient_value and intended_response privately in their schema fields. Use send only if all three drafts are truthful and each stands on its own in an inbox; otherwise abstain."#,
+Set each available candidate's evidence_claim_ids to only the brief claims it actually uses. State recipient_value and intended_response privately in their schema fields. Use send only when every allowed mode is truthful, every unavailable mode abstains, and at least one candidate stands on its own in an inbox; otherwise hold_for_research."#,
             signature = pb.signature,
             min_words = pb.min_words,
             max_words = pb.max_words,
@@ -2909,16 +3061,24 @@ Purpose and goal are private CRM notes, never substitutes for buyer-facing prose
                 let Some(right_raw) = raw_by_person.get(right_id) else {
                     continue;
                 };
-                let reused = left_raw.candidates.iter().any(|left_candidate| {
-                    right_raw.candidates.iter().any(|right_candidate| {
-                        cross_recipient_structural_similarity(
-                            &candidate_sequence(left_candidate),
-                            &candidate_sequence(right_candidate),
-                            &pb.signature,
-                        )
-                        .is_some()
-                    })
-                });
+                let reused = left_raw
+                    .candidates
+                    .iter()
+                    .filter(|candidate| candidate.available)
+                    .any(|left_candidate| {
+                        right_raw
+                            .candidates
+                            .iter()
+                            .filter(|candidate| candidate.available)
+                            .any(|right_candidate| {
+                                cross_recipient_structural_similarity(
+                                    &candidate_sequence(left_candidate),
+                                    &candidate_sequence(right_candidate),
+                                    &pb.signature,
+                                )
+                                .is_some()
+                            })
+                    });
                 if reused {
                     let issue = format!(
                         "cross_account_template_reuse: current candidate batches for {left_id} and {right_id} repeat an opening or question skeleton"
@@ -3116,7 +3276,7 @@ async fn review_person_copy(
         let brief = build_sendable_brief(&pb.key, context, person)
             .map_err(|reason| anyhow!("pre-writer brief no longer passes: {reason}"))?;
         person_progress("validating three unchanged candidates");
-        let candidate_issues = candidate_batch_issues(
+        let mut candidate_issues = candidate_batch_issues(
             pb,
             shared,
             account,
@@ -3125,6 +3285,14 @@ async fn review_person_copy(
             &brief,
             gtm_context,
         );
+        candidate_issues.extend(recent_candidate_similarity_issues(
+            db,
+            pb,
+            sequence_id,
+            &raw.candidates,
+        )?);
+        candidate_issues.sort();
+        candidate_issues.dedup();
         if !candidate_issues.is_empty() {
             return Err(anyhow!(
                 "candidate validation held the batch: {}",
@@ -3146,13 +3314,23 @@ async fn review_person_copy(
                     intended_response: candidate.intended_response.clone(),
                     recipient_value: candidate.recipient_value.clone(),
                     contribution_status: candidate.contribution_status.key().into(),
+                    available: candidate.available,
+                    abstention_reason: candidate.abstention_reason.clone(),
+                    content_hash: candidate
+                        .available
+                        .then(|| crate::db::touch_content_hash(&candidate.subject, &candidate.body))
+                        .unwrap_or_default(),
                     ..Default::default()
                 })
                 .collect::<Vec<_>>(),
         )?;
         person_progress("running two blind inbox selections");
-        let (selected, reviews) =
-            select_unchanged_candidate(client, pb, person, &raw.candidates).await?;
+        let CandidateSelectionOutcome {
+            selected,
+            selector_a,
+            selector_b,
+            reviews,
+        } = select_unchanged_candidate(client, pb, person, &raw.candidates).await?;
         db.mark_selected_message_candidate(
             sequence_id,
             &selected.id,
@@ -3161,6 +3339,21 @@ async fn review_person_copy(
                 .map(|review| review.score as i64)
                 .unwrap_or(0),
         )?;
+        db.record_message_selection_audit(&MessageSelectionAudit {
+            sequence_id: sequence_id.to_string(),
+            selector_a_candidate_id: selector_a.selected_candidate_id.clone(),
+            selector_a_passed: selector_a.passes(),
+            selector_a_score: selector_a.score() as i64,
+            selector_a_reasons: selector_a.reasons.clone(),
+            selector_b_candidate_id: selector_b.selected_candidate_id.clone(),
+            selector_b_passed: selector_b.passes(),
+            selector_b_score: selector_b.score() as i64,
+            selector_b_reasons: selector_b.reasons.clone(),
+            agreed_candidate_id: selected.id.clone(),
+            selected_content_hash: crate::db::touch_content_hash(&selected.subject, &selected.body),
+            copy_policy_hash: current_copy_policy_hash().into(),
+            ..Default::default()
+        })?;
         let mut sequence = candidate_sequence(&selected);
         sequence.applied_principles =
             normalize_principle_ids(&raw.applied_principles, &allowed_principles);
@@ -7467,6 +7660,52 @@ pub(crate) fn cross_recipient_structural_similarity(
         .then_some((body_similarity, question_similarity))
 }
 
+fn recent_candidate_similarity_issues(
+    db: &SharedDb,
+    pb: &Playbook,
+    current_sequence_id: &str,
+    candidates: &[MessageCandidate],
+) -> Result<Vec<String>> {
+    let recent = db.recent_message_candidate_audit(&pb.key, current_sequence_id, 300)?;
+    let mut issues = Vec::new();
+    for candidate in candidates.iter().filter(|candidate| candidate.available) {
+        let candidate_sequence = candidate_sequence(candidate);
+        for prior in &recent {
+            let prior_sequence = CopySequence {
+                touches: vec![CopyTouch {
+                    stage: 1,
+                    day_offset: 0,
+                    channel: prior.channel.clone(),
+                    subject: prior.subject.clone(),
+                    body: prior.body.clone(),
+                    purpose: String::new(),
+                    goal: String::new(),
+                }],
+                applied_principles: Vec::new(),
+            };
+            if let Some((body_similarity, question_similarity)) =
+                cross_recipient_structural_similarity(
+                    &candidate_sequence,
+                    &prior_sequence,
+                    &pb.signature,
+                )
+            {
+                issues.push(format!(
+                    "cross_account_template_reuse: candidate {} duplicates prior sequence {} (body {:.0}%, question {:.0}%)",
+                    candidate.id,
+                    prior.sequence_id,
+                    body_similarity * 100.0,
+                    question_similarity * 100.0,
+                ));
+                break;
+            }
+        }
+    }
+    issues.sort();
+    issues.dedup();
+    Ok(issues)
+}
+
 fn cross_recipient_similarity_issue(
     db: &SharedDb,
     pb: &Playbook,
@@ -7703,17 +7942,19 @@ fn candidate_schema(n: usize) -> Value {
         "items": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["id", "mode", "channel", "subject", "body", "evidence_claim_ids", "intended_response", "recipient_value", "contribution_status"],
+            "required": ["id", "mode", "channel", "subject", "body", "evidence_claim_ids", "intended_response", "recipient_value", "contribution_status", "available", "abstention_reason"],
             "properties": {
                 "id": { "type": "string", "description": "Stable candidate id unique within this recipient." },
-                "mode": { "type": "string", "enum": ["operating_question", "completed_teardown", "routing_question"] },
+                "mode": { "type": "string", "enum": ["operating_question", "evidence_contribution", "routing_question"] },
                 "channel": { "type": "string", "enum": ["email", "linkedin"] },
                 "subject": { "type": "string" },
                 "body": { "type": "string" },
-                "evidence_claim_ids": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+                "evidence_claim_ids": { "type": "array", "items": { "type": "string" } },
                 "intended_response": { "type": "string", "description": "One natural reply this exact unchanged message is designed to earn." },
                 "recipient_value": { "type": "string", "description": "What the recipient gains before educating Andrew." },
-                "contribution_status": { "type": "string", "enum": ["none", "prepared_observation", "completed_public_evidence_screen"] }
+                "contribution_status": { "type": "string", "enum": ["none", "prepared_observation", "completed_public_evidence_screen"] },
+                "available": { "type": "boolean" },
+                "abstention_reason": { "type": "string" }
             }
         }
     })
@@ -7846,13 +8087,13 @@ mod tests {
         mentions_historical_outage_result, mentions_outreach_asset, names_historical_outage_result,
         narrates_internal_copy_logic, normalize_dashes, normalize_principle_ids,
         normalize_thread_subjects, outagehub_historical_binding_issues, provisional_channel,
-        provisional_day_offset, select_people_for_planning, sequence_quality_issues,
-        source_attribution_issues, supported_touch_count, supported_touch_count_for_brand,
-        touch_question_limit, touch_word_band, unconfirmed_subject_claim_issues,
-        unsupported_account_task_noun_issues, unsupported_subject_number_issues,
-        wapahki_leads_with_generic_facility_fit, wapahki_names_operating_consequence,
-        word_set_similarity, CopyAccount, CopySequence, CopyTouch, EditDoc, EditReview,
-        PlanProgressRecipient, PlanProgressUpdate, TouchReview,
+        provisional_day_offset, recipient_role_binding_matches, select_people_for_planning,
+        sequence_quality_issues, source_attribution_issues, supported_touch_count,
+        supported_touch_count_for_brand, touch_question_limit, touch_word_band,
+        unconfirmed_subject_claim_issues, unsupported_account_task_noun_issues,
+        unsupported_subject_number_issues, wapahki_leads_with_generic_facility_fit,
+        wapahki_names_operating_consequence, word_set_similarity, CopyAccount, CopySequence,
+        CopyTouch, EditDoc, EditReview, PlanProgressRecipient, PlanProgressUpdate, TouchReview,
     };
 
     #[test]
@@ -9826,5 +10067,33 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(channels, vec!["email", "email"]);
         assert_eq!(days, vec![0, 6]);
+    }
+
+    #[test]
+    fn verified_adjacent_person_uses_routing_sentinel_without_fake_role_claim() {
+        assert!(recipient_role_binding_matches(
+            "verified-adjacent-person:person-1",
+            "person-1",
+            None,
+            true,
+        ));
+        assert!(!recipient_role_binding_matches(
+            "verified-adjacent-person:person-1",
+            "person-2",
+            None,
+            true,
+        ));
+        assert!(!recipient_role_binding_matches(
+            "verified-adjacent-person:person-1",
+            "person-1",
+            None,
+            false,
+        ));
+        assert!(recipient_role_binding_matches(
+            "claim-role",
+            "person-1",
+            Some("claim-role"),
+            false,
+        ));
     }
 }

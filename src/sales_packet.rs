@@ -129,6 +129,15 @@ pub fn import_sales_application(db: &SharedDb, path: &Path) -> Result<String> {
     db.upsert_sales_application_brief(&brief)
 }
 
+/// Import a human-prepared proof asset. The database validates evidence scope
+/// and brand-specific content depth; import alone never approves copy or sends.
+pub fn import_proof_asset(db: &SharedDb, path: &Path) -> Result<String> {
+    let raw = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let asset: ProofAsset = serde_json::from_slice(&raw)
+        .with_context(|| format!("parsing proof asset JSON {}", path.display()))?;
+    db.upsert_proof_asset(&asset)
+}
+
 /// Build a bounded artifact only from the operator's draft brief and its
 /// active claim ids. It intentionally produces structured outside-in work,
 /// never customer results, ROI, private workflows, or invented integrations.
@@ -193,33 +202,83 @@ pub fn prepare_proof_asset(
     {
         anyhow::bail!("historical replay requires a completed location-outage match claim");
     }
-    let content = serde_json::json!({
-        "asset_type": asset_type,
-        "brand": brief.brand,
-        "sales_opportunity_id": sales_opportunity_id,
-        "selected_play": brief.selected_play,
-        "workflow_or_task": brief.operational_workflow,
-        "trigger": brief.trigger,
-        "current_workaround": {
-            "text": brief.current_workaround,
-            "status": brief.current_workaround_status,
-        },
-        "consequence_hypothesis": brief.consequence_hypothesis,
-        "decision_improved": brief.decision_improved,
-        "facts": selected_claims.iter().map(|claim| serde_json::json!({
-            "claim_id": claim.id,
-            "claim_type": claim.claim_type,
-            "text": claim.claim_text,
-            "source_url": claim.source_url,
-            "source_excerpt": claim.source_excerpt,
-            "observed_at": claim.observed_at,
-        })).collect::<Vec<_>>(),
-        "inferences": brief.inferences,
-        "unknowns": brief.uncertainties,
-        "kill_conditions": brief.technical_kill_conditions,
-        "required_customer_input": brief.required_customer_input,
-        "evidence_boundary": "Outside-in public evidence only. This artifact does not establish a private workflow, loss, ROI, causation, performance, or customer result.",
-    });
+    let evidence_items = selected_claims
+        .iter()
+        .map(|claim| {
+            serde_json::json!({
+                "claim_id": claim.id,
+                "claim_type": claim.claim_type,
+                "text": claim.claim_text,
+                "source_url": claim.source_url,
+                "source_excerpt": claim.source_excerpt,
+                "observed_at": claim.observed_at,
+            })
+        })
+        .collect::<Vec<_>>();
+    let content = if brief.brand.eq_ignore_ascii_case("gnk") {
+        let mut base = serde_json::json!({
+            "analysis_version": "gnk_outside_in_v1",
+            "asset_type": asset_type,
+            "examined_scope": brief.operational_workflow,
+            "evidence_items": evidence_items,
+            "limitations": brief.uncertainties,
+            "recipient_usable_result": "",
+            "required_customer_input": brief.required_customer_input,
+            "evidence_boundary": "Outside-in public evidence only. Complete the analytical fields manually before marking this prepared or completed.",
+        });
+        if asset_type == "workflow_risk_map" {
+            base["workflow_steps"] = serde_json::json!([]);
+            base["risk_connections"] = serde_json::json!([]);
+        } else {
+            base["observable_surface"] = serde_json::json!("");
+            base["failure_points"] = serde_json::json!([]);
+            base["returned_analysis"] = serde_json::json!("");
+        }
+        base
+    } else if brief.brand.eq_ignore_ascii_case("wapahki") && asset_type == "wapahki_task_brief" {
+        serde_json::json!({
+            "analysis_version": "wapahki_task_brief_v1",
+            "facility_task": brief.operational_workflow,
+            "confirmed_facts": evidence_items,
+            "inferences": brief.inferences,
+            "unknowns": brief.uncertainties,
+            "likely_value_driver": brief.consequence_hypothesis,
+            "technical_kill_conditions": brief.technical_kill_conditions,
+            "minimum_data_for_feasibility": brief.required_customer_input,
+            "paid_feasibility_reason": brief.commercial_potential,
+            "recipient_usable_result": format!(
+                "A sourced task brief for {} that separates confirmed task evidence from the operating unknowns and kill conditions required for a feasibility decision.",
+                brief.operational_workflow
+            ),
+            "evidence_boundary": "Outside-in public evidence only. This Task Brief does not establish private cycle time, variation, safety, sanitation, economics, ownership, or fit.",
+        })
+    } else {
+        serde_json::json!({
+            "asset_type": asset_type,
+            "brand": brief.brand,
+            "sales_opportunity_id": sales_opportunity_id,
+            "selected_play": brief.selected_play,
+            "workflow_or_task": brief.operational_workflow,
+            "trigger": brief.trigger,
+            "current_workaround": {
+                "text": brief.current_workaround,
+                "status": brief.current_workaround_status,
+            },
+            "consequence_hypothesis": brief.consequence_hypothesis,
+            "decision_improved": brief.decision_improved,
+            "facts": evidence_items,
+            "inferences": brief.inferences,
+            "unknowns": brief.uncertainties,
+            "kill_conditions": brief.technical_kill_conditions,
+            "required_customer_input": brief.required_customer_input,
+            "recipient_usable_result": format!(
+                "A source-cited {} for {} showing the public evidence, result boundary, and the exact decision it could inform.",
+                asset_type.replace('_', " "),
+                brief.operational_workflow
+            ),
+            "evidence_boundary": "Outside-in public evidence only. This artifact does not establish a private workflow, loss, ROI, causation, performance, or customer result.",
+        })
+    };
     let packet_dir = output_root
         .join(&brief.brand)
         .join(sales_opportunity_id)
@@ -231,7 +290,9 @@ pub fn prepare_proof_asset(
         .list_proof_assets(sales_opportunity_id)?
         .into_iter()
         .find(|asset| asset.asset_type == asset_type);
-    let status = if asset_type == "historical_outage_replay" {
+    let status = if brief.brand.eq_ignore_ascii_case("gnk") {
+        "planned"
+    } else if asset_type == "historical_outage_replay" {
         "completed"
     } else {
         "prepared"
@@ -488,9 +549,13 @@ fn export_one(db: &SharedDb, opportunity: &SalesOpportunity, path: &Path) -> Res
         .filter(|sequence| sequence.sales_opportunity_id == opportunity.id)
         .collect::<Vec<_>>();
     let mut candidates = Vec::<MessageCandidateAudit>::new();
+    let mut selector_provenance = Vec::new();
     let mut approvals = Vec::new();
     for sequence in sequences {
         candidates.extend(db.list_message_candidate_audit(&sequence.id)?);
+        if let Some(selection) = db.get_message_selection_audit(&sequence.id)? {
+            selector_provenance.push(selection);
+        }
         let touches = db
             .list_touches_for_sequence(&sequence.id)?
             .into_iter()
@@ -507,6 +572,7 @@ fn export_one(db: &SharedDb, opportunity: &SalesOpportunity, path: &Path) -> Res
         approvals.push(HumanApprovalEntry { sequence, touches });
     }
     write_json(&path.join("message_candidates.json"), &candidates)?;
+    write_json(&path.join("selector_provenance.json"), &selector_provenance)?;
     write_json(&path.join("human_approval.json"), &approvals)?;
 
     let followups = db.list_conditional_followups(&opportunity.id)?;

@@ -52,7 +52,11 @@ pub struct PilotAudit {
     pub researched_accounts: usize,
     pub segments: Vec<String>,
     pub generated_messages: usize,
+    pub selector_provenance_messages: usize,
     pub manually_approved_messages: usize,
+    pub approved_distinct_accounts: usize,
+    pub approved_distinct_facilities: usize,
+    pub complete_wapahki_task_briefs: usize,
     pub allowlisted_smtp_messages: usize,
     pub casl_program_approval_recorded: bool,
     pub wrong_role_sequences: Vec<String>,
@@ -160,8 +164,11 @@ pub fn audit(
         .map(|value| !value.trim().is_empty())
         .unwrap_or(false);
 
-    let mut generated_messages = 0usize;
-    let mut manually_approved_messages = 0usize;
+    let mut generated_accounts = HashSet::<String>::new();
+    let mut selector_provenance_accounts = HashSet::<String>::new();
+    let mut approved_accounts = HashSet::<String>::new();
+    let mut approved_facilities = HashSet::<String>::new();
+    let mut complete_wapahki_task_briefs = HashSet::<String>::new();
     let mut allowlisted_smtp_messages = 0usize;
     let mut wrong_role_sequences = Vec::new();
     let mut unsupported_sequences = Vec::new();
@@ -272,14 +279,91 @@ pub fn audit(
             ));
             continue;
         }
-        generated_messages += 1;
         let first_touch = touches.iter().find(|touch| touch.stage == 1);
-        let exact_approval = first_touch
-            .map(|touch| db.touch_has_current_exact_approval(&touch.id))
-            .transpose()?
-            .unwrap_or(false);
+        let Some(first_touch) = first_touch else {
+            unsupported_sequences.push(format!(
+                "{} / {}: generated sequence has no T1",
+                lead.name, person.name
+            ));
+            continue;
+        };
+        let candidate_modes = db.list_message_candidate_audit(&sequence.id)?;
+        let mode_set = candidate_modes
+            .iter()
+            .map(|candidate| candidate.mode.as_str())
+            .collect::<HashSet<_>>();
+        let selection = db.get_message_selection_audit(&sequence.id)?;
+        let selected = candidate_modes.iter().find(|candidate| candidate.selected);
+        let selected_hash = crate::db::touch_content_hash(&first_touch.subject, &first_touch.body);
+        let provenance_valid = candidate_modes.len() == 3
+            && mode_set
+                == HashSet::from([
+                    "operating_question",
+                    "evidence_contribution",
+                    "routing_question",
+                ])
+            && candidate_modes
+                .iter()
+                .filter(|candidate| candidate.selected)
+                .count()
+                == 1
+            && selected.is_some_and(|candidate| {
+                candidate.available
+                    && candidate.content_hash == selected_hash
+                    && candidate.subject == first_touch.subject
+                    && candidate.body == first_touch.body
+            })
+            && selection.as_ref().is_some_and(|selection| {
+                selection.selector_a_passed
+                    && selection.selector_b_passed
+                    && selection.selector_a_candidate_id == selection.selector_b_candidate_id
+                    && selection.agreed_candidate_id == selection.selector_a_candidate_id
+                    && selection.copy_policy_hash == current_copy_policy_hash()
+                    && selection.selected_content_hash == selected_hash
+                    && selected.is_some_and(|candidate| {
+                        candidate.candidate_id == selection.agreed_candidate_id
+                    })
+            });
+        if !provenance_valid {
+            unsupported_sequences.push(format!(
+                "{} / {}: missing full three-mode abstention/candidate and two-selector exact-copy provenance",
+                lead.name, person.name
+            ));
+            continue;
+        }
+        selector_provenance_accounts.insert(lead.id.clone());
+
+        if let Some(asset) = context.proof_asset.as_ref() {
+            let artifact_issues = crate::db::proof_asset_gate_issues(asset);
+            if !artifact_issues.is_empty() {
+                unsupported_sequences.push(format!(
+                    "{} / {}: superficial artifact: {}",
+                    lead.name,
+                    person.name,
+                    artifact_issues.join("; ")
+                ));
+                continue;
+            }
+            if brand == "wapahki"
+                && asset.asset_type == "wapahki_task_brief"
+                && matches!(asset.status.as_str(), "prepared" | "completed")
+            {
+                if let Some(opportunity) = context.opportunity.as_ref() {
+                    if !opportunity.facility_id.trim().is_empty() {
+                        complete_wapahki_task_briefs.insert(opportunity.facility_id.clone());
+                    }
+                }
+            }
+        }
+        generated_accounts.insert(lead.id.clone());
+        let exact_approval = db.touch_has_current_exact_approval(&first_touch.id)?;
         if exact_approval {
-            manually_approved_messages += 1;
+            approved_accounts.insert(lead.id.clone());
+            if let Some(opportunity) = context.opportunity.as_ref() {
+                if !opportunity.facility_id.trim().is_empty() {
+                    approved_facilities.insert(opportunity.facility_id.clone());
+                }
+            }
         }
         if exact_approval
             && allowlist_configured
@@ -309,8 +393,12 @@ pub fn audit(
     let mut audit = PilotAudit {
         researched_accounts: researched_accounts.len(),
         segments,
-        generated_messages,
-        manually_approved_messages,
+        generated_messages: generated_accounts.len(),
+        selector_provenance_messages: selector_provenance_accounts.len(),
+        manually_approved_messages: approved_accounts.len(),
+        approved_distinct_accounts: approved_accounts.len(),
+        approved_distinct_facilities: approved_facilities.len(),
+        complete_wapahki_task_briefs: complete_wapahki_task_briefs.len(),
         allowlisted_smtp_messages,
         casl_program_approval_recorded,
         wrong_role_sequences,
@@ -336,6 +424,12 @@ pub fn audit(
             audit.generated_messages
         ));
     }
+    if audit.selector_provenance_messages < minimum_messages {
+        audit.blockers.push(format!(
+            "need {minimum_messages} distinct-account messages with three persisted mode decisions and two agreeing selector records; found {}",
+            audit.selector_provenance_messages
+        ));
+    }
     if !audit.wrong_role_sequences.is_empty() {
         audit.blockers.push(format!(
             "{} generated sequence(s) target the wrong role",
@@ -353,6 +447,26 @@ pub fn audit(
             "need {minimum_approvals} exact-copy manual approvals bound to sequence, touch, policy, and content hash; found {}",
             audit.manually_approved_messages
         ));
+    }
+    if audit.approved_distinct_accounts < minimum_approvals {
+        audit.blockers.push(format!(
+            "need {minimum_approvals} exact approvals on distinct accounts; found {}",
+            audit.approved_distinct_accounts
+        ));
+    }
+    if brand == "wapahki" {
+        if audit.complete_wapahki_task_briefs < minimum_accounts {
+            audit.blockers.push(format!(
+                "need {minimum_accounts} distinct facilities with complete Wapahki Task Briefs; found {}",
+                audit.complete_wapahki_task_briefs
+            ));
+        }
+        if audit.approved_distinct_facilities < minimum_approvals {
+            audit.blockers.push(format!(
+                "need {minimum_approvals} exact approvals across distinct Wapahki facilities; found {}",
+                audit.approved_distinct_facilities
+            ));
+        }
     }
     if audit.allowlisted_smtp_messages == 0 {
         audit.blockers.push(

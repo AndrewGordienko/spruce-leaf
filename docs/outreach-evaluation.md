@@ -12,8 +12,16 @@ holdout that prompt authors cannot see.
    truthful capabilities), and fix the human preference before running a model.
 2. Change one variable at a time: writer model, reasoning effort, prompt version, or research bundle. Do not change the list and copy system together.
 3. Run `cargo run -- eval-outreach --double-blind`. The verifier judges both candidate orders; order-inconsistent cases fail.
-4. Promotion requires at least 30 cases, double-blind order checking, at least 90% pairwise agreement, at least 90% absolute sendability accuracy across 20 or more human labels, and zero unsupported claims in a human-labelled sendable draft.
+4. Promotion requires the current brand sample (GnK 30 with 6 sealed holdouts, Wapahki 10 with 2, OutageHub 40 with 10), double-blind order checking, at least 90% selection and absolute-sendability accuracy for every brand, at least 90% accuracy on each sealed holdout, and zero unsupported claims in a human-labelled sendable draft.
 5. Model scores authorize no sends. Use human approval as the pre-send gate, then judge the motion by positive-reply rate and qualified conversations on randomized account-level arms.
+
+For a real inventory audit, run `cargo run -- --brand <brand> acceptance-report
+--output artifacts/acceptance/<date>`. The command is read-only: it creates the
+brand's governed company sample, qualification decisions, contact-evidence
+records, candidate/selector inventory, blank Andrew review sheet, cross-account
+similarity report, and grouped failure report. It never researches, generates,
+labels, approves, schedules, or sends. Empty candidate output is a valid and
+important result when no account passes the pre-writing gates.
 
 The writer, editor, and verifier have independent controls:
 

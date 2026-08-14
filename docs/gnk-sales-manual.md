@@ -82,7 +82,7 @@ T1 is approximately 60–110 words with a 3–9 word operational subject. It use
 
 The recipient owes Andrew no market research. Reject “trying to understand,” “would value your perspective,” generic capability paragraphs, and a diagnostic question followed by vague software language. An easy correction is legitimate only when the trigger and contribution already make the note worth reading.
 
-Generate exactly three unchanged modes, fact-check them, and let two blind selectors choose or hold. Reviewers do not rewrite or merge. Exact-copy human approval remains mandatory.
+Persist one decision for each governed mode, but generate copy only for evidence-supported modes and record explicit abstentions for the others. Fact-check every available candidate and let two blind selectors choose or hold without rewriting or merging. Exact-copy human approval remains mandatory.
 
 ## Follow-up
 

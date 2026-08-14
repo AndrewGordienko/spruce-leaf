@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::{
     AcquisitionContext, CustomerDevelopmentRecord, EvidenceClaim, GtmExperiment, GtmPlay, Lead,
-    MarketSegment, OpportunityStakeholder, Person, SalesBrief, SalesOpportunity, SharedDb,
-    SignalDefinition, SignalObservation,
+    MarketSegment, OpportunityStakeholder, Person, ProofAsset, SalesBrief, SalesOpportunity,
+    SharedDb, SignalDefinition, SignalObservation,
 };
 use crate::playbook::Playbook;
 
@@ -292,6 +292,10 @@ pub struct GtmActionContext {
     /// validated projection, never the old free-form account hypothesis.
     #[serde(default)]
     pub sales_brief: Option<SalesBrief>,
+    /// Exact prepared/completed artifact bound by the Sales Brief. Writers see
+    /// only its validated recipient-facing result, never a status flag alone.
+    #[serde(default)]
+    pub proof_asset: Option<ProofAsset>,
     /// Reviewed source/channel history. The writer may reference only this
     /// context when the person is not a cold-research acquisition.
     #[serde(default)]
@@ -571,6 +575,57 @@ pub fn graded_problem_confirmed_for_lead(
                             .is_some_and(|quote| !quote.trim().is_empty())
                 })
         }))
+}
+
+/// Follow-up authorization is scoped to the exact opportunity, person, and
+/// conversation thread. One employee's reply must never widen another cold
+/// thread at the same account.
+pub fn graded_problem_confirmed_for_thread(
+    db: &crate::db::Db,
+    brand: &str,
+    sales_opportunity_id: &str,
+    person_id: &str,
+) -> Result<bool> {
+    for observation in db
+        .list_active_signal_observations(Some(brand), None, Some(person_id))?
+        .into_iter()
+        .filter(|observation| {
+            observation.definition_key == "conversation.problem_confirmed"
+                && observation.source_name == "prospect_reply"
+                && observation.status == "verified"
+                && !observation.conversation_id.trim().is_empty()
+        })
+    {
+        let Some(conversation) = db.get_conversation(&observation.conversation_id)? else {
+            continue;
+        };
+        if conversation.person_id != person_id {
+            continue;
+        }
+        let in_scope = db
+            .sequence_gtm_attribution(&conversation.sequence_id)?
+            .is_some_and(|sequence| {
+                sequence.sales_opportunity_id == sales_opportunity_id
+                    && sequence.person_id == person_id
+                    && sequence.brand.eq_ignore_ascii_case(brand)
+            });
+        if !in_scope {
+            continue;
+        }
+        if serde_json::from_str::<serde_json::Value>(&observation.value_json)
+            .ok()
+            .is_some_and(|value| {
+                value.get("grade").and_then(|grade| grade.as_str()) == Some("explicit")
+                    && value
+                        .get("supporting_quote")
+                        .and_then(|quote| quote.as_str())
+                        .is_some_and(|quote| !quote.trim().is_empty())
+            })
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// A contact-specific cold-outreach boundary. Routers are held for explicit
@@ -1329,7 +1384,11 @@ pub fn prepare_action(
     // Deterministic commercial priority: lane + component breakdown derived
     // from the same persisted evidence that authorized the state. Persisted on
     // the opportunity so the CRM can display *why* an account sits in a lane.
-    let engaged = graded_problem_confirmed_for_lead(db, brand, lead_id)?;
+    let engaged = if let Some(opportunity) = &opportunity {
+        graded_problem_confirmed_for_thread(db, brand, &opportunity.id, &person.id)?
+    } else {
+        false
+    };
     let priority = if brand.eq_ignore_ascii_case("outagehub") {
         if let Some(opportunity) = &opportunity {
             db.recompute_outagehub_opportunity_priority(&opportunity.id)?
@@ -1353,6 +1412,12 @@ pub fn prepare_action(
     let sales_brief = match &opportunity {
         Some(opportunity) => db.get_sales_brief(&opportunity.id, &person.id)?,
         None => None,
+    };
+    let proof_asset = match &sales_brief {
+        Some(brief) if !brief.artifact_id.trim().is_empty() => {
+            db.get_proof_asset(&brief.artifact_id)?
+        }
+        _ => None,
     };
     let acquisition_context = match &opportunity {
         Some(opportunity) => db.get_acquisition_context(&opportunity.id, &person.id)?,
@@ -1388,6 +1453,7 @@ pub fn prepare_action(
         engaged,
         priority,
         sales_brief,
+        proof_asset,
         acquisition_context,
     })
 }
@@ -1626,7 +1692,7 @@ pub fn default_plays() -> Vec<GtmPlay> {
             required_signal_keys: vec!["account.fit_evidence".into(), "account.specific_recurring_decision".into(), "account.believable_operating_consequence".into(), "account.external_trigger_or_mechanism_evidence".into()],
             minimum_signal_matches: 4,
             hypothesis: "A source-backed trigger creates a recurring exception decision whose inputs, coordination, or existing system boundary produces a meaningful operating consequence.".into(),
-            action_policy: "Work one bounded problem segment at a time and qualify company × workflow opportunity, not company category. Cold planning produces T1 only from a complete SendableBrief: atomic account claims, person-specific role evidence, one expensive moment, consequence, concrete deliverable, required input, improved decision, and expected reply. Titles and account keywords never prove direct ownership. Generate three unchanged modes, validate facts, select blindly, and require exact-copy manual approval. If the offer cannot honestly say what GnK examines and returns, hold it. Automation never schedules cold copy.".into(),
+            action_policy: "Work one bounded problem segment at a time and qualify company × workflow opportunity, not company category. Cold planning produces T1 only from a complete SendableBrief: atomic account claims, person-specific role evidence or an honest routing sentinel, one expensive moment, consequence, genuinely prepared artifact, required input, improved decision, and expected reply. Titles and account keywords never prove direct ownership. Persist each governed mode, abstain from unsupported modes, validate facts and artifact content, select blindly, and require exact-copy manual approval. If the offer cannot honestly say what GnK examined and returns, hold it. Automation never schedules cold copy.".into(),
             proof_type: "bounded_workflow_replay".into(),
             proof_description: "Apply the proposed workflow to a small historical sample and compare decision time, exception handling, and outcome quality with the current process.".into(),
             success_metric: "The account-specific consequence named in research: resolution time, leakage or recoveries, audit exposure, customer SLA, throughput, escalation, or constrained expert capacity.".into(),
